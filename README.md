@@ -6,7 +6,7 @@ Crawl the package and release information from PyPi API and store the result int
 
 - [ ] Build each component:
   - [ ] A program uploading a file to a specific directory of Google Drive. 
-  - [ ] A program extracting all package name from PyPi 
+  - [X] A program extracting all package name from PyPi 
   - [ ] A program downloading a json from PyPi api given specific package name 
   - [ ] A program downloading json from a specific pypi release 
 - [ ] Build a program checking the status of Google Drive directory and do ETL action. 
