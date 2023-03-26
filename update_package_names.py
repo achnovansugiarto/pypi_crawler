@@ -34,11 +34,14 @@ def load_pkg_names():
 
 if __name__ == '__main__':
     loaded_pkg_names = load_pkg_names()
+    print("number of loaded pkg names:", len(load_pkg_names))
     current_pkg_names = download_pypi_package_names()
+    print("number of current pkg names:", len(current_pkg_names))
     new_pkgs = set(current_pkg_names) - set(loaded_pkg_names)
     if len(new_pkgs):
-        print('New packages released:', new_pkgs)
+        print('Number of new packages: ', len(new_pkgs))
         pkgs = sorted(list(set(new_pkgs) | set(loaded_pkg_names)))
+        print('Number of joined pkgs:', len(pkgs))
         save_pkg_name_file(pkgs)
     else:
         print('No new released pacakge')
