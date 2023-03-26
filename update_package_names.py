@@ -30,6 +30,7 @@ def save_pkg_name_file(pkg_names):
 def load_pkg_names():
     with open(PATH, 'r') as f:
         package_names = [x.strip() for x in f]
+        package_names = [x for x in package_names if len(x) > 0]
     return package_names
 
 if __name__ == '__main__':
