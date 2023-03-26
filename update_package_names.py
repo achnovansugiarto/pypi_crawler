@@ -34,7 +34,7 @@ def load_pkg_names():
 
 if __name__ == '__main__':
     loaded_pkg_names = load_pkg_names()
-    print("number of loaded pkg names:", len(load_pkg_names))
+    print("number of loaded pkg names:", len(loaded_pkg_names))
     current_pkg_names = download_pypi_package_names()
     print("number of current pkg names:", len(current_pkg_names))
     new_pkgs = set(current_pkg_names) - set(loaded_pkg_names)
