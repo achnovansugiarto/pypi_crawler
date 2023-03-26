@@ -37,7 +37,8 @@ if __name__ == '__main__':
     current_pkg_names = download_pypi_package_names()
     new_pkgs = set(current_pkg_names) - set(loaded_pkg_names)
     if len(new_pkgs):
-        print('New packages released:', new_pkgs)    
-        save_pkg_name_file(current_pkg_names)
+        print('New packages released:', new_pkgs)
+        pkgs = sorted(list(set(new_pkgs) | set(loaded_pkg_names)))
+        save_pkg_name_file(pkgs)
     else:
         print('No new released pacakge')
