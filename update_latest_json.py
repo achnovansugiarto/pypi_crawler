@@ -24,21 +24,23 @@ def download_new(pkg_name, result):
     if not os.path.exists(save_path):
         with open(save_path, 'w', encoding='utf8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+            print(save_path, 'saved')
         return True
     else:
         return False
 
 def remove_old(pkg_name, result):
-    rc = len(result['releases'].keys())
-    if rc - 1 > 0:
-        old_json_path = f'data/latest/{pkg_name}.rc{rc-1}.json'
+    rc = len(result['releases'].keys()) - 1
+    while rc > 0:
+        old_json_path = f'data/latest/{pkg_name}.rc{rc}.json'
         if os.path.exists(old_json_path):
             os.remove(old_json_path)
             print(f'{old_json_path} removed')
+            break
         else:
             print(f'{old_json_path} does not exist')
-    else:
-        print(f'No older version')
+        rc -= 1
+
     
 if __name__ == '__main__':    
     update(sys.argv[1])
