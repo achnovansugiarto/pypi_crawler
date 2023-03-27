@@ -1,0 +1,225 @@
+{
+  "info": {
+    "author": "Maciej Nowak",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: Console",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Topic :: Software Development :: Embedded Systems",
+      "Topic :: System :: Emulators",
+      "Topic :: Utilities"
+    ],
+    "description": "# QEMU Runner\nThis project allows creation of self-contained runner for QEMU with embedded command line arguments. Command line arguments are described in files called **layers**. They are simple INI files that can be combined together to express more complex command lines.\n\n```shell\n> cat ./arm_virt.ini\n[general]\nengine = qemu-system-arm\n\n[machine]\n@=virt\n\n> cat ./ram_2G.ini\n[general]\nmemory = 2G\n\n> qemu_make_runner -l ./arm_virt.ini ./ram_2G.ini -o ./my_runner.pyz\n> python ./my_runner.pyz --dry-run kernel.elf arg1 arg2  # --dry-run to see effective command line instead of running QEMU\nqemu-system-arm -machine virt -kernel kernel.elf -append 'arg1 arg2'\n```\n\nResulting `my_runner.pyz` file is ZIP file with `qemu_runner` package and layers. Runner has no extra dependencies, using only Python 3.8+ standard library. QEMU is found according to search precedence described below.\n\nExisting runner can be used as base for next runner. **Derived runner** will contain all layers from base runner along with additional layers specified when deriving. This features allows extending base runner with project specific settings without being aware of base settings.\n\n```shell\n> cat ./semihosting.ini\n[semihosting-config]\nenable=on\ntarget=native\n\n> python ./my_runner.pyz --layers ./semihosting.ini --derive ./derived.pyz\n> python ./derived.pyz --dry-run kernel.elf arg1 arg2  # --dry-run to see effective command line instead of running QEMU\nqemu-system-arm -machine virt -semihosting-config enable=on,target=native -kernel kernel.elf -append 'arg1 arg2'\n```\n\nRunner provides following features, consult `--help` output for details:\n* GDB server settings\n* Start with CPU halted\n* Inspect command line\n\n# QEMU search precedence\nIf environment variable `QEMU_DEV` is set, it is used as path to QEMU executable.\nIf environment variable `QEMU_DEV` is not set but argument `--qemu` is specified it is used as path to QEMU executable.\n\nIf `QEMU_DEV` is not set, directories are searched for QEMU executable with name specified as `engine` in \ncombined layer:\n1. Directory specified by `QEMU_DIR` environment variable\n2. Directory specified by `--qemu-dir` argument\n3. Each ancestor directory containing runner, up to the root directory and `qemu` subdirectory at each level.\n   If runner's path is `c:\\dir1\\dir2\\runner.pyz`, then following directories are checked:\n   1. `c:\\dir1\\dir2`\n   2. `c:\\dir1\\dir2\\qemu`\n   3. `c:\\dir1\\`\n   4. `c:\\dir1\\qemu`\n   5. `c:\\`\n   6. `c:\\qemu`\n4. Repeat step 2 with path of base runner in case of derived runners with `--tract-qemu` option.\n5. Directories in `PATH` environment variable.\n\nOn Windows, `PATHEXT` variable is used to determine executable extension.\n\n# Environment variables\nSeveral environment variables influences the way QEMU command line is constructed:\n* `QEMU_FLAGS` - arguments to be added to the QEMU command line during execution \n* `QEMU_RUNNER_FLAGS` - arguments will be interpreted exactly as if they were added to runner execution. \n\nExample:\n```shell\nshell> QEMU_FLAGS = '-d int' QEMU_RUNNER_FLAGS = '--halted' ./runner.pyz --dry-run kernel.elf\nqemu-system-arm -machine virt -d int -S -kernel kernel.elf\n```\n\n# Layer search precedence\nIf layer path is absolute and file is not found, search process fails immediately.\n\nIf layer path is relative, following directories are searched:\n1. Current directory\n2. Packages declaring entry point `qemu_runner_layer_packages` (see below)\n\n# Layer file format\n**Layers** are plain INI files with sections describing QEMU command line. Layers can be combined together allowing user to build bigger command line from simpler building blocks.\n\nValues are interpreted as strings unless specified otherwise. When value is described as boolean, values `1`, `yes`, `true` and `on` are interpreted as true, values `0`, `no`, `false` and `off` are interpreted as false. Other values are invalid.\n\n## Section `[general]`\nSection `[general]` describes most common QEMU arguments. \n\nAvailable settings:\n* `engine` - Name of QEMU executable (e.g.: `qemu-system-arm`, `qemu-system-sparc`)\n* `cpu` - CPU to use in machine (`-cpu option`)\n* `memory` - RAM memory size, supports suffixes like `M`, `G` (e.g. `20M`, `4G`)\n* `gdb` (boolean) - If true QEMU will be started with gdbserver enabled.\n* `gdb_dev` - Use specified value as gdbserver listend address. If not used, default QEMU address will be used (`tcp::1234` at the time this document is written). Note that specifing only `gdb_dev` does not enable gdbserver.\n* `halted` - Freeze QEMU CPU at startup.\n\n## Section `[name]`\nEach section corresponds to single QEMU argument, e.g. section `[machine]` corresponds to `-machine` argument. Value specified as `@` key will be used as direct argument value (machine name, device type, etc). Remaining arguments will be added as key-value properties (note: for `id` property see next section).\n\nFor example, layer:\n```ini\n[machine]\n@=virt\nusb=on\ngic-version=2\n```\n\nwill be translated into\n\n```\n-machine virt,usb=on,gic-version=2\n```\n\n## Section `[name:id]`\nAs INI file syntax does not allow duplicated section names it is not possible to describe many QEMU arguments without additional syntax: `-device`, `-netdev`, etc. These arguments can be differentiated by `id` property which can be specified as section name in format `argument_name:id`.\n\nFor example, layer:\n```ini\n[device:d1]\n@=type1\narg1=10\narg2=20\n\n[device:d2]\n@=type1\narg1=10\narg2=20\n\n[device:d3]\n@=type2\narg3=10\narg4=20\n```\n\ntranslates into:\n\n```\n-device type1,id=d1,arg1=10,arg2=20 -device type1,id=d2,arg1=10,arg2=20 -device type2,id=d3,arg3=10,arg4=20\n```\n\n\n## Variable resolution\nIn sections `[name]` and `[name:id]` it is possible to use variables which will be resolved directly before building complete command lines. Variables are in form `${VARIABLE_NAME}`.\n\nCurrently available variables:\n\n| Variable name | Value                                                           |\n|---------------|-----------------------------------------------------------------|\n| `KERNEL_DIR`  | Directory containing kernel executable (path is not normalized) |\n\n## How layers are combined\nLayers can be combined by applying one layer on top of the another. Operation 'build layer `LResult` by applying layer `LAdd` on top of `LBase`' is defined as follows:\n* `[general]` (except `cmdline`) - `LResult` contains all settings from layers `LAdd` and `LBase`, values in `LAdd` override values in `LBase`\n* `[general]`, `cmdline` value  - `LResult` contains `cmdline` from `LBase` followed by `LAdd` (command line arguments are combined)\n* `[name]`\n  * If `LBase` does not contain section `[name]`, `LResult` will contain section from `LAdd`.\n  * If `LBase` contains section `[name]`, `LResult` will contain `[name]` with all settings from `LBase` and `LAdd`, values in `LAdd` override values in `LBase`.\n* `[name:id]`\n  * The same rules as with section `[name]` applies, `id` is treated as part of section name.\n\nNote:\n* It is not possible to remove section by applying another layer\n* It is not possible to change `id` property\n* It is not possible to remove argument from section\n\n# Putting layers into pip-installable package\nIt is possible to distribute layers as pure Python package that can be installed using `pip`. Layers distributes in that way are always visible and there is no need to specify full path to file.\n\nCreating package with layers:\n1. Create Python package `layers_pkg`, add empty `__init__.py` file.\n2. Put layer files into `layers_pkg/layers` folder, it is possible to use more complex directory structure.\n3. Add `MANIFEST.in` file with `recursive-include layers_pkg/layers *.ini` in it.\n4. Add `setup.py` file:\n```python\nfrom setuptools import setup\n\nsetup(\n    name='layers-pkg',\n    version='1.0.0',\n    packages=['layers_pkg'],\n    zip_safe=True,\n    include_package_data=True,\n    entry_points={\n        'qemu_runner_layer_packages': ['layers_pkg=layers_pkg'] # Always use `package_name=package_name`\n    }\n)\n```\n5. Create Python package using tools of your choice (`python setup.py` or `pyproject-build`)\n\nPackage might contain other files, as it is normal Python package.\n\n**NOTE:** This is simplified process of creating Python package, refer to Python documentation for more details.\n\n`qemu_runner` tools uses `qemu_runner_layer_packages` entry point to discover all registered packages, from each entry point module portion is used in search for layers.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Novakov/qemu-runne",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "qemu-runner",
+    "package_url": "https://pypi.org/project/qemu-runner/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/qemu-runner/",
+    "project_urls": {
+      "Homepage": "https://github.com/Novakov/qemu-runne"
+    },
+    "release_url": "https://pypi.org/project/qemu-runner/1.2.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.8",
+    "summary": "Create self-contained wrappers around QEMU to hide & share long command-line invocations",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16825592,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d41cdde4a8b9e37b60c68f25d3f1c84bcc7708ddb8e0494b662357d62ab6663a",
+          "md5": "21756f571873779c86f8d08db8d6094a",
+          "sha256": "f7c28bc29440ddafd6fdcfdaf044e5f916a047dd3cfc97576f2f10b92e2d53cc"
+        },
+        "downloads": -1,
+        "filename": "qemu_runner-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "21756f571873779c86f8d08db8d6094a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 15344,
+        "upload_time": "2022-04-13T16:51:59",
+        "upload_time_iso_8601": "2022-04-13T16:51:59.492722Z",
+        "url": "https://files.pythonhosted.org/packages/d4/1c/dde4a8b9e37b60c68f25d3f1c84bcc7708ddb8e0494b662357d62ab6663a/qemu_runner-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91c6639654bbaf118183ceccc06ee3c78a537b0a5645befe3c291be0996f7cad",
+          "md5": "10ce1eea45831f874c50b2480edc891a",
+          "sha256": "0854853098d9ec0fe8312380d4280435bd59e5ed94ad22ead40d13277c07083e"
+        },
+        "downloads": -1,
+        "filename": "qemu-runner-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "10ce1eea45831f874c50b2480edc891a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15729,
+        "upload_time": "2022-04-13T16:52:00",
+        "upload_time_iso_8601": "2022-04-13T16:52:00.947859Z",
+        "url": "https://files.pythonhosted.org/packages/91/c6/639654bbaf118183ceccc06ee3c78a537b0a5645befe3c291be0996f7cad/qemu-runner-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6255db1258fe7bd78307f5db259d001f4cd23936c81428bba58861bce269dc9",
+          "md5": "9a3c15872eefad48824bf238f02e584d",
+          "sha256": "0fc2a17853e3b0b6e7600b1b45a8bb66ee4fb11cbd4589765ac570cbc20070f7"
+        },
+        "downloads": -1,
+        "filename": "qemu_runner-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9a3c15872eefad48824bf238f02e584d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 15553,
+        "upload_time": "2022-11-07T18:12:55",
+        "upload_time_iso_8601": "2022-11-07T18:12:55.681743Z",
+        "url": "https://files.pythonhosted.org/packages/b6/25/5db1258fe7bd78307f5db259d001f4cd23936c81428bba58861bce269dc9/qemu_runner-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac090f74a3aef67416b2ddfb349e52c1b627338c33ddb1d4f637d5b05c0f05d6",
+          "md5": "c20d154c4d1e2e38f60be33b7e71f8d8",
+          "sha256": "da6ad8189671a8a40428ad9744010f3bae79df2108bfa68cd611d5260efc7f1e"
+        },
+        "downloads": -1,
+        "filename": "qemu-runner-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c20d154c4d1e2e38f60be33b7e71f8d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15943,
+        "upload_time": "2022-11-07T18:12:57",
+        "upload_time_iso_8601": "2022-11-07T18:12:57.007843Z",
+        "url": "https://files.pythonhosted.org/packages/ac/09/0f74a3aef67416b2ddfb349e52c1b627338c33ddb1d4f637d5b05c0f05d6/qemu-runner-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c65fc19c8c8622ed9a02c9e6baf5dc17f1521ed89228a9a7ce6055692033840b",
+          "md5": "e36a0cb9396b72586d53acee0d41c77e",
+          "sha256": "0a64826c9fef1e9ca3f692503d2f913713011a22b343a51049986223ba0c06a7"
+        },
+        "downloads": -1,
+        "filename": "qemu_runner-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e36a0cb9396b72586d53acee0d41c77e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 16538,
+        "upload_time": "2023-02-12T18:23:56",
+        "upload_time_iso_8601": "2023-02-12T18:23:56.518459Z",
+        "url": "https://files.pythonhosted.org/packages/c6/5f/c19c8c8622ed9a02c9e6baf5dc17f1521ed89228a9a7ce6055692033840b/qemu_runner-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76348a1a28ab97f4bf2d599803912962514c96929572fd8a77b322e4dddf0c52",
+          "md5": "b769abb2a18887d4d11e030088b8ca0e",
+          "sha256": "6dd25d09b7d5efa151af657b94a94c4aeee353f0bc72b139243da860fb8fde08"
+        },
+        "downloads": -1,
+        "filename": "qemu-runner-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b769abb2a18887d4d11e030088b8ca0e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 24534,
+        "upload_time": "2023-02-12T18:23:57",
+        "upload_time_iso_8601": "2023-02-12T18:23:57.841236Z",
+        "url": "https://files.pythonhosted.org/packages/76/34/8a1a28ab97f4bf2d599803912962514c96929572fd8a77b322e4dddf0c52/qemu-runner-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c65fc19c8c8622ed9a02c9e6baf5dc17f1521ed89228a9a7ce6055692033840b",
+        "md5": "e36a0cb9396b72586d53acee0d41c77e",
+        "sha256": "0a64826c9fef1e9ca3f692503d2f913713011a22b343a51049986223ba0c06a7"
+      },
+      "downloads": -1,
+      "filename": "qemu_runner-1.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e36a0cb9396b72586d53acee0d41c77e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 16538,
+      "upload_time": "2023-02-12T18:23:56",
+      "upload_time_iso_8601": "2023-02-12T18:23:56.518459Z",
+      "url": "https://files.pythonhosted.org/packages/c6/5f/c19c8c8622ed9a02c9e6baf5dc17f1521ed89228a9a7ce6055692033840b/qemu_runner-1.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "76348a1a28ab97f4bf2d599803912962514c96929572fd8a77b322e4dddf0c52",
+        "md5": "b769abb2a18887d4d11e030088b8ca0e",
+        "sha256": "6dd25d09b7d5efa151af657b94a94c4aeee353f0bc72b139243da860fb8fde08"
+      },
+      "downloads": -1,
+      "filename": "qemu-runner-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b769abb2a18887d4d11e030088b8ca0e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 24534,
+      "upload_time": "2023-02-12T18:23:57",
+      "upload_time_iso_8601": "2023-02-12T18:23:57.841236Z",
+      "url": "https://files.pythonhosted.org/packages/76/34/8a1a28ab97f4bf2d599803912962514c96929572fd8a77b322e4dddf0c52/qemu-runner-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
