@@ -3,6 +3,11 @@ import requests
 import json
 import os
 
+def update(pkg_name):
+    result = get_data(pkg_name)
+    if download_new(pkg_name, result):
+        remove_old(pkg_name, result)
+
 def get_data(pkg_name):
     url = f'https://pypi.org/pypi/{pkg_name}/json'
     result = requests.get(url).json()
@@ -32,8 +37,5 @@ def remove_old(pkg_name, result):
     else:
         print('no older version')
     
-if __name__ == '__main__':
-    pkg_name = sys.argv[1]
-    result = get_data(pkg_name)
-    if download_new(pkg_name, result):
-        remove_old(pkg_name, result)
+if __name__ == '__main__':    
+    update(sys.argv[1])
