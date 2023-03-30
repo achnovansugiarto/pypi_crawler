@@ -1,0 +1,1550 @@
+{
+  "info": {
+    "author": "Clemens Winter",
+    "author_email": "clemenswinter1@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence"
+    ],
+    "description": "# HyperState\n\n[![PyPI](https://img.shields.io/pypi/v/hyperstate.svg?style=flat-square)](https://pypi.org/project/hyperstate/)\n[![Documentation Status](https://readthedocs.org/projects/entity-gym/badge/?version=latest&style=flat-square)](https://hyperstate.readthedocs.io/en/latest/?badge=latest)\n\nOpinionated library for managing hyperparameter configs and mutable program state of machine learning training systems.\n\n**Key Features**:\n- (De)serialize nested Python dataclasses as [Rusty Object Notation](https://github.com/ron-rs/ron)\n- Override any config value from the command line\n- Automatic checkpointing and restoration of full program state\n- Checkpoints are (partially) human readable and can be modified in a text editor\n- Powerful tools for versioning and schema evolution that can detect breaking changes and make it easy to restructure your program while remaining backwards compatible with old checkpoints\n- Large binary objects in checkpoints can be loaded lazily only when accessed\n- Fermented-vegetable free\n- DSL for hyperparameter schedules \n- (planned) Edit hyperparameters of running experiments on the fly without restarts\n\n## Quick start guide\n\nInstall with pip:\n\n```\npip install hyperstate\n```\n\nAll you need to use HyperState is a (nested) dataclass for your hyperparameters:\n\n```python\nfrom dataclasses import dataclass\n\n\n@dataclass\nclass OptimizerConfig:\n    lr: float = 0.003\n    batch_size: int = 512\n\n\n@dataclass\nclass NetConfig:\n    hidden_size: int = 128\n    num_layers: int = 2\n\n\n@dataclass\nclass Config:\n    optimizer: OptimizerConfig\n    net: NetConfig\n    steps: int = 100\n```\n\nThe `hyperstate.load` function can load values from a config file and/or apply specific overrides from the command line.\n\n```python\nimport argparse\nimport hyperstate\n\nif __name__ == \"__main__\":\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--config\", type=str, default=None, help=\"Path to config file\")\n    parser.add_argument(\"--hps\", nargs=\"+\", help=\"Override hyperparameter value\")\n    args = parser.parse_args()\n    config = hyperstate.load(Config, file=args.config, overrides=args.hps)\n    print(config)\n```\n\n```shell\n$ python main.py --hps net.num_layers=96 steps=50\nConfig(optimizer=OptimizerConfig(lr=0.003, batch_size=512), net=NetConfig(hidden_size=128, num_layers=96), steps=50)\n```\n\n```shell\n$ cat config.ron\nConfig(\n    optimizer: (\n        lr: 0.05,\n        batch_size: 4096,\n    ),\n)\n$ python main.py --config=config.ron\nConfig(optimizer=OptimizerConfig(lr=0.05, batch_size=4096), net=NetConfig(hidden_size=128, num_layers=2), steps=100)\n```\n\nThe full code for this example can be found in [examples/basic-config](examples/basic-config).\n\nLearn more about:\n- [Configs](#configs)\n- [Versioning and schema evolution](#versioning)\n- [Serializing complex objects](#unstable-feature-serializable)\n- [Checkpointing and schedules](#unstable-feature-hyperstate)\n- [Example application](examples/mnist)\n\n## Configs\n\nHyperState supports a strictly typed subset of Python objects:\n- dataclasses\n- containers: `Dict`, `List`, `Tuple`, `Optional`\n- primitives: `int`, `float`, `str`, `Enum`\n- objects with custom serialization logic: [`hyperstate.Serializable`](#serializable)\n\nUse `hyperstate.dump` to serialize configs.\nThe second argument to `dump` is a path to a file, and can be omitted to return the serialized config as a string instead of saving it to a file:\n\n```python\n>>> print(hyperstate.dump(Config(lr=0.1, batch_size=256))\nConfig(\n    lr: 0.1,\n    batch_size: 256,\n)\n```\n\nUse `hyperstate.load` to deserialize configs.\nThe `load` method takes the type of the config as the first argugment, and allows you to optionally specify the path to a config file and/or a `List[str]` of overrides:\n\n```python\n@dataclass\nclass OptimizerConfig:\n    lr: float\n    batch_size: int\n\n@dataclass\nclass Config:\n    optimzer: OptimizerConfig\n    steps: int\n\n\nconfig = hyperstate.load(Config, file=\"config.ron\", overrides=[\"optimizer.lr=0.1\", \"steps=100\"])\n```\n\n## Versioning\n\nVersioning allows you to modify your `Config` class while still remaining compatible with checkpoints recorded at previous version.\nTo benefit from versionining, your config must inherit `hyperstate.Versioned` and implement its `version` function:\n\n```python\n@dataclass\nclass Config(hyperstate.Versioned):\n    lr: float\n    batch_size: int\n    \n    @classmethod\n    def version(clz) -> int:\n        return 0\n```\n\nWhen serializing the config, hyperstate will now record an additional `version` field with the value of the current version.\nAny snapshots that contain configs without a version field are assumed to have a version of `0`.\n\n### `RewriteRule`\n\nNow suppose you modify your `Config` class, e.g. by renaming the `lr` field to `learning_rate`.\nTo still be able to load old configs that are using `lr` instead of `learning_rate`, you increase the `version` to `1` and add an entry to the dictionary returned by `upgrade_rules` that tells HyperState to change `lr` to `learning_rate` when upgrading configs from version `0`.\n\n```python\nfrom dataclasses import dataclass\nfrom typing import Dict, List\nfrom hyperstate import Versioned\nfrom hyperstate.schema.rewrite_rule import RenameField, RewriteRule\n\n@dataclass\nclass Config(Versioned):\n    learning_rate: float\n    batch_size: int\n    \n    @classmethod\n    def version(clz) -> int:\n        return 1\n\n    @classmethod\n    def upgrade_rules(clz) -> Dict[int, List[RewriteRule]]:\n        \"\"\"\n        Returns a list of rewrite rules that can be applied to the given version\n        to make it compatible with the next version.\n        \"\"\"\n        return {\n            0: [RenameField(old_field=(\"lr\",), new_field=(\"learning_rate\",))],\n        }\n```\n\nIn the majority of cases, you don't actually have to manually write out `RewriteRule`s.\nInstead, they are generated for you automatically by the [Schema Evolution CLI](#schema-evolution-cli).\n\n### Schema evolution CLI\n\nHyperState comes with a command line tool for managing changes to your config schema.\nTo access the CLI, simply add the following code to the Python file defining your config:\n\n```python\n# config.py\nfrom hyperstate import schema_evolution_cli\n\nif __name__ == \"__main__\":\n    schema_evolution_cli(Config)\n```\n\nRun `python config.py` to see a list of available commands, described in more detail below.\n\n#### `dump-schema`\n\nThe `dump-schema` command creates a file describing the schema of your config.\nThis file should commited to version control, and is used to detect changes to the config schema and perform automatic upgrades.\n\n#### `check-schema`\n\nThe `check-schema` command compares your config class to a schema file and detects any backwards incompatible changes.\nIt also emits a suggested list of [`RewriteRule`](#rewrite-rule)s that can upgrade old configs to the new schema.\nHyperState does not always guess the correct `RewriteRule`s so you still need to check that they are correct.\n\n```\n$ python config.py check-schema\nWARN  field renamed to learning_rate: lr\nWARN  schema changed but version identical\nSchema incompatible\n\nProposed mitigations\n- add upgrade rules:\n    0: [\n        RenameField(old_field=('lr',), new_field=('learning_rate',)),\n    ],\n- bump version to 1\n```\n\n#### `upgrade-schema`\n\nThe `upgrade-schema` command functions much the same as `check-schema`, but also updates your schema config files once all backwards-incompatability issues have been address.\n\n#### `upgrade-config`\n\nThe `upgrade-config` command takes a list of paths to config files, and upgrades them to the latest version.\n\n### Automated Tests\n\nTo prevent accidental backwards-incompatible modifications of your `Config` class, you can use the following code as an automated test that checks your config `Class` against a schema file created with [`dump-schema`](#dump-schema): \n\n```python\nfrom hyperstate.schema.schema_change import Severity\nfrom hyperstate.schema.schema_checker import SchemaChecker\nfrom hyperstate.schema.types import load_schema\nfrom config import Config\n\ndef test_schema():\n    old = load_schema(\"config-schema.ron\")\n    checker = SchemaChecker(old, Config)\n    if checker.severity() >= Severity.WARN:\n        checker.print_report()\n    assert checker.severity() == Severity.INFO\n```\n\n## _[unstable feature]_ `Serializable`\n\nYou can define custom serialization logic for a class by inheriting from `hyperstate.Serializable` and implementing the `serialize` and `deserialize` methods.\n\n```python\nfrom dataclasses import dataclass\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport hyperstate\n\n@dataclass\nclass Config:\n   inputs: int\n\nclass LinearRegression(nn.Module, hyperstate.Serializable):\n    def __init__(self, inputs):\n        super(Net, self).__init__()\n        self.fc1 = nn.Linear(inputs, 1)\n        \n    def forward(self, x):\n        return self.fc1(x)\n    \n    # `serialize` should return a representation of the object consisting only of\n    # primitives, containers, numpy arrays, and torch tensors.\n    def serialize(self) -> Any:\n        return self.state_dict()\n\n    # `deserialize` should take a serialized representation of the object and\n    # return an instance of the class. The `ctx` argument allows you to pass\n    # additional information to the deserialization function.\n    @classmethod\n    def deserialize(clz, state_dict, ctx):\n        net = clz(ctx[\"config\"].inputs)\n        return net.load_state_dict(state_dict)\n\n@dataclass\nclass State:\n    net: LinearRegression\n\nconfig = hyperstate.load(\"config.ron\")\nstate = hyperstate.load(\"state.ron\", ctx={\"config\": config})\n```\n\nObjects that implement `Serializable` are stored in separate files using a binary encoding.\nIn the above example, calling `hyperstate.dump(state, \"checkpoint/state.ron\")` will result in the following file structure:\n\n```\ncheckpoint\n├── state.net.blob\n└── state.ron\n```\n\n### _[unstable feature]_ `Lazy`\n\nIf you inherit from `hyperstate.Lazy`, any fields with `Serializable` types will only be loaded/deserialized when accessed. If the `.blob` file for a field is missing, HyperState will not raise an error unless the corresponding field is accessed.\n\n### _[unstable feature]_`blob`\n\nTo include objects in your state that do not directly implement `hyperstate.Serializable`, you can seperately implement `hyperstate.Serializable` and use the `blob` function to mix in the `Serializable` implementation:\n\n```python\nimport torch.optim as optim\nimport torch.nn as nn\nimport hyperstate\n\nclass SerializableOptimizer(hyperstate.Serializable):\n    def serialize(self):\n        return self.state_dict()\n\n    @classmethod\n    def deserialize(clz, state_dict: Any, config: Config, state: \"State\") -> optim.Optimizer:\n        optimizer = blob(optim.SerializableAdam, mixin=SerializableOptimizer)(state.net.parameters())\n        optimizer.load_state_dict(state_dict)\n        return optimizer\n\n@dataclass\nclass State(hyperstate.Lazy):\n    net: nn.Module\n    optimizer: blob(Adam, mixin=SerializableOptimizer)\n```\n\n\n\n## _[unstable feature]_ `HyperState`\n\nTo unlock the full power of HyperState, you must inherit from the `HyperState` class.\nThis class combines an immutable config and mutable state, and provides automatic checkpointing, hyperparameter schedules, and the on-the-fly changes to the config and state (not implemented yet).\n\n```python\nfrom dataclasses import dataclass\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport hyperstate\n\n@dataclass\nclass Config:\n   inputs: int\n   steps: int\n\nclass LinearRegression(nn.Module, hyperstate.Serializable):\n    def __init__(self, inputs):\n        super(Net, self).__init__()\n        self.fc1 = nn.Linear(inputs, 1)\n    def forward(self, x):\n        return self.fc1(x)\n    def serialize(self) -> Any:\n        return self.state_dict()\n    @classmethod\n    def deserialize(clz, state_dict, ctx):\n        net = clz(ctx[\"config\"].inputs)\n        return net.load_state_dict(state_dict)\n\n@dataclass\nclass State:\n    net: LinearRegression\n    step: int\n\n\nclass Trainer(HyperState[Config, State]):\n    def __init__(\n        self,\n        # Path to the config file\n        initial_config: str,\n        # Optional path to the checkpoint directory, which enables automatic checkpointing.\n        # If any checkpoint files are present, they will be used to initialize the state.\n        checkpoint_dir: Optional[str] = None,\n        # List of manually specified config overrides.\n        config_overrides: Optional[List[str]] = None,\n    ):\n        super().__init__(Config, State, initial_config, checkpoint_dir, overrides=config_overrides)\n\n    def initial_state(self) -> State:\n        \"\"\"\n        This function is called to initialize the state if no checkpoint files are found.\n        \"\"\"\n        return State(net=LinearRegression(self.config.inputs))\n\n    def train(self) -> None:\n        for step in range(self.state.step, self.config.steps):\n            # training code...\n\n            self.state.step = step\n            # At the end of each iteration, call `self.step()` to checkpoint the state and apply hyperparameter schedules.\n            self.step()\n```\n\n### _[unstable feature]_ Checkpointing\n\nWhen using the `HyperState` object, the config and state are automatically checkpointed to the configured directory when calling the `step` method.\n\n### _[unstable feature]_ Schedules\n\nAny `int`/`float` fields in the config can also be set to a schedule that will be updated at each step.\nFor example, the following config defines a schedule that linearly decays the learning rate from 1.0 to 0.1 over 1000 steps:\n\n```rust\nConfig(\n    lr: Schedule(\n      key: \"state.step\",\n      schedule: [\n        (0, 1.0),\n        \"lin\",\n        (1000, 0.1),\n      ],\n    ),\n    batch_size: 256,\n)\n```\n\nWhen you call `step()`, all config values that are schedules will be updated.\n\n\n## License\n\nHyperState is dual-licensed under the MIT license and Apache License (Version 2.0).\n\nSee LICENSE-MIT and LICENSE-APACHE for more information.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "hyperstate",
+    "package_url": "https://pypi.org/project/hyperstate/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/hyperstate/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/hyperstate/0.4.3/",
+    "requires_dist": [
+      "python-ron (>=0.2.1,<0.3.0)",
+      "click (>=8.1,<9.0)",
+      "msgpack (>=1.0.3,<2.0.0)",
+      "dill (>=0.3.4,<0.4.0)",
+      "docstring-parser (>=0.13,<0.14)",
+      "numpy (>=1.21.4,<2.0.0)",
+      "typing-extensions (>=4.3.0,<5.0.0)"
+    ],
+    "requires_python": ">=3.7.1,<3.11.0",
+    "summary": "Library for managing hyperparameters and mutable state of machine learning training systems.",
+    "version": "0.4.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17289887,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f3cf15a738feaa9d21f83f43f623b692a6356e08bfed25d952dd1aeb18eab0d",
+          "md5": "e0454a312feffe9b6c08d92dc20b8d52",
+          "sha256": "ad8efec09d969d93d9e2eefe6df2ef1df8426d0c3faafab8c1d640cad992072c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0454a312feffe9b6c08d92dc20b8d52",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21872,
+        "upload_time": "2021-12-11T05:13:22",
+        "upload_time_iso_8601": "2021-12-11T05:13:22.936768Z",
+        "url": "https://files.pythonhosted.org/packages/8f/3c/f15a738feaa9d21f83f43f623b692a6356e08bfed25d952dd1aeb18eab0d/hyperstate-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b0ddde2196bf083005dccfdedd3deb474925d76cf349842c81529cf697262a1",
+          "md5": "04145e505485f78fa1e1634627ad212c",
+          "sha256": "4036e4a12302825d061c9af9897330dbeac2b437add0550941fa4f8d83e122e5"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "04145e505485f78fa1e1634627ad212c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 16987,
+        "upload_time": "2021-12-11T05:13:24",
+        "upload_time_iso_8601": "2021-12-11T05:13:24.399163Z",
+        "url": "https://files.pythonhosted.org/packages/4b/0d/dde2196bf083005dccfdedd3deb474925d76cf349842c81529cf697262a1/hyperstate-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d547c8b4b2bd12dc87991b8018ae04b34eee982dffa5a3b0ca5c9795e1ba36f0",
+          "md5": "fa10e6c266b3fb456648e234f6138451",
+          "sha256": "06a8d57c6b44b7952434cd0ec5936b28f829b7edc65fb83d067be98584db21db"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fa10e6c266b3fb456648e234f6138451",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 22015,
+        "upload_time": "2021-12-11T05:28:49",
+        "upload_time_iso_8601": "2021-12-11T05:28:49.116329Z",
+        "url": "https://files.pythonhosted.org/packages/d5/47/c8b4b2bd12dc87991b8018ae04b34eee982dffa5a3b0ca5c9795e1ba36f0/hyperstate-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "72dfb0dcd27b8b0dd92ea786eb82f77a5ada11fe7a40a901a6821bf64a4eef9a",
+          "md5": "2ce476595fc5c3197acdd9c48b8287a4",
+          "sha256": "1137055fe4558da1601c94e18ed9112969e555f7831b78f612d285b574189025"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2ce476595fc5c3197acdd9c48b8287a4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 16829,
+        "upload_time": "2021-12-11T05:28:50",
+        "upload_time_iso_8601": "2021-12-11T05:28:50.053990Z",
+        "url": "https://files.pythonhosted.org/packages/72/df/b0dcd27b8b0dd92ea786eb82f77a5ada11fe7a40a901a6821bf64a4eef9a/hyperstate-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4098d63dfa147943946bf154f76ae318b434deff0f9abdec7f0f8b608aa89bff",
+          "md5": "ac4f15539b34b87a27376c1c74fbadf3",
+          "sha256": "20e97d985483592c711d4b8d858b63767bf337b71acc9e54f0a5935c68fae06c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ac4f15539b34b87a27376c1c74fbadf3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 22217,
+        "upload_time": "2022-02-20T19:36:32",
+        "upload_time_iso_8601": "2022-02-20T19:36:32.844896Z",
+        "url": "https://files.pythonhosted.org/packages/40/98/d63dfa147943946bf154f76ae318b434deff0f9abdec7f0f8b608aa89bff/hyperstate-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93a93b0a62a0d2d26bcb6cedd208cb73f82117f408f632f3ee096134211c6f6f",
+          "md5": "b9d329048a067191c3a9ad1f4035accb",
+          "sha256": "ecd32718e7bd9bda750a7197047fb19eae03fd89fcb523219198d8d0a17021e8"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b9d329048a067191c3a9ad1f4035accb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17046,
+        "upload_time": "2022-02-20T19:36:33",
+        "upload_time_iso_8601": "2022-02-20T19:36:33.967166Z",
+        "url": "https://files.pythonhosted.org/packages/93/a9/3b0a62a0d2d26bcb6cedd208cb73f82117f408f632f3ee096134211c6f6f/hyperstate-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c1a7d21d1d9b59a47925c56bbaf46e7a6612cd5049d26bcc16c2d1ca05c82130",
+          "md5": "eea91a9c2ab213068a87658a26baaa88",
+          "sha256": "994afc112e94f96fc4d9f51185303dc6448c8b34f0b4b08542814418dc9cccfe"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eea91a9c2ab213068a87658a26baaa88",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 23757,
+        "upload_time": "2022-02-23T06:17:11",
+        "upload_time_iso_8601": "2022-02-23T06:17:11.262077Z",
+        "url": "https://files.pythonhosted.org/packages/c1/a7/d21d1d9b59a47925c56bbaf46e7a6612cd5049d26bcc16c2d1ca05c82130/hyperstate-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9db878ff10981f52f3392123f9e891bcbf563a30f30106ba7ccec5a68dcce413",
+          "md5": "c6c9c433cf8c5475517b9f78684e5326",
+          "sha256": "c39b83ee459662f1d846c2bea9e3af75e30a976a4ef7cbc042a75174ef352a67"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c6c9c433cf8c5475517b9f78684e5326",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18109,
+        "upload_time": "2022-02-23T06:17:12",
+        "upload_time_iso_8601": "2022-02-23T06:17:12.532896Z",
+        "url": "https://files.pythonhosted.org/packages/9d/b8/78ff10981f52f3392123f9e891bcbf563a30f30106ba7ccec5a68dcce413/hyperstate-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71643b546b425dd8af9131744876613c692e830a93b14767661621f10b070f19",
+          "md5": "62f60a2a1e581668f13e03dbe954ecdc",
+          "sha256": "680793ffe66ffdc2c390af7dcd233cf6602a5b0c6f6d9b503c61c819180c2095"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "62f60a2a1e581668f13e03dbe954ecdc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24943,
+        "upload_time": "2022-02-23T16:12:39",
+        "upload_time_iso_8601": "2022-02-23T16:12:39.488378Z",
+        "url": "https://files.pythonhosted.org/packages/71/64/3b546b425dd8af9131744876613c692e830a93b14767661621f10b070f19/hyperstate-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fdfdc1311e96fc3b0818fd2bbed3dd8ff3672ad817470c40b646aa6beb3a602f",
+          "md5": "737fd32c2f1d3417a03bebab4baa5a61",
+          "sha256": "c641ca4ef88d8a9ce85df8792f62b74cc7581e390fd312dc7da67e59e7595356"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "737fd32c2f1d3417a03bebab4baa5a61",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19240,
+        "upload_time": "2022-02-23T16:12:40",
+        "upload_time_iso_8601": "2022-02-23T16:12:40.599429Z",
+        "url": "https://files.pythonhosted.org/packages/fd/fd/c1311e96fc3b0818fd2bbed3dd8ff3672ad817470c40b646aa6beb3a602f/hyperstate-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d94aab21163d3f77f16f640a8c98574e8e496c27cb8c3e5663b87a0775bd11c9",
+          "md5": "eee3a9ab95c87c05006d5c84d8b6516f",
+          "sha256": "7410ee22b4846893cb712e789c4f69855d992359e4d3b36b0e15c6f39e0ce48d"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eee3a9ab95c87c05006d5c84d8b6516f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 33218,
+        "upload_time": "2022-03-29T03:39:04",
+        "upload_time_iso_8601": "2022-03-29T03:39:04.180889Z",
+        "url": "https://files.pythonhosted.org/packages/d9/4a/ab21163d3f77f16f640a8c98574e8e496c27cb8c3e5663b87a0775bd11c9/hyperstate-0.2.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "25f0ac4fd34c0057b362d9f2e0baea528fd826c65ed4e202e2a06a299e4769e3",
+          "md5": "5c2c67386ff7caab2276d403f6117ae4",
+          "sha256": "2618c23365c303668ed981e8d064784f0b2e2aa3022568ff41144e655acd9358"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5c2c67386ff7caab2276d403f6117ae4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35948,
+        "upload_time": "2022-03-29T03:39:05",
+        "upload_time_iso_8601": "2022-03-29T03:39:05.916053Z",
+        "url": "https://files.pythonhosted.org/packages/25/f0/ac4fd34c0057b362d9f2e0baea528fd826c65ed4e202e2a06a299e4769e3/hyperstate-0.2.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f06f5fb399fbd384e2e7671c029b30a43e1bfcda633ad2c3a920494a90887924",
+          "md5": "b9c5219a4a0e3157f65bcdbbdf74ef05",
+          "sha256": "172ac058cd4fe2deaa9a01ab3de2cbf02d9bb1916f570350f463a1f1ff05cf44"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b9c5219a4a0e3157f65bcdbbdf74ef05",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 33263,
+        "upload_time": "2022-04-02T15:18:58",
+        "upload_time_iso_8601": "2022-04-02T15:18:58.556306Z",
+        "url": "https://files.pythonhosted.org/packages/f0/6f/5fb399fbd384e2e7671c029b30a43e1bfcda633ad2c3a920494a90887924/hyperstate-0.2.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "154546e75ab8473c29b495d2b201cc5154bc4bbe7cf1ef49aa11b982a4d36076",
+          "md5": "6ebed50501396a5200bb8a60f5a9e68e",
+          "sha256": "fdbcd520bee0baf3f6531f65f76b73881cab18d682efc155cf17a944043a0a42"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ebed50501396a5200bb8a60f5a9e68e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35971,
+        "upload_time": "2022-04-02T15:19:00",
+        "upload_time_iso_8601": "2022-04-02T15:19:00.117981Z",
+        "url": "https://files.pythonhosted.org/packages/15/45/46e75ab8473c29b495d2b201cc5154bc4bbe7cf1ef49aa11b982a4d36076/hyperstate-0.2.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb73a905ee5e833dd796b104d95ccc17d120fae27ba1c829aad7429f19b9f1d6",
+          "md5": "f277b659f05e1fceb29cf7bf3bf2cbfc",
+          "sha256": "34aedd3d1d9a575235e5b2b63e39409d75ed411e48f6ca237490d3702dd9facd"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f277b659f05e1fceb29cf7bf3bf2cbfc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 34412,
+        "upload_time": "2022-04-16T17:51:24",
+        "upload_time_iso_8601": "2022-04-16T17:51:24.326063Z",
+        "url": "https://files.pythonhosted.org/packages/bb/73/a905ee5e833dd796b104d95ccc17d120fae27ba1c829aad7429f19b9f1d6/hyperstate-0.2.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6bb00ac1f92d36524b640f0539c26c9fbf76dd676809a96c05ba4eec4f425adc",
+          "md5": "1783d8d398120c9b355c00b7676a2961",
+          "sha256": "e1b42d37169edf32dc41738078fc6fd3f3af2d2e9bf534628902e86f62254654"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1783d8d398120c9b355c00b7676a2961",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37139,
+        "upload_time": "2022-04-16T17:51:26",
+        "upload_time_iso_8601": "2022-04-16T17:51:26.030918Z",
+        "url": "https://files.pythonhosted.org/packages/6b/b0/0ac1f92d36524b640f0539c26c9fbf76dd676809a96c05ba4eec4f425adc/hyperstate-0.2.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5135874fe1e8651467badfba0a40fdbe07519c11782abb88b11f81a54c4b2024",
+          "md5": "55e7a6d4431ad78d5cdd18c785957513",
+          "sha256": "4afe249de9cae57799479f6d2e9e4c56bcdbc1f54a64bb2de1438b90f823d12c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "55e7a6d4431ad78d5cdd18c785957513",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 34402,
+        "upload_time": "2022-04-16T21:24:36",
+        "upload_time_iso_8601": "2022-04-16T21:24:36.431458Z",
+        "url": "https://files.pythonhosted.org/packages/51/35/874fe1e8651467badfba0a40fdbe07519c11782abb88b11f81a54c4b2024/hyperstate-0.2.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4791f804c0d5118824190378aaa49dd6af88eb8d83e093ce8ecd2c8a47a0137e",
+          "md5": "588df6fdbceae909925d58436be7bbbf",
+          "sha256": "9bc04d52c6818eb3725e997adce58951c9239371b9459bc51d6c72b529f259ea"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "588df6fdbceae909925d58436be7bbbf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37129,
+        "upload_time": "2022-04-16T21:24:37",
+        "upload_time_iso_8601": "2022-04-16T21:24:37.702617Z",
+        "url": "https://files.pythonhosted.org/packages/47/91/f804c0d5118824190378aaa49dd6af88eb8d83e093ce8ecd2c8a47a0137e/hyperstate-0.2.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "57f48e879db23da10f20114d276b9ff7a5e456ed9cd84c6200ebd6e389c13324",
+          "md5": "90b4d1d8df939091eaba0d3715111b3d",
+          "sha256": "ad696570a8d8ea9e0bfae0b9b2a056ab550ad3ff92cc087e3001be075ca536e8"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "90b4d1d8df939091eaba0d3715111b3d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 34399,
+        "upload_time": "2022-04-16T21:33:00",
+        "upload_time_iso_8601": "2022-04-16T21:33:00.032890Z",
+        "url": "https://files.pythonhosted.org/packages/57/f4/8e879db23da10f20114d276b9ff7a5e456ed9cd84c6200ebd6e389c13324/hyperstate-0.2.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d17378319a9c66b0c91000f845f894eb270ecc833b4d79cbac2609558f9c816f",
+          "md5": "c2298203fd18258935558aa4c5dd4f80",
+          "sha256": "59a6d7a3bc2ac46388c045ee3960361e522d8abfce09a330c26248802b69ae14"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c2298203fd18258935558aa4c5dd4f80",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37153,
+        "upload_time": "2022-04-16T21:33:01",
+        "upload_time_iso_8601": "2022-04-16T21:33:01.716901Z",
+        "url": "https://files.pythonhosted.org/packages/d1/73/78319a9c66b0c91000f845f894eb270ecc833b4d79cbac2609558f9c816f/hyperstate-0.2.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01bfd9354b59c25d50c766e81060986ed67c0d19bcd51778c5def2a59f7d8fbd",
+          "md5": "5023f03348283110fea85522e61a80d2",
+          "sha256": "cdbb17f498cb4dd50dd9a70544d76477602f25ad29703e972ef19f4078061922"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5023f03348283110fea85522e61a80d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 34394,
+        "upload_time": "2022-04-16T21:56:39",
+        "upload_time_iso_8601": "2022-04-16T21:56:39.039481Z",
+        "url": "https://files.pythonhosted.org/packages/01/bf/d9354b59c25d50c766e81060986ed67c0d19bcd51778c5def2a59f7d8fbd/hyperstate-0.2.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9825bd906084ba0f4dacc6d0e3e25f03c1297caccf42c21a040560a0a83087ed",
+          "md5": "89238e76878dd5f6fcf34f6e934b4dac",
+          "sha256": "3ad9a77298f8c786bf4eb044b30c5093942e0cc8151ed7278574270c0b86e47b"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89238e76878dd5f6fcf34f6e934b4dac",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37122,
+        "upload_time": "2022-04-16T21:56:40",
+        "upload_time_iso_8601": "2022-04-16T21:56:40.615434Z",
+        "url": "https://files.pythonhosted.org/packages/98/25/bd906084ba0f4dacc6d0e3e25f03c1297caccf42c21a040560a0a83087ed/hyperstate-0.2.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87753161e422ebcdd0ca9bdf5d6cfc47ded7aa9998d0f46f3344a45d52f50686",
+          "md5": "e626dbbb742ed1008a8a4b8ad1dddc6f",
+          "sha256": "223391c73e526bb622ed38d9e0c1e91e7c1eaa6b808fc0fb79b1fedcb7b8d103"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e626dbbb742ed1008a8a4b8ad1dddc6f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25184,
+        "upload_time": "2022-02-23T16:52:50",
+        "upload_time_iso_8601": "2022-02-23T16:52:50.116360Z",
+        "url": "https://files.pythonhosted.org/packages/87/75/3161e422ebcdd0ca9bdf5d6cfc47ded7aa9998d0f46f3344a45d52f50686/hyperstate-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db478d4be497279027b9633e4bbe1bddc0bb3d8fbd60b3e37570752134a5f9af",
+          "md5": "5a7474348aebdd4b69e998659a0ba981",
+          "sha256": "5f72bc1698c4c11bd7a6811b027d883fb68acc9e0e8a0c4a6f241cd0745fa56b"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5a7474348aebdd4b69e998659a0ba981",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19463,
+        "upload_time": "2022-02-23T16:52:51",
+        "upload_time_iso_8601": "2022-02-23T16:52:51.228089Z",
+        "url": "https://files.pythonhosted.org/packages/db/47/8d4be497279027b9633e4bbe1bddc0bb3d8fbd60b3e37570752134a5f9af/hyperstate-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8405da85538ed02145c92f0d3b53701b13194e12d6d71525d634858cbdd40b35",
+          "md5": "2c692b0b29d4c7f4711a1d8cff4a3097",
+          "sha256": "5ef502180885dbe2673e960fcc87ffc712d14f1e08d8fbe8517b6cf0e3906727"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2c692b0b29d4c7f4711a1d8cff4a3097",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 27506,
+        "upload_time": "2022-02-24T05:46:29",
+        "upload_time_iso_8601": "2022-02-24T05:46:29.584315Z",
+        "url": "https://files.pythonhosted.org/packages/84/05/da85538ed02145c92f0d3b53701b13194e12d6d71525d634858cbdd40b35/hyperstate-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "73ff2b9393907a12b885104daceacc18f92fc11b45dcd4a37cc4b1730edf0547",
+          "md5": "59a24182c17bbf738cd0e604e177cd34",
+          "sha256": "f5301ebeaf1fc6624fbbd636d147e19643f094bb4f75316c3346e9e6799e7e95"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "59a24182c17bbf738cd0e604e177cd34",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21300,
+        "upload_time": "2022-02-24T05:46:30",
+        "upload_time_iso_8601": "2022-02-24T05:46:30.596149Z",
+        "url": "https://files.pythonhosted.org/packages/73/ff/2b9393907a12b885104daceacc18f92fc11b45dcd4a37cc4b1730edf0547/hyperstate-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a9609482ed276344bc9e946570d86440634129d21373ee96b5ad989fc418ccfd",
+          "md5": "72fcaf4156bbdb740ce23dc70156e3c1",
+          "sha256": "fc2524c045cfe326452bf66771d235f01c3b6e8f1b10865474d85aa0dd64152c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "72fcaf4156bbdb740ce23dc70156e3c1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 27618,
+        "upload_time": "2022-02-25T04:37:39",
+        "upload_time_iso_8601": "2022-02-25T04:37:39.899078Z",
+        "url": "https://files.pythonhosted.org/packages/a9/60/9482ed276344bc9e946570d86440634129d21373ee96b5ad989fc418ccfd/hyperstate-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b856426a51b18173ce5bf64754e526470a1c642cb11c6c08c067bf59da0c80a",
+          "md5": "8e187585c7e6d1f0caba01e14c011109",
+          "sha256": "1ac4a792513215f0fb7f5aa565067ad1d00964a1054a3ffd2873ba9e6d93c608"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8e187585c7e6d1f0caba01e14c011109",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21415,
+        "upload_time": "2022-02-25T04:37:41",
+        "upload_time_iso_8601": "2022-02-25T04:37:41.095053Z",
+        "url": "https://files.pythonhosted.org/packages/0b/85/6426a51b18173ce5bf64754e526470a1c642cb11c6c08c067bf59da0c80a/hyperstate-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1a710b3e6770040adf027211d7f42f2bfa166cc017344b6c2923ce9ee788e38",
+          "md5": "dd0e4784007d0d4a148c7db3cd1f81f5",
+          "sha256": "e411c2f6571ed02b11f4bbe9c5764e03c389f98038bcb380c04015853ec8459f"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dd0e4784007d0d4a148c7db3cd1f81f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 32179,
+        "upload_time": "2022-02-26T03:35:18",
+        "upload_time_iso_8601": "2022-02-26T03:35:18.607362Z",
+        "url": "https://files.pythonhosted.org/packages/e1/a7/10b3e6770040adf027211d7f42f2bfa166cc017344b6c2923ce9ee788e38/hyperstate-0.2.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e0c28a1dc22a49e0cb1604531575f2c7a10fc70d2c4a48c19ae72d7d639bd0c1",
+          "md5": "f67deb7d0b71623b352200d28b8dffee",
+          "sha256": "a1caec10e9018efc60824990c735a676cbe12e272ba1aee428149917775955fe"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f67deb7d0b71623b352200d28b8dffee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35182,
+        "upload_time": "2022-02-26T03:35:20",
+        "upload_time_iso_8601": "2022-02-26T03:35:20.416222Z",
+        "url": "https://files.pythonhosted.org/packages/e0/c2/8a1dc22a49e0cb1604531575f2c7a10fc70d2c4a48c19ae72d7d639bd0c1/hyperstate-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5cd5593d556216c3ae6e405cf26262299582b0e63fd16b60e154361b605dc296",
+          "md5": "b7e4380a350937dd52b5092cf8f83efe",
+          "sha256": "c6f74760375aef6fb7c199aca4f11f5bdace0e18546b8ad616bd7c7a29dbf2cf"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7e4380a350937dd52b5092cf8f83efe",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 32433,
+        "upload_time": "2022-02-27T16:24:30",
+        "upload_time_iso_8601": "2022-02-27T16:24:30.746372Z",
+        "url": "https://files.pythonhosted.org/packages/5c/d5/593d556216c3ae6e405cf26262299582b0e63fd16b60e154361b605dc296/hyperstate-0.2.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c775e2b2e397ceb568bf87622666599801b28efa5193722b6c248cb34cb1c91",
+          "md5": "9d616e764db0d944bbfa1d46cdc73b56",
+          "sha256": "67081aac86aed2a03657fc486a932fac9bc5a5f8aea0e28b8e4e70abdad7ef72"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9d616e764db0d944bbfa1d46cdc73b56",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35415,
+        "upload_time": "2022-02-27T16:24:32",
+        "upload_time_iso_8601": "2022-02-27T16:24:32.262679Z",
+        "url": "https://files.pythonhosted.org/packages/5c/77/5e2b2e397ceb568bf87622666599801b28efa5193722b6c248cb34cb1c91/hyperstate-0.2.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2284858211ce62b6207cc70b75901966fade70058a656509dd83b50cc07abcec",
+          "md5": "ecb6fe8eb5f043028081371b552e7698",
+          "sha256": "60c5fedd669e5d5005d4cf0b7f83924d912c90d0f1fc8d1b591d8ae01ecb851c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ecb6fe8eb5f043028081371b552e7698",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 32601,
+        "upload_time": "2022-03-16T21:58:15",
+        "upload_time_iso_8601": "2022-03-16T21:58:15.848578Z",
+        "url": "https://files.pythonhosted.org/packages/22/84/858211ce62b6207cc70b75901966fade70058a656509dd83b50cc07abcec/hyperstate-0.2.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cdc7becb86600fc9805bf9947e9765925bf6b22c30027578857fc13d52073fc3",
+          "md5": "21af1347213346c3cd5100720466a52b",
+          "sha256": "919d35fcdf78aef268746dc33e90b2802bb954bfa98497e64fd66de68b445890"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "21af1347213346c3cd5100720466a52b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35557,
+        "upload_time": "2022-03-16T21:58:17",
+        "upload_time_iso_8601": "2022-03-16T21:58:17.304487Z",
+        "url": "https://files.pythonhosted.org/packages/cd/c7/becb86600fc9805bf9947e9765925bf6b22c30027578857fc13d52073fc3/hyperstate-0.2.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "219fd6c31a1759b320086b8f6fc5c85619b0b24be08ad6fdcb0c0a443c0cf05c",
+          "md5": "ead660f9cc24084a4a3163e68a33024b",
+          "sha256": "abd2def06d7ce46755dfa17a7ee38cd60a866048faea1924b152912315076354"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ead660f9cc24084a4a3163e68a33024b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 33218,
+        "upload_time": "2022-03-29T03:14:11",
+        "upload_time_iso_8601": "2022-03-29T03:14:11.221594Z",
+        "url": "https://files.pythonhosted.org/packages/21/9f/d6c31a1759b320086b8f6fc5c85619b0b24be08ad6fdcb0c0a443c0cf05c/hyperstate-0.2.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "29fbd48c1aa61bdaedd0a02b03b9dcdb33e598afc17623d44dc8ffe5a0e1c987",
+          "md5": "cab77ff75a954e68b77693b85dadcacd",
+          "sha256": "c9c5a165b17e372193b8aca25d19d7a52e549df15aadb56611c81fc6548a0ec5"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.2.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cab77ff75a954e68b77693b85dadcacd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35931,
+        "upload_time": "2022-03-29T03:14:12",
+        "upload_time_iso_8601": "2022-03-29T03:14:12.989817Z",
+        "url": "https://files.pythonhosted.org/packages/29/fb/d48c1aa61bdaedd0a02b03b9dcdb33e598afc17623d44dc8ffe5a0e1c987/hyperstate-0.2.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47c44f93739cc85f63b7c5d9efb4377c080002d114df416ba270ae0f42e299bc",
+          "md5": "f7d8181e6340202d8c3e72e1cf696823",
+          "sha256": "1a123f602add3c78f54a2b2933abded23e99a399f641117e06e3ca79bb0bca5a"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f7d8181e6340202d8c3e72e1cf696823",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 34916,
+        "upload_time": "2022-04-17T00:39:58",
+        "upload_time_iso_8601": "2022-04-17T00:39:58.442006Z",
+        "url": "https://files.pythonhosted.org/packages/47/c4/4f93739cc85f63b7c5d9efb4377c080002d114df416ba270ae0f42e299bc/hyperstate-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0007651f281ef483acaa8cb3281d0019a1a2e21bc9e240333ddef9cad9ef79c",
+          "md5": "f9990320f9e4b6ce34b4ab56f27d5a23",
+          "sha256": "94858da4f95877f7494a3c33772f2027c75f86b34369f8698f5296e3244c837a"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f9990320f9e4b6ce34b4ab56f27d5a23",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37583,
+        "upload_time": "2022-04-17T00:39:59",
+        "upload_time_iso_8601": "2022-04-17T00:39:59.927642Z",
+        "url": "https://files.pythonhosted.org/packages/d0/00/7651f281ef483acaa8cb3281d0019a1a2e21bc9e240333ddef9cad9ef79c/hyperstate-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f7f713bdab8174d5cb97033482b96ab3aafe64d80a6001c508af19b27011869",
+          "md5": "986c0cf8b977911b1b67b51c396975f7",
+          "sha256": "f1456bf7513b4c5be427314c0b9f84d37fe7885fe68e45f28af3400c067aa75e"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "986c0cf8b977911b1b67b51c396975f7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37558,
+        "upload_time": "2022-05-27T01:10:02",
+        "upload_time_iso_8601": "2022-05-27T01:10:02.455457Z",
+        "url": "https://files.pythonhosted.org/packages/6f/7f/713bdab8174d5cb97033482b96ab3aafe64d80a6001c508af19b27011869/hyperstate-0.3.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b5977fd60995709a65a5d2ee4d5d3e173474901102ea5ec42c4795ec40850d7",
+          "md5": "e038c1dfcd6d74b7ed0c10449d8b1206",
+          "sha256": "ef0e267e2607b92e7ce0046900d41f51635edf588279fb8953bc4b0b7f2e4de0"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e038c1dfcd6d74b7ed0c10449d8b1206",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 39934,
+        "upload_time": "2022-05-27T01:10:04",
+        "upload_time_iso_8601": "2022-05-27T01:10:04.335808Z",
+        "url": "https://files.pythonhosted.org/packages/1b/59/77fd60995709a65a5d2ee4d5d3e173474901102ea5ec42c4795ec40850d7/hyperstate-0.3.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "659f626e441cd219edfb7fb795c5f3379fd7526a26202fb8373019026942df0f",
+          "md5": "02ed9e8444bde315c4a8ffbb0ed86c0c",
+          "sha256": "17fb00e9dcc795fec45d3a23262fd287b5e11bdbcf8bad7a95c795a578434a41"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "02ed9e8444bde315c4a8ffbb0ed86c0c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<4.0.0",
+        "size": 37570,
+        "upload_time": "2022-06-24T16:01:52",
+        "upload_time_iso_8601": "2022-06-24T16:01:52.110886Z",
+        "url": "https://files.pythonhosted.org/packages/65/9f/626e441cd219edfb7fb795c5f3379fd7526a26202fb8373019026942df0f/hyperstate-0.3.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c3dc126c9b1cc65732728caefaabf79cb49ab79babbe5ec071bfc93fe66f50d",
+          "md5": "c432ae1031427e2095c15402fb646daa",
+          "sha256": "1a683b8bd3ca5fe9a16dec9da242321cee19f47e08e7a6af8cfad0e611477061"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c432ae1031427e2095c15402fb646daa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<4.0.0",
+        "size": 39945,
+        "upload_time": "2022-06-24T16:01:54",
+        "upload_time_iso_8601": "2022-06-24T16:01:54.347192Z",
+        "url": "https://files.pythonhosted.org/packages/0c/3d/c126c9b1cc65732728caefaabf79cb49ab79babbe5ec071bfc93fe66f50d/hyperstate-0.3.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a5fb8a392d76b3407eece35a71c7ebc879ef1ca968524c80c7b312dbf5c66719",
+          "md5": "f1cd7c5f99299ae2ab6d6a77384e2af8",
+          "sha256": "6154824aa06557c3a53dbdfdc6c4e6ca46d36fc0ac65f01a03ca18d529d0cb51"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f1cd7c5f99299ae2ab6d6a77384e2af8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<4.0.0",
+        "size": 37715,
+        "upload_time": "2022-06-28T15:57:32",
+        "upload_time_iso_8601": "2022-06-28T15:57:32.111100Z",
+        "url": "https://files.pythonhosted.org/packages/a5/fb/8a392d76b3407eece35a71c7ebc879ef1ca968524c80c7b312dbf5c66719/hyperstate-0.3.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "591d376d25722cf88b3709f9afda911b636bb39eac706af5dac9c47325b3550e",
+          "md5": "d2e5d45140ab85abe41192de8799a39a",
+          "sha256": "ac05d7263342ba17dcd40e60e9df1cce72b1dd7eb487934ff8f30f8cafb16c83"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d2e5d45140ab85abe41192de8799a39a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<4.0.0",
+        "size": 40079,
+        "upload_time": "2022-06-28T15:57:33",
+        "upload_time_iso_8601": "2022-06-28T15:57:33.591646Z",
+        "url": "https://files.pythonhosted.org/packages/59/1d/376d25722cf88b3709f9afda911b636bb39eac706af5dac9c47325b3550e/hyperstate-0.3.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b7a4d1193444efbf101c77aebfcc0bb3042c8009f3b4f2dcbdeeda23c166ca1",
+          "md5": "2a65ee45a8ba605f1eef9fe78f37f7d2",
+          "sha256": "97b1283d616f6e340dda923da69fb16e3ac5107266ffdf5ac66f3b812b27184c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2a65ee45a8ba605f1eef9fe78f37f7d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35055,
+        "upload_time": "2022-04-17T03:34:40",
+        "upload_time_iso_8601": "2022-04-17T03:34:40.868765Z",
+        "url": "https://files.pythonhosted.org/packages/9b/7a/4d1193444efbf101c77aebfcc0bb3042c8009f3b4f2dcbdeeda23c166ca1/hyperstate-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "787b8f58a1147299b80042d0f477cbb783cb90133a0e71d98066b86a0183592e",
+          "md5": "6f3081ab533c0706d488ce0b1becde41",
+          "sha256": "4d7fff43895c57f7da38fc11619fc76cf819bacfa8c8f2c4f6699cde4882343d"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6f3081ab533c0706d488ce0b1becde41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37643,
+        "upload_time": "2022-04-17T03:34:42",
+        "upload_time_iso_8601": "2022-04-17T03:34:42.563300Z",
+        "url": "https://files.pythonhosted.org/packages/78/7b/8f58a1147299b80042d0f477cbb783cb90133a0e71d98066b86a0183592e/hyperstate-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cf6eb262f206c708c74cbf4c6923fe73c8aadf5c066e2fc28e20bbfebd9dc0d",
+          "md5": "7b731455aef62725f482b2e0fbd6cc87",
+          "sha256": "39c7cf95c5a8e9d238cb606fa5737e285a03240499ed66adea2866fec7b82d12"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7b731455aef62725f482b2e0fbd6cc87",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35054,
+        "upload_time": "2022-04-17T03:50:05",
+        "upload_time_iso_8601": "2022-04-17T03:50:05.185911Z",
+        "url": "https://files.pythonhosted.org/packages/3c/f6/eb262f206c708c74cbf4c6923fe73c8aadf5c066e2fc28e20bbfebd9dc0d/hyperstate-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc160a7db4e626935215b2b186234b23c88e89383fcbe91983a763ca8516554f",
+          "md5": "0b335a9bd1567676088b851d9060890a",
+          "sha256": "b01b7d1477b4d01ad7905add581fb7342f07ba62412929dcddb85ef2ff4b989c"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0b335a9bd1567676088b851d9060890a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37633,
+        "upload_time": "2022-04-17T03:50:06",
+        "upload_time_iso_8601": "2022-04-17T03:50:06.832071Z",
+        "url": "https://files.pythonhosted.org/packages/cc/16/0a7db4e626935215b2b186234b23c88e89383fcbe91983a763ca8516554f/hyperstate-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "af38458386983b0dd2f9d8a8725644ccbd2f2cf237b77034e4823b368cd452fd",
+          "md5": "2bc374870ec78ec318046f4ef8978090",
+          "sha256": "d4c9936cd1bf22abec73dc9d556e7996d12dff566592522d1df951b69c763877"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2bc374870ec78ec318046f4ef8978090",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35102,
+        "upload_time": "2022-04-17T15:51:20",
+        "upload_time_iso_8601": "2022-04-17T15:51:20.296638Z",
+        "url": "https://files.pythonhosted.org/packages/af/38/458386983b0dd2f9d8a8725644ccbd2f2cf237b77034e4823b368cd452fd/hyperstate-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "35709ed1eea776ec1c57741135db91b1b1f9abdec47ffb76d0be9137a49b19b7",
+          "md5": "b274a723b790ce7add005f64ab5fe2e7",
+          "sha256": "8470b8e6e0c7bbe86c6055b24c41475e495e95de039ac84428376bc3e700c34a"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b274a723b790ce7add005f64ab5fe2e7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37658,
+        "upload_time": "2022-04-17T15:51:21",
+        "upload_time_iso_8601": "2022-04-17T15:51:21.788176Z",
+        "url": "https://files.pythonhosted.org/packages/35/70/9ed1eea776ec1c57741135db91b1b1f9abdec47ffb76d0be9137a49b19b7/hyperstate-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0be0d91480cb7dc782069fd569db9a2d283a0fa444afc7e9f0cbf1474096830c",
+          "md5": "1ceba222da7c1cea24621338131bbee5",
+          "sha256": "9ce4ffc7bb259c5c9366d45881ee12b6c3638a16e3e865e08dfb27b8c5738cd2"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ceba222da7c1cea24621338131bbee5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35956,
+        "upload_time": "2022-04-17T18:23:30",
+        "upload_time_iso_8601": "2022-04-17T18:23:30.572257Z",
+        "url": "https://files.pythonhosted.org/packages/0b/e0/d91480cb7dc782069fd569db9a2d283a0fa444afc7e9f0cbf1474096830c/hyperstate-0.3.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eaae7491ad76b4ab30efb4cd551c98e55a5990a99bd3d581ba6381f35b6c719c",
+          "md5": "d944aa7d338929ece4f90b57b711dad0",
+          "sha256": "b9ed2fdd512fc404b41fb3f58cafd5a09415d098213ba75629cd9f9c595b9ab4"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d944aa7d338929ece4f90b57b711dad0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 38539,
+        "upload_time": "2022-04-17T18:23:32",
+        "upload_time_iso_8601": "2022-04-17T18:23:32.168182Z",
+        "url": "https://files.pythonhosted.org/packages/ea/ae/7491ad76b4ab30efb4cd551c98e55a5990a99bd3d581ba6381f35b6c719c/hyperstate-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ddc8ab3d2e49673006bd968fc507aabfa3794ad3756ba505aefe720776349197",
+          "md5": "ff5a750231ca9669241e2c37e891fdbf",
+          "sha256": "40fdb97cd099a181c99e120d19bd3dccb963fe73fd74c6543c7aa3294462832b"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ff5a750231ca9669241e2c37e891fdbf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 35964,
+        "upload_time": "2022-04-17T18:36:55",
+        "upload_time_iso_8601": "2022-04-17T18:36:55.895723Z",
+        "url": "https://files.pythonhosted.org/packages/dd/c8/ab3d2e49673006bd968fc507aabfa3794ad3756ba505aefe720776349197/hyperstate-0.3.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e24bea0eb7df130896d896103f6b28481c590f4d4e0cac43f0f1627e919b9c1",
+          "md5": "65224f4b4acf033a74ccb1b6395109b6",
+          "sha256": "982709e1298a37f90edc1a955b5123dc3ee189a8847b26bd38eb3dc872adaeb0"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65224f4b4acf033a74ccb1b6395109b6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 38546,
+        "upload_time": "2022-04-17T18:36:57",
+        "upload_time_iso_8601": "2022-04-17T18:36:57.471195Z",
+        "url": "https://files.pythonhosted.org/packages/1e/24/bea0eb7df130896d896103f6b28481c590f4d4e0cac43f0f1627e919b9c1/hyperstate-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a57a29e5103b35f4240f2e0176c1161945799d9286633c6ddfb9ee6278fc944a",
+          "md5": "3e0b777602fb81e711f8a336f6264ee5",
+          "sha256": "c39737f5c331402182f3a857a74a3df4fd51195100f84a4ac947b0cfce400ab3"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3e0b777602fb81e711f8a336f6264ee5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 36015,
+        "upload_time": "2022-04-17T19:42:44",
+        "upload_time_iso_8601": "2022-04-17T19:42:44.554733Z",
+        "url": "https://files.pythonhosted.org/packages/a5/7a/29e5103b35f4240f2e0176c1161945799d9286633c6ddfb9ee6278fc944a/hyperstate-0.3.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "608d86087996ad4b0e288de3cff05938ad99b000e6b13eba5f6df281eb2b1e70",
+          "md5": "a9e53fae3aa86a55b994d92dac443edb",
+          "sha256": "eb48e96e400656784d52bb0c3167cf2d932d766f60cd4a8c291d9df4204796da"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a9e53fae3aa86a55b994d92dac443edb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 38607,
+        "upload_time": "2022-04-17T19:42:46",
+        "upload_time_iso_8601": "2022-04-17T19:42:46.086289Z",
+        "url": "https://files.pythonhosted.org/packages/60/8d/86087996ad4b0e288de3cff05938ad99b000e6b13eba5f6df281eb2b1e70/hyperstate-0.3.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97dfda20a40169b8ee9f557cd2b08caba7d85aac159ecc9030af4e2b55f7628f",
+          "md5": "163c6b2220aa17ec17cb54518c8e66e8",
+          "sha256": "623984e04843515dad9820f83c67b7a38de0696de2595f4d4a76eea84be7cf1e"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "163c6b2220aa17ec17cb54518c8e66e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 37211,
+        "upload_time": "2022-05-07T01:10:59",
+        "upload_time_iso_8601": "2022-05-07T01:10:59.599509Z",
+        "url": "https://files.pythonhosted.org/packages/97/df/da20a40169b8ee9f557cd2b08caba7d85aac159ecc9030af4e2b55f7628f/hyperstate-0.3.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "10619fdd48e6113916d42ae7b6dabd96ca480ee6035ab63e9c74cb382d23e057",
+          "md5": "46f5d719b4d646800627d6f08e76862d",
+          "sha256": "8e498707f22f7e5356999eaa5107d6d17081eb03e8299d987f6cf10b65b52c36"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.3.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "46f5d719b4d646800627d6f08e76862d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 39647,
+        "upload_time": "2022-05-07T01:11:01",
+        "upload_time_iso_8601": "2022-05-07T01:11:01.274290Z",
+        "url": "https://files.pythonhosted.org/packages/10/61/9fdd48e6113916d42ae7b6dabd96ca480ee6035ab63e9c74cb382d23e057/hyperstate-0.3.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a21e8a826ed107c1f4e0b7d9c2f135dfa099aa1bc9a995fe37314a5c185c7b2",
+          "md5": "a41e71a28c79bfa23c83453b4dc30a97",
+          "sha256": "aab11a25327907b844ff3077ca276925e86ba09635e3da0e6cb533aff67c33ea"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a41e71a28c79bfa23c83453b4dc30a97",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 38314,
+        "upload_time": "2022-07-11T15:23:12",
+        "upload_time_iso_8601": "2022-07-11T15:23:12.202647Z",
+        "url": "https://files.pythonhosted.org/packages/9a/21/e8a826ed107c1f4e0b7d9c2f135dfa099aa1bc9a995fe37314a5c185c7b2/hyperstate-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "175c3335bd5a52e84edf66a821cd5c8acfe5de0b8a393e3372ced76b46c6d55b",
+          "md5": "72397e9b4252133abebd108f99629a2c",
+          "sha256": "0cf65b8052ddd7506c5366c4f624f126f835dc4cd1ce4cdbd0a27b435d801dc2"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72397e9b4252133abebd108f99629a2c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 40506,
+        "upload_time": "2022-07-11T15:23:14",
+        "upload_time_iso_8601": "2022-07-11T15:23:14.214145Z",
+        "url": "https://files.pythonhosted.org/packages/17/5c/3335bd5a52e84edf66a821cd5c8acfe5de0b8a393e3372ced76b46c6d55b/hyperstate-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "885c6b0df25a2b96377be9206c15347bb807ff23268eb3151465e987d66213cc",
+          "md5": "4a5140f7c032fc48bd0218051ab944ef",
+          "sha256": "be801b3ff429e7bda8a1e07dab20fbba01d96e93c34a5422e6202cf50788bed5"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a5140f7c032fc48bd0218051ab944ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 38347,
+        "upload_time": "2022-07-15T02:53:49",
+        "upload_time_iso_8601": "2022-07-15T02:53:49.586027Z",
+        "url": "https://files.pythonhosted.org/packages/88/5c/6b0df25a2b96377be9206c15347bb807ff23268eb3151465e987d66213cc/hyperstate-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb770be0ce13ba344ca5402d155a52914e982d42adf58dabde47887743994be2",
+          "md5": "e94ab5452ad9ecbad2234681a36f2163",
+          "sha256": "2abbde5eb916270eba82aeeafb27c0316a2eb6674cbcc45d24ddfd7384ff0844"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e94ab5452ad9ecbad2234681a36f2163",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 40550,
+        "upload_time": "2022-07-15T02:53:51",
+        "upload_time_iso_8601": "2022-07-15T02:53:51.479477Z",
+        "url": "https://files.pythonhosted.org/packages/eb/77/0be0ce13ba344ca5402d155a52914e982d42adf58dabde47887743994be2/hyperstate-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c0cbebec98dfc47889e2a9c1b55b90bdf05e43ca341dfdc5777f04ef7c0adfe",
+          "md5": "cac64ff9a849d7fd5c853c123bad9267",
+          "sha256": "84ed396cb49f7b964e3d7f78aa007973ab0e86c52625ec91d71f2aaecff93990"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cac64ff9a849d7fd5c853c123bad9267",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 38442,
+        "upload_time": "2022-10-02T01:18:01",
+        "upload_time_iso_8601": "2022-10-02T01:18:01.160930Z",
+        "url": "https://files.pythonhosted.org/packages/4c/0c/bebec98dfc47889e2a9c1b55b90bdf05e43ca341dfdc5777f04ef7c0adfe/hyperstate-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c26f080cc4741537652347fef91a397810da90eb75da655f8c29f41c0cd5bfc",
+          "md5": "d64d56104bff577aa151f4f50bb876a0",
+          "sha256": "d8d05a6b4732f5b3edad3d28e4f0a00a41057da818820e87efb4f1128ca9d17f"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d64d56104bff577aa151f4f50bb876a0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 40629,
+        "upload_time": "2022-10-02T01:18:03",
+        "upload_time_iso_8601": "2022-10-02T01:18:03.254109Z",
+        "url": "https://files.pythonhosted.org/packages/4c/26/f080cc4741537652347fef91a397810da90eb75da655f8c29f41c0cd5bfc/hyperstate-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63dc8c7f342bedfda161f71e4fe43fa3c21312f0a69b7ece208a3a0bc0137b73",
+          "md5": "3ef6ab076b4bce52fddc1c6135ccccfe",
+          "sha256": "af420d64a6acebf365c8d7560bca300784a23dfefce80c57f6d131092faaf52f"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ef6ab076b4bce52fddc1c6135ccccfe",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 38447,
+        "upload_time": "2023-03-14T16:10:55",
+        "upload_time_iso_8601": "2023-03-14T16:10:55.310911Z",
+        "url": "https://files.pythonhosted.org/packages/63/dc/8c7f342bedfda161f71e4fe43fa3c21312f0a69b7ece208a3a0bc0137b73/hyperstate-0.4.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df8f19463d34591edff187ee1e16c87659c21cb8aa294520897825d9cdda404c",
+          "md5": "84fd9f8455f82107056023a72cc0ac5d",
+          "sha256": "9cfda2f89b43c5cc0a065bfebcf898123105405c5e49638a9680090662d7f1ae"
+        },
+        "downloads": -1,
+        "filename": "hyperstate-0.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "84fd9f8455f82107056023a72cc0ac5d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.1,<3.11.0",
+        "size": 39193,
+        "upload_time": "2023-03-14T16:10:56",
+        "upload_time_iso_8601": "2023-03-14T16:10:56.739734Z",
+        "url": "https://files.pythonhosted.org/packages/df/8f/19463d34591edff187ee1e16c87659c21cb8aa294520897825d9cdda404c/hyperstate-0.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "63dc8c7f342bedfda161f71e4fe43fa3c21312f0a69b7ece208a3a0bc0137b73",
+        "md5": "3ef6ab076b4bce52fddc1c6135ccccfe",
+        "sha256": "af420d64a6acebf365c8d7560bca300784a23dfefce80c57f6d131092faaf52f"
+      },
+      "downloads": -1,
+      "filename": "hyperstate-0.4.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "3ef6ab076b4bce52fddc1c6135ccccfe",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7.1,<3.11.0",
+      "size": 38447,
+      "upload_time": "2023-03-14T16:10:55",
+      "upload_time_iso_8601": "2023-03-14T16:10:55.310911Z",
+      "url": "https://files.pythonhosted.org/packages/63/dc/8c7f342bedfda161f71e4fe43fa3c21312f0a69b7ece208a3a0bc0137b73/hyperstate-0.4.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "df8f19463d34591edff187ee1e16c87659c21cb8aa294520897825d9cdda404c",
+        "md5": "84fd9f8455f82107056023a72cc0ac5d",
+        "sha256": "9cfda2f89b43c5cc0a065bfebcf898123105405c5e49638a9680090662d7f1ae"
+      },
+      "downloads": -1,
+      "filename": "hyperstate-0.4.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "84fd9f8455f82107056023a72cc0ac5d",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7.1,<3.11.0",
+      "size": 39193,
+      "upload_time": "2023-03-14T16:10:56",
+      "upload_time_iso_8601": "2023-03-14T16:10:56.739734Z",
+      "url": "https://files.pythonhosted.org/packages/df/8f/19463d34591edff187ee1e16c87659c21cb8aa294520897825d9cdda404c/hyperstate-0.4.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
