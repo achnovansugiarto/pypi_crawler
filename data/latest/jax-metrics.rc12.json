@@ -1,0 +1,626 @@
+{
+  "info": {
+    "author": "Cristian Garcia",
+    "author_email": "cgarcia.e88@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "<!-- codecov badge -->\n[![codecov](https://codecov.io/gh/cgarciae/jax_metrics/branch/master/graph/badge.svg?token=3IKEUAU3C8)](https://codecov.io/gh/cgarciae/jax_metrics)\n\n# JAX Metrics\n\n_A Metrics library for the JAX ecosystem_\n\n#### Main Features\n* Standard metrics that can be used in any JAX project.\n* Pytree abstractions that can natively integrate with all JAX APIs and pytree-supporting frameworks (flax.struct, equinox, treex, etc).\n* Distributed-friendly APIs that make it super easy to synchronize metrics across devices.\n* Automatic accumulation over epochs.\n\n\nJAX Metrics is implemented on top of [Treeo](https://github.com/cgarciae/treeo).\n\n## What is included?\n* The Keras-like `Loss` and `Metric` abstractions.\n* A `metrics` module containing popular metrics.\n* The `losses` and `regularizers` modules containing popular losses.\n* The `Metrics` and `Losses` combinators.\n\n<!-- ## Why JAX Metrics? -->\n\n## Installation\nInstall using pip:\n```bash\npip install jax_metrics\n```\n\n## Status\nMetrics on this library are usually tested against their Keras or Torchmetrics counterparts for numerical equivalence. This code base comes from Treex and Elegy so it's already in use.\n\n## Getting Started\n\n### Metric\n\nThe `Metric` API consists of 3 basic methods:\n\n* `reset`: Used to both initialize and reset a metric.\n* `update`: Takes in new data and updates the metric state.\n* `compute`: Returns the current value of the metric.\n\nSimple usage looks like this:\n\n\n```python\nimport jax_metrics as jm\n\nmetric = jm.metrics.Accuracy()\n\n# Update the metric with a batch of predictions and labels\nmetric = metric.update(target=y, preds=logits)\n\n# Get the current value of the metric\nacc = metric.compute() # 0.95\n\n# alternatively, produce a logs dict\nlogs = metric.compute_logs() # {'accuracy': 0.95}\n\n# Reset the metric\nmetric = metric.reset()\n```\n\nNote that `update` enforces the use of keyword arguments. Also the `Metric.name` property is used as the key in the returned dict, by default this is the name of the class in lowercase but can be overridden in the constructor via the `name` argument.\n\n#### Tipical Training Setup\n\nBecause Metrics are pytrees they can be used with `jit`, `pmap`, etc. On a more realistic scenario you will proably want to use them inside some of your JAX functions in a setup similar to this:\n\n```python\nimport jax_metrics as jm\n\nmetric = jm.metrics.Accuracy()\n\ndef loss_fn(params, metric, x, y):\n    ...\n    metric = metric.update(target=y, preds=logits)\n    ...\n\n    return loss, metric\n\n@jax.jit\ndef train_step(params, metric, x, y):\n    grads, metric = jax.grad(loss_fn, has_aux=True)(\n        params, metric, x, y\n    )\n    ...\n    return params, metric\n\n@jax.jit\ndef reset_step(metric: jm.Metric) -> jm.Metric:\n    return metric.reset()\n```\n\nSince the loss function usually has access to the predictions and labels, its usually where you would call `metric.update`, and the new metric state can be returned as an auxiliary output.\n\n#### Distributed Training\n\nJAX Metrics has a distributed friendly API via the `batch_updates` and `reduce` methods. A simple example of a loss function inside a data parallel setup could look like this:\n\n```python\ndef loss_fn(params, metric, x, y):\n    ...\n    # compuate batch update\n    batch_updates = metric.batch_updates(target=y, preds=logits)\n    # gather over all devices and reduce\n    batch_updates = jax.lax.all_gather(batch_updates, \"device\").reduce()\n    # update metric\n    metric = metric.merge(batch_updates)\n    ...\n```\n\nThe `batch_updates` method behaves similar to `update` but returns a new metric state with only information about that batch, `jax.lax.all_gather` \"gathers\" the metric state over all devices plus adds a new axis to the metric state, and `reduce` reduces the metric state over all devices (first axis). Finally, `merge` combines the accumulated metric state over the previous batches with the batch updates.\n\n### Loss\n\nThe `Loss` API just consists of a `__call__` method. Simple usage looks like this:\n\n```python\nimport jax_metrics as jm\n\ncrossentropy = jm.losses.Crossentropy()\n\n# get reduced loss value\nloss = crossentropy(target=y, preds=logits) # 0.23\n```\nNote that losses are not pytrees so they should be marked as static. Similar to Keras, all losses have a `reduction` strategy that can be specified in the constructor and (usually) makes sure that the output is a scalar.\n\n<details>\n<summary><b>Why have losses in a metrics library?</b></summary>\n<!-- #### Why have losses in a metrics library? -->\n\nThere are a few reasons for having losses in a metrics library:\n\n1. Most code from this library was originally written for and will still be consumed by Elegy. Since Elegy needs support for calculating cumulative losses, as you will see later, a Metric abstraction called `Losses` was created for this.\n2. A couple of API design decisions are shared between the `Loss` and `Metric` APIs. This includes: \n    * `__call__` and `update` both accept any number keyword only arguments. This is used to facilitate composition (see [Combinators](#combinators) section).\n    * Both classes have the `index_into` and `rename_arguments` methods that allow them to modify how arguments are consumed.\n    * Argument names are standardized to be consistent when ever possible, e.g. both `metrics.Accuracy` and `losses.Crossentropy` use the `target` and `preds` arguments.\n\n</details>\n\n### Combinators\nCombinators enable you to group together multiple metrics while also being instances of `Metric` and thus maintaining the same API.\n#### Metrics\nThe `Metrics` combinator lets you combine multiple metrics into a single Metric object.\n\n```python\nmetrics = jm.Metrics([\n    jm.metrics.Accuracy(),\n    jm.metrics.F1(), # not yet implemented 😅, coming soon?\n])\n\n# same API\nmetrics = metrics.update(target=y, preds=logits)\n# compute now returns a dict\nmetrics.compute() # {'accuracy': 0.95, 'f1': 0.87}\n# same as compute_logs in the case\nmetrics.compute_logs() # {'accuracy': 0.95, 'f1': 0.87}\n# Reset the metrics\nmetrics = metrics.reset()\n```\n\nAs you can see the `Metrics.update` method accepts and forwards all the arguments required by the individual metrics. In this example they use the same arguments, but in practice they may consume different subsets of the arguments. Also, if names are repeated then unique names are generated for each metric by appending a number to the metric name.\n\nIf a dictionary is used instead of a list, the keys are used instead of the `name` property of the metrics to determine the key in the returned dict.\n\n```python\nmetrics = jm.Metrics({\n    \"acc\": jm.metrics.Accuracy(),\n    \"f_one\": jm.metrics.F1(), # not yet implemented 😅, coming soon?\n})\n\n# same API\nmetrics = metrics.update(target=y, preds=logits)\n# compute new returns a dict\nmetrics.compute() # {'acc': 0.95, 'f_one': 0.87}\n# same as compute_logs in the case\nmetrics.compute_logs() # {'acc': 0.95, 'f_one': 0.87}\n# Reset the metrics\nmetrics = metrics.reset()\n```\n\nYou can use nested structures of dicts and lists to group metrics, the keys of the dicts are used to determine group names. Group names and metrics names are concatenated using `\"/\"` e.g. `\"{group_name}/{metric_name}\"`.\n\n#### Losses\n\n`Losses` is a `Metric` combinator that behaves very similarly to `Metrics` but contains `Loss` instances. `Losses` calculates the cumulative **mean** value of each loss over the batches.\n\n```python\nlosses = jm.Losses([\n    jm.losses.Crossentropy(),\n    jm.regularizers.L2(1e-4),\n])\n\n# same API\nlosses = losses.update(target=y, preds=logits, parameters=params)\n# compute new returns a dict\nlosses.compute() # {'crossentropy': 0.23, 'l2': 0.005}\n# same as compute_logs in the case\nlosses.compute_logs() # {'crossentropy': 0.23, 'l2': 0.005}\n# you can also compute the total loss\nloss = losses.total_loss() # 0.235\n# Reset the losses\nlosses = losses.reset()\n```\n\nAs with `Metrics`, the `update` method accepts and forwards all the arguments required by the individual losses. In this example `target` and `preds` are used by the `Crossentropy`, while `parameters` is used by the `L2`. The `total_loss` method returns the sum of all values returned by `compute`.\n\nIf a dictionary is used instead of a list, the keys are used instead of the `name` property of the losses to determine the key in the returned dict.\n\n```python\nlosses = jm.Losses({\n    \"xent\": jm.losses.Crossentropy(),\n    \"l2\": jm.regularizers.L2(1e-4),\n})\n\n# same API\nlosses = losses.update(target=y, preds=logits, parameters=params)\n# compute new returns a dict\nlosses.compute() # {'xent': 0.23, 'l2': 0.005}\n# same as compute_logs in the case\nlosses.compute_logs() # {'xent': 0.23, 'l2': 0.005}\n# you can also compute the total loss\nloss = losses.total_loss() # 0.235\n# Reset the losses\nlosses = losses.reset()\n```\n\nIf you want to use `Losses` to calculate the loss of a model, you should use `batch_updates` followed by `total_loss` to get the correct batch loss. For example, a loss function could be written as:\n\n```python\ndef loss_fn(..., losses):\n    ...\n    batch_updates = losses.batch_updates(target=y, preds=logits, parameters=params)\n    loss = batch_updates.total_loss()\n    losses = losses.merge(batch_updates)\n    ...\n    return loss, losses\n```\nFor convenience, the previous pattern can be simplified to a single line using the `loss_and_update` method:\n```python\ndef loss_fn(...):\n    ...\n    loss, lossses = losses.loss_and_update(target=y, preds=logits, parameters=params)\n    ...\n    return loss, losses\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://cgarciae.github.io/jax_metrics",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "jax-metrics",
+    "package_url": "https://pypi.org/project/jax-metrics/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/jax-metrics/",
+    "project_urls": {
+      "Homepage": "https://cgarciae.github.io/jax_metrics",
+      "Repository": "https://github.com/cgarciae/jax_metrics"
+    },
+    "release_url": "https://pypi.org/project/jax-metrics/0.2.5/",
+    "requires_dist": [
+      "einops (>=0.4.0)",
+      "simple_pytree (>=0.1.3)",
+      "optax (>=0.1.1)",
+      "jax",
+      "jaxlib"
+    ],
+    "requires_python": ">=3.8,<3.12",
+    "summary": "",
+    "version": "0.2.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17323363,
+  "releases": {
+    "0.1.0a0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f47e109af1a52bc3665455dc0b508e9e80024640b9372518b535d0231d5bb1dc",
+          "md5": "c674506c39bdc97e91500e8a6d84da92",
+          "sha256": "38920dbcffef4d892878c420ab4801202798e9966c197dea4486975fa8f98a22"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c674506c39bdc97e91500e8a6d84da92",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 77271,
+        "upload_time": "2022-04-13T14:27:38",
+        "upload_time_iso_8601": "2022-04-13T14:27:38.097246Z",
+        "url": "https://files.pythonhosted.org/packages/f4/7e/109af1a52bc3665455dc0b508e9e80024640b9372518b535d0231d5bb1dc/jax_metrics-0.1.0a0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f60fb3c10d3cf40727e844383826f536387bb1771abfc08a54d1d855e3fbea11",
+          "md5": "bafa65d234d28cdeaf608183902ecbc9",
+          "sha256": "464c9c4154a9e0f7a2e626b785d57fb9366a5907f9bcaed15754f71f3b10b30e"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bafa65d234d28cdeaf608183902ecbc9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 53517,
+        "upload_time": "2022-04-13T14:27:40",
+        "upload_time_iso_8601": "2022-04-13T14:27:40.170522Z",
+        "url": "https://files.pythonhosted.org/packages/f6/0f/b3c10d3cf40727e844383826f536387bb1771abfc08a54d1d855e3fbea11/jax_metrics-0.1.0a0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b1a1bb144697213bf1f395c154a2313fdd7e01cf5fa4ff2c5e339aaf0ba82a2",
+          "md5": "bee8abb01584fc9d913fe8a18b627b97",
+          "sha256": "78d36f254806bb38c84d4e7557dce32a8ee1e180622c37afa01ba25b7db6cb5b"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bee8abb01584fc9d913fe8a18b627b97",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 79445,
+        "upload_time": "2022-04-17T16:20:19",
+        "upload_time_iso_8601": "2022-04-17T16:20:19.237791Z",
+        "url": "https://files.pythonhosted.org/packages/3b/1a/1bb144697213bf1f395c154a2313fdd7e01cf5fa4ff2c5e339aaf0ba82a2/jax_metrics-0.1.0a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e40a68d2186c6995f1c10f06008cc43d6e0a66541e06dd473488ba9219d9995",
+          "md5": "694c184d87b89174c3e33b191c67c177",
+          "sha256": "c89e1b5b2a1a411ef66abdecd31c09da4d0941ec17e2bdb99725b15f449765fa"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "694c184d87b89174c3e33b191c67c177",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 57961,
+        "upload_time": "2022-04-17T16:20:21",
+        "upload_time_iso_8601": "2022-04-17T16:20:21.922362Z",
+        "url": "https://files.pythonhosted.org/packages/7e/40/a68d2186c6995f1c10f06008cc43d6e0a66541e06dd473488ba9219d9995/jax_metrics-0.1.0a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07d08b2ad9a6154ca17bfd85d1308d401a934cc9961967d3952220094d21f20f",
+          "md5": "d84821dbdb79b1c9e36160bcb48afe30",
+          "sha256": "20e29a40003107e40437a1155b1117b50fea4df0a89f6b6e5c4859285dddd251"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d84821dbdb79b1c9e36160bcb48afe30",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 79550,
+        "upload_time": "2022-04-22T14:25:14",
+        "upload_time_iso_8601": "2022-04-22T14:25:14.108661Z",
+        "url": "https://files.pythonhosted.org/packages/07/d0/8b2ad9a6154ca17bfd85d1308d401a934cc9961967d3952220094d21f20f/jax_metrics-0.1.0a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0df799fd522d9cdc2ee319047e5ca86d21232aa0ce2335cbde80fd3a5556258d",
+          "md5": "3db882576a9e359b3b3a9a5f140159ad",
+          "sha256": "487edd0fb5a26573f77109001e955fe3a833a4f669015a4b181a448dae1d94b2"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3db882576a9e359b3b3a9a5f140159ad",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 58192,
+        "upload_time": "2022-04-22T14:25:15",
+        "upload_time_iso_8601": "2022-04-22T14:25:15.971173Z",
+        "url": "https://files.pythonhosted.org/packages/0d/f7/99fd522d9cdc2ee319047e5ca86d21232aa0ce2335cbde80fd3a5556258d/jax_metrics-0.1.0a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2a9c1b5e03bcd7485298159ddf6af34005f718bc9d794ef0863c88cbe96ac9c",
+          "md5": "3f55e16f71a7db64d996e3f45b7f9100",
+          "sha256": "86294fc384717d2b1c1d7628c74bb2136bed9682542dc910b5aed58919883c0d"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3f55e16f71a7db64d996e3f45b7f9100",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 79675,
+        "upload_time": "2022-05-23T02:30:04",
+        "upload_time_iso_8601": "2022-05-23T02:30:04.559834Z",
+        "url": "https://files.pythonhosted.org/packages/f2/a9/c1b5e03bcd7485298159ddf6af34005f718bc9d794ef0863c88cbe96ac9c/jax_metrics-0.1.0a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "431fd003e178a5e6d2c91d09f92673c80ae66d997f223c8eba59bfc10902c55b",
+          "md5": "b8982cded68f3b3ed69da9d7b2e3fb7d",
+          "sha256": "9fc4b15dbb6f2245a57be54d05fdf4918680a4b27e37c79b99a1d1a6b2a00691"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.0a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8982cded68f3b3ed69da9d7b2e3fb7d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 58505,
+        "upload_time": "2022-05-23T02:30:06",
+        "upload_time_iso_8601": "2022-05-23T02:30:06.875979Z",
+        "url": "https://files.pythonhosted.org/packages/43/1f/d003e178a5e6d2c91d09f92673c80ae66d997f223c8eba59bfc10902c55b/jax_metrics-0.1.0a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c24b8b17aed25eb519cb21e2c624a3c8b9bd225ec7aff9747735ba964058b32",
+          "md5": "f736e1e6889a5953984416512e037d90",
+          "sha256": "8ba98dcaca72e5e9fb4c14706dd5196e07e502c7c8d41daff647f779178df01f"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f736e1e6889a5953984416512e037d90",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 79650,
+        "upload_time": "2022-05-23T16:06:33",
+        "upload_time_iso_8601": "2022-05-23T16:06:33.802522Z",
+        "url": "https://files.pythonhosted.org/packages/2c/24/b8b17aed25eb519cb21e2c624a3c8b9bd225ec7aff9747735ba964058b32/jax_metrics-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3a7e0ad52ea89173236f7f5a4de98b2415ceb67bc0a8a0d2c5bd3595d138593",
+          "md5": "8ff9a0d5fd213cd9690ec089fe7d7819",
+          "sha256": "c2579ec3f7117901aab6ed0e6144075d851f559782e9f3288651ab94965f59cf"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ff9a0d5fd213cd9690ec089fe7d7819",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 58083,
+        "upload_time": "2022-05-23T16:06:35",
+        "upload_time_iso_8601": "2022-05-23T16:06:35.726478Z",
+        "url": "https://files.pythonhosted.org/packages/a3/a7/e0ad52ea89173236f7f5a4de98b2415ceb67bc0a8a0d2c5bd3595d138593/jax_metrics-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c774c8a7de9aaa58edb7f1244844427005d7a060e4135a5870f6efad828f50eb",
+          "md5": "2e9347148bed6524d9fdb4dbfd52446e",
+          "sha256": "d3e2bc06645cb4ba59775965e315ac6b4a79f76e6e74bd6e21f229782c18711c"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e9347148bed6524d9fdb4dbfd52446e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.11",
+        "size": 79661,
+        "upload_time": "2022-06-12T22:23:33",
+        "upload_time_iso_8601": "2022-06-12T22:23:33.034542Z",
+        "url": "https://files.pythonhosted.org/packages/c7/74/c8a7de9aaa58edb7f1244844427005d7a060e4135a5870f6efad828f50eb/jax_metrics-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb771b6b2738f707f15e0127cdc11dfc949e18c168d7469a2cc7528a74f20777",
+          "md5": "cb2832c2651627d06290cbfb8b338c5a",
+          "sha256": "d529e59b467f6a94b35b57f5949f16518ad079bf31a911506edd31918637e4da"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb2832c2651627d06290cbfb8b338c5a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.11",
+        "size": 58075,
+        "upload_time": "2022-06-12T22:23:38",
+        "upload_time_iso_8601": "2022-06-12T22:23:38.676585Z",
+        "url": "https://files.pythonhosted.org/packages/cb/77/1b6b2738f707f15e0127cdc11dfc949e18c168d7469a2cc7528a74f20777/jax_metrics-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "481c94760cd77eb416648df40ac237e11aa9d1e344f67b41a70112f09c5959bf",
+          "md5": "9f70f592e46b988379efcb0946520b04",
+          "sha256": "cacc7787345fb527c9e86d203e68cb4a786caa179516f4377556d962f054a2bf"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9f70f592e46b988379efcb0946520b04",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 77003,
+        "upload_time": "2023-03-04T22:04:00",
+        "upload_time_iso_8601": "2023-03-04T22:04:00.834486Z",
+        "url": "https://files.pythonhosted.org/packages/48/1c/94760cd77eb416648df40ac237e11aa9d1e344f67b41a70112f09c5959bf/jax_metrics-0.2.0-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "74d4ad1736c06ef4bec25e8338c82895610990c9cf18d2e97a595edd3df06f01",
+          "md5": "fc80db969e8f51281486a161732792d8",
+          "sha256": "5bc67288f3f019444df2d15d80e961e0181d92c3f6a9df61bff4afdef203cbaf"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fc80db969e8f51281486a161732792d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 55033,
+        "upload_time": "2023-03-04T22:04:02",
+        "upload_time_iso_8601": "2023-03-04T22:04:02.498474Z",
+        "url": "https://files.pythonhosted.org/packages/74/d4/ad1736c06ef4bec25e8338c82895610990c9cf18d2e97a595edd3df06f01/jax_metrics-0.2.0.tar.gz",
+        "yanked": true,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0ef9b440ff2f8f3941c4b370757ee346145c0ede1136bd1c37b43a6175989e6",
+          "md5": "260548248f7bed6455fcb87e5545176a",
+          "sha256": "b86ba8ebd0eaa734b6d8c861734ddd05f906f7c53a409fe2b8376c7ad01ef25d"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "260548248f7bed6455fcb87e5545176a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 77003,
+        "upload_time": "2023-03-04T22:24:00",
+        "upload_time_iso_8601": "2023-03-04T22:24:00.866925Z",
+        "url": "https://files.pythonhosted.org/packages/c0/ef/9b440ff2f8f3941c4b370757ee346145c0ede1136bd1c37b43a6175989e6/jax_metrics-0.2.1-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2d14cb7baa1caba981a585ca5ce0784e52dc4a182f078c7a4c372eebbb9ff98",
+          "md5": "7ed0d7114df4fe053f4e6ed20a66c99a",
+          "sha256": "98a4bc5195bea7e6d230cf4acdd13ab7861e406ac8e0ac7cba72a21e7b75b8e8"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7ed0d7114df4fe053f4e6ed20a66c99a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 55064,
+        "upload_time": "2023-03-04T22:24:03",
+        "upload_time_iso_8601": "2023-03-04T22:24:03.072582Z",
+        "url": "https://files.pythonhosted.org/packages/e2/d1/4cb7baa1caba981a585ca5ce0784e52dc4a182f078c7a4c372eebbb9ff98/jax_metrics-0.2.1.tar.gz",
+        "yanked": true,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c70e9cfa7b4bc4092392d438076def9f957a52c0f3630d2ca51718a116bee38",
+          "md5": "76a4393690f1c9b5b3035a93d21a16d2",
+          "sha256": "d1fd3e75048e1df2f1a5bb196a97451e3401ef5ae69f56a247dacdf23a7a4bb3"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76a4393690f1c9b5b3035a93d21a16d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 76926,
+        "upload_time": "2023-03-04T23:30:14",
+        "upload_time_iso_8601": "2023-03-04T23:30:14.850606Z",
+        "url": "https://files.pythonhosted.org/packages/4c/70/e9cfa7b4bc4092392d438076def9f957a52c0f3630d2ca51718a116bee38/jax_metrics-0.2.2-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c1f8fcd4e9e26fdfacd2fde039afee3eaeb5d356101775df0404d2734de525da",
+          "md5": "aa6efeb4e36ae0c3ab77a1ea27e879f4",
+          "sha256": "d330133bd9495553c77ef96e2358283da0ae58ff7304d272b3a501e139f08491"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aa6efeb4e36ae0c3ab77a1ea27e879f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 55052,
+        "upload_time": "2023-03-04T23:30:16",
+        "upload_time_iso_8601": "2023-03-04T23:30:16.842548Z",
+        "url": "https://files.pythonhosted.org/packages/c1/f8/fcd4e9e26fdfacd2fde039afee3eaeb5d356101775df0404d2734de525da/jax_metrics-0.2.2.tar.gz",
+        "yanked": true,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "52f7e7f5b587e33f0636e4c0b4d0c7d1ade9cafa6340d2a1c88dddd48151e4dd",
+          "md5": "6d8160a340960e260f6eac3a53b55d02",
+          "sha256": "41c4c47b68fdcba0bacee31ef5bd97ce2b8db1127ea1875de98c52ff85184554"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6d8160a340960e260f6eac3a53b55d02",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 76717,
+        "upload_time": "2023-03-05T00:02:33",
+        "upload_time_iso_8601": "2023-03-05T00:02:33.276090Z",
+        "url": "https://files.pythonhosted.org/packages/52/f7/e7f5b587e33f0636e4c0b4d0c7d1ade9cafa6340d2a1c88dddd48151e4dd/jax_metrics-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c385fcae870cfd7c8fbeddf04e9fb99ac5a74b4fe540378839cfb0a2ec87f05",
+          "md5": "456487249c9dd77f86c60f04e6d7c7f1",
+          "sha256": "9ecb404c84b1e42683a7e7272fd40866d0dc5674fbb1b220b48de4dab69fee39"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "456487249c9dd77f86c60f04e6d7c7f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 54712,
+        "upload_time": "2023-03-05T00:02:35",
+        "upload_time_iso_8601": "2023-03-05T00:02:35.597288Z",
+        "url": "https://files.pythonhosted.org/packages/6c/38/5fcae870cfd7c8fbeddf04e9fb99ac5a74b4fe540378839cfb0a2ec87f05/jax_metrics-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d068d745aecfdde934f507fdbdadfc04d2a15063946b92814ee2657cccc8180",
+          "md5": "2402961d421880abcacb70397290545b",
+          "sha256": "ceafd2beb5795db8faf5597d69cb2f4803885ba368103b48c93f933a6246ba4a"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2402961d421880abcacb70397290545b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 76724,
+        "upload_time": "2023-03-16T18:50:19",
+        "upload_time_iso_8601": "2023-03-16T18:50:19.117452Z",
+        "url": "https://files.pythonhosted.org/packages/0d/06/8d745aecfdde934f507fdbdadfc04d2a15063946b92814ee2657cccc8180/jax_metrics-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "443e9708a58ea034e93498a1e62038d49ec0fe3dc2e438eaffc50eeffac13d84",
+          "md5": "5b0aa94bd68555a624421649a2f23741",
+          "sha256": "6dcc67b6cd8fd3fbc0e2a1c7745a151259a7a822f6549d5751ded0448f70e3f7"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5b0aa94bd68555a624421649a2f23741",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 54709,
+        "upload_time": "2023-03-16T18:50:21",
+        "upload_time_iso_8601": "2023-03-16T18:50:21.090966Z",
+        "url": "https://files.pythonhosted.org/packages/44/3e/9708a58ea034e93498a1e62038d49ec0fe3dc2e438eaffc50eeffac13d84/jax_metrics-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99f9428c0dc2f7ebbfe635a2d6e0895febc3bbb94ce788b8e30f14950f2f2229",
+          "md5": "77ae069c93b26c1c648d8201cc34ccad",
+          "sha256": "bd67889c964881dd7fa442d00fd48f35387ded29615e974b5ee47ec52fab3b58"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "77ae069c93b26c1c648d8201cc34ccad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.12",
+        "size": 76721,
+        "upload_time": "2023-03-16T18:59:16",
+        "upload_time_iso_8601": "2023-03-16T18:59:16.885233Z",
+        "url": "https://files.pythonhosted.org/packages/99/f9/428c0dc2f7ebbfe635a2d6e0895febc3bbb94ce788b8e30f14950f2f2229/jax_metrics-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d9e1fc767449db82f757d0effa76cf82f93168a0d52d04222094241a73bf6251",
+          "md5": "6f9bec8ca92e6f4e8ac6837546d0b857",
+          "sha256": "aaa55dbc31240ef2538e4e1ae32834e5f32c15016b3829bc5d4b47765919ac0c"
+        },
+        "downloads": -1,
+        "filename": "jax_metrics-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6f9bec8ca92e6f4e8ac6837546d0b857",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.12",
+        "size": 54700,
+        "upload_time": "2023-03-16T18:59:19",
+        "upload_time_iso_8601": "2023-03-16T18:59:19.240453Z",
+        "url": "https://files.pythonhosted.org/packages/d9/e1/fc767449db82f757d0effa76cf82f93168a0d52d04222094241a73bf6251/jax_metrics-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "99f9428c0dc2f7ebbfe635a2d6e0895febc3bbb94ce788b8e30f14950f2f2229",
+        "md5": "77ae069c93b26c1c648d8201cc34ccad",
+        "sha256": "bd67889c964881dd7fa442d00fd48f35387ded29615e974b5ee47ec52fab3b58"
+      },
+      "downloads": -1,
+      "filename": "jax_metrics-0.2.5-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "77ae069c93b26c1c648d8201cc34ccad",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<3.12",
+      "size": 76721,
+      "upload_time": "2023-03-16T18:59:16",
+      "upload_time_iso_8601": "2023-03-16T18:59:16.885233Z",
+      "url": "https://files.pythonhosted.org/packages/99/f9/428c0dc2f7ebbfe635a2d6e0895febc3bbb94ce788b8e30f14950f2f2229/jax_metrics-0.2.5-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d9e1fc767449db82f757d0effa76cf82f93168a0d52d04222094241a73bf6251",
+        "md5": "6f9bec8ca92e6f4e8ac6837546d0b857",
+        "sha256": "aaa55dbc31240ef2538e4e1ae32834e5f32c15016b3829bc5d4b47765919ac0c"
+      },
+      "downloads": -1,
+      "filename": "jax_metrics-0.2.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6f9bec8ca92e6f4e8ac6837546d0b857",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<3.12",
+      "size": 54700,
+      "upload_time": "2023-03-16T18:59:19",
+      "upload_time_iso_8601": "2023-03-16T18:59:19.240453Z",
+      "url": "https://files.pythonhosted.org/packages/d9/e1/fc767449db82f757d0effa76cf82f93168a0d52d04222094241a73bf6251/jax_metrics-0.2.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

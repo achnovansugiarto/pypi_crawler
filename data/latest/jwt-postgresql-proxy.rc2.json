@@ -1,0 +1,178 @@
+{
+  "info": {
+    "author": "Department for International Trade",
+    "author_email": "webops@digital.trade.gov.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# jwt-postgresql-proxy [![CircleCI](https://circleci.com/gh/uktrade/jwt-postgresql-proxy.svg?style=svg)](https://circleci.com/gh/uktrade/jwt-postgresql-proxy) [![Test Coverage](https://api.codeclimate.com/v1/badges/ff380168c33456b7a248/test_coverage)](https://codeclimate.com/github/uktrade/jwt-postgresql-proxy/test_coverage)\n\nStateless JWT authentication in front of PostgreSQL\n\n\n## Use case\n\nYou have a PostgreSQL database, and would like to frequently issue temporary credentials to a set of users, where a single real-world user can have a number of temporary credentials issued at any given moment. This can be done just with PostgreSQL, but involves work-arounds:\n\n- GRANTing multiple permissions at the same time can result in \"tuple concurrently updated\" errors, requiring explicit locking to avoid, and so can be slow when there are multiple users attempting to get credentials for a high number of database objects at any one time.\n\n- For objects created by the temporary database users, ownership has to be transferred, for example by database triggers, to a permanent role for the real-world user.\n\nThis proxy avoids having to do the above workarounds:\n\n- Database credentials are issued as a temporary stateless JWT token, by code that holds a private key.\n\n- Instead of connecting directly to the database, users connect to this proxy. It verifies the credentials using the corresponding public key, and connects to the database as the permanent database user, the credentials of which the real-world user never knows.\n\nThe JWT token being _stateless_ means that the issuer of credentials does not need to communicate with the proxy via some internal API, and this proxy does not need a database to store credentials.\n\n\n## Usage: Issuing and using credentials\n\nAn Ed25519 public/private key pair needs to be created, for example using the [Python cryptography package](https://github.com/pyca/cryptography):\n\n```python\nfrom cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey\nfrom cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat\n\nprivate_key = Ed25519PrivateKey.generate()\nprint(private_key.private_bytes(encoding=Encoding.PEM, format=PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()))\nprint(private_key.public_key().public_bytes(encoding=Encoding.PEM, format=PublicFormat.SubjectPublicKeyInfo))\n```\n\nThe issuer of credentials would use the private key to create a JWT for a database user, such as in the below Python example for the database user `my_user` for the next 24 hours.\n\n```python\nfrom base64 import urlsafe_b64encode\nimport json\nimport time\nfrom cryptography.hazmat.backends import default_backend\nfrom cryptography.hazmat.primitives.serialization import load_pem_private_key\n\ndef b64encode_nopadding(to_encode):\n    return urlsafe_b64encode(to_encode).rstrip(b'=')\n\nprivate_key = load_pem_private_key(\n    # In real cases, take the private key from an environment variable or secret store\n    b'-----BEGIN PRIVATE KEY-----\\n' \\\n    b'MC4CAQAwBQYDK2VwBCIEINQG5lNt1bE8TZa68mV/WZdpqsXaOXBHvgPQGm5CcjHp\\n' \\\n    b'-----END PRIVATE KEY-----\\n', password=None, backend=default_backend())\nheader = {\n    'typ': 'JWT',\n    'alg': 'EdDSA',\n    'crv': 'Ed25519',\n}\npayload = {\n    'sub': 'my_user',\n    'exp': int(time.time() + 60 * 60 * 24),\n}\nto_sign = b64encode_nopadding(json.dumps(header).encode('utf-8')) + b'.' + b64encode_nopadding(json.dumps(payload).encode('utf-8'))\nsignature = b64encode_nopadding(private_key.sign(to_sign))\njwt = (to_sign + b'.' + signature).decode()\nprint(jwt)\n```\n\nThe JWT can be given to the real-world user, and used as the PostgreSQL password to connect to the proxy as `my_user`.\n\n```python\nimport psycopg2\n\njwt = 'eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJFZERTQSIsICJjcnYiOiAiRWQyNTUxOSJ9.eyJzdWIiOiAibXlfdXNlciIsICJleHAiOiAxNjEwNTYxOTYxfQ.YeTn4oYwOvQLApTg2WgldX--qRywM0MV-EoDdL7ZNr0HnoadxZ9wKt_fqqT7L8w1d378UtaXavq0B_LUYUt4Dg'\nconn = psycopg2.connect(password=jwt, user='my_user', host='host-of-the-proxy', dbname='my_dbname', port=5432)\n```\n\n\n## Usage: installing, configuring, and running the proxy\n\nTo install, Python `pip` is used\n\n```bash\npip install jwt-postgresql-proxy\n```\n\nConfiguration is done via environment variables. All of the below environment variables are required.\n\n| Variable            | Description                                                                                                                                                                                                                                                                                        |\n|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|\n| PUBLIC_KEYS__i       | For any integer `i`, a public key corresponding to the private key used to sign the JWTs used by clients as the PostgreSQL password. Multiple keys are allowed at any given time to allow for key rotation. Each key must be in PEM format, and have no password.                          |\n| UPSTREAM__HOST       | The host of the database that the proxy connects to.                                                                                                                                                                                                                                               |\n| UPSTREAM__PORT       | The port of the database that the proxy connects to.                                                                                                                                                                                                                                               |\n| UPSTREAM__PASSWORD   | The password of the database that the proxy connects to. Note that all users that the proxy connects to on the database must have the same password. While unusual, this isn't materially different to always connecting as the same \"master\" user which has a single password, which is a typical pattern. |\n| DOWNSTREAM__IP       | The IP of the network interface to listen on for incoming connections. This is empty to listen on all interfaces, or `127.0.0.1` to listen only for connections on localhost. |\n| DOWNSTREAM__PORT     | The port to listen on for incoming connections. Typically, this is `5432`. |\n| DOWNSTREAM__CERTFILE | The path to the certificate presented to incoming downstream connections. |\n| DOWNSTREAM__KEYFILE  | The path to the private key used in downstream connections. |\n\nIf you wish, the files at `DOWNSTREAM__CERTFILE` and `DOWNSTREAM__KEYFILE` can be self-signed, and generated using the command\n\n```bash\nopenssl req -nodes -new -x509 -subj \"/CN=my.dbhost.test\" -keyout server.key -out server.crt\n```\n\nTo start the proxy\n\n```bash\njwt-postgresql-proxy\n```\n\n\n## Tests\n\n```bash\n./start-postgres.sh  # Only needs to be done once\n./test.sh\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/uktrade/jwt-postgresql-proxy",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "jwt-postgresql-proxy",
+    "package_url": "https://pypi.org/project/jwt-postgresql-proxy/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/jwt-postgresql-proxy/",
+    "project_urls": {
+      "Homepage": "https://github.com/uktrade/jwt-postgresql-proxy"
+    },
+    "release_url": "https://pypi.org/project/jwt-postgresql-proxy/0.0.2/",
+    "requires_dist": [
+      "cryptography (>=3.3.1)",
+      "gevent (>=20.12.1)"
+    ],
+    "requires_python": ">=3.8.0",
+    "summary": "Stateless JWT authentication in front of PostgreSQL",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9121477,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2790383de2aee61d9699d0ad4113abde097629eb5a0c40c2947facdf7392aa58",
+          "md5": "a1cbe91c00f82ef825add4e94e17a89d",
+          "sha256": "3711993f9e21ca59e53e890b216765c6aaa9bf3fa923fb7db24d8ef4282da5d4"
+        },
+        "downloads": -1,
+        "filename": "jwt_postgresql_proxy-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a1cbe91c00f82ef825add4e94e17a89d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 7714,
+        "upload_time": "2021-01-12T23:36:03",
+        "upload_time_iso_8601": "2021-01-12T23:36:03.781965Z",
+        "url": "https://files.pythonhosted.org/packages/27/90/383de2aee61d9699d0ad4113abde097629eb5a0c40c2947facdf7392aa58/jwt_postgresql_proxy-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f237a5e47f21e4a2ba07c16ebb9a3ae3e0a95417a5d2da8e680f042d6ccb0d3",
+          "md5": "09e3b19082cf1434d0b830951facaf1c",
+          "sha256": "03cf6b93c990fdd9d725300ac9cd9a2de5b179b59bb289a4c5998ac23af745ba"
+        },
+        "downloads": -1,
+        "filename": "jwt-postgresql-proxy-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09e3b19082cf1434d0b830951facaf1c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 7693,
+        "upload_time": "2021-01-12T23:36:05",
+        "upload_time_iso_8601": "2021-01-12T23:36:05.123325Z",
+        "url": "https://files.pythonhosted.org/packages/3f/23/7a5e47f21e4a2ba07c16ebb9a3ae3e0a95417a5d2da8e680f042d6ccb0d3/jwt-postgresql-proxy-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22d8497a30d80507d95aba443860a7552c6cbdc76a0dd7666d875362f958c78c",
+          "md5": "a6339f57a736a6e0e22ab878bec30d19",
+          "sha256": "b1ebd9d38bdc5e78eeeebb8634bc0e6bc3a74af1747d11f95f160c19450f70b5"
+        },
+        "downloads": -1,
+        "filename": "jwt_postgresql_proxy-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a6339f57a736a6e0e22ab878bec30d19",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 7732,
+        "upload_time": "2021-01-13T07:26:20",
+        "upload_time_iso_8601": "2021-01-13T07:26:20.994086Z",
+        "url": "https://files.pythonhosted.org/packages/22/d8/497a30d80507d95aba443860a7552c6cbdc76a0dd7666d875362f958c78c/jwt_postgresql_proxy-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "67626cfb24aba6c3c6bd7e01a35fa051b604742dd9d5eea69e5bb6e9e1518002",
+          "md5": "a3bd0b22790db88627a00b314ec3d261",
+          "sha256": "c788df1babf7f5a6ed6846a2b16ca81a211e163c4b655d2a28762a3133c10c0c"
+        },
+        "downloads": -1,
+        "filename": "jwt-postgresql-proxy-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a3bd0b22790db88627a00b314ec3d261",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 7700,
+        "upload_time": "2021-01-13T07:26:22",
+        "upload_time_iso_8601": "2021-01-13T07:26:22.265782Z",
+        "url": "https://files.pythonhosted.org/packages/67/62/6cfb24aba6c3c6bd7e01a35fa051b604742dd9d5eea69e5bb6e9e1518002/jwt-postgresql-proxy-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "22d8497a30d80507d95aba443860a7552c6cbdc76a0dd7666d875362f958c78c",
+        "md5": "a6339f57a736a6e0e22ab878bec30d19",
+        "sha256": "b1ebd9d38bdc5e78eeeebb8634bc0e6bc3a74af1747d11f95f160c19450f70b5"
+      },
+      "downloads": -1,
+      "filename": "jwt_postgresql_proxy-0.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a6339f57a736a6e0e22ab878bec30d19",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8.0",
+      "size": 7732,
+      "upload_time": "2021-01-13T07:26:20",
+      "upload_time_iso_8601": "2021-01-13T07:26:20.994086Z",
+      "url": "https://files.pythonhosted.org/packages/22/d8/497a30d80507d95aba443860a7552c6cbdc76a0dd7666d875362f958c78c/jwt_postgresql_proxy-0.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "67626cfb24aba6c3c6bd7e01a35fa051b604742dd9d5eea69e5bb6e9e1518002",
+        "md5": "a3bd0b22790db88627a00b314ec3d261",
+        "sha256": "c788df1babf7f5a6ed6846a2b16ca81a211e163c4b655d2a28762a3133c10c0c"
+      },
+      "downloads": -1,
+      "filename": "jwt-postgresql-proxy-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a3bd0b22790db88627a00b314ec3d261",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8.0",
+      "size": 7700,
+      "upload_time": "2021-01-13T07:26:22",
+      "upload_time_iso_8601": "2021-01-13T07:26:22.265782Z",
+      "url": "https://files.pythonhosted.org/packages/67/62/6cfb24aba6c3c6bd7e01a35fa051b604742dd9d5eea69e5bb6e9e1518002/jwt-postgresql-proxy-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

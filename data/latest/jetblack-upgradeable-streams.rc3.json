@@ -1,0 +1,223 @@
+{
+  "info": {
+    "author": "Rob Blackbourn",
+    "author_email": "rob.blackbourn@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# asyncio-upgradeable-streams\n\nAn experiment in upgradeable streams.\n\n## Overview\n\nAn upgradeable stream starts life as a plain socket connection, but is capable\nof being \"upgraded\" to TLS. This is sometimes known as\n[STARTTLS](https://en.wikipedia.org/wiki/Opportunistic_TLS).\nCommon examples of this are SMTP, LDAP, and HTTP proxy tunneling with CONNECT.\n\nThe asyncio library provides\n[loop.start_tls](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.start_tls)\nfor this purpose, however there is little information on how this can be used.\n\nThis project provides an implementation of\n[asyncio.open_connection](https://docs.python.org/3/library/asyncio-stream.html#asyncio.open_connection)\nand [asyncio.start_server](https://docs.python.org/3/library/asyncio-stream.html#asyncio.start_server)\nwith an extra optional boolean parameter `upgradeadble`. When this is set the\nTLS negotiation is deferred, and the `writer` has a new method `start_tls` which\ncan be called to upgrade the connection to TLS.\n\nThis was tested using Python 3.9.7 on Ubuntu Linux 21.10.\n\n## Issues\n\nThe solution makes use of private variables in the python standard library which\nmay change at the will of the python library maintainer. In particular it has\nto reset the reader in the `StreamReaderProtocol` and the transport in the\n`StreamWriter`.\n\n## Installation\n\nThis can be installed with pip.\n\n```bash\npip install jetblack-upgradeable-streams\n```\n\n## Examples\n\nThe following examples can be found in the \"demos\" folder. They expect a Linux\nenvironment.\n\n### Client\n\nA new argument `upgradeable` has been added to the\n`open_connection` function to enable upgrading. When `upgradeable` is `True`\nthe TLS negotiation is deferred and the `ssl` parameter is stored for use when\nthe connection is upgraded.\nThe `writer` has a new method `start_tls` to upgrade the connection to TLS.\n\n1. The client connects without TLS.\n\n2. First the client sends \"PING\" to the server. The server should respond\n   with \"PONG\".\n\n3. Next the client sends \"STARTTLS\" to instruct the server to upgrade the\n   connection to TLS. The client then calls the `start_tls` method on the\n   `writer` to negotiate the secure connection. The method returns a new\n   `reader` and `writer`.\n\n4. Using the new writer the client sends \"PING\" to the server, this time over\n   the encrypted stream. The server should respond with \"PONG\".\n\n5. Finally the client sends \"QUIT\" to the server and closes the connection.\n\n```python\nimport asyncio\nimport socket\nimport ssl\n\nfrom upgradeable_streams import open_connection\n\n\nasync def start_client():\n    ctx = ssl.create_default_context(\n        purpose=ssl.Purpose.SERVER_AUTH,\n        cafile='/etc/ssl/certs/ca-certificates.crt'\n    )\n    host = socket.getfqdn()\n\n    print(\"Connect to server as upgradeable\")\n    reader, writer = await open_connection(\n        host,\n        10001,\n        ssl=ctx,\n        upgradeable=True\n    )\n\n    print(f\"The writer ssl context is {writer.get_extra_info('sslcontext')}\")\n\n    print(\"Sending PING\")\n    writer.write(b'PING\\n')\n    response = (await reader.readline()).decode('utf-8').rstrip()\n    print(f\"Received: {response}\")\n\n    print(\"Sending STARTTLS\")\n    writer.write(b'STARTTLS\\n')\n\n    print(\"Upgrading the connection\")\n    # Upgrade\n    reader, writer = await writer.start_tls()\n\n    print(f\"The writer ssl context is {writer.get_extra_info('sslcontext')}\")\n\n    print(\"Sending PING\")\n    writer.write(b'PING\\n')\n    response = (await reader.readline()).decode('utf-8').rstrip()\n    print(f\"Received: {response}\")\n\n    print(\"Sending QUIT\")\n    writer.write(b'QUIT\\n')\n    await writer.drain()\n\n    print(\"Closing client\")\n    writer.close()\n    await writer.wait_closed()\n    print(\"Client disconnected\")\n\nif __name__ == '__main__':\n    asyncio.run(start_client())\n```\n\n### Server\n\nAn extra argument `upgradeable` has been added to the `start_server` function\nto enable upgrading to TLS. The `ssl` context is stored for use when a client\nconnection is upgraded to TLS.\nThe `writer` has a new method `start_tls` to upgrade the connection to TLS.\n\n1. The server listens for client connections.\n\n2. On receiving a connection it enters a read loop.\n\n3. When the server receives \"PING\" it responds with \"PONG\".\n\n4. When the server receives \"STARTTLS\" it calls the `start_tls` method on the\n   `writer` to negotiate the TLS connection. The method returns a new `reader`\n   and `writer`.\n\n5. When the server receives \"QUIT\" it closes the connection.\n\nThe code expects certificate and key PEM files in \"~/.keys/server.{crt,key}\".\n\n```python\nimport asyncio\nfrom asyncio import StreamReader, StreamWriter\nfrom os.path import expanduser\nimport socket\nimport ssl\nfrom typing import Union\n\nfrom upgradeable_streams import start_server, UpgradeableStreamWriter\n\n\nasync def handle_client(\n        reader: StreamReader,\n        writer: Union[UpgradeableStreamWriter, StreamWriter]\n) -> None:\n    print(\"Client connected\")\n\n    while True:\n        request = (await reader.readline()).decode('utf8').rstrip()\n        print(f\"Read '{request}'\")\n\n        if request == 'QUIT':\n            break\n\n        elif request == 'PING':\n            print(\"Sending pong\")\n            writer.write(b'PONG\\n')\n            await writer.drain()\n\n        elif request == 'STARTTLS':\n            if not isinstance(writer, UpgradeableStreamWriter):\n                raise ValueError('writer not upgradeable')\n            print(\"Upgrading connection to TLS\")\n            # Upgrade\n            reader, writer = await writer.start_tls()\n\n    print(\"Closing client\")\n    writer.close()\n    await writer.wait_closed()\n    print(\"Client closed\")\n\n\nasync def run_server():\n    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n    ctx.load_verify_locations(cafile=\"/etc/ssl/certs/ca-certificates.crt\")\n    ctx.load_cert_chain(\n        expanduser(\"~/.keys/server.crt\"),\n        expanduser(\"~/.keys/server.key\")\n    )\n    host = socket.getfqdn()\n\n    print(\"Starting server as upgradeable\")\n    server = await start_server(\n        handle_client,\n        host,\n        10001,\n        ssl=ctx,\n        upgradeable=True\n    )\n\n    async with server:\n        await server.serve_forever()\n\nif __name__ == '__main__':\n    asyncio.run(run_server())\n```\n\n## Development\n\nPull requests are welcome. In particular anything to reduce the reliance on the\nimplementation details in the standard library.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/rob-blackbourn/asyncio-upgradeable-streams",
+    "keywords": "",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "jetblack-upgradeable-streams",
+    "package_url": "https://pypi.org/project/jetblack-upgradeable-streams/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/jetblack-upgradeable-streams/",
+    "project_urls": {
+      "Homepage": "https://github.com/rob-blackbourn/asyncio-upgradeable-streams",
+      "Repository": "https://github.com/rob-blackbourn/asyncio-upgradeable-streams"
+    },
+    "release_url": "https://pypi.org/project/jetblack-upgradeable-streams/0.3.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.8,<4.0",
+    "summary": "An experiment in upgradeable streams",
+    "version": "0.3.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12104484,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8839fe917822e1dc45ad3ce7a0d3a1af878eff78973d8c1da9dacb0b012ebc97",
+          "md5": "c114ebb91577e4eebe0ba0994a4d028d",
+          "sha256": "0fa49aeace330b677384a46e86858451381f5fd139296c86572fbd2297f36506"
+        },
+        "downloads": -1,
+        "filename": "jetblack_upgradeable_streams-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c114ebb91577e4eebe0ba0994a4d028d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 6090,
+        "upload_time": "2021-11-23T10:03:52",
+        "upload_time_iso_8601": "2021-11-23T10:03:52.563557Z",
+        "url": "https://files.pythonhosted.org/packages/88/39/fe917822e1dc45ad3ce7a0d3a1af878eff78973d8c1da9dacb0b012ebc97/jetblack_upgradeable_streams-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4a4788202bad09a71093deed4ef317d60aed92cac41eea3eb409019b34b9fdf",
+          "md5": "e0a963bbf3a8b5d0f3f400f75e347a7a",
+          "sha256": "328b6dd96019f159779b22782b8189215a849b72275c869d5ecf2d40db3ba896"
+        },
+        "downloads": -1,
+        "filename": "jetblack-upgradeable-streams-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e0a963bbf3a8b5d0f3f400f75e347a7a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 5710,
+        "upload_time": "2021-11-23T10:03:50",
+        "upload_time_iso_8601": "2021-11-23T10:03:50.710333Z",
+        "url": "https://files.pythonhosted.org/packages/d4/a4/788202bad09a71093deed4ef317d60aed92cac41eea3eb409019b34b9fdf/jetblack-upgradeable-streams-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91dd00caeb7482a9e265de1015f1a64fdf29cffac26e4025a3d06c79abb6afec",
+          "md5": "755f8b707b3403bbda2831fd28d12dc8",
+          "sha256": "b4095db8832868ea9a4afd04b90877c3e6cf74664aa761673f7bbdc7a2f3462d"
+        },
+        "downloads": -1,
+        "filename": "jetblack_upgradeable_streams-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "755f8b707b3403bbda2831fd28d12dc8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 6089,
+        "upload_time": "2021-11-23T10:05:01",
+        "upload_time_iso_8601": "2021-11-23T10:05:01.532444Z",
+        "url": "https://files.pythonhosted.org/packages/91/dd/00caeb7482a9e265de1015f1a64fdf29cffac26e4025a3d06c79abb6afec/jetblack_upgradeable_streams-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf7897aa04430123f4082277d398610b057c5e2b13870a7565e3643c9c82d026",
+          "md5": "d2d981bc6508b1a56d897b87b25e2632",
+          "sha256": "78c3bb59c7260ab7cc603653839a4e88055bc334b9b1c57309adc2137aafc50e"
+        },
+        "downloads": -1,
+        "filename": "jetblack-upgradeable-streams-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d2d981bc6508b1a56d897b87b25e2632",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 5708,
+        "upload_time": "2021-11-23T10:04:58",
+        "upload_time_iso_8601": "2021-11-23T10:04:58.964472Z",
+        "url": "https://files.pythonhosted.org/packages/cf/78/97aa04430123f4082277d398610b057c5e2b13870a7565e3643c9c82d026/jetblack-upgradeable-streams-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "74d703a85e78f7009ba42346ec3fb83182ec0a0169b6d94ec52b7c73de30a1cb",
+          "md5": "4115016c1e05a5e76ee0efbb58f540e8",
+          "sha256": "edb96057f676bc2f73a31be0c7c1a97f80a337005ec41c5cd9f6f480c5bb0d6b"
+        },
+        "downloads": -1,
+        "filename": "jetblack_upgradeable_streams-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4115016c1e05a5e76ee0efbb58f540e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 6308,
+        "upload_time": "2021-11-23T16:43:04",
+        "upload_time_iso_8601": "2021-11-23T16:43:04.922689Z",
+        "url": "https://files.pythonhosted.org/packages/74/d7/03a85e78f7009ba42346ec3fb83182ec0a0169b6d94ec52b7c73de30a1cb/jetblack_upgradeable_streams-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99dce55335d20899ebd46eef5b367f8221195527123bd957db822abe913551dc",
+          "md5": "a5af482db65a9a1af39ddaf65f088cfb",
+          "sha256": "3855714e734f054f52729b1de7237411468e9e86a62846662600dda7ed063d12"
+        },
+        "downloads": -1,
+        "filename": "jetblack-upgradeable-streams-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a5af482db65a9a1af39ddaf65f088cfb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 6059,
+        "upload_time": "2021-11-23T16:43:03",
+        "upload_time_iso_8601": "2021-11-23T16:43:03.341961Z",
+        "url": "https://files.pythonhosted.org/packages/99/dc/e55335d20899ebd46eef5b367f8221195527123bd957db822abe913551dc/jetblack-upgradeable-streams-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "74d703a85e78f7009ba42346ec3fb83182ec0a0169b6d94ec52b7c73de30a1cb",
+        "md5": "4115016c1e05a5e76ee0efbb58f540e8",
+        "sha256": "edb96057f676bc2f73a31be0c7c1a97f80a337005ec41c5cd9f6f480c5bb0d6b"
+      },
+      "downloads": -1,
+      "filename": "jetblack_upgradeable_streams-0.3.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4115016c1e05a5e76ee0efbb58f540e8",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 6308,
+      "upload_time": "2021-11-23T16:43:04",
+      "upload_time_iso_8601": "2021-11-23T16:43:04.922689Z",
+      "url": "https://files.pythonhosted.org/packages/74/d7/03a85e78f7009ba42346ec3fb83182ec0a0169b6d94ec52b7c73de30a1cb/jetblack_upgradeable_streams-0.3.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "99dce55335d20899ebd46eef5b367f8221195527123bd957db822abe913551dc",
+        "md5": "a5af482db65a9a1af39ddaf65f088cfb",
+        "sha256": "3855714e734f054f52729b1de7237411468e9e86a62846662600dda7ed063d12"
+      },
+      "downloads": -1,
+      "filename": "jetblack-upgradeable-streams-0.3.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a5af482db65a9a1af39ddaf65f088cfb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 6059,
+      "upload_time": "2021-11-23T16:43:03",
+      "upload_time_iso_8601": "2021-11-23T16:43:03.341961Z",
+      "url": "https://files.pythonhosted.org/packages/99/dc/e55335d20899ebd46eef5b367f8221195527123bd957db822abe913551dc/jetblack-upgradeable-streams-0.3.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

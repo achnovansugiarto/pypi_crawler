@@ -1,0 +1,421 @@
+{
+  "info": {
+    "author": "justfoxing",
+    "author_email": "justfoxingprojects@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python"
+    ],
+    "description": "JFX Bridge for IDA (IDABridge)\n=====================\nIDA's a great reverse engineering tool, and I like scripting my RE as much as possible.\n\nIDABridge is a Python RPC bridge that aims to break you out of the IDA Python environment, so you can more easily integrate with tools like IPython and Jupyter, while being as transparent as possible so you don't have to rewrite all of your scripts.\n\nIf you like this, you might also be interested in the equivalents for other reverse-engineering tools:\n* [ghidra_bridge](https://github.com/justfoxing/ghidra_bridge) for Ghidra [![ghidra_bridge PyPi version](https://img.shields.io/pypi/v/ghidra_bridge.svg)](https://pypi.org/project/ghidra-bridge/)\n* [jfx_bridge_jeb](https://github.com/justfoxing/jfx_bridge_jeb) for JEB Decompiler [![jfx_bridge_jeb PyPi version](https://img.shields.io/pypi/v/jfx_bridge_jeb.svg)](https://pypi.org/project/jfx-bridge-jeb/)\n\nTable of contents\n======================\n* [How to use for IDA](#how-to-use-for-ida)\n* [Security warning](#security-warning)\n* [Remote eval](#remote-eval)\n* [Long-running commands](#long-running-commands)\n* [Remote imports](#remote-imports)\n* [Thread safety, callbacks and avoiding blocking](#thread-safety-callbacks-and-avoiding-blocking)\n* [How it works](#how-it-works)\n* [Tested](#tested)\n* [Contributors](#contributors)\n\nHow to use for IDA\n======================\n\n## Install the jfx_bridge_ida package and server scripts\n1. Install the jfx_bridge_ida package (packaged at https://pypi.org/project/jfx-bridge-ida/):\n```\npip install jfx_bridge_ida\n```\n\n2. Install the server scripts to a directory you'll load in IDA.\n```\npython -m jfx_bridge_ida.install_server ~/.ida_scripts\n```\n\n3. If you're using IDA with a different python environment (e.g., using python2), install the jfx-bridge package into that python environment. That'll look something like the following:\n```\npython2 -m pip install jfx_bridge\n```\n\n## Start Server\n### IDA Context\n\n1. Open File->Script file... <Alt-F7>\n2. Navigate to where you installed the server scripts\n3. Run jfx_bridge_ida_server.py\n\n\n## Setup Client\nFrom the client python environment:\n```python\nimport jfx_bridge_ida\n\nb = jfx_bridge_ida.IDABridge()\n\nidaapi = b.get_idaapi()\nidc = b.get_idc()\nidautils = b.get_idautils()\n\nprint(idc.ScreenEA())\n\n# or use the sark module for easier scripting! Remember to install sark in the IDA python environment\nsark = b.get_sark()\nprint(sark.Line())\n```\n\nSecurity warning\n=====================\nBe aware that when running, an IDABridge server effectively provides code execution as a service. If an attacker is able to talk to the port the bridge server is running on, they can trivially gain execution with the privileges IDA is run with. \n\nAlso be aware that the protocol used for sending and receiving bridge messages is unencrypted and unverified - a person-in-the-middle attack would allow complete control of the commands and responses, again providing trivial code execution on the server (and with a little more work, on the client). \n\nBy default, the server only listens on localhost to slightly reduce the attack surface. Only listen on external network addresses if you're confident you're on a network where it is safe to do so. Additionally, it is still possible for attackers to send messages to localhost (e.g., via malicious javascript in the browser, or by exploiting a different process and attacking the bridge to elevate privileges). You can mitigate this risk by running the bridge server from a IDA process with reduced permissions (a non-admin user, or inside a container), by only running it when needed, or by running on non-network connected systems.\n\nRemote eval\n=====================\nIDABridge is designed to be transparent, to allow easy porting of non-bridged scripts without too many changes. However, if you're happy to make changes, and you run into slowdowns caused by running lots of remote queries (e.g., something like `for f in sark.functions(): doSomething()` can be quite slow with a large number of functions as each function will result in a message across the bridge), you can make use of the remote_eval() function to ask for the result to be evaluated on the bridge server all at once, which will require only a single message roundtrip.\n\nThe following example demonstrates getting a list of all the names of all the functions in a binary:\n```python\nimport jfx_bridge_ida \nb = jfx_bridge_ida.IDABridge()\nname_list = b.remote_eval(\"[f.name for f in sark.functions()]\")\n```\n\nIf your evaluation is going to take some time, you might need to use the timeout_override argument to increase how long the bridge will wait before deciding things have gone wrong.\n\nIf you need to supply an argument for the remote evaluation, you can provide arbitrary keyword arguments to the remote_eval function which will be passed into the evaluation context as local variables. The following argument passes in a function:\n```python\nimport jfx_bridge_ida \nb = jfx_bridge_ida.IDABridge()\nfunc = b.get_sark().Function()\ncalls_list = b.remote_eval(\"[sark.Function(x.to).name for x in f.xrefs_from]\", f=func)\n```\nAs a simplification, note also that the evaluation context has the same globals loaded into the \\_\\_main\\_\\_ of the script that started the server - in the case of the IDABridge server, these include the idaapi, idautils and idc module, and sark if it was installed when the server was started.\n\nLong-running commands\n=====================\nIf you have a particularly slow call in your script, it may hit the response timeout that the bridge uses to make sure the connection hasn't broken. If this happens, you'll see something like `Exception: Didn't receive response <UUID> before timeout`.\n\nThere are two options to increase the timeout. When creating the bridge, you can set a timeout value in seconds with the response_timeout argument (e.g., `b = jfx_bridge_ida.IDABridge(response_timeout=20)`) which will apply to all commands run across the bridge. Alternatively, if you just want to change the timeout for one command, you can use remote_eval as mentioned above, with the timeout_override argument (e.g., `b.remote_eval(\"[f.name for f in sark.functions()]\", timeout_override=20)`). If you use the value -1 for either of these arguments, the response timeout will be disabled and the bridge will wait forever for your response to come back - note that this can cause your script to hang if the bridge runs into problems.\n\nRemote imports\n=====================\nIf you want to import modules from the IDA-side, you have a range of options (in order of most-recommended to least):\n* If you're using one of the main IDA api modules (idaapi, idautils, idc, sark), by default IDABridge grabs thes from the remote-side and copies them into sys.modules when the IDABridge is created, so you can do `import idaapi` after the bridge is created. If that causes problems, you can disable that functionality with the do_import argument when the bridge is created (e.g., `b = jfx_bridge_ida.IDABridge(do_import=False)`.\n* Alternatively, if you're using one of the main IDA api modules and you don't want to use the import functionality, IDABridge provides get functions for these (e.g., `idaapi = b.get_idaapi()`). You can also specify do_import=True on these get functions to embed the modules into sys.modules and allow importing as above for that specific module.\n* If you're not after one of the main IDA modules (e.g., you want something like ida_kernwin), you can use remote_import to get a BridgedModule back directly (e.g., `ida_kernwin = b.remote_import(\"ida_kernwin\")`). This has the advantage that you have exact control over getting the remote module (and can get remote modules with the same name as local modules) and when it's released, but it does take a little more work than the following method.\n* Alternatively, you can specify hook_import=True when creating the bridge (e.g., `b = jfx_bridge_ida.IDABridge(hook_import=True)`). This will add a hook to the import machinery such that, if nothing else can fill the import, the bridge will try to handle it. This allows you to just use the standard `from ida_kernwin import get_screen_ea` syntax after you've connected the bridge. This has the advantage that it may be a little easier to use (you still have to make sure the imports happen AFTER the bridge is connected), but it doesn't allow you to import remote modules with the same name as local modules (the local imports take precedence) and it places the remote modules in sys.modules as proper imports, so they and the bridge will likely stay loaded until the process terminates. Additionally, multiple bridges with hook_import=True will attempt to resolve imports in the order they were connected, which may not be the behaviour you want.\n\nThread safety, callbacks and avoiding blocking\n=====================\nAs of IDA 7.2, all APIs not explicitly marked THREAD_SAFE have to be called from the main thread in IDA. If they aren't, IDA throws a `RuntimeError: Function can be called from the main thread only`. \n\nHowever, the IDABridge server can't run on the main thread, or you wouldn't be able to use IDA while it was running. To handle this, we inspect call commands being sent over the bridge to see if they refer to IDA APIs. If they do, they're wrapped in the IDA execute_sync() function, which will ship them off to the main thread. All remote_eval and remote_exec commands and calls to remoteify-ed objects are also shipped to the main thread - it's too hard to inspect them to see if they use IDA APIs, so we just assume they all do.\n\nAll of this should happen transparently, so you shouldn't need to make any changes to your code - with one exception. If your local code is being called from IDA over the bridge (e.g., you've subclassed idaapi.UI_Hooks and overridden the screen_ea_changed() function to get callbacks when the visible address changes), you MUST allow that call to return BEFORE you call another IDA function. \n\nThis is because IDA will call your local code from the main thread, then block waiting for a response. If your local code then attempts to call an IDA function over the bridge, it will need to get on the main thread to do so - but the main thread is still held by IDA code that called you. This will lead to a `Didn't receive response <UUID> before timeout` exception. \n\nIf you need to call an IDA function, trigger a different thread to do it and allow the original call to return quickly. Using a different thread is also recommended if you need to pause and ask the user for something or do some intensive computation. Generally, the best practice is return calls from IDA as quickly as possible - the main thread is also responsible for the IDA UI, so if it's spending a lot of time waiting for responses across the bridge, the UI will be slow or unusable.\n\nNote that this doesn't apply to local \\_\\_init\\_\\_ code on a class that inherits from an IDA class - the bridge recognises the \\_\\_\\_init\\_\\_ will run on the non-IDA side. So the following will work fine:\n```python\nclass X(idaapi.UI_Hooks): \n    def __init__(self):\n        idaapi.UI_Hooks.__init__(self)\n```\n\nFinally, the call inspection logic is pretty gnarly, so it's possible that something has been missed. If you see a `RuntimeError: Function can be called from the main thread only` when you do a call, please open an issue on Github with the code that causes it so we can get it fixed.\n\nHow it works\n=====================\nThe actual bridge RPC code is implemented in [jfx-bridge](https://github.com/justfoxing/jfx_bridge/). Check it out there and file non-IDA specific issues related to the bridge there.\n\nTested\n=====================\n* IDA 7.4/Windows/Python 3.7.3->Python 3.7.3\n* IDA 7.2/Linux/Python 2.7.17->Python 3.7.2\n* IDA 6.9/Windows/Python 2.7.17->Python 3.7.2\n\n\nContributors\n=====================\n* Thx @fmagin for better iPython support, and much more useful reprs!\n* Thanks also to @fmagin for remote_eval, allowing faster remote processing for batch queries!\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/justfoxing/jfx_bridge_ida",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "jfx-bridge-ida",
+    "package_url": "https://pypi.org/project/jfx-bridge-ida/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/jfx-bridge-ida/",
+    "project_urls": {
+      "Homepage": "https://github.com/justfoxing/jfx_bridge_ida"
+    },
+    "release_url": "https://pypi.org/project/jfx-bridge-ida/0.2.1/",
+    "requires_dist": [
+      "jfx-bridge (>=0.8.0)"
+    ],
+    "requires_python": "",
+    "summary": "RPC bridge from Python to IDA Python interpreter",
+    "version": "0.2.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8048853,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb33101d900e8090f5bfaa07498d7463aaa9941ae44ce01d3f327bf9fa9640b9",
+          "md5": "c10ad25d833ea2418c96b6f07efb0e73",
+          "sha256": "75a7936b33fef86550076fd21d627600fdf8e6bf93d923a546a7c6e42a980768"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c10ad25d833ea2418c96b6f07efb0e73",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9292,
+        "upload_time": "2020-03-14T04:13:05",
+        "upload_time_iso_8601": "2020-03-14T04:13:05.375015Z",
+        "url": "https://files.pythonhosted.org/packages/eb/33/101d900e8090f5bfaa07498d7463aaa9941ae44ce01d3f327bf9fa9640b9/jfx_bridge_ida-0.0.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5818053317aa7f57a6f3052816c6f2aa4da5e2e179c836e797734aa29a58e9a8",
+          "md5": "e571295384570bd7f034435077c7a740",
+          "sha256": "98bc02e877dd831c305f3f6e32d4c936b588a748f5a84474af33775690f7785a"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e571295384570bd7f034435077c7a740",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9437,
+        "upload_time": "2020-07-01T10:30:49",
+        "upload_time_iso_8601": "2020-07-01T10:30:49.106803Z",
+        "url": "https://files.pythonhosted.org/packages/58/18/053317aa7f57a6f3052816c6f2aa4da5e2e179c836e797734aa29a58e9a8/jfx_bridge_ida-0.0.2-py2.py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": "Accidental release, incorrect dependency for jfx_bridge version"
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0d6568e02579519c9e8dbcb4b61cdae0819be6f752cc6f6bd3ef90c16bfa258",
+          "md5": "228dd6e6c3343205a6293d0839ffadcf",
+          "sha256": "721fc765d1e58ce986ee4751c966db96bf431d11ebd7b84bc2eb26a4cb7fee90"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "228dd6e6c3343205a6293d0839ffadcf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6920,
+        "upload_time": "2020-07-01T10:30:49",
+        "upload_time_iso_8601": "2020-07-01T10:30:49.902661Z",
+        "url": "https://files.pythonhosted.org/packages/d0/d6/568e02579519c9e8dbcb4b61cdae0819be6f752cc6f6bd3ef90c16bfa258/jfx_bridge_ida-0.0.2.tar.gz",
+        "yanked": true,
+        "yanked_reason": "Accidental release, incorrect dependency for jfx_bridge version"
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a376bf1bc419d547fc0c131d155d8c596cdf4e0cfe9b40d9f91679af3d0b5241",
+          "md5": "8c5ce76be599aaf70c60da03962628fb",
+          "sha256": "186dc95461c601d7e906ac4ec897dbc92240516bfbf946393f88789aa0bd46c8"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8c5ce76be599aaf70c60da03962628fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9438,
+        "upload_time": "2020-07-01T22:45:24",
+        "upload_time_iso_8601": "2020-07-01T22:45:24.472642Z",
+        "url": "https://files.pythonhosted.org/packages/a3/76/bf1bc419d547fc0c131d155d8c596cdf4e0cfe9b40d9f91679af3d0b5241/jfx_bridge_ida-0.0.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86d3ecdda9765b3614db962d9fa0fcca077d9bc4d9d786ee5e6d4bf95978e4ac",
+          "md5": "a760be0d66cfad4439ef7e68bd8066a1",
+          "sha256": "0b93f743a97dbc54d0f033a86770b82221a61cf8b487a14c23d70a24308bfd97"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a760be0d66cfad4439ef7e68bd8066a1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6922,
+        "upload_time": "2020-07-01T22:45:25",
+        "upload_time_iso_8601": "2020-07-01T22:45:25.475311Z",
+        "url": "https://files.pythonhosted.org/packages/86/d3/ecdda9765b3614db962d9fa0fcca077d9bc4d9d786ee5e6d4bf95978e4ac/jfx_bridge_ida-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "825ed747716cd0070758860d2123ee082b76812ab8c96eb73148c10f7939b06b",
+          "md5": "376146d235e7e2786109c81b68a18972",
+          "sha256": "8750e4fa927eb1c534a122fcb214e05232df8990ffa82d4c7e4afff256984609"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "376146d235e7e2786109c81b68a18972",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9645,
+        "upload_time": "2020-07-19T05:16:42",
+        "upload_time_iso_8601": "2020-07-19T05:16:42.751734Z",
+        "url": "https://files.pythonhosted.org/packages/82/5e/d747716cd0070758860d2123ee082b76812ab8c96eb73148c10f7939b06b/jfx_bridge_ida-0.0.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c179edfd0320ff8b9e429e0d962a508966fd9de062b136dddcd5de9e4a371c54",
+          "md5": "227f4d0121c0042b5d16d04ef50647b3",
+          "sha256": "f2405750770443ba567dd91cd95cec88b3238607229ebb0a399ddcfedefff6d5"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "227f4d0121c0042b5d16d04ef50647b3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7578,
+        "upload_time": "2020-07-19T05:16:43",
+        "upload_time_iso_8601": "2020-07-19T05:16:43.502807Z",
+        "url": "https://files.pythonhosted.org/packages/c1/79/edfd0320ff8b9e429e0d962a508966fd9de062b136dddcd5de9e4a371c54/jfx_bridge_ida-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4568755c668f3e4fcb4d46c3dd46fb1a0740513b51d288430b420fb5b429d78",
+          "md5": "59f0c1687dd0104882aa0da457d2004c",
+          "sha256": "400d22a7fedb7dba170798fd2063c86e550c8019f7a2771ddbdbcc81f3acc21d"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "59f0c1687dd0104882aa0da457d2004c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14696,
+        "upload_time": "2020-07-22T00:16:00",
+        "upload_time_iso_8601": "2020-07-22T00:16:00.055381Z",
+        "url": "https://files.pythonhosted.org/packages/e4/56/8755c668f3e4fcb4d46c3dd46fb1a0740513b51d288430b420fb5b429d78/jfx_bridge_ida-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84dd655cf5b5b5e0fa7c2443e579294e8bb35438b44fb5b17b173ba4893a3112",
+          "md5": "5abe3b3e455483b07c104c6065df5d6e",
+          "sha256": "b2449df42e93a289f3b889392053ada1e7a4148f58589aec4d8e81f1722fc0a7"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5abe3b3e455483b07c104c6065df5d6e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15729,
+        "upload_time": "2020-07-22T00:16:01",
+        "upload_time_iso_8601": "2020-07-22T00:16:01.088869Z",
+        "url": "https://files.pythonhosted.org/packages/84/dd/655cf5b5b5e0fa7c2443e579294e8bb35438b44fb5b17b173ba4893a3112/jfx_bridge_ida-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "121a6adcb617bf98dd9e05c4dec1d4ecad97ff261ea3137d32e145d7e72626b8",
+          "md5": "5204e00ece6bd5433c05803f9e08b726",
+          "sha256": "3b757bf5cc884e02538b6636236b2f198e9194cf5ae4ba7fe651b71b554b1da0"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.1.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5204e00ece6bd5433c05803f9e08b726",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15120,
+        "upload_time": "2020-07-25T23:41:01",
+        "upload_time_iso_8601": "2020-07-25T23:41:01.907458Z",
+        "url": "https://files.pythonhosted.org/packages/12/1a/6adcb617bf98dd9e05c4dec1d4ecad97ff261ea3137d32e145d7e72626b8/jfx_bridge_ida-0.1.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21b9a07d2255b22b93051a39ea5ffab2a99b036b3aa5d8143886b004b12a4fd3",
+          "md5": "99efe1a6048fe6551432c287b4c92c61",
+          "sha256": "805e771093f6bee44cbc1d3a89fbe9e02bec40f3ecfe2a1839e9c12730a5bf86"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "99efe1a6048fe6551432c287b4c92c61",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16148,
+        "upload_time": "2020-07-25T23:41:02",
+        "upload_time_iso_8601": "2020-07-25T23:41:02.793226Z",
+        "url": "https://files.pythonhosted.org/packages/21/b9/a07d2255b22b93051a39ea5ffab2a99b036b3aa5d8143886b004b12a4fd3/jfx_bridge_ida-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1bd6e696f226429ee740db548ec37ee3a315078f24b97b879e398dd8dd073d3b",
+          "md5": "8ba663c94a1ab4b87bd23a7098a15911",
+          "sha256": "65c5f5e9c3c35c7433f8210451673074b6be89ff68260deda256d5cca7cf1926"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ba663c94a1ab4b87bd23a7098a15911",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 16271,
+        "upload_time": "2020-08-25T09:22:21",
+        "upload_time_iso_8601": "2020-08-25T09:22:21.558674Z",
+        "url": "https://files.pythonhosted.org/packages/1b/d6/e696f226429ee740db548ec37ee3a315078f24b97b879e398dd8dd073d3b/jfx_bridge_ida-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cfcba3c9e2db96ff13d7781386365ec243125fc4cdbfc056f6c81834afbf201b",
+          "md5": "878749c6b71aca7016e761e739c9d6fa",
+          "sha256": "b24517905e49bb09bf3cae5d0cf75122e446e96a018b562417e721062606e1b8"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "878749c6b71aca7016e761e739c9d6fa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17242,
+        "upload_time": "2020-08-25T09:22:22",
+        "upload_time_iso_8601": "2020-08-25T09:22:22.739561Z",
+        "url": "https://files.pythonhosted.org/packages/cf/cb/a3c9e2db96ff13d7781386365ec243125fc4cdbfc056f6c81834afbf201b/jfx_bridge_ida-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "700a182cb066521142b610a78800be9e2564fc686e092d95e8e0c1bb12991ee0",
+          "md5": "be9da4a0a212cac5ffb15c68ab83f9f5",
+          "sha256": "12cc272d8f14576eb79b88c2b30dd99121ddd4e821e3517a1ea0e92004f920e5"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.2.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "be9da4a0a212cac5ffb15c68ab83f9f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 16292,
+        "upload_time": "2020-08-27T03:32:11",
+        "upload_time_iso_8601": "2020-08-27T03:32:11.990487Z",
+        "url": "https://files.pythonhosted.org/packages/70/0a/182cb066521142b610a78800be9e2564fc686e092d95e8e0c1bb12991ee0/jfx_bridge_ida-0.2.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d76cb6f7759544c6c11c364d0eca7368e5bfd29d5c741710ad60cb0f24573393",
+          "md5": "bc2b9330ec16eea23cc2c2ab93cf43bb",
+          "sha256": "5a1eb106f3bf6ab6fc7910e5e93cd869dd550bb99c9c39b28c53efcbaa996243"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge_ida-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bc2b9330ec16eea23cc2c2ab93cf43bb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17256,
+        "upload_time": "2020-08-27T03:32:12",
+        "upload_time_iso_8601": "2020-08-27T03:32:12.830783Z",
+        "url": "https://files.pythonhosted.org/packages/d7/6c/b6f7759544c6c11c364d0eca7368e5bfd29d5c741710ad60cb0f24573393/jfx_bridge_ida-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "700a182cb066521142b610a78800be9e2564fc686e092d95e8e0c1bb12991ee0",
+        "md5": "be9da4a0a212cac5ffb15c68ab83f9f5",
+        "sha256": "12cc272d8f14576eb79b88c2b30dd99121ddd4e821e3517a1ea0e92004f920e5"
+      },
+      "downloads": -1,
+      "filename": "jfx_bridge_ida-0.2.1-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "be9da4a0a212cac5ffb15c68ab83f9f5",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 16292,
+      "upload_time": "2020-08-27T03:32:11",
+      "upload_time_iso_8601": "2020-08-27T03:32:11.990487Z",
+      "url": "https://files.pythonhosted.org/packages/70/0a/182cb066521142b610a78800be9e2564fc686e092d95e8e0c1bb12991ee0/jfx_bridge_ida-0.2.1-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d76cb6f7759544c6c11c364d0eca7368e5bfd29d5c741710ad60cb0f24573393",
+        "md5": "bc2b9330ec16eea23cc2c2ab93cf43bb",
+        "sha256": "5a1eb106f3bf6ab6fc7910e5e93cd869dd550bb99c9c39b28c53efcbaa996243"
+      },
+      "downloads": -1,
+      "filename": "jfx_bridge_ida-0.2.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "bc2b9330ec16eea23cc2c2ab93cf43bb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 17256,
+      "upload_time": "2020-08-27T03:32:12",
+      "upload_time_iso_8601": "2020-08-27T03:32:12.830783Z",
+      "url": "https://files.pythonhosted.org/packages/d7/6c/b6f7759544c6c11c364d0eca7368e5bfd29d5c741710ad60cb0f24573393/jfx_bridge_ida-0.2.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

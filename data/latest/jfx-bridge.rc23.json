@@ -1,0 +1,1100 @@
+{
+  "info": {
+    "author": "justfoxing",
+    "author_email": "justfoxingprojects@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python"
+    ],
+    "description": "jfx(justfoxing) bridge\n=====================\nOriginally developed as part of https://github.com/justfoxing/ghidra_bridge\n\njfx_bridge is a simple, single file Python RPC bridge, designed to allow interacting from modern python3 to python2. It was built to operate in constrained interpreters, like the Jython interpreters built into more than one reverse-engineering tool, to allow you to access and interact with the data in the tool, and then use modern python and up-to-date packages to do your work.\n\nThe aim is to be as transparent as possible, so once you're set up, you shouldn't need to know if an object is local or from the remote environment - the bridge should seamlessly handle getting/setting/calling against it.\n\nIf you like this, feel free to buy me a coffee: https://ko-fi.com/justfoxing\n\nTable of contents\n======================\n* [How to use](#how-to-use)\n* [Security warning](#security-warning)\n* [Remote eval](#remote-eval)\n* [Remoteify and remote exec](#remoteify-and-remote-exec)\n* [Long-running commands](#long-running-commands)\n* [Remote imports](#remote-imports)\n* [Optimising for performance](#optimising-for-performance)\n* [How it works](#how-it-works)\n* [Design principles](#design-principles)\n* [Tested](#tested)\n* [TODO](#todo)\n* [Contributors](#contributors)\n\nHow to use\n======================\nYou might actually want one of the following projects that uses jfx_bridge:\n\n* [ghidra_bridge](https://github.com/justfoxing/ghidra_bridge) for Ghidra [![ghidra_bridge PyPi version](https://img.shields.io/pypi/v/ghidra_bridge.svg)](https://pypi.org/project/ghidra-bridge/)\n* [jfx_bridge_ida](https://github.com/justfoxing/jfx_bridge_ida) for IDA Pro [![jfx_bridge_ida PyPi version](https://img.shields.io/pypi/v/jfx_bridge_ida.svg)](https://pypi.org/project/jfx-bridge-ida/)\n* [jfx_bridge_jeb](https://github.com/justfoxing/jfx_bridge_jeb) for JEB Decompiler [![jfx_bridge_jeb PyPi version](https://img.shields.io/pypi/v/jfx_bridge_jeb.svg)](https://pypi.org/project/jfx-bridge-jeb/)\n\nSecurity warning\n=====================\nBe aware that when running, a jfx_bridge server effectively provides code execution as a service. If an attacker is able to talk to the port jfx_bridge is running on, they can trivially gain execution with the privileges the server is run with. \n\nAlso be aware that the protocol used for sending and receiving jfx_bridge messages is unencrypted and unverified - a person-in-the-middle attack would allow complete control of the commands and responses, again providing trivial code execution on the server (and with a little more work, on the client). \n\nBy default, the jfx_bridge server only listens on localhost to slightly reduce the attack surface. Only listen on external network addresses if you're confident you're on a network where it is safe to do so. Additionally, it is still possible for attackers to send messages to localhost (e.g., via malicious javascript in the browser, or by exploiting a different process and attacking jfx_bridge to elevate privileges). You can mitigate this risk by running jfx_bridge from a process with reduced permissions (a non-admin user, or inside a container), by only running it when needed, or by running on non-network connected systems.\n\nRemote eval\n=====================\njfx_bridge is designed to be transparent, to allow easy porting of non-bridged scripts without too many changes. However, if you're happy to make changes, and you run into slowdowns caused by running lots of remote queries (e.g., something like `for remote_val in remote_iterable: doSomethingRemote()` can be quite slow with a large number of values as each one will result in a message across the bridge), you can make use of the remote_eval() function to ask for the result to be evaluated on the bridge server all at once, which will require only a single message roundtrip.\n\nThe following example demonstrates getting a list of all the names of all the functions in a binary:\n```python\nimport ghidra_bridge \nb = ghidra_bridge.GhidraBridge(namespace=globals())\nname_list = b.remote_eval(\"[ f.getName() for f in currentProgram.getFunctionManager().getFunctions(True)]\")\n```\n\nIf your evaluation is going to take some time, you might need to use the timeout_override argument to increase how long the bridge will wait before deciding things have gone wrong.\n\nIf you need to supply an argument for the remote evaluation, you can provide arbitrary keyword arguments to the remote_eval function which will be passed into the evaluation context as local variables. The following argument passes in a function:\n```python\nimport ghidra_bridge \nb = ghidra_bridge.GhidraBridge(namespace=globals())\nfunc = currentProgram.getFunctionManager().getFunctions(True).next()\nmnemonics = b.remote_eval(\"[ i.getMnemonicString() for i in currentProgram.getListing().getInstructions(f.getBody(), True)]\", f=func)\n```\nAs a simplification, note also that the evaluation context has the same globals loaded into the \\_\\_main\\_\\_ of the script that started the server.\n\nRemoteify and remote exec\n=====================\nMaybe turning something into a list comprehension is too clunky, or you need more flexibility than remote eval provides - perhaps you need to define a callback with exception handling for bridge failures, to avoid a unexpected bridge disconnection breaking things on the other end. In that case, remoteify() might be for you! remoteify takes a module, function or class and defines it on the remote side of the connection then returns you a bridged handle back to it. This allows you to do things like:\n\n```python\nimport ghidra_bridge \nb = ghidra_bridge.GhidraBridge(namespace=globals())\n\n# define the function locally\ndef get_function_names(program):\n    # all this code will be run remotely, in a single bridge call\n    name_list = []\n    for f in program.getFunctionManager().getFunctions(True):\n        name_list.append(f.getName())\n    return name_list\n\n# push the function to the remote side and get a handle back\nremote_get_function_names = b.bridge.remoteify(get_function_names)\n\n# call the remote version of the function!\nnames = remote_get_function_names(currentProgram)\n```\n\nThis works similarly for classes, with two caveats. First, only classes defined in files can be remoteify-ed - classes defined dynamically in a REPL will fail when the python inspect module tries to get their source (a limitation of inspect). Second, if you're defining a class that inherits from a remote class (for example, for a callback), you need to be a little careful, as follows:\n```python\nimport jfx_bridge \nb = jfx_bridge.BridgeClient()\n\n# we lie to the local interpreter about what we want to inherit from - inspect.getsource tries to follow the inheritance chain, and doesn't understand bridged objects\nRemoteCallback = object\nclass SafeCallback(RemoteCallback):\n    \"\"\" We want to install a callback, but need to swallow any errors from the bridge on the remote end in case it's disconnected \"\"\"\n    def __init__(self, callback_fn)\n        self.callback = callback_fn\n\n    def do_callback(self, value):\n        try:\n            self.callback(value)\n        except:\n            # swallow the exceptions\n            pass\n\n# now get a handle to the remote class we really want to inherit from, so we can tell the other side\nRemoteCallback = b.remote_import(\"foobar\").Callback\n\n# push the class to the remote side and get a handle back\n# Note that we supply the real class to inherit from as a kwarg\nRemoteSafeCallback = b.remoteify(SafeCallback, RemoteCallback=RemoteCallback)\n\n# instantiate!\nx = RemoteSafeCallback(callback_fn)\n```\n\nAs the previous example shows, you can supply globals to the definitions by providing kwargs to remoteify. \n\nremoteify-ing a module, function or class requires that the Python interpreters on BOTH ends understand your code - the local end needs to understand it enough to create the module, function or class, and the remote end needs to understand it to create it and run it. This means that if you're remoteify-ing something from Python 3 to Python 2, you'll need to make sure it's compatible with both languages.\n\nremoteify() is built on top of the remote_exec() function, which provides access to exec(). If you need something even more flexible than remoteify, remote_exec() is a backdoor that should let you do just about anything you can think of. remote_exec just takes a string of code to execute (and optionally kwargs to add as globals), so the code only has to be understood by the remote Python interpreter - this might be helpful if you're having problems writing something that's compatible with two different versions.\n\nLong-running commands\n=====================\nIf you have a particularly slow call in your script, it may hit the response timeout that the bridge uses to make sure the connection hasn't broken. If this happens, you'll see something like `BridgeTimeoutException: Didn't receive response <UUID> before timeout`.\n\nThere are two options to increase the timeout. When creating the bridge, you can set a timeout value in seconds with the response_timeout argument (e.g., `b = jfx_bridge.bridge.BridgeClient(response_timeout=20)`) which will apply to all commands run across the bridge. Alternatively, if you just want to change the timeout for one command, you can use remote_eval as mentioned above, with the timeout_override argument (e.g., `b.remote_eval(\"<long running eval>\", timeout_override=20)`). If you use the value -1 for either of these arguments, the response timeout will be disabled and the bridge will wait forever for your response to come back - note that this can cause your script to hang if the bridge runs into problems.\n\nRemote imports\n=====================\nIf you want to import modules from the other side (e.g., to access modules only available there), there are two options:\n* Use remote_import to get a BridgedModule back directly (e.g., `remote_module = b.remote_import(\"foo.bar\")`). This has the advantage that you have exact control over getting the remote module (and can get remote modules with the same name as local modules) and when it's released, but it does take a little more work.\n* Specify hook_import=True when creating the bridge (e.g., `b = jfx_bridge.bridge.BridgeClient(hook_import=True)`). This will add a hook to the import machinery such that, if nothing else can fill the import, the bridge will try to handle it. This allows you to just use the standard `import foo.bar` syntax after you've connected the bridge. This has the advantage that it may be a little easier to use (you still have to make sure the imports happen AFTER the bridge is connected), but it doesn't allow you to import remote modules with the same name as local modules (the local imports take precedence) and it places the remote modules in sys.modules as proper imports, so they and the bridge will likely stay loaded until the process terminates. Additionally, multiple bridges with hook_import=True will attempt to resolve imports in the order they were connected, which may not be the behaviour you want.\n\nOptimising for performance\n=====================\nIf your bridged script is running slowly, a few tips:\n* Don't optimise without data! Create the bridge with record_stats=True, and use get_stats() to record the statistics (hits on different remote commands and send times) through your script to see where the most bridge usage is taking place. As a simple rule of thumb, more hits = more traffic on the bridge = slower script.\n```python\nb = jfx_bridge.bridge.BridgeClient(record_stats=True)\nstart_stats = b.get_stats()\n\n# do something chunky\n....\n\nprint(b.get_stats() - start_stats)\n\n# Stats(total_hits=918,hits={'remote_import': 32, 'add_response': 354, 'remote_get': 212, 'remote_call': 71, 'remote_get_type': 18, 'remote_del': 156, 'remote_eval': 10, 'local_get_type': 4, 'local_get': 29, 'local_eval': 2, 'local_del': 11, 'remote_isinstance': 6, 'local_call': 5, 'remote_call_nonreturn': 3, 'remote_create_type': 1, 'remote_set': 4},total_time=(512, 8.389705419540405),times={'send_cmd': (512, 8.389705419540405)})\n```\n* Cache values that don't change. Every \".\" on a bridged object requires a call across the bridge to fetch the attribute, so something like `bridged_foo.bridged_bar.bridged_flam` requires two calls to access. If you know bridged_flam isn't going to change (e.g., it's a function several modules deep) and you need to use it multiple times, get it once then save it to avoid repeating the calls.\n* For loops that cause lots of bridged operations can often be replaced with remote_evals doing list comprehesions. Instead of:\n```python\nname_list = []\nfor bridged_x in bridged_get_objects():\n    name_list.append(bridged_x.get_name()) # 2 bridge calls for each x (1 to get the get_name function, 1 to call it)\n```\ntry:\n```python\nname_list = b.remote_eval(\"[x.get_name() for x in bridged_get_objects()]\", bridged_get_objects=bridged_get_objects)\n```\n* Use nonreturning calls when you don't need the result and don't have to wait for the bridged function to complete. Every BridgedCallable has a _bridge_call_nonreturn() function, which takes whatever arguments/kwargs you give it and calls the function across the bridge, but doesn't wait for a response. This is useful for when you want to call remote code that might be slow, but you don't care about the response. Alternatively, if you want remote code to call you, but you know you're not going to respond (e.g., event notifications), you can decorate your functions with @jfx_bridge.bridge.nonreturn.\n```python\nremote_time = b.remote_import(\"time\")\nremote_time.sleep._bridge_call_nonreturn(9999999) # returns immediately\n\n@jfx_bridge.bridge.nonreturn\ndef callback(foo):\n    time.sleep(9999999)\n    \n# on the remote side, will call back to the callback function and return immediately    \nremote_trigger_callback(callback) \n```\n\nHow it works\n=====================\nbridge.py contains a py2/3 compatible python object RPC proxy. One python environment sets up a server on a port, which clients connect to. The bridge provides a handful of commands to carry out remote operations against python objects in the other environment.\n\nA typical first step is remote_import() with a module to load in the target environment. This will make the RPC call to the remote bridge, which will load the module, then create a BridgeHandle to keep it alive and reference it across the bridge. It'll then return it to the local bridge, along with a list of the callable and non-callable attributes of the module.\n\nAt the local bridge, this will be deserialized into a BridgedObject, which overrides \\_\\_getattribute\\_\\_ and \\_\\_setattr\\_\\_ to catch any get/set to the attribute fields, and proxy them back across to the remote bridge, using the bridge handle reference so it knows which module (or other object) we're talking about.\n\nThe \\_\\_getattribute\\_\\_ override also affects callables, so doing bridged_obj.func() actually returns a BridgedCallable object, which is then invoked (along with any args/kwargs in use). This packs the call parameters off to the remote bridge, which identifies the appropriate object and invokes the call against it, then returns the result.\n\nThe bridges are symmetric, so the local bridge is able to send references to local python objects to the remote bridge, and have them used over there, with interactions being sent back to the local bridge (e.g., providing a callback function as an argument works).\n\nFinally, there's a few other miscellaneous features to make life easier - bridged objects which are python iterators/iterables will behave as iterators/iterables in the remote environment, and bridged objects representing types can be inherited from to make your own subclasses of them (note that this will actually create the subclass in the remote environment - this is designed so you can create types to implement Java interfaces for callbacks/listeners/etc in Jython environments, so it was easier to make sure they behave if they're created in the Jython environment).\n\nDesign principles\n=====================\n* Needs to be run in Jython 2.7 and Python 3\n* Needs to be easy to install in constrained environments - no pip install, just add a single directory \n(these two requirements ruled out some of the more mature Python RPC projects I looked into)\n\nTested\n=====================\n* Automatically tested on Python 3.10->Python 2.7, Python 3.11->Python 2.7, Python 2.7->Python 2.7, Python 2.7->Python 3.10, Python 3.11->Python 3.10\n\nTODO\n=====================\n* Handle server/client teardown cleanly\n* Exceptions - pull traceback info in the exceptions we handle for pushing back\n* Better transport/serialization (JSON/TCP just feels wrong)\n* Better threadpool control (don't keep all threads around forever, allow some to die off)\n\nContributors\n=====================\n* Thx @fmagin for better iPython support, and much more useful reprs!\n* Thanks also to @fmagin for remote_eval, allowing faster remote processing for batch queries!\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/justfoxing/jfx_bridge",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "jfx-bridge",
+    "package_url": "https://pypi.org/project/jfx-bridge/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/jfx-bridge/",
+    "project_urls": {
+      "Homepage": "https://github.com/justfoxing/jfx_bridge"
+    },
+    "release_url": "https://pypi.org/project/jfx-bridge/1.0.0/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "RPC bridge to/from Python2/Python3/Jython/etc",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16614831,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ed41fa45ca7a5947172c18227288138590f3266c956846e935d42421f749af2",
+          "md5": "fd0ea1f78272e609a186cf8afb45c810",
+          "sha256": "70bd1d8cf3b5b56d56d404368a5aadc5093a3aae57b70e04c34c05235f8cf59c"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd0ea1f78272e609a186cf8afb45c810",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 21822,
+        "upload_time": "2020-02-06T19:35:18",
+        "upload_time_iso_8601": "2020-02-06T19:35:18.932640Z",
+        "url": "https://files.pythonhosted.org/packages/5e/d4/1fa45ca7a5947172c18227288138590f3266c956846e935d42421f749af2/jfx_bridge-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "940b955a6fd31fbad6178b6d73fb13b9818372535c87d0867bce8c812e9b6d0d",
+          "md5": "f5af911171340c2577dd6eb60aee53b4",
+          "sha256": "df7b5137d84dce6f09b09dfec32030656e6056f7197e8a813cfe48ae5c23a8cf"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f5af911171340c2577dd6eb60aee53b4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23370,
+        "upload_time": "2020-02-06T19:35:20",
+        "upload_time_iso_8601": "2020-02-06T19:35:20.827914Z",
+        "url": "https://files.pythonhosted.org/packages/94/0b/955a6fd31fbad6178b6d73fb13b9818372535c87d0867bce8c812e9b6d0d/jfx_bridge-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dc44f2c23e247183b3f6fe2b1ae76cbc0b9ecccef8dac3de17f5aad2606ba56c",
+          "md5": "5b9ed34a64cf07d917f9b2ed4276c943",
+          "sha256": "d6cbc0775ec8af1299671d1d43ccb2c326ccc2b7d1616d68ea48f2517666f339"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.1.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5b9ed34a64cf07d917f9b2ed4276c943",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 21849,
+        "upload_time": "2020-03-02T11:34:55",
+        "upload_time_iso_8601": "2020-03-02T11:34:55.887966Z",
+        "url": "https://files.pythonhosted.org/packages/dc/44/f2c23e247183b3f6fe2b1ae76cbc0b9ecccef8dac3de17f5aad2606ba56c/jfx_bridge-0.1.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "acb258e39cf06577c87c66b32545ec5b813d3c5e4381da950bacab7cfcc2ce42",
+          "md5": "6f90105104392de1d071e6c8d3c2383c",
+          "sha256": "42fae73f1601b863ebc9ba14549d506cecb5047ffe1b2c3c525fb4b71971e861"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6f90105104392de1d071e6c8d3c2383c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23399,
+        "upload_time": "2020-03-02T11:34:57",
+        "upload_time_iso_8601": "2020-03-02T11:34:57.004588Z",
+        "url": "https://files.pythonhosted.org/packages/ac/b2/58e39cf06577c87c66b32545ec5b813d3c5e4381da950bacab7cfcc2ce42/jfx_bridge-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc101990c0edf48e01f4c4ad28db762d2b2be1cdd23279ba2250d881fcb680c7",
+          "md5": "60cab49ee860e32d6a22a1efaaa00707",
+          "sha256": "bbcd0818ec04a1b85345a80f3f9918098b2a5c822bdd93c816a0484d91ae95a4"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "60cab49ee860e32d6a22a1efaaa00707",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 22371,
+        "upload_time": "2020-03-05T10:49:04",
+        "upload_time_iso_8601": "2020-03-05T10:49:04.875870Z",
+        "url": "https://files.pythonhosted.org/packages/fc/10/1990c0edf48e01f4c4ad28db762d2b2be1cdd23279ba2250d881fcb680c7/jfx_bridge-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e9ec3de2bbd8d814217c537e08aa3034dc5065d6fb6147e8fdd155bc7d1b97f",
+          "md5": "e847fd507a0148b27ba71f8b3ebc03d7",
+          "sha256": "61d39d0bccce9d93736ffea387e87b60f717631fb99ad35f46b908a1c9437d2e"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e847fd507a0148b27ba71f8b3ebc03d7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23852,
+        "upload_time": "2020-03-05T10:49:05",
+        "upload_time_iso_8601": "2020-03-05T10:49:05.985252Z",
+        "url": "https://files.pythonhosted.org/packages/4e/9e/c3de2bbd8d814217c537e08aa3034dc5065d6fb6147e8fdd155bc7d1b97f/jfx_bridge-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4ed84d308bd3cdd1fcf2c3bdf375234d812b93061346cc87c275649d4afbfb92",
+          "md5": "86e47097f8506d59d8c96dfc2928d807",
+          "sha256": "4875cd6588961d9c0dd3c507ce490d5e6f9fa51f80a75f10d0f33860f928549b"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "86e47097f8506d59d8c96dfc2928d807",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 23415,
+        "upload_time": "2020-06-01T01:36:16",
+        "upload_time_iso_8601": "2020-06-01T01:36:16.218778Z",
+        "url": "https://files.pythonhosted.org/packages/4e/d8/4d308bd3cdd1fcf2c3bdf375234d812b93061346cc87c275649d4afbfb92/jfx_bridge-0.3.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d47803936a968e41af878ee0478834967d37f74dd32be96852442e161eafb7d",
+          "md5": "cf1fd37c8ae62a87ee40b4180881c587",
+          "sha256": "4ab832f8deed4cbdfe22660a674ba299f200111b27d3ce23bb0b7c25b541db0a"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf1fd37c8ae62a87ee40b4180881c587",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24904,
+        "upload_time": "2020-06-01T01:36:17",
+        "upload_time_iso_8601": "2020-06-01T01:36:17.071275Z",
+        "url": "https://files.pythonhosted.org/packages/6d/47/803936a968e41af878ee0478834967d37f74dd32be96852442e161eafb7d/jfx_bridge-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4415e6c6787de5bbdcd81984a886094990ce7214293d811ab1234d8c953c5281",
+          "md5": "17b9a7f132fa214023e9acaeb0346667",
+          "sha256": "cbeef97ad8fe082d1f3fe3824dbd9497b78c94e78e1dd12c40c143026bc9bcfe"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "17b9a7f132fa214023e9acaeb0346667",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 23544,
+        "upload_time": "2020-07-01T10:33:06",
+        "upload_time_iso_8601": "2020-07-01T10:33:06.297531Z",
+        "url": "https://files.pythonhosted.org/packages/44/15/e6c6787de5bbdcd81984a886094990ce7214293d811ab1234d8c953c5281/jfx_bridge-0.3.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "efb004496c4546f1a5ed74cfd0dc257d7d0f0b1e0ea322ba68704f317ecb27a6",
+          "md5": "e2f7de5bb525bf8c30fe6ba4b36393ea",
+          "sha256": "31ca513f8534453ff526e1b37d5de29ad7b97524d18c488ad1e1df7317fbee63"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e2f7de5bb525bf8c30fe6ba4b36393ea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25181,
+        "upload_time": "2020-07-01T10:33:07",
+        "upload_time_iso_8601": "2020-07-01T10:33:07.099131Z",
+        "url": "https://files.pythonhosted.org/packages/ef/b0/04496c4546f1a5ed74cfd0dc257d7d0f0b1e0ea322ba68704f317ecb27a6/jfx_bridge-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39bd8edc2e4a84407a398ff259bd3dc5172dacc6fd6bbe59b7d8289ecfcf8100",
+          "md5": "a1fd6eef13422e918aa94e29a0a8e384",
+          "sha256": "1fd347d4aecb999755a3630cfcb47aa2811e5c107335b77578817d336c2f6c51"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a1fd6eef13422e918aa94e29a0a8e384",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 23592,
+        "upload_time": "2020-07-02T00:57:53",
+        "upload_time_iso_8601": "2020-07-02T00:57:53.128484Z",
+        "url": "https://files.pythonhosted.org/packages/39/bd/8edc2e4a84407a398ff259bd3dc5172dacc6fd6bbe59b7d8289ecfcf8100/jfx_bridge-0.3.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20ba7ad3a77cf563d37a3425b23135c4f8241846122b5a8659fe96ce5e73b3bb",
+          "md5": "c8520e94996de0a7dd618266fdba5b08",
+          "sha256": "29f7ab56f45b49ca5e590096fa7072bd9b8de4c668f348c040e7d77cb9f43728"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c8520e94996de0a7dd618266fdba5b08",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25215,
+        "upload_time": "2020-07-02T00:57:54",
+        "upload_time_iso_8601": "2020-07-02T00:57:54.170787Z",
+        "url": "https://files.pythonhosted.org/packages/20/ba/7ad3a77cf563d37a3425b23135c4f8241846122b5a8659fe96ce5e73b3bb/jfx_bridge-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b4fcc935b3e16f2973a66713ffb4c160c24017e74d7920c39b3b8e386aa43741",
+          "md5": "347ea9785fff8898d2b959656f892864",
+          "sha256": "772dbff9022a7cbc99fd95f85d865b42c4e59c6558e0179b214a08dbeb24720e"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "347ea9785fff8898d2b959656f892864",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 24071,
+        "upload_time": "2020-07-05T01:14:55",
+        "upload_time_iso_8601": "2020-07-05T01:14:55.863582Z",
+        "url": "https://files.pythonhosted.org/packages/b4/fc/c935b3e16f2973a66713ffb4c160c24017e74d7920c39b3b8e386aa43741/jfx_bridge-0.3.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "640c42543b4516ca5860f29ec1bd2667ed45ed07ed803bc4921112d20f4a56d0",
+          "md5": "f731c8cc84c18f82522ac145fa6bb16c",
+          "sha256": "4feeabbf664e9ea919d483a6d4bd830cd2ecfe638ef9b23e634203c0b5ba9023"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f731c8cc84c18f82522ac145fa6bb16c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26010,
+        "upload_time": "2020-07-05T01:14:56",
+        "upload_time_iso_8601": "2020-07-05T01:14:56.834616Z",
+        "url": "https://files.pythonhosted.org/packages/64/0c/42543b4516ca5860f29ec1bd2667ed45ed07ed803bc4921112d20f4a56d0/jfx_bridge-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ba32433622595e613cf095785dceef3b43bf04de992445057ff967ba98d6dca",
+          "md5": "bc61e5ab512e1a7202495db172db4f4f",
+          "sha256": "2e3d26317e0afb254e2eaf57fcc7d37a7e398abed4fae9c7c3477f2a501f2537"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc61e5ab512e1a7202495db172db4f4f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 27185,
+        "upload_time": "2020-07-14T06:45:22",
+        "upload_time_iso_8601": "2020-07-14T06:45:22.871673Z",
+        "url": "https://files.pythonhosted.org/packages/9b/a3/2433622595e613cf095785dceef3b43bf04de992445057ff967ba98d6dca/jfx_bridge-0.4.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "edcfb6e835044c09b43c6b925077326bd5b92c9ba91068d683e47d3fab43aade",
+          "md5": "621c42bab9f4f8e6352bc1ece38b8249",
+          "sha256": "7e7f7e1b0e2cf1780be4b9f5aa2d6bf323b950513bd45d820ec71a0104166fc2"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "621c42bab9f4f8e6352bc1ece38b8249",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29764,
+        "upload_time": "2020-07-14T06:45:23",
+        "upload_time_iso_8601": "2020-07-14T06:45:23.985603Z",
+        "url": "https://files.pythonhosted.org/packages/ed/cf/b6e835044c09b43c6b925077326bd5b92c9ba91068d683e47d3fab43aade/jfx_bridge-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88dc40d99a8d876d1baa910d1a50cf76a047f1145637d0ebf56212d769424da6",
+          "md5": "b1cdcef835f848ef4dc399554341da74",
+          "sha256": "05bc90208036b27a524b0ac1a80c2789f2dc738caf98d4735277f4764b65a7ef"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1cdcef835f848ef4dc399554341da74",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 27778,
+        "upload_time": "2020-07-16T06:43:03",
+        "upload_time_iso_8601": "2020-07-16T06:43:03.485778Z",
+        "url": "https://files.pythonhosted.org/packages/88/dc/40d99a8d876d1baa910d1a50cf76a047f1145637d0ebf56212d769424da6/jfx_bridge-0.4.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f2cb3b7a570891d4a9d51ab2e2d1b94e0dd9c5fa23c5ef9149bac56bb353712",
+          "md5": "278a14fb1ee754c4f0ab1ae8d691d939",
+          "sha256": "c5e24bbf67d148a9a4e64f6124e92ff72e3082a33c7d41d0dc96e344b738a0d3"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "278a14fb1ee754c4f0ab1ae8d691d939",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 30337,
+        "upload_time": "2020-07-16T06:43:04",
+        "upload_time_iso_8601": "2020-07-16T06:43:04.547394Z",
+        "url": "https://files.pythonhosted.org/packages/2f/2c/b3b7a570891d4a9d51ab2e2d1b94e0dd9c5fa23c5ef9149bac56bb353712/jfx_bridge-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a521b592f155fec3655c3978515dedc7418f91439ece929edf77619ec0523eca",
+          "md5": "3511ecf72ea95c2edb6cb64df4c01e96",
+          "sha256": "3ed0659da3d477a7628f9773d2e1b5ac69f1bb9e8fbcc8adeace024b5cc6f836"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3511ecf72ea95c2edb6cb64df4c01e96",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 28360,
+        "upload_time": "2020-07-21T23:28:51",
+        "upload_time_iso_8601": "2020-07-21T23:28:51.711749Z",
+        "url": "https://files.pythonhosted.org/packages/a5/21/b592f155fec3655c3978515dedc7418f91439ece929edf77619ec0523eca/jfx_bridge-0.4.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e085ab048e57a2f5af60e501c110e3e2c54d66c6b8321870f0012e842278727f",
+          "md5": "73913034695b4a95ecbdbcfbac62e057",
+          "sha256": "efbe842e811af55583c0d10d2cc5edb5eded018aa83d497f40e61f8d8ef1035b"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "73913034695b4a95ecbdbcfbac62e057",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 30878,
+        "upload_time": "2020-07-21T23:28:52",
+        "upload_time_iso_8601": "2020-07-21T23:28:52.761870Z",
+        "url": "https://files.pythonhosted.org/packages/e0/85/ab048e57a2f5af60e501c110e3e2c54d66c6b8321870f0012e842278727f/jfx_bridge-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db8ff3f07f5e5fa6ce8faf403f5cff5836f83ecfcbc571a92ceaac04aa183de7",
+          "md5": "1fd9dd54129bee38a8adf215e348dd84",
+          "sha256": "b7066eeaaafb4d05f17c55f95482983b3f2ca5167f2e8df495dd50a66e8979df"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.5.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1fd9dd54129bee38a8adf215e348dd84",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 30085,
+        "upload_time": "2020-07-23T23:15:40",
+        "upload_time_iso_8601": "2020-07-23T23:15:40.386064Z",
+        "url": "https://files.pythonhosted.org/packages/db/8f/f3f07f5e5fa6ce8faf403f5cff5836f83ecfcbc571a92ceaac04aa183de7/jfx_bridge-0.5.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bcbd80ab832554d38feca56dfdfba49eafcc5198b1bdce02f3b6f178f5a6ebf0",
+          "md5": "f6facd15982189245e4c844de00cef95",
+          "sha256": "62ce5594501e52f6b2c034d0e0fbc60f72eaf8cdf02e38de55ba0bb0223e2937"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f6facd15982189245e4c844de00cef95",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32561,
+        "upload_time": "2020-07-23T23:15:41",
+        "upload_time_iso_8601": "2020-07-23T23:15:41.529735Z",
+        "url": "https://files.pythonhosted.org/packages/bc/bd/80ab832554d38feca56dfdfba49eafcc5198b1bdce02f3b6f178f5a6ebf0/jfx_bridge-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1718e53575578194ec9e72fba278ab94d667ed7817d49c6a83841c4deb673cb2",
+          "md5": "4b828ded936831796b81caccbff39d32",
+          "sha256": "ffb589b74e4966eea62b25a9dd8f908d0a8d4092c0322eacbe96bbb67f19f889"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.5.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4b828ded936831796b81caccbff39d32",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 30099,
+        "upload_time": "2020-07-26T10:05:52",
+        "upload_time_iso_8601": "2020-07-26T10:05:52.738294Z",
+        "url": "https://files.pythonhosted.org/packages/17/18/e53575578194ec9e72fba278ab94d667ed7817d49c6a83841c4deb673cb2/jfx_bridge-0.5.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21313c79fe6b1c3d31ad9c081d818ddc3f09f384d9ba1fd6b24aa21a7e0538e4",
+          "md5": "6a967f7f22c0c47c0bf60d7919df73da",
+          "sha256": "01f6e9741433a5dff5994898c2604b9d3332d88423a3b70fe6bc71fbb1fb98ec"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6a967f7f22c0c47c0bf60d7919df73da",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32591,
+        "upload_time": "2020-07-26T10:05:53",
+        "upload_time_iso_8601": "2020-07-26T10:05:53.873373Z",
+        "url": "https://files.pythonhosted.org/packages/21/31/3c79fe6b1c3d31ad9c081d818ddc3f09f384d9ba1fd6b24aa21a7e0538e4/jfx_bridge-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59298b13448e527966a9e09e2400834597bb3ce8817000f9eae1e40050bc6e74",
+          "md5": "06ebbc394ea46e474c1ff2eff8b8a73b",
+          "sha256": "6a48acfecda7d34fc452ba70caacaf70701344472e075a252d73a06c2757e4dd"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.6.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06ebbc394ea46e474c1ff2eff8b8a73b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 32656,
+        "upload_time": "2020-08-15T12:06:42",
+        "upload_time_iso_8601": "2020-08-15T12:06:42.348023Z",
+        "url": "https://files.pythonhosted.org/packages/59/29/8b13448e527966a9e09e2400834597bb3ce8817000f9eae1e40050bc6e74/jfx_bridge-0.6.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88deb5de18ea9f3d5a7f44b2b0e0efc468b9c5d2058679282b044753e19445ea",
+          "md5": "5c1f66eced8db96a29c4589afe8772f2",
+          "sha256": "da65a398e0556224ac7a5ffccb1f54e4d52bb9be5b6d13036ee018acf9e7d98e"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5c1f66eced8db96a29c4589afe8772f2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 36317,
+        "upload_time": "2020-08-15T12:06:43",
+        "upload_time_iso_8601": "2020-08-15T12:06:43.368917Z",
+        "url": "https://files.pythonhosted.org/packages/88/de/b5de18ea9f3d5a7f44b2b0e0efc468b9c5d2058679282b044753e19445ea/jfx_bridge-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b917b4679158b863133a0204b78cdd8fdfac726a7bf6866cf0cb1fb2ec7695e8",
+          "md5": "67f9bfc6fc085632d94c66a5fbddbe3e",
+          "sha256": "f0d799f746eceb590f2f9bdac2e6f8b4828d75e45e05dc6c6871326cdaf08809"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.7.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "67f9bfc6fc085632d94c66a5fbddbe3e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 36244,
+        "upload_time": "2020-08-22T21:33:38",
+        "upload_time_iso_8601": "2020-08-22T21:33:38.866509Z",
+        "url": "https://files.pythonhosted.org/packages/b9/17/b4679158b863133a0204b78cdd8fdfac726a7bf6866cf0cb1fb2ec7695e8/jfx_bridge-0.7.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c4392749b89522d0c77855a062aa2608e5f9f6e73c793a86d7c50c805ebe4d3",
+          "md5": "e652ca1be0bd405265fe90b31dc2e08f",
+          "sha256": "c7577f8f8ce943a25a627255264eb3a018104b9691164ce89082cf42a81b07ed"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e652ca1be0bd405265fe90b31dc2e08f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40900,
+        "upload_time": "2020-08-22T21:33:40",
+        "upload_time_iso_8601": "2020-08-22T21:33:40.217646Z",
+        "url": "https://files.pythonhosted.org/packages/5c/43/92749b89522d0c77855a062aa2608e5f9f6e73c793a86d7c50c805ebe4d3/jfx_bridge-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ac7af1b06fbe7267420b84f3474c80cd74301af65ec3ae4999417e2166181a6",
+          "md5": "3a92b666f4babc18f71ec90089cc4c9d",
+          "sha256": "de8b169932a2b9909088bf9da19321bc734ec8eb61bb6d7e76ff3ca73107c0a2"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.7.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3a92b666f4babc18f71ec90089cc4c9d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 36324,
+        "upload_time": "2020-08-25T09:11:35",
+        "upload_time_iso_8601": "2020-08-25T09:11:35.026785Z",
+        "url": "https://files.pythonhosted.org/packages/6a/c7/af1b06fbe7267420b84f3474c80cd74301af65ec3ae4999417e2166181a6/jfx_bridge-0.7.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c91702dac7d509bfb35156ea914acdea07c77ab090aa96237eeed7e94fd83441",
+          "md5": "e7ebee37ca6aef429aab50dbce079834",
+          "sha256": "c6c04cc96b1ff4fae4f3850524cb140e253bc99e54a0022741b15e855d6dd9cb"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.7.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e7ebee37ca6aef429aab50dbce079834",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40980,
+        "upload_time": "2020-08-25T09:11:36",
+        "upload_time_iso_8601": "2020-08-25T09:11:36.569916Z",
+        "url": "https://files.pythonhosted.org/packages/c9/17/02dac7d509bfb35156ea914acdea07c77ab090aa96237eeed7e94fd83441/jfx_bridge-0.7.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b76c3c878ece0eb816162f5a1aeb0a01413a2098435c79f2c50fc17e5830437",
+          "md5": "8ff431ada9a63e1598a9e0833fce7f2c",
+          "sha256": "efaa9c0a615f054784550b32f1e0c978c2a1bc346391b2385421eb1296e7e53e"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ff431ada9a63e1598a9e0833fce7f2c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 36738,
+        "upload_time": "2020-08-27T03:10:08",
+        "upload_time_iso_8601": "2020-08-27T03:10:08.940719Z",
+        "url": "https://files.pythonhosted.org/packages/2b/76/c3c878ece0eb816162f5a1aeb0a01413a2098435c79f2c50fc17e5830437/jfx_bridge-0.8.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d93578d739b7c776453acad3c5b5cb1d099386f345468c58ace88e27782df115",
+          "md5": "712a773423e51de209bbc3e7be7d758f",
+          "sha256": "fd7d4afd473f532b9901e6c6e8b8f7f871703a95f967cd4b59d7a037bb96f1bf"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "712a773423e51de209bbc3e7be7d758f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 41381,
+        "upload_time": "2020-08-27T03:10:10",
+        "upload_time_iso_8601": "2020-08-27T03:10:10.143785Z",
+        "url": "https://files.pythonhosted.org/packages/d9/35/78d739b7c776453acad3c5b5cb1d099386f345468c58ace88e27782df115/jfx_bridge-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9758a740d096a0ec6433c5fdc57cbfc2b9892ca3e14bec4c3cb88f5775d6c994",
+          "md5": "abbb37c7bad021fecec53b4be3f9be63",
+          "sha256": "a042954d70c2cdad218889a96b21dea5bf1f5e2633b36813136093c0071d0be1"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "abbb37c7bad021fecec53b4be3f9be63",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 36993,
+        "upload_time": "2022-02-14T09:41:15",
+        "upload_time_iso_8601": "2022-02-14T09:41:15.850415Z",
+        "url": "https://files.pythonhosted.org/packages/97/58/a740d096a0ec6433c5fdc57cbfc2b9892ca3e14bec4c3cb88f5775d6c994/jfx_bridge-0.8.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45d02d8323b15e9eb040d40178f502e3867d1975312dd91edcc75b7d506ba802",
+          "md5": "233ec9cbe59c8958cd185d5f9615cda4",
+          "sha256": "1ca0f37ad2d124e3fc6ac72b24c86b36ba2094a2e995700d2c34a4d61d58d886"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "233ec9cbe59c8958cd185d5f9615cda4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 41820,
+        "upload_time": "2022-02-14T09:41:17",
+        "upload_time_iso_8601": "2022-02-14T09:41:17.476836Z",
+        "url": "https://files.pythonhosted.org/packages/45/d0/2d8323b15e9eb040d40178f502e3867d1975312dd91edcc75b7d506ba802/jfx_bridge-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "acd44d4b4ab972e547c81d9ceaf8aaec7c28addaaf9893fcfdf3b749cc5da22b",
+          "md5": "b2ab87de97a634261ea15fd992776d5e",
+          "sha256": "d7170bef4c9fdbd17936f9fd1b7799b1744251635f91ce7225d9d9f736b5bda9"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b2ab87de97a634261ea15fd992776d5e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 36996,
+        "upload_time": "2022-02-14T10:00:30",
+        "upload_time_iso_8601": "2022-02-14T10:00:30.106434Z",
+        "url": "https://files.pythonhosted.org/packages/ac/d4/4d4b4ab972e547c81d9ceaf8aaec7c28addaaf9893fcfdf3b749cc5da22b/jfx_bridge-0.8.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "adbba3c511b9dcfd9c84b36dd226d7cf0ffdc95d2159aa6eb29819d5be9a6ec1",
+          "md5": "e0ddc845b009941a96519300dbfc0917",
+          "sha256": "13458107f393dfe70509eb5ed2754d3e83618fc893a9c4d8d088f1b80a868b1a"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.8.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e0ddc845b009941a96519300dbfc0917",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 41833,
+        "upload_time": "2022-02-14T10:00:31",
+        "upload_time_iso_8601": "2022-02-14T10:00:31.417220Z",
+        "url": "https://files.pythonhosted.org/packages/ad/bb/a3c511b9dcfd9c84b36dd226d7cf0ffdc95d2159aa6eb29819d5be9a6ec1/jfx_bridge-0.8.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f24324fd3e4ca16def3ea632f9468829aef561f06e328f3a729a1660cd1ada0f",
+          "md5": "405243e37e203f0e1c83f7289945b370",
+          "sha256": "831cdf17cb782e3879e6d4b21a6ec2815d9d308f9c32bcf50c9abe9a007af87f"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "405243e37e203f0e1c83f7289945b370",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 37309,
+        "upload_time": "2022-02-15T09:59:01",
+        "upload_time_iso_8601": "2022-02-15T09:59:01.546493Z",
+        "url": "https://files.pythonhosted.org/packages/f2/43/24fd3e4ca16def3ea632f9468829aef561f06e328f3a729a1660cd1ada0f/jfx_bridge-0.9.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e5f74544bbad3e9e72a096ba861c767ae5389b8ac7274726cdbb8083489cc0b",
+          "md5": "cfbd971efe4d53ccfb7549256b6ed341",
+          "sha256": "e458c79ab3015ed29c385a752aa231c043a0e6ecfa5270d1629b47e9a9ab1a1c"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cfbd971efe4d53ccfb7549256b6ed341",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42203,
+        "upload_time": "2022-02-15T09:59:02",
+        "upload_time_iso_8601": "2022-02-15T09:59:02.741993Z",
+        "url": "https://files.pythonhosted.org/packages/6e/5f/74544bbad3e9e72a096ba861c767ae5389b8ac7274726cdbb8083489cc0b/jfx_bridge-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8912fe403fa607123a158c47eb761cdd9bc371e70139c5c096a1b7c98f827cb0",
+          "md5": "1d510e77047732d2830359f08756355f",
+          "sha256": "bec7a17a220635f2db4851846f097ec05797224ce562d131f244aa16ca0ba7ad"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1d510e77047732d2830359f08756355f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 37524,
+        "upload_time": "2022-02-19T05:06:11",
+        "upload_time_iso_8601": "2022-02-19T05:06:11.013309Z",
+        "url": "https://files.pythonhosted.org/packages/89/12/fe403fa607123a158c47eb761cdd9bc371e70139c5c096a1b7c98f827cb0/jfx_bridge-0.9.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "599b0761e34bc50878c8254ca1078c65ba62492f2f2afbd19ab58654fc8f1c72",
+          "md5": "c4703b30f685826c1857601e0ebde36e",
+          "sha256": "d53d7e5e38c492596f4bde0e1a6a1d7063ff4caf53a6d375522cac57398149ab"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c4703b30f685826c1857601e0ebde36e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42429,
+        "upload_time": "2022-02-19T05:06:12",
+        "upload_time_iso_8601": "2022-02-19T05:06:12.500925Z",
+        "url": "https://files.pythonhosted.org/packages/59/9b/0761e34bc50878c8254ca1078c65ba62492f2f2afbd19ab58654fc8f1c72/jfx_bridge-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f9c6e2ce38eff9055fbc87e8631e50e935a9653ff8303070b55bd397a75fea2",
+          "md5": "2907944effacf54a130de2fe40f82abd",
+          "sha256": "b823c08d07c0262c877519d525a3a5ded4bbcd7bef16844cfb18cb14817959b6"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2907944effacf54a130de2fe40f82abd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 37602,
+        "upload_time": "2023-01-30T02:39:26",
+        "upload_time_iso_8601": "2023-01-30T02:39:26.501393Z",
+        "url": "https://files.pythonhosted.org/packages/9f/9c/6e2ce38eff9055fbc87e8631e50e935a9653ff8303070b55bd397a75fea2/jfx_bridge-0.9.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca5fb65640c8bd3d9cfd9d8fe9b2222ee4266baa85a0223fb987849cea65244c",
+          "md5": "e13bda11985844e5f5aa94a38171e91e",
+          "sha256": "b19f7fc574bffdb1204f7e32fb5ac2f3f84762860b4bc6343d5e993eee18775f"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e13bda11985844e5f5aa94a38171e91e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42620,
+        "upload_time": "2023-01-30T02:39:27",
+        "upload_time_iso_8601": "2023-01-30T02:39:27.913229Z",
+        "url": "https://files.pythonhosted.org/packages/ca/5f/b65640c8bd3d9cfd9d8fe9b2222ee4266baa85a0223fb987849cea65244c/jfx_bridge-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "15b3b00dc30564bf1da409be4498c9dd66d33b049f59b0a67a73e3e81ea8faec",
+          "md5": "b0c2dfb65e20fc5a1b70401b2a2faec4",
+          "sha256": "7f47b1d8547b440d8e45905cad9dce432186d6d61829cf252b02ad406b289bd2"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0c2dfb65e20fc5a1b70401b2a2faec4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 37593,
+        "upload_time": "2023-01-30T03:31:53",
+        "upload_time_iso_8601": "2023-01-30T03:31:53.778602Z",
+        "url": "https://files.pythonhosted.org/packages/15/b3/b00dc30564bf1da409be4498c9dd66d33b049f59b0a67a73e3e81ea8faec/jfx_bridge-0.9.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f8438f8f4692329e2b7d15d1e4c182be1601d3def1cd463d3bef04bc16860ca7",
+          "md5": "1e417abb4bc522492b8d7f652ee47e03",
+          "sha256": "9ac42971385b0635591a943b65b8c512ff8193117cd070edaa952022e0345541"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-0.9.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1e417abb4bc522492b8d7f652ee47e03",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42601,
+        "upload_time": "2023-01-30T03:31:55",
+        "upload_time_iso_8601": "2023-01-30T03:31:55.361757Z",
+        "url": "https://files.pythonhosted.org/packages/f8/43/8f8f4692329e2b7d15d1e4c182be1601d3def1cd463d3bef04bc16860ca7/jfx_bridge-0.9.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "498b6b054a1dd51f71da6324554eceb30e0bd4c8254c1d7c2744b9791fb0547c",
+          "md5": "2909a36c44f33b9a0f6172bf4e3dd836",
+          "sha256": "c7beda4776e219fdca60c42cbce31a97df392c164474c9b5420ed033f346ad30"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-1.0.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2909a36c44f33b9a0f6172bf4e3dd836",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 37606,
+        "upload_time": "2023-01-30T03:42:08",
+        "upload_time_iso_8601": "2023-01-30T03:42:08.372829Z",
+        "url": "https://files.pythonhosted.org/packages/49/8b/6b054a1dd51f71da6324554eceb30e0bd4c8254c1d7c2744b9791fb0547c/jfx_bridge-1.0.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce13796445dd00e517bc9551261cb86e9b0d8cff873b37f92421a3e0badc61bc",
+          "md5": "52c1c3e220c78a9497362046cd19820c",
+          "sha256": "e291b51f510bd2587619434f94c89f0c805936c492924c0d905e9222fa290729"
+        },
+        "downloads": -1,
+        "filename": "jfx_bridge-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "52c1c3e220c78a9497362046cd19820c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42624,
+        "upload_time": "2023-01-30T03:42:09",
+        "upload_time_iso_8601": "2023-01-30T03:42:09.998524Z",
+        "url": "https://files.pythonhosted.org/packages/ce/13/796445dd00e517bc9551261cb86e9b0d8cff873b37f92421a3e0badc61bc/jfx_bridge-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "498b6b054a1dd51f71da6324554eceb30e0bd4c8254c1d7c2744b9791fb0547c",
+        "md5": "2909a36c44f33b9a0f6172bf4e3dd836",
+        "sha256": "c7beda4776e219fdca60c42cbce31a97df392c164474c9b5420ed033f346ad30"
+      },
+      "downloads": -1,
+      "filename": "jfx_bridge-1.0.0-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "2909a36c44f33b9a0f6172bf4e3dd836",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 37606,
+      "upload_time": "2023-01-30T03:42:08",
+      "upload_time_iso_8601": "2023-01-30T03:42:08.372829Z",
+      "url": "https://files.pythonhosted.org/packages/49/8b/6b054a1dd51f71da6324554eceb30e0bd4c8254c1d7c2744b9791fb0547c/jfx_bridge-1.0.0-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ce13796445dd00e517bc9551261cb86e9b0d8cff873b37f92421a3e0badc61bc",
+        "md5": "52c1c3e220c78a9497362046cd19820c",
+        "sha256": "e291b51f510bd2587619434f94c89f0c805936c492924c0d905e9222fa290729"
+      },
+      "downloads": -1,
+      "filename": "jfx_bridge-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "52c1c3e220c78a9497362046cd19820c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 42624,
+      "upload_time": "2023-01-30T03:42:09",
+      "upload_time_iso_8601": "2023-01-30T03:42:09.998524Z",
+      "url": "https://files.pythonhosted.org/packages/ce/13/796445dd00e517bc9551261cb86e9b0d8cff873b37f92421a3e0badc61bc/jfx_bridge-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
