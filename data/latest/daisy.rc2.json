@@ -1,0 +1,161 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "William Patton <pattonw@hhmi.org>, Jan Funke <funkej@janelia.hhmi.org>, \"Tri M. Nguyen\" <tri_nguyen@hms.harvard.edu>, Caroline Malin-Mayor <malinmayorc@janelia.hhmi.org>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Daisy: A Blockwise Task Scheduler\n\n> Blockwise task scheduler for processing large volumetric data\n\n\n## What is Daisy?\n\nDaisy is a library framework that facilitates distributed processing of big nD datasets across clusters of computers.\nIt combines the best of MapReduce/Hadoop (the ability to map a process function across elements) and Luigi (the ability to chain dependent tasks together) together in one lightweight and efficient package with a focus on processing nD datasets.\n\nDaisy documentations are at https://daisy-docs.readthedocs.io/\n\n\n## Overview\n\nDeveloped by researchers at HHMI Janelia and Harvard, the intention behind Daisy was to develop a scalable and fast distributed block-wise scheduler for processing very large (TBs to PBs) 3D/4D bio image datasets.\nWe needed a fast and scalable scheduler but also resilient to failures and recoverable/resumable from hardware errors.\nDaisy should also be generalizable enough to support efficient processing of different tasks with different computation and input/output modalities.\n\n\n### Daisy is lightweight\n\n* Daisy uses high performance TCP/IP libraries for communications between the scheduler and workers.\n\n* It minimizes network overheads by sending only coordinates and status checks. Daisy does not enforce the exact method of data transfers to/between workers so that maximum performance is achieved for different tasks.\n\n\n### Daisy's API is easy-to-use and extensible\n\n* Built on Python, Daisy provides an easy-to-use native interface for Python scripts useful for both simple and complex use cases.\n\n* Simplistically, Daisy is a framework for `map`ping a function across independent sub-blocks in the dataset.\n\n* More complex usages include specifying inter-block dependencies, inter-task dependencies, using Daisy's array interface and geometric graph interface.\n\n\n### Daisy chains complex pipelines of tasks\n\n* Inspired by powerful workflow management frameworks like [Luigi](https://github.com/spotify/luigi) for automating long running tasks and decreasing overall processing time through task pipelining, Daisy allows user to specify dependency between tasks, allowing for task chaining and running multiple tasks in a pipeline with dynamic concurrent per-block execution.\n\n* For instance, Daisy can chain a `map` task and a `reduce` task to implement a `map-reduce` task for nD datasets. Of course, any other combinations of `map` and `reduce` tasks are composable.\n\n* By tracking dependencies at the `block` level, tasks can be executed concurrently to maximize pipelining parallelism.\n\n\n### Daisy is tuned for processing datasets with real-world units\n\n* Daisy has a native inferface to represent of regions in a volume in real world units, easily handling voxel sizes, with convenience functions for region manipulation (intersection, union, growing or shrinking, etc.)\n\n* Daisy provides an array interface that can wrap any object with a shape attribute and slicing operations (zarr, hdf5, numpy array)\n\n* Daisy provides a geometric graph interface with support for file system and MongoDB storage (nodes are locations in space, and can be accessed by region)\n\n\n## Installation\n\n```sh\npip install -e git+https://github.com/funkelab/daisy#egg=daisy\n```\n\nAlternatively, install through PyPI (though outdated at the moment):\n```sh\npip install daisy\n```\n\n## Quickstart\n\nSee the following code in a [IPython notebook](/examples/daisy_quickstart.ipynb)!\n\n### Map task\n\nFirst, let's run a simple `map` task with Daisy. Supposed we have an array `a` that we want to compute the square for each element and store in `b`\n\n```python\nimport numpy as np\nshape = 4096000\n\na = np.arange(shape, dtype=np.int64)\nb = np.empty_like(a, dtype=np.int64)\n\nprint(a)\n# prints [0 1 2 ... 4095997 4095998 4095999]\n```\n\nWe can use the following `process_fn`:\n\n```python\ndef process_fn():\n    # iterating and squaring each element in a and store to b\n    with np.nditer([a, b],\n                   op_flags=[['readonly'], ['readwrite']]) as it:\n        with it:\n           for x,y in it:\n                y[...] = x**2\n\n%timeit process_fn()  # 3.55 s ± 22.7 ms per loop\nprint(b)\n# prints [0 1 4 ... 16777191424009 16777199616004 16777207808001]\n```\n\nSince `process_fn` linearly processes `a` in a single-thread, it is quite slow.\nLet's use Daisy to break `a` into blocks and run `process_fn` in parallel.\n\nFirst, we'll wrap `a` in a `daisy.Array` and make a `b` array based on `zarr` that multiple concurrent process can write to. We will also define `block_shape` - the granularity that each worker will be working at.\n\n```python\nimport daisy\nimport zarr\n\nshape = 4096000\nblock_shape = 1024*16\n\n# input array is wrapped in daisy.Array for easy of Roi indexing\na = daisy.Array(np.arange(shape, dtype=np.int64),\n                roi=daisy.Roi((0,), shape),\n                voxel_size=(1,))\n\n# to parallelize across processes, we need persistent read/write arrays\n# we'll use zarr here to do do that\nb = zarr.open_array(zarr.TempStore(), 'w', (shape,),\n                    chunks=(block_shape,),\n                    dtype=np.int64)\n# output array is wrapped in daisy.Array for easy of Roi indexing\nb = daisy.Array(b,\n                roi=daisy.Roi((0,), shape),\n                voxel_size=(1,))\n```\n\nThe `process_fn` is then modified slightly to take in a `block` object and perform read/write using the ROIs given by it.\n\n```python\n# same process function as previously, but with additional code\n# to read and write data to persistent arrays\ndef process_fn_daisy(block):\n\n    a_sub = a[block.read_roi].to_ndarray()\n    b_sub = np.empty_like(a_sub)\n    with np.nditer([a_sub, b_sub],\n                   op_flags=[['readonly'], ['readwrite']],\n                  ) as it:\n        with it:\n           for x,y in it:\n                y[...] = x**2\n    \n    b[block.write_roi] = b_sub\n```\n\nNext, we define `total_roi` based on total amount of work (`shape`) and `block_roi` based on scheduling block size (`block_shape`). We then make a `daisy.Task` and run it.\n\n```python\ntotal_roi = daisy.Roi((0,), shape)  # total ROI to map process over\nblock_roi = daisy.Roi((0,), (block_shape,))  # block ROI for parallel processing\n\n# creating a Daisy task, note that we do not specify how each\n# worker should read/write to input/output arrays\ntask = daisy.Task(\n    total_roi=total_roi,\n    read_roi=block_roi,\n    write_roi=block_roi,\n    process_function=process_fn_daisy,\n    num_workers=8,\n    task_id='square',\n)\n\ndaisy.run_blockwise([task])\n'''\nprints Execution Summary\n-----------------\n\n  Task square:\n\n    num blocks : 250\n    completed ✔: 250 (skipped 0)\n    failed    ✗: 0\n    orphaned  ∅: 0\n\n    all blocks processed successfully\n'''\n\n# %timeit daisy.run_blockwise([task])  # 1.26 s ± 16.1 ms per loop\n\nprint(b.to_ndarray())\n# prints [0 1 4 ... 16777191424009 16777199616004 16777207808001]\n```\n\nSee that with just a minor modification, using Daisy to run multiple workers in parallel results in a 2.8176x speedups on a computer with 6 cores. For longer running tasks with larger block sizes (to minimize process spawning/joining overheads) the speedups should approach the # of threads/cores running in parallel more.\n\n### Reduce task\n\nNow we'll write and run a `reduce` task. This task performs a sum of blocks of shape `reduce_shape` from `b` and stores the results to `c`.\n\n```python\nimport multiprocessing\n\nreduce_shape = shape/16\n\n# while using zarr with daisy.Array can be easier to understand and less error prone, it is not a requirement.\n# Here we make a shared memory array for collecting results from different workers\nc = multiprocessing.Array('Q', range(int(shape/reduce_shape)))\n\ndef process_fn_sum_reduce(block):\n    b_sub = b[block.write_roi].to_ndarray()\n    s = np.sum(b_sub)\n    # compute c idx based on block offset and shape\n    idx = (block.write_roi.offset / block.write_roi.shape)[0]\n    c[idx] = s\n\ntotal_roi = daisy.Roi((0,), shape)  # total ROI to map process over\nblock_roi = daisy.Roi((0,), reduce_shape)  # block ROI for parallel processing\n\ntask1 = daisy.Task(\n    total_roi=total_roi,\n    read_roi=block_roi,\n    write_roi=block_roi,\n    process_function=process_fn_sum_reduce,\n    num_workers=8,\n    task_id='sum_reduce',\n)\n\ndaisy.run_blockwise([task1])\nprint(c[:])\n```\n\nThis concludes our quickstart tutorial. For more examples/tutorials please see the [examples/](/examples) directory.\n\n\n## Citing Daisy\n\nTo cite this repository please use the following bibtex entry:\n\n```\n@software{daisy2022github,\n  author = {Tri Nguyen and Caroline Malin-Mayor and William Patton and Jan Funke},\n  title = {Daisy: block-wise task dependencies for luigi.},\n  url = {https://github.com/funkelab/daisy},\n  version = {1.0},\n  year = {2022},\n}\n```\n\nIn the above bibtex entry, the version number is intended to be that from [daisy/setup.py](/setup.py), and the year corresponds to the project's 1.0 release.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "daisy",
+    "package_url": "https://pypi.org/project/daisy/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/daisy/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/daisy/1.0/",
+    "requires_dist": [
+      "numpy",
+      "tornado (>=5)",
+      "tqdm",
+      "funlib.math",
+      "funlib.geometry",
+      "pytest ; extra == 'dev'",
+      "black ; extra == 'dev'",
+      "mypy ; extra == 'dev'",
+      "filelock ; extra == 'dev'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Blockwise task scheduler for processing large volumetric data.",
+    "version": "1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16877960,
+  "releases": {
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ed1b769ce72814e9e0c1d35e0788ed0370812424ecc3807a7b850055780b9c8",
+          "md5": "d9a0ca1e9486a8faeaa56ba61ca343af",
+          "sha256": "c35f9db08436d9debc5decb4f641d07ac01035c487b506bcad98817642b74115"
+        },
+        "downloads": -1,
+        "filename": "daisy-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d9a0ca1e9486a8faeaa56ba61ca343af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 41489,
+        "upload_time": "2019-08-17T14:16:32",
+        "upload_time_iso_8601": "2019-08-17T14:16:32.900703Z",
+        "url": "https://files.pythonhosted.org/packages/5e/d1/b769ce72814e9e0c1d35e0788ed0370812424ecc3807a7b850055780b9c8/daisy-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3447034353b0b57c68d5cde521c18f44cf6630f1e63ba702f99bde62459f064a",
+          "md5": "17f15b49afb88f7b2a0074d0f4692d86",
+          "sha256": "a756c890cad5d278697d08342ea43684fcc619c36c61481e83613926d194990b"
+        },
+        "downloads": -1,
+        "filename": "daisy-1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "17f15b49afb88f7b2a0074d0f4692d86",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 45980,
+        "upload_time": "2023-02-15T21:46:53",
+        "upload_time_iso_8601": "2023-02-15T21:46:53.068083Z",
+        "url": "https://files.pythonhosted.org/packages/34/47/034353b0b57c68d5cde521c18f44cf6630f1e63ba702f99bde62459f064a/daisy-1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69e9e081043ad70acbb822f7f5ccb8573d712accd8cad1b4452f62662993949e",
+          "md5": "3d851a5fc495193b0a2b1396040e84d8",
+          "sha256": "229f43347b9804943def366583139a966b9e38898b6faa781e512b6c9c4a5a5a"
+        },
+        "downloads": -1,
+        "filename": "daisy-1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3d851a5fc495193b0a2b1396040e84d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 43564,
+        "upload_time": "2023-02-15T21:46:54",
+        "upload_time_iso_8601": "2023-02-15T21:46:54.403796Z",
+        "url": "https://files.pythonhosted.org/packages/69/e9/e081043ad70acbb822f7f5ccb8573d712accd8cad1b4452f62662993949e/daisy-1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3447034353b0b57c68d5cde521c18f44cf6630f1e63ba702f99bde62459f064a",
+        "md5": "17f15b49afb88f7b2a0074d0f4692d86",
+        "sha256": "a756c890cad5d278697d08342ea43684fcc619c36c61481e83613926d194990b"
+      },
+      "downloads": -1,
+      "filename": "daisy-1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "17f15b49afb88f7b2a0074d0f4692d86",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 45980,
+      "upload_time": "2023-02-15T21:46:53",
+      "upload_time_iso_8601": "2023-02-15T21:46:53.068083Z",
+      "url": "https://files.pythonhosted.org/packages/34/47/034353b0b57c68d5cde521c18f44cf6630f1e63ba702f99bde62459f064a/daisy-1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "69e9e081043ad70acbb822f7f5ccb8573d712accd8cad1b4452f62662993949e",
+        "md5": "3d851a5fc495193b0a2b1396040e84d8",
+        "sha256": "229f43347b9804943def366583139a966b9e38898b6faa781e512b6c9c4a5a5a"
+      },
+      "downloads": -1,
+      "filename": "daisy-1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3d851a5fc495193b0a2b1396040e84d8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 43564,
+      "upload_time": "2023-02-15T21:46:54",
+      "upload_time_iso_8601": "2023-02-15T21:46:54.403796Z",
+      "url": "https://files.pythonhosted.org/packages/69/e9/e081043ad70acbb822f7f5ccb8573d712accd8cad1b4452f62662993949e/daisy-1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

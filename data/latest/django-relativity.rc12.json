@@ -1,0 +1,624 @@
+{
+  "info": {
+    "author": "Alex Hill",
+    "author_email": "alex@hill.net.au",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# django-relativity\n\n[![PyPI](https://img.shields.io/pypi/v/django-relativity.svg)](https://pypi.org/project/django-relativity/)\n[![Build Status](https://app.travis-ci.com/AlexHill/django-relativity.svg?branch=master)](https://app.travis-ci.com/github/AlexHill/django-relativity)\n\ndjango-relativity provides a `Relationship` field that lets you declare the non-foreign-key relationships between your models and use them throughout the ORM.\n\n_Non-foreign-key relationships?_\n\nLike the relationship between a node and its descendants in a tree, or between two tagged items that share a tag. Almost anything you can express with Django's filter syntax, you can use to define a relationship.\n\n_Use them throughout the ORM?_\n\nYes, across joins, in `filter()`, in methods like `prefetch_related()` or `values()` - anywhere Django expects to see a field.\n\n## What problem does this solve?\n\nSometimes the relationships between our models are more complex than equality between a primary key field on one model and a foreign key on another.\n\nFor example: when working with trees, we very often need to find a given node's descendants - its children, their children, and so on. The exact query we have to run depends on how we've chosen to implement our tree structure at the database level, and fortunately there are mature libraries available to take care of that for us. [django-mptt](http://django-mptt.readthedocs.io/en/latest/models.html#get-descendants-include-self-false) and [django-treebeard](http://django-treebeard.readthedocs.io/en/latest/api.html#treebeard.models.Node.get_descendants) both provide methods called `get_descendants()` for exactly this purpose. These return a queryset selecting the node's descendants, which we can then filter further, or use as an argument to another filter, and so on. So what's the problem?\n\nThe problem is that the node-descendants relationship is invisible to the Django ORM. We can't filter against it, like `Node.objects.filter(descendants__in=objs)`. We can't traverse it, like `Node.objects.filter(descendants__name__startswith=\"A\")`. We can't prefetch it. None of the niceties that Django provides for working with relationships are available for us to use with this relationship, because it can't be declared as a `ManyToManyField` or `ForeignKey`.\n\ndjango-relativity lets all those ORM features work with almost any kind of relationship you can dream up.\n\n### MPTT and treebeard helpers\n\nIf you use django-mptt or django-treebeard and you want to jump right in, relativity comes with fields to select a node's descendants and its subtree (which respectively exclude and include the current node). The default reverse relation names for these fields are `ascendants` and `rootpath`.\n\n```python\n# For django-mptt\nfrom relativity.mptt import MPTTDescendants, MPTTSubtree\n\n# for treebeard with materialised path\nfrom relativity.treebeard import MP_Descendants, MP_Subtree\n\n# for treebeard with nested sets\nfrom relativity.treebeard import NS_Descendants, NS_Subtree\n\n\nclass TreeNode(MPTTModel):\n    ...\n    \n    # after defining all your other fields, including TreeForeignKey...\n    descendants = MPTTDescendants()\n    subtree = MPTTSubtree()\n```\n\n## What does the code look like?\n\nHere are some models for an imaginary website about chemistry, where users can filter compounds by regular expression and save their searches:\n\n```python\nfrom relativity.fields import L, Relationship\n\nclass Chemical(Model):\n    common_name = TextField()\n    chemical_name = TextField()\n    formula = TextField()\n\nclass SavedFilter(Model):\n    user = ForeignKey(User)\n    search_regex = TextField()\n    chemicals = Relationship(\n        to=Chemical,\n        predicate=Q(formula__regex=L('search_regex')),\n    )\n```\n\nNow I can use that field like this:\n\n```python\nmy_filter.chemicals.all()  # all the chemicals whose formulae match this filter\nmy_chemical.saved_filters.all()  # all the filters whose regexps match this chemical\nmy_user.filter(saved_filters__chemicals=my_chemical)  # users with filters matching this chemical\nmy_chemical.filter(saved_filters__user=my_user)  # chemicals in any of this user's filters\n```\n\nIn short, I can use it just like a normal Django relation. It provides forward and reverse properties that return Managers, and I can use it in filters spanning multiple models.\n\n_How does that `Relationship` field work?_\n\nA `Relationship` behaves like a `ForeignKey` or `ManyToManyField` and defines a relationship with another model. Unlike the built-in Django relations, `Relationship` doesn't use its own database column or table to determine which instances are related. Instead, you give it an arbitrary _predicate_, expressed as a normal Django `Q`, which determines which instances of the `to` model are in the relationship.\n\n_What's that `L` doing there?_\n\nIn Django ORM expressions, `F` is a reference to a field on the model being queried. `L` is similar, but refers to a field on the model on which the `Relationship` is defined. Think of it as L for the _left-hand_ side of a join, or L for the _local_ model.\n\nGoing back to our example - the `chemicals` field provides the set of `Chemical`s whose formulae match the `SavedFilter`'s regular expression.\n\nLet's make some chemicals:\n\n```python\n>>> Chemical.objects.create(name=\"baking soda\", formula=\"NaHCO3\")\n... Chemical.objects.create(common_name=\"freon\",  formula=\"CF2Cl2\")\n... Chemical.objects.create(common_name=\"grain alcohol\", formula=\"C2H5OH\")\n... Chemical.objects.create(common_name=\"quartz\", formula=\"SiO2\")\n... Chemical.objects.create(common_name=\"salt\", formula=\"NaCl\")\n```\n\nNow, say I'm a user who's interested in chemicals containing chlorine. Simple enough:\n\n```python\n>>> chloriney = SavedFilter.objects.create(user=alex, search_regex=r'Cl')\n>>> chloriney.compounds.all()\n<QuerySet [<Chemical: CF2Cl2>, <Chemical: NaCl>]>\n```\n\nAnne is interested in oxides, so her regex is a bit more complicated:\n\n```python\n>>> oxides = SavedFilter.objects.create(user=anne, search_regex=r'([A-Z][a-z]?\\d*)O(\\d+|(?!H))')\n>>> oxides.compounds.all()\n<QuerySet [<Chemical: NaHCO3>, <Chemical: SiO2>]>\n```\n\nNow, this is nothing you couldn't do with a helper method on `SavedFilter` which returns the appropriate QuerySet. But now we add a new chemical to our database, and we want to identify users who are interested in that chemical so we can notify them:\n\n```python\n>>> added_chemical = Chemical.objects.create(common_name=\"chlorine dioxide\", chemical_name=\"chlorine dioxide\", formula=\"ClO2\")\n<Chemical: ClO2>\n>>> User.objects.filter(saved_filters__chemicals=added_chemical)\n<QuerySet [<User: alex>, <User: anne>]>\n```\n\nThis is why I call django-relativity a _force-multiplier_ for the ORM. `Relationship`s work with the ORM just like `ForeignKey`s or `ManyToManyField`s. You can traverse them and filter on them just like you can with the built-in relationship fields. The goal of django-relativity is for `Relationship`s to be able to do anything a normal Django relationship field can do.\n\n### Reverse relations\n\n`Relationship`s work in the reverse direction as well, with the same naming behaviour as Django's fields: the default related name is `<model_name>_set` or `<model_name>` depending on arity, overridable with the `related_name` argument. `related_query_name` works as well.\n\nIn the example above, `my_chemical.saved_filter_set.all()` will return all of the `SavedFilter`s matching `my_chemical`. `Chemical.objects.filter(saved_filters__user=alex)` will select all of the chemicals in all of my saved filters.\n\n### Arity\n\nRelationships between models can be one-to-one, one-to-many, many-to-one, or many-to-many. `Relationship` can express all of those, using the `multiple` and `reverse_multiple` arguments. Both default to `True`.\n\nHere's a many-to-one example - many cart items can be associated with each product, but only one product is associated with each cart item.\n\n```python\nclass CartItem(models.Model):\n    product_code = models.TextField()\n    product = Relationship(\n        to=Product,\n        predicate=Q(sku=L('product_code')),\n        multiple=False,\n    )\n```\n\n## What state is this project in?\n\nThis project is used in production and in active development. Things not covered by the tests have every chance of not working.\n\n\n## Migrating from relativity < 0.2.0\n\nBefore 0.2.0, it was necessary to import a backported version of `django.db.models.Q` from `relativity.compat` in order to make migrations work in Django 1.11. From 0.2.0 onwards, that's no longer necessary. The backported `Q` still exists as an alias to django.db.models, but a DeprecationWarning will be issued on import. You should replace all uses with Django's standard `Q`.\n\nFrom 0.2.0 onwards, relativity's fields do not generate migrations. When migrating from older versions, I recommend simply removing all references to relativity's fields from the original migrations that created them, rather than generating new migrations removing the virtual fields.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/alexhill/django-relativity",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-relativity",
+    "package_url": "https://pypi.org/project/django-relativity/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/django-relativity/",
+    "project_urls": {
+      "Homepage": "https://github.com/alexhill/django-relativity"
+    },
+    "release_url": "https://pypi.org/project/django-relativity/0.2.6/",
+    "requires_dist": [
+      "django (>=1.11)"
+    ],
+    "requires_python": "",
+    "summary": "A flexible relationship field for the Django ORM.",
+    "version": "0.2.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14572816,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5625b2120b0917f514db68fd0821518369e02520c9cc902e6a846da34bdb64a3",
+          "md5": "f310a57f1f578ee6b4302fb1fc7147dd",
+          "sha256": "2cf8ea3729dc4f59f3e04408e4f7077f0b4df10275dbae150d7b5efb7d5cccb5"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f310a57f1f578ee6b4302fb1fc7147dd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8080,
+        "upload_time": "2018-06-04T18:37:12",
+        "upload_time_iso_8601": "2018-06-04T18:37:12.499614Z",
+        "url": "https://files.pythonhosted.org/packages/56/25/b2120b0917f514db68fd0821518369e02520c9cc902e6a846da34bdb64a3/django_relativity-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "289f427726dbd038c6e9ef1074d79f546f189854fd26970ae2f0bea5bb2db933",
+          "md5": "7117a90ac9c50043a33c9c62c8717ebe",
+          "sha256": "e6c3b61e2d287d1e70e803002861c43fa456d5aeea523a7b0811a0384ba596ef"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7117a90ac9c50043a33c9c62c8717ebe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7402,
+        "upload_time": "2018-06-04T18:37:13",
+        "upload_time_iso_8601": "2018-06-04T18:37:13.530398Z",
+        "url": "https://files.pythonhosted.org/packages/28/9f/427726dbd038c6e9ef1074d79f546f189854fd26970ae2f0bea5bb2db933/django-relativity-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "832dde831a2669fbf5ee0de6a4e6014a4ecd040195256ae7c8a9fdc1d53d269c",
+          "md5": "7045f8b7fe7ae19192ae2a41fe8e98da",
+          "sha256": "98e0d99ea1c516001ad725f088a4ffd40f402c98a33cd1b0097828177546fbe1"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7045f8b7fe7ae19192ae2a41fe8e98da",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8893,
+        "upload_time": "2018-06-05T16:57:41",
+        "upload_time_iso_8601": "2018-06-05T16:57:41.424596Z",
+        "url": "https://files.pythonhosted.org/packages/83/2d/de831a2669fbf5ee0de6a4e6014a4ecd040195256ae7c8a9fdc1d53d269c/django_relativity-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d30b69c7af5d41ed8c66f81c6f1ffd4024a0fe97a3bd92ce0b5e68c9545b1ac1",
+          "md5": "76c754343209fed8f95987b864177971",
+          "sha256": "52e928df8a55114ff055252864ff99e6caf77a2862bb2aab07b9cd811736de58"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "76c754343209fed8f95987b864177971",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10547,
+        "upload_time": "2018-06-05T16:57:43",
+        "upload_time_iso_8601": "2018-06-05T16:57:43.653586Z",
+        "url": "https://files.pythonhosted.org/packages/d3/0b/69c7af5d41ed8c66f81c6f1ffd4024a0fe97a3bd92ce0b5e68c9545b1ac1/django-relativity-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30c40f9e7004f9bf94b7ab34b2aac3f2cd3bdaf2991175b1ebcc9094b05e8724",
+          "md5": "6d420629fe046a323babee4309c44aa3",
+          "sha256": "fc4286de1276fb94af215daabb36a771b9b7058cacaf978d57f9ef0e15bf7758"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6d420629fe046a323babee4309c44aa3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9657,
+        "upload_time": "2018-08-30T15:32:49",
+        "upload_time_iso_8601": "2018-08-30T15:32:49.423829Z",
+        "url": "https://files.pythonhosted.org/packages/30/c4/0f9e7004f9bf94b7ab34b2aac3f2cd3bdaf2991175b1ebcc9094b05e8724/django_relativity-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b55d5ace1ed4774b98ccd4bbd61b9389790a0f6d66d261c89fc8af6a1a16b2fd",
+          "md5": "b6a61f962ce68e291ec9d7449e666cbe",
+          "sha256": "87a546582c0e6ec826d239552354afd89794721c3861f7dec858b0558809a69d"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b6a61f962ce68e291ec9d7449e666cbe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11365,
+        "upload_time": "2018-08-30T15:32:52",
+        "upload_time_iso_8601": "2018-08-30T15:32:52.142280Z",
+        "url": "https://files.pythonhosted.org/packages/b5/5d/5ace1ed4774b98ccd4bbd61b9389790a0f6d66d261c89fc8af6a1a16b2fd/django-relativity-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8da52f32227007380b1c733fc1f5e96f8dc05e04542d1f85512ea9ab94584f94",
+          "md5": "3663c33c31ccbee4ee8db94339b85b4f",
+          "sha256": "159d5d90d3ddf2f18d032a7d1ea95aaccdc169faf31d55547159c7d26d39c47e"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3663c33c31ccbee4ee8db94339b85b4f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9987,
+        "upload_time": "2018-09-13T17:32:34",
+        "upload_time_iso_8601": "2018-09-13T17:32:34.982886Z",
+        "url": "https://files.pythonhosted.org/packages/8d/a5/2f32227007380b1c733fc1f5e96f8dc05e04542d1f85512ea9ab94584f94/django_relativity-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84ca02699d955c8b873eba3bb73cccfc8ec52bf2d4f35290b2d49d9a8f7ba340",
+          "md5": "0eec1f705c4493b42f01cd7fb53f9305",
+          "sha256": "3e6fa5e45c967c062e2712a8810ef83a1f6a6de9918f8b6eedd75080c7e2c32d"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0eec1f705c4493b42f01cd7fb53f9305",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11882,
+        "upload_time": "2018-09-13T17:32:39",
+        "upload_time_iso_8601": "2018-09-13T17:32:39.672944Z",
+        "url": "https://files.pythonhosted.org/packages/84/ca/02699d955c8b873eba3bb73cccfc8ec52bf2d4f35290b2d49d9a8f7ba340/django-relativity-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c00882eceb0d1b1d557fb653e89f514b721b864e22c14e3017d864c935649cb9",
+          "md5": "fd745c77898d4945c61d9673e243694c",
+          "sha256": "06e559fc998e96d16e84eca1699c83e42e0bffdd09833203bc2fb643a27cb340"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.1.5-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd745c77898d4945c61d9673e243694c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14969,
+        "upload_time": "2020-02-07T07:35:45",
+        "upload_time_iso_8601": "2020-02-07T07:35:45.709019Z",
+        "url": "https://files.pythonhosted.org/packages/c0/08/82eceb0d1b1d557fb653e89f514b721b864e22c14e3017d864c935649cb9/django_relativity-0.1.5-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0e5b902d1c7feb517e026e435611ea1657edbdfdb4c1ee0eabc657ac5501903",
+          "md5": "2e2c5c023a52f57e1858170cbc70bcaf",
+          "sha256": "b81449f98f90437d0682da226f14181fe4ed66b71b8e44d52ec452c65910ee4d"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2e2c5c023a52f57e1858170cbc70bcaf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14944,
+        "upload_time": "2020-02-07T07:35:48",
+        "upload_time_iso_8601": "2020-02-07T07:35:48.133158Z",
+        "url": "https://files.pythonhosted.org/packages/c0/e5/b902d1c7feb517e026e435611ea1657edbdfdb4c1ee0eabc657ac5501903/django-relativity-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c79bf33030c58b9ef76bef7ddcf60f1a5ccf50c2fffa1d2b6d237240a4f0c1fb",
+          "md5": "cd5c265a689fe02810dc0acfc0c87114",
+          "sha256": "bedf47dc13574e1688cca9613bd5ac02055a71e910277a88dde2d1a821ccecb9"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cd5c265a689fe02810dc0acfc0c87114",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15255,
+        "upload_time": "2020-02-07T17:12:30",
+        "upload_time_iso_8601": "2020-02-07T17:12:30.622725Z",
+        "url": "https://files.pythonhosted.org/packages/c7/9b/f33030c58b9ef76bef7ddcf60f1a5ccf50c2fffa1d2b6d237240a4f0c1fb/django_relativity-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41a5da4fcc01a03416a2d20e916410d2731355ca39328cafdc030b24fc149f00",
+          "md5": "cbd8b2e4f9123f18ac517807e5611dc3",
+          "sha256": "2bf4ce063a499d17d53cc3c643a13e807faee1c96a88b13d85e7ea420583a6af"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cbd8b2e4f9123f18ac517807e5611dc3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14805,
+        "upload_time": "2020-02-07T17:12:37",
+        "upload_time_iso_8601": "2020-02-07T17:12:37.814953Z",
+        "url": "https://files.pythonhosted.org/packages/41/a5/da4fcc01a03416a2d20e916410d2731355ca39328cafdc030b24fc149f00/django-relativity-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8338a7c55ed09b49b55b0a23479efbfb21588ce1cc7d5bb5a130a00966924dfb",
+          "md5": "c440a3d45005f600900401f64493352d",
+          "sha256": "f5e9687fb1b4c313fb467c71127ba360a7b47b94ca8eec06fdd38945c49cb04e"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c440a3d45005f600900401f64493352d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15692,
+        "upload_time": "2020-02-10T05:17:39",
+        "upload_time_iso_8601": "2020-02-10T05:17:39.138527Z",
+        "url": "https://files.pythonhosted.org/packages/83/38/a7c55ed09b49b55b0a23479efbfb21588ce1cc7d5bb5a130a00966924dfb/django_relativity-0.2.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1cef6da2b54fdf02b9fbc7e7e05808d9c3ccf3c1a9b2af0a13fb08529e208cb0",
+          "md5": "7bcef23bf74be2e2adb8a2ba450ca73a",
+          "sha256": "b43237df548a284f2d295a21bf05e9226f817becd2b1bddb29d6a92907e9ef1f"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7bcef23bf74be2e2adb8a2ba450ca73a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12915,
+        "upload_time": "2020-02-10T05:17:41",
+        "upload_time_iso_8601": "2020-02-10T05:17:41.296851Z",
+        "url": "https://files.pythonhosted.org/packages/1c/ef/6da2b54fdf02b9fbc7e7e05808d9c3ccf3c1a9b2af0a13fb08529e208cb0/django-relativity-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91fc83abcab43c28a79d3eecf3e4f38b55c33d297d7742460a851213408fadfe",
+          "md5": "1188a1d4fa57c7010e2e2789951dffd8",
+          "sha256": "df09abe3a67fdd56fd8930556423bb65496018d5139d3e08865ba576f93b9364"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1188a1d4fa57c7010e2e2789951dffd8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15887,
+        "upload_time": "2020-05-30T08:06:26",
+        "upload_time_iso_8601": "2020-05-30T08:06:26.322829Z",
+        "url": "https://files.pythonhosted.org/packages/91/fc/83abcab43c28a79d3eecf3e4f38b55c33d297d7742460a851213408fadfe/django_relativity-0.2.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e594c9b15ddbb76787efd45247fd531c1647082c29b0a80f575523f08c98010",
+          "md5": "5e9ef7e1bd7dd9c7097ba93ba8554327",
+          "sha256": "4393267c1349c6ae2726eefff92bf3863d503facc66fe532a5df70fe2a8a0d83"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5e9ef7e1bd7dd9c7097ba93ba8554327",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15861,
+        "upload_time": "2020-05-30T08:06:33",
+        "upload_time_iso_8601": "2020-05-30T08:06:33.493864Z",
+        "url": "https://files.pythonhosted.org/packages/6e/59/4c9b15ddbb76787efd45247fd531c1647082c29b0a80f575523f08c98010/django-relativity-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8be0031e201eb9b451cba5dfc4c78b94e60165d71d226f9ba109c699c9181dd2",
+          "md5": "10a40c6ef2f54a4f2e383581d31906ad",
+          "sha256": "b7c0fac0391798e627e6ceb3f077d46e72add79071052b92174e68eb96f61620"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "10a40c6ef2f54a4f2e383581d31906ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 16449,
+        "upload_time": "2021-04-28T03:44:29",
+        "upload_time_iso_8601": "2021-04-28T03:44:29.412132Z",
+        "url": "https://files.pythonhosted.org/packages/8b/e0/031e201eb9b451cba5dfc4c78b94e60165d71d226f9ba109c699c9181dd2/django_relativity-0.2.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8b0b6a6f2ab50a0f172e6df52b0dc9fb089753c4e0b4c6c655bea7353f2c188",
+          "md5": "af5ddae39c3a3b38e492f6f05c02774a",
+          "sha256": "3eb7d57a79bcb5e18d5661d9e2b90f748ba507e2ebf160865934d92c0144a889"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af5ddae39c3a3b38e492f6f05c02774a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17757,
+        "upload_time": "2021-04-28T03:44:30",
+        "upload_time_iso_8601": "2021-04-28T03:44:30.996055Z",
+        "url": "https://files.pythonhosted.org/packages/a8/b0/b6a6f2ab50a0f172e6df52b0dc9fb089753c4e0b4c6c655bea7353f2c188/django-relativity-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dbb847b069c8f0feaf3adb53ce723de9545565e39c70b366a22a099776f1ab57",
+          "md5": "c2cc798eea3ab83cc92188a4eaaa4693",
+          "sha256": "08c3aafebf3cac5925ace2af2637ec7a0399ab88a9ff9df94dccaea3d60178c8"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c2cc798eea3ab83cc92188a4eaaa4693",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 16532,
+        "upload_time": "2021-04-28T17:36:12",
+        "upload_time_iso_8601": "2021-04-28T17:36:12.037712Z",
+        "url": "https://files.pythonhosted.org/packages/db/b8/47b069c8f0feaf3adb53ce723de9545565e39c70b366a22a099776f1ab57/django_relativity-0.2.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "14ab1e0ef77533b3882442adae8a9fd556e374e8a8b4ee53ec8eda1693c16504",
+          "md5": "fd77beacf0e5e237b923ca3db72dbadd",
+          "sha256": "e4b409eb7552eb9bff843f7644f6975a76feb1d4a0bf56f7e9fea53f4847e48b"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd77beacf0e5e237b923ca3db72dbadd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15059,
+        "upload_time": "2021-04-28T17:36:14",
+        "upload_time_iso_8601": "2021-04-28T17:36:14.214598Z",
+        "url": "https://files.pythonhosted.org/packages/14/ab/1e0ef77533b3882442adae8a9fd556e374e8a8b4ee53ec8eda1693c16504/django-relativity-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "990aa229ae58e062d1f70dcc0c1b246cdb1db0c4dfe77477514d3374acd9da0f",
+          "md5": "98864094a11ee3fb7a8daff876131f2c",
+          "sha256": "59e77a595af6a1e9edf04d39d44f5d829211d47faff0b2830b2e82e001deca03"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.5-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "98864094a11ee3fb7a8daff876131f2c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 11830,
+        "upload_time": "2021-10-06T04:45:51",
+        "upload_time_iso_8601": "2021-10-06T04:45:51.479687Z",
+        "url": "https://files.pythonhosted.org/packages/99/0a/a229ae58e062d1f70dcc0c1b246cdb1db0c4dfe77477514d3374acd9da0f/django_relativity-0.2.5-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e18e0d2a4a6de7096feef1a81e95aec970ba800fe59a29a6329b7d561202ecc4",
+          "md5": "f801b2a666e035b9482bd49734ec4feb",
+          "sha256": "6e98edb389e4eceb49e8b173d7f48ef5e379efe538fc16649c245ccd583d7d1f"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f801b2a666e035b9482bd49734ec4feb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13600,
+        "upload_time": "2021-10-06T04:45:53",
+        "upload_time_iso_8601": "2021-10-06T04:45:53.550683Z",
+        "url": "https://files.pythonhosted.org/packages/e1/8e/0d2a4a6de7096feef1a81e95aec970ba800fe59a29a6329b7d561202ecc4/django-relativity-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41f174bad8688bb105914c057db0f8b5067b40e4ce35bd68086900d1c7479dfb",
+          "md5": "88a7493c1125db0fa8c508134a783dc6",
+          "sha256": "059c1aa129308f445b568b408556e0748c81238d764902954e8f5c9d4b8562b6"
+        },
+        "downloads": -1,
+        "filename": "django_relativity-0.2.6-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "88a7493c1125db0fa8c508134a783dc6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 11984,
+        "upload_time": "2022-07-28T03:57:57",
+        "upload_time_iso_8601": "2022-07-28T03:57:57.375053Z",
+        "url": "https://files.pythonhosted.org/packages/41/f1/74bad8688bb105914c057db0f8b5067b40e4ce35bd68086900d1c7479dfb/django_relativity-0.2.6-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee93e02dc850fc04d9925e830812d201c92e4ef29c9bdf12d47bd67cd102a8c8",
+          "md5": "01088e704a3985c8b92dbc7a80980d67",
+          "sha256": "8ad75f52bdb3c50cf27ef7268c7ae3ecec599b869bdde1f172685942e8e0b340"
+        },
+        "downloads": -1,
+        "filename": "django-relativity-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "01088e704a3985c8b92dbc7a80980d67",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10989,
+        "upload_time": "2022-07-28T03:58:00",
+        "upload_time_iso_8601": "2022-07-28T03:58:00.340521Z",
+        "url": "https://files.pythonhosted.org/packages/ee/93/e02dc850fc04d9925e830812d201c92e4ef29c9bdf12d47bd67cd102a8c8/django-relativity-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "41f174bad8688bb105914c057db0f8b5067b40e4ce35bd68086900d1c7479dfb",
+        "md5": "88a7493c1125db0fa8c508134a783dc6",
+        "sha256": "059c1aa129308f445b568b408556e0748c81238d764902954e8f5c9d4b8562b6"
+      },
+      "downloads": -1,
+      "filename": "django_relativity-0.2.6-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "88a7493c1125db0fa8c508134a783dc6",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 11984,
+      "upload_time": "2022-07-28T03:57:57",
+      "upload_time_iso_8601": "2022-07-28T03:57:57.375053Z",
+      "url": "https://files.pythonhosted.org/packages/41/f1/74bad8688bb105914c057db0f8b5067b40e4ce35bd68086900d1c7479dfb/django_relativity-0.2.6-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ee93e02dc850fc04d9925e830812d201c92e4ef29c9bdf12d47bd67cd102a8c8",
+        "md5": "01088e704a3985c8b92dbc7a80980d67",
+        "sha256": "8ad75f52bdb3c50cf27ef7268c7ae3ecec599b869bdde1f172685942e8e0b340"
+      },
+      "downloads": -1,
+      "filename": "django-relativity-0.2.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "01088e704a3985c8b92dbc7a80980d67",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 10989,
+      "upload_time": "2022-07-28T03:58:00",
+      "upload_time_iso_8601": "2022-07-28T03:58:00.340521Z",
+      "url": "https://files.pythonhosted.org/packages/ee/93/e02dc850fc04d9925e830812d201c92e4ef29c9bdf12d47bd67cd102a8c8/django-relativity-0.2.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,278 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Murad Akhundov <akhundov1murad@gmail.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11"
+    ],
+    "description": "# Diator - CQRS Library for Python\n\nDiator is a Python library for implementing CQRS pattern in your Python applications. It provides a set of abstractions and utilities to help you separate your read and write concerns, allowing for better scalability, performance, and maintainability of your application.\n\n## Features\n\n- Implements the CQRS pattern\n- Simple, yet flexible API\n- Works with Redis Pub/Sub (and will support the other message brokers)\n- Easy to integrate with existing codebases\n- Well-documented\n\n## Installation\n\nYou can install Diator using pip:\n\n```bash\npip install diator[redis]  # Currently only Redis is supported\n```\n\n## Basic usage\n\n### Define Commands and Queries\n\n```python\nfrom diator.requests import Request\nfrom diator.response import Response\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass JoinMeetingCommand(Request)\n    meeting_id: int = dataclasses.field(default=1)\n    user_id: int = dataclasses.field(default=1)\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass ReadMeetingQuery(Request)\n    meeting_id: int = dataclasses.field(default=1)\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass ReadMeetingQueryResult(Response)\n    meeting_id: int = dataclasses.field(default=1)\n    link: str = dataclasses.field()\n\n```\n\n### Define Events\n\n```python\nfrom diator.events import DomainEvent, NotificationEvent\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass UserJoinedDomainEvent(Event):  # will be handled by special event handler\n    user_id: int = dataclasses.field()\n    meeting_id: int = dataclasses.field()\n    timestamp: datetime = dataclasses.field()\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass UserJoinedNotificationEvent(NotificationEvent):  # will be sent to a message broker\n    user_id: int = dataclasses.field()\n\n```\n\n### Define Command and Event Handlers\n\n```python\nfrom diator.requests import RequestHandler\nfrom diator.events import EventHandler\n\n\nclass JoinMeetingCommandHandler(RequestHandler[JoinMeetingCommand, None]):  # Command Handler doesn't return anything\n    def __init__(self, meeting_api: MeetingAPI) -> None:\n        self._meeting_api = meeting_api\n        self._events: list[Event] = []\n\n    @property\n    def events(self) -> list[Event]:\n        return self._events\n\n    async def handle(self, request: JoinMeetingCommand) -> None:\n        await self._meeting_api.join(request.meeting_id, request.user_id)\n        self._events.append(\n            UserJoinedDomainEvent(user_id=request.user_id, timestamp=datetime.utcnow(), meeting_id=request.meeting_id)\n        )\n        self._events.append(\n            UserJoinedNotificationEvent(user_id=request.user_id)\n        )\n\n\nclass UserJoinedDomainEventHandler(EventHandler[UserJoinedDomainEvent]):\n    def __init__(self, meeting_api: MeetingAPI) -> None:\n        self._meeting_api = meeting_api\n\n    async def handle(self, event: UserJoinedDomainEvent) -> None:\n        await self._meeting_api.notify(event.meeting_id, \"New user joined!\")\n\n\nclass ReadMeetingQueryHandler(RequestHandler[ReadMeetingQuery, ReadMeetingQueryResult]):  # Request Handler returns query result\n    def __init__(self, meeting_api: MeetingAPI) -> None:\n        self._meeting_api = meeting_api\n        self._events: list[Event] = []\n\n    @property\n    def events(self) -> list[Event]:\n        return self._events\n\n    async def handle(self, request: ReadMeetingQuery) -> ReadMeetingQueryResult:\n        link = await self._meeting_api.get_link(request.meeting_id)\n        return ReadMeetingQueryResult(\n            meeting_id=request.meeting_id,\n            link=link\n        )\n\n```\n\n### Setup dependencies\n\n```python\nfrom rodi import Container as ExternalContainer  # using rodi as di-framework\nfrom diator.container.rodi import RodiContainer\n\n\ndef setup_di() -> RodiContainer:\n    external_container = ExternalContainer()\n\n    external_container.register(UserJoinedDomainEventHandler)\n    external_container.register(JoinMeetingCommandHandler)\n    external_container.register(ReadMeetingQueryHandler)\n\n    container = RodiContainer()\n    container.attach_external_container(external_container)\n\n    return container\n\n```\n\n### Define Middleware\n\n```python\nfrom diator.requests import Request\n\n\nclass SomeMiddleware:\n    async def __call__(request: Request, handle):\n        \"\"\"\n        Some logic related to request part of the circle.\n        \"\"\"\n\n        response = await handle(request)\n\n        \"\"\"\n        Some logic related to response part of the circle.\n        \"\"\"\n        return response\n\n```\n\n### Build Mediator object\n\n```python\nfrom diator.requests import RequestMap\nfrom diator.events.message_brokers.redis import RedisMessageBroker\nfrom diator.events import EventEmitter\nfrom diator.mediator import Mediator\nfrom diator.events import EventMap\nfrom diator.middlewares import MiddlewareChain\n\n\nasync def main() -> None:\n    container = setup_di()\n\n    event_map = EventMap()\n    event_map.bind(UserJoinedDomainEvent, UserJoinedDomainEventHandler)  # Mapping event to event handler\n    request_map = RequestMap()\n    request_map.bind(JoinMeetingCommand, JoinMeetingCommandHandler)  # Mapping command to command handler\n    request_map.bind(ReadMeetingQuery, ReadMeetingQueryHandler)  # Mapping query to query handler\n\n    redis_client = redis.Redis.from_url(\"redis://localhost:6379/0\")  # Creating Async Redis Client\n\n    middleware_chain = MiddlewareChain()\n    middleware_chain.add(SomeMiddleware())  # Adding Middleware to a chain\n\n    event_emitter = EventEmitter(\n        message_broker=RedisMessageBroker(redis_client),\n        event_map=event_map,\n        container=container,\n    )\n\n    mediator = Mediator(\n        request_map=request_map, \n        event_emitter=event_emitter, \n        container=container, \n        middleware_chain=MiddlewareChain\n    )\n\n    \"\"\" \n    1. JoinMeetingCommand is handled by JoinMeetingCommandHandler\n    2. JoinMeetingCommandHandler publishes Domain and Notification Events\n    3. UserJoinedDomainEvent is handled by UserJoinedDomainEventHandler\n    4. UserJoinedNotificationEvent is sent to the Redis Pub/Sub\n    \"\"\"\n    await mediator.send(JoinMeetingCommand(user_id=1))\n\n    # Returns ReadMeetingQueryResult\n    response = await mediator.send(ReadMeetingQuery(meeting_id=1))\n\n\nif __name__ == \"__main__\":\n    asyncio.run(main())\n\n```\n\nRedis Pub/Sub output:\n\n```json\n{\n   \"message_type\":\"notification_event\",\n   \"message_name\":\"UserJoinedNotificationEvent\",\n   \"message_id\":\"9f62e977-73f7-462b-92cb-8ea658d3bcb5\",\n   \"payload\":{\n      \"event_id\":\"9f62e977-73f7-462b-92cb-8ea658d3bcb5\",\n      \"event_timestamp\":\"2023-03-07T09:26:02.588855\",\n      \"user_id\":123\n   }\n}\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "CQRS,async,asyncio,command,commands,di,diator,event,events,mediator,mediatr,queries,query",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "diator",
+    "package_url": "https://pypi.org/project/diator/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/diator/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/akhundMurad/diator/issues",
+      "Homepage": "https://github.com/akhundMurad/diator"
+    },
+    "release_url": "https://pypi.org/project/diator/0.0.4/",
+    "requires_dist": [
+      "dataclass-factory",
+      "orjson",
+      "redis; extra == 'redis'",
+      "black; extra == 'test'",
+      "isort; extra == 'test'",
+      "mypy; extra == 'test'",
+      "pytest; extra == 'test'",
+      "pytest-asyncio; extra == 'test'",
+      "types-redis; extra == 'test'",
+      "vulture; extra == 'test'"
+    ],
+    "requires_python": ">=3.10",
+    "summary": "Diator is a Python library for implementing CQRS pattern in your Python applications.",
+    "version": "0.0.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17464579,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d21cc5a665ab8d801c9eebfce0b10159f3a95e3b995f8e5cce1d63d3403989c6",
+          "md5": "aaf3c6fc0353274aa618909301247bf0",
+          "sha256": "55f0c327656ccf1f62b8d081c00c48715b4b7d92f1611d3e1dd092207c52b86c"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aaf3c6fc0353274aa618909301247bf0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 9778,
+        "upload_time": "2023-03-07T08:41:49",
+        "upload_time_iso_8601": "2023-03-07T08:41:49.689870Z",
+        "url": "https://files.pythonhosted.org/packages/d2/1c/c5a665ab8d801c9eebfce0b10159f3a95e3b995f8e5cce1d63d3403989c6/diator-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79fdc350cec80843c2fd27d3f42937c209d3c860c6852e34c79138e4379b50e1",
+          "md5": "8be58202095c5d5f18f83c8c7c9b1637",
+          "sha256": "8476c911814928022ebb01bccb5a92eabe104ebb20e255aae777af0dd8f32f92"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8be58202095c5d5f18f83c8c7c9b1637",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 8359,
+        "upload_time": "2023-03-07T08:41:51",
+        "upload_time_iso_8601": "2023-03-07T08:41:51.805691Z",
+        "url": "https://files.pythonhosted.org/packages/79/fd/c350cec80843c2fd27d3f42937c209d3c860c6852e34c79138e4379b50e1/diator-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bef5ebcb3495b516690f2a98129a5fd7dce09270a4e1586dfdeb366a0e74d9e0",
+          "md5": "c51cccf6a039ad91dcb82fffbd529a25",
+          "sha256": "f78d53eaee115c4df3016b5544e09e9344a6631b7f7c3303d9ebc7747d9e906c"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c51cccf6a039ad91dcb82fffbd529a25",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 11047,
+        "upload_time": "2023-03-07T09:50:09",
+        "upload_time_iso_8601": "2023-03-07T09:50:09.464300Z",
+        "url": "https://files.pythonhosted.org/packages/be/f5/ebcb3495b516690f2a98129a5fd7dce09270a4e1586dfdeb366a0e74d9e0/diator-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6be19f06ce6a7de37dfd9e4732dc079fa1d8889110852c5f673b91a565b5556d",
+          "md5": "34c4d8f280968b61d1c9968e558d29d9",
+          "sha256": "9fba70556de4820ce69c4c7107420515f4966989ece1e145e34525ffde09b2ce"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "34c4d8f280968b61d1c9968e558d29d9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 9339,
+        "upload_time": "2023-03-07T09:50:11",
+        "upload_time_iso_8601": "2023-03-07T09:50:11.521006Z",
+        "url": "https://files.pythonhosted.org/packages/6b/e1/9f06ce6a7de37dfd9e4732dc079fa1d8889110852c5f673b91a565b5556d/diator-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b601e77a40db3fb13078e769708d3c8f47f0909dd7a429e8a6e2281607d3c8a",
+          "md5": "01f2f7c8cbd4a17aa757d74d369fd67f",
+          "sha256": "c5e8a11e58e0774ad75a927c2392237d53657bf3fa6f9e00299372a610da69b5"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "01f2f7c8cbd4a17aa757d74d369fd67f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 14703,
+        "upload_time": "2023-03-17T21:06:23",
+        "upload_time_iso_8601": "2023-03-17T21:06:23.775185Z",
+        "url": "https://files.pythonhosted.org/packages/4b/60/1e77a40db3fb13078e769708d3c8f47f0909dd7a429e8a6e2281607d3c8a/diator-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99472b9a4d127e610cccdcbd09ef9a10ea4640de1731fe0e64fd624135896740",
+          "md5": "24459d303f206426e22bd040bd8ff2bc",
+          "sha256": "a5fd22e09f28f178054f80a2d0225b42a488786b4a52a565eab31feb8487d11a"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24459d303f206426e22bd040bd8ff2bc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 10694,
+        "upload_time": "2023-03-17T21:06:25",
+        "upload_time_iso_8601": "2023-03-17T21:06:25.732209Z",
+        "url": "https://files.pythonhosted.org/packages/99/47/2b9a4d127e610cccdcbd09ef9a10ea4640de1731fe0e64fd624135896740/diator-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca24823c365f65db64895d84ab3ed7fdd6a47b40d90f6e5acf746fe57f46ad58",
+          "md5": "4bd745c2f6101a68c9dd956ee796857a",
+          "sha256": "a86133d3c7d18ba683f70608e6c6b0ecf6e1f53133037d43c40f8a7e4219a56f"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4bd745c2f6101a68c9dd956ee796857a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 14772,
+        "upload_time": "2023-03-27T17:28:12",
+        "upload_time_iso_8601": "2023-03-27T17:28:12.634916Z",
+        "url": "https://files.pythonhosted.org/packages/ca/24/823c365f65db64895d84ab3ed7fdd6a47b40d90f6e5acf746fe57f46ad58/diator-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe6c5f9e9bdca53130775b3a2066b392a94c061ebb6be51c1bac125fa9dfaffa",
+          "md5": "7cb7e1ed8b88f795e7c7b602471ad83d",
+          "sha256": "b3744f79c48bca9217eedac88b409cb54c7ac3195fe3571bf5b7b2cf1c44a9cc"
+        },
+        "downloads": -1,
+        "filename": "diator-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7cb7e1ed8b88f795e7c7b602471ad83d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 10729,
+        "upload_time": "2023-03-27T17:28:20",
+        "upload_time_iso_8601": "2023-03-27T17:28:20.058760Z",
+        "url": "https://files.pythonhosted.org/packages/fe/6c/5f9e9bdca53130775b3a2066b392a94c061ebb6be51c1bac125fa9dfaffa/diator-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ca24823c365f65db64895d84ab3ed7fdd6a47b40d90f6e5acf746fe57f46ad58",
+        "md5": "4bd745c2f6101a68c9dd956ee796857a",
+        "sha256": "a86133d3c7d18ba683f70608e6c6b0ecf6e1f53133037d43c40f8a7e4219a56f"
+      },
+      "downloads": -1,
+      "filename": "diator-0.0.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4bd745c2f6101a68c9dd956ee796857a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.10",
+      "size": 14772,
+      "upload_time": "2023-03-27T17:28:12",
+      "upload_time_iso_8601": "2023-03-27T17:28:12.634916Z",
+      "url": "https://files.pythonhosted.org/packages/ca/24/823c365f65db64895d84ab3ed7fdd6a47b40d90f6e5acf746fe57f46ad58/diator-0.0.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fe6c5f9e9bdca53130775b3a2066b392a94c061ebb6be51c1bac125fa9dfaffa",
+        "md5": "7cb7e1ed8b88f795e7c7b602471ad83d",
+        "sha256": "b3744f79c48bca9217eedac88b409cb54c7ac3195fe3571bf5b7b2cf1c44a9cc"
+      },
+      "downloads": -1,
+      "filename": "diator-0.0.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "7cb7e1ed8b88f795e7c7b602471ad83d",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.10",
+      "size": 10729,
+      "upload_time": "2023-03-27T17:28:20",
+      "upload_time_iso_8601": "2023-03-27T17:28:20.058760Z",
+      "url": "https://files.pythonhosted.org/packages/fe/6c/5f9e9bdca53130775b3a2066b392a94c061ebb6be51c1bac125fa9dfaffa/diator-0.0.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

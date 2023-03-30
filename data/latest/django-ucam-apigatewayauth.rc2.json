@@ -1,0 +1,187 @@
+{
+  "info": {
+    "author": "DevOps Division, University Information Services, University of Cambridge",
+    "author_email": "devops@uis.cam.ac.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python"
+    ],
+    "description": "# Django API Gateway Authentication\n\nThis is a library which contains:\n\n* an authentication provider for Django, allowing the headers passed from the\n  [API Gateway](https://developer.api.apps.cam.ac.uk/your-api-here) to be interpreted\n  and used within a Django app,\n* a set of permissions classes allowing the authentication information provided by the API Gateway\n  to be used in authorization decisions throughout an API-based app,\n\n## Required settings\n\nThe following Django settings are required to allow this library to be used:\n\n* `PERMISSIONS_SPECIFICATION_URL`, if you plan to enforce authorization using a permissions spec\n    this should contain the url (either in the form of a `file://`, `gs://` or `https://` url)\n    which contains the permissions spec yaml document,\n* `UCAMLOOKUP_USERNAME` and `UCAMLOOKUP_PASSWORD`, these are required if your permissions spec\n    contains references to Lookup groups, which this library will need to query Lookup to\n    determine membership of these groups.\n\n## Expected headers passed from the API Gateway\n\nThis library expects the API Gateway to provide the following headers and uses them to determine\nthe identity of the principal querying an API:\n\n* `x-api-org-name`: the API Gateway organisation name,\n  * This library ensures that this is provided by does not make any decisions based on its value,\n* `x-api-developer-app-class`: should be the static string `confidential` or `public`,\n  * This library ensures that this is provided by does not make any decisions based on its value,\n* `x-api_developer-app-id`: the identifier for the developer app created within the API Gateway,\n  * This library ensures that this is provided by does not make any decisions based on its value,\n* `x-api-oauth2-client-id`: the identifier of the client credentials issued within the API Gateway,\n  * This library ensures that this is provided by does not make any decisions based on its value,\n* `x-api-oauth2-scope`: a space separated list of oauth2 scopes\n  * This is used to determine access to resources within this library\n* `x-api-oauth2-user`: the identifier of the user who is making use of the API - this can either be\n  a crsid identifier identifying the user who is interacting with the API or an application\n  identifier related to the application which is accessing the API.\n\n## Trusting the headers provided by the API Gateway\n\nIn order for this library to interpret the headers provided by the API Gateway, add the following\nto your restframework settings:\n\n```py\nREST_FRAMEWORK = {\n    'DEFAULT_AUTHENTICATION_CLASSES': [\n        # rely on the API Gateway to provide authentication details\n        'apigatewayauth.APIGatewayAuthentication'\n    ],\n}\n```\n\nThis will enforce that any requests to your API have provided the expected headers which the\nAPI Gateway provides to give details about the identity of the principal.\n\n> **NOTE** this library expects that all requests are proxied via the API Gateway, but does not\n> authenticate the API Gateway directly. You must ensure that only the API Gateway can contact your\n> backend, without this protection the headers which this library uses for authentication can be\n> trivially spoofed.\n\nFor local development the above headers should be provided in order to allow the information\nprovided by the API gateway to be mocked.\n\n## Authorization helpers\n\nThis library provides a set of permissions classes which allow authentication decisions to be made\nbased on the information provided from the API Gateway\n\n### Enforcing scopes\n\nThe `HasAnyScope` permissions class can be used to enforce that a client has a token granted by the\nAPI Gateway with any of the given scopes, e.g.:\n\n```py\nfrom rest_framework import viewsets\nfrom apigatewayauth.permissions import HasAnyScope\n\nclass ExampleViewSet(viewsets.ReadOnlyModelViewSet):\n\n  permission_classes = [\n    # ensure that a client has either the examples.readonly or examples scopes:\n    HasAnyScope(\n      'https://api.apps.cam.ac.uk/example/examples.readonly',\n      'https://api.apps.cam.ac.uk/example/examples'\n    )\n  ]\n```\n\n### Enforcing specified permissions\n\nThis library includes modules to allow a 'permissions specification' to be read to determine if\na principal has a given permission.\n\nA permissions spec is a yaml document which should contain permission names as keys and the\nprincipals or groups which are granted this permission, e.g.:\n\n```yml\nREAD_EXAMPLES:\n  principals:\n    - 1234@application.api.apps.cam.ac.uk\n    - wgd23@v1.person.identifiers.cam.ac.uk\n  groups:\n    - 105217@groups.lookup.cam.ac.uk\n\nWRITE_EXAMPLES:\n  principals:\n    - abcd@application.api.apps.cam.ac.uk\n```\n\nThis library provides helpers to allow an app to determine whether a client has been granted a\ngiven permission in a permission spec, e.g.:\n\n```py\nfrom rest_framework import viewsets\nfrom apigatewayauth.permissions import SpecifiedPermission\n\nIsExampleReader = SpecifiedPermission(\"READ_EXAMPLES\")\nIsExampleWriter = SpecifiedPermission(\"WRITE_EXAMPLES\")\n\nclass ExampleViewSet(viewsets.ModelViewSet):\n\n  def get_permissions(self):\n    if self.action in ('retrieve', 'list'):\n      self.permission_classes = [IsExampleReader | IsExampleWriter]\n    elif self.action in ('create', 'update', 'destroy')\n      self.permission_classes = [IsExampleWriter]\n    return super().get_permissions()\n```\n\n### Limiting actions to 'resource owners'\n\nThis library contains a helper permission which allows actions to be limited to resource owners.\nThis requires integration at the model and queryset level, to allow querysets to be filtered\nbased on the identity of the principal using the API. This defers decisions about who 'owns' a\ngiven model to the model class. For example:\n\n```py\nfrom django.db import models\nfrom rest_framework import viewsets\nfrom identitylib.identifiers import Identifier\n\nfrom apigatewayauth.permissions import IsResourceOwningPrincipal\n\n\n\nclass Example(models.Model):\n\n  name = models.TextField('Name')\n  # this field contains the identifier of a principal - e.g. 'wgd23@v1.person.identifiers.cam.ac.uk'\n  owner = models.TextField('Owner')\n\n  @staticmethod\n  def get_queryset_for_principal(principal_identifier: Identifier):\n    \"\"\"\n    This method should return a queryset which limits results to those owned by the principal\n    identified by the given identifier. This is used to limit results returned from list endpoints.\n\n    \"\"\"\n\n    return Example.objects.filter(owner__iexact=str(principal_identifier))\n\n  def is_owned_by(self, principal_identifier: Identifier):\n    \"\"\"\n    This method returns whether an instance of this model is owned by the principal identified\n    by the given identifier. This is used in read, update or delete operations to determine if\n    the given principal can act on this object.\n\n    \"\"\"\n\n    return self.owner.lower() == str(principal_identifier).lower()\n\n\nclass ExampleViewSet(viewsets.ModelViewSet):\n  \"\"\"\n  A viewset that exposes our example model.\n\n  \"\"\"\n\n  # use our resource owning principal permission class\n  permission_classes = [IsResourceOwningPrincipal]\n\n\n  def get_queryset(self):\n    \"\"\"\n    Ensure that the queryset we use is limited based on the conditions we've defined on our model.\n\n    \"\"\"\n\n    return IsResourceOwningPrincipal.get_queryset_for_principal(Example, self.request)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.developers.cam.ac.uk/uis/devops/django/api-gateway-auth",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-ucam-apigatewayauth",
+    "package_url": "https://pypi.org/project/django-ucam-apigatewayauth/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/django-ucam-apigatewayauth/",
+    "project_urls": {
+      "Homepage": "https://gitlab.developers.cam.ac.uk/uis/devops/django/api-gateway-auth"
+    },
+    "release_url": "https://pypi.org/project/django-ucam-apigatewayauth/0.0.2/",
+    "requires_dist": [
+      "django (~=3.2.7)",
+      "djangorestframework",
+      "geddit",
+      "PyYAML",
+      "ucam-identitylib (>=0.1.7)",
+      "django-ucamlookup (~=3.0.5)"
+    ],
+    "requires_python": "",
+    "summary": "A Django module allow auth based on the headers passed from the API Gateway",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13292108,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20fef025fe1f089fd113575b872373e2a5cb0760bba714f0772266c1faa4ba3b",
+          "md5": "caac3e31cd7a5e3871bbfbab9a1b8dff",
+          "sha256": "72b3a764e7ab16d688b3686d5fb7a18656c15d6c7dc13f8b59cc749accabc7ea"
+        },
+        "downloads": -1,
+        "filename": "django_ucam_apigatewayauth-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "caac3e31cd7a5e3871bbfbab9a1b8dff",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16684,
+        "upload_time": "2022-03-23T14:55:18",
+        "upload_time_iso_8601": "2022-03-23T14:55:18.760051Z",
+        "url": "https://files.pythonhosted.org/packages/20/fe/f025fe1f089fd113575b872373e2a5cb0760bba714f0772266c1faa4ba3b/django_ucam_apigatewayauth-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a1b26a7d5814d2e07f9a887a522a55ef46b14b30c75e330de0a634a7d33988c1",
+          "md5": "aa41eafa4a5600c4dcf71be95e1da819",
+          "sha256": "60cd53762b5569034349c82aa8a221f45b30f4194e755e5c9ca85e16a65338b2"
+        },
+        "downloads": -1,
+        "filename": "django-ucam-apigatewayauth-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aa41eafa4a5600c4dcf71be95e1da819",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14553,
+        "upload_time": "2022-03-23T14:55:20",
+        "upload_time_iso_8601": "2022-03-23T14:55:20.488931Z",
+        "url": "https://files.pythonhosted.org/packages/a1/b2/6a7d5814d2e07f9a887a522a55ef46b14b30c75e330de0a634a7d33988c1/django-ucam-apigatewayauth-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a53c8488e8e8e6533b8f09967266fb9bf8e5df83089bfea0239d9b985ccb263",
+          "md5": "b2906844e78f76b44e0d71888ec67e0f",
+          "sha256": "0e4e087be62b9c9d26f559599e7963a2f11aea9f37a6a0b1508fd47b8708a800"
+        },
+        "downloads": -1,
+        "filename": "django_ucam_apigatewayauth-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b2906844e78f76b44e0d71888ec67e0f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16686,
+        "upload_time": "2022-03-25T11:16:38",
+        "upload_time_iso_8601": "2022-03-25T11:16:38.564140Z",
+        "url": "https://files.pythonhosted.org/packages/8a/53/c8488e8e8e6533b8f09967266fb9bf8e5df83089bfea0239d9b985ccb263/django_ucam_apigatewayauth-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "25f8e7cbdbac466f2600e55eee41c8e047739df3466f3973b8abbb0ce2463e80",
+          "md5": "49aef3cdb70a31d1e452c27f5fa5eb5f",
+          "sha256": "7b4ad291769c6579f5c1156abf9d064c237c527f26f3afb07aee4965b073a57b"
+        },
+        "downloads": -1,
+        "filename": "django-ucam-apigatewayauth-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "49aef3cdb70a31d1e452c27f5fa5eb5f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14524,
+        "upload_time": "2022-03-25T11:16:40",
+        "upload_time_iso_8601": "2022-03-25T11:16:40.124448Z",
+        "url": "https://files.pythonhosted.org/packages/25/f8/e7cbdbac466f2600e55eee41c8e047739df3466f3973b8abbb0ce2463e80/django-ucam-apigatewayauth-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8a53c8488e8e8e6533b8f09967266fb9bf8e5df83089bfea0239d9b985ccb263",
+        "md5": "b2906844e78f76b44e0d71888ec67e0f",
+        "sha256": "0e4e087be62b9c9d26f559599e7963a2f11aea9f37a6a0b1508fd47b8708a800"
+      },
+      "downloads": -1,
+      "filename": "django_ucam_apigatewayauth-0.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b2906844e78f76b44e0d71888ec67e0f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 16686,
+      "upload_time": "2022-03-25T11:16:38",
+      "upload_time_iso_8601": "2022-03-25T11:16:38.564140Z",
+      "url": "https://files.pythonhosted.org/packages/8a/53/c8488e8e8e6533b8f09967266fb9bf8e5df83089bfea0239d9b985ccb263/django_ucam_apigatewayauth-0.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "25f8e7cbdbac466f2600e55eee41c8e047739df3466f3973b8abbb0ce2463e80",
+        "md5": "49aef3cdb70a31d1e452c27f5fa5eb5f",
+        "sha256": "7b4ad291769c6579f5c1156abf9d064c237c527f26f3afb07aee4965b073a57b"
+      },
+      "downloads": -1,
+      "filename": "django-ucam-apigatewayauth-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "49aef3cdb70a31d1e452c27f5fa5eb5f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 14524,
+      "upload_time": "2022-03-25T11:16:40",
+      "upload_time_iso_8601": "2022-03-25T11:16:40.124448Z",
+      "url": "https://files.pythonhosted.org/packages/25/f8/e7cbdbac466f2600e55eee41c8e047739df3466f3973b8abbb0ce2463e80/django-ucam-apigatewayauth-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,542 @@
+{
+  "info": {
+    "author": "Opus 10 Engineering",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Framework :: Django",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "django-pgpubsub\n===============\n\n``django-pgpubsub`` provides a framework for building an asynchronous\nand distributed message processing network on top of a Django application\nusing a PostgreSQL database. This is achieved by leveraging Postgres'\n[LISTEN/NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)\nprotocol to build a message queue at the database layer.\nThe simple user-friendly interface,\nminimal infrastructural requirements and the ability to leverage Postgres'\ntransactional behaviour to achieve exactly-once messaging, makes\n``django-pgpubsub`` a solid choice as a lightweight alternative to AMPQ\nmessaging services, such as\n[Celery](https://docs.celeryq.dev/en/stable/search.html?q=ampq)\n\n\nPrimary Authors\n---------------\n* [Paul Gilmartin](https://github.com/PaulGilmartin)\n* [Wesley Kendall](https://github.com/wesleykendall)\n\n\nHighlights\n==========\n\n- **Minimal Operational Infrastructure**: If you're already running a Django application\n  on top of a Postgres database, the installation of this library is the sum total\n  of the operational work required to implement a framework for a distributed\n  message processing framework. No additional servers or server configuration\n  is required.\n\n- **Integration with Postgres Triggers (via django-pgtrigger)**:\n  To quote the [official](https://www.postgresql.org/docs/current/sql-notify.html)\n  Postgres docs:\n\n  *\"When NOTIFY is used to signal the occurrence of changes to a particular table,\n  a useful programming technique is to put the NOTIFY in a statement trigger that is triggered\n  by table updates.\n  In this way, notification happens automatically when the table is changed,\n  and the application programmer cannot accidentally forget to do it.\"*\n\n  By making use of the ``django-pgtrigger``\n  [library](https://pypi.org/project/django-pgtrigger/), ``django-pgpubsub``\n  offers a Django application layer abstraction of the trigger-notify Postgres\n  pattern. This allows developers to easily write python-callbacks which will\n  be invoked (asynchronously) whenever a custom ``django-pgtrigger`` is invoked.\n  Utilising a Postgres-trigger as the ground-zero for emitting a\n  message based on a database table event is far more robust than relying\n  on something at the application layer (for example, a ``post_save`` signal,\n  which could easily be missed if the ``bulk_create`` method was used).\n\n- **Lightweight Polling**: we make use of the Postgres ``LISTEN/NOTIFY``\n  protocol to have achieve notification polling which uses\n  [no CPU and no database transactions unless there is a message to read.](https://www.psycopg.org/docs/advanced.html#asynchronous-notifications)\n\n- **Exactly-once notification processing**: ``django-pgpubsub`` can be configured so\n  that notifications are processed exactly once. This is achieved by storing\n  a copy of each new notification in the database and mandating that a notification\n  processor must obtain a postgres lock on that message before processing it.\n  This allows us to have concurrent processes listening to the same message channel\n  with the guarantee that no two channels will act on the same notification. Moreover,\n  the use of Django's ``.select_for_update(skip_locked=True)`` method allows\n  concurrent listeners to continue processing incoming messages without waiting\n  for lock-release events from other listening processes.\n\n- **Durability and Recovery**: ``django-pgpubsub`` can be configured so that\n  notifications are stored in the database before they're sent to be processed.\n  This allows us to replay any notification which may have been missed by listening\n  processes, for example in the event a notification was sent whilst the listening\n  processes were down.\n\n- **Atomicity**: The Postgres ``NOTIFY`` protocol respects the atomicity\n  of the transaction in which it is invoked. The result of this is that\n  any notifications sent using ``django-pgpubsub`` will be sent if and only if\n  the transaction in which it sent is successfully committed to the database.\n\n\nLimitations\n===========\n\n- A database-based queue will not be capable of the same volume of throughput as a dedicated\n  AMPQ queue.\n\n- If a message is sent using Postgres' ``NOTIFY`` and no process is listening at that time,\n  the message is lost forever. As explained in the **Durability and Recovery** section above,\n  pgpubsub can easily be configured so that we can replay \"lost\" messages, but this comes at the\n  performance penalty of inserting a row into a table before sending each notification. This is the same\n  penalty we must pay if we wish to have concurrent processes listening to the same channel without\n  duplicate notiifcation processing, as explained in the **Exactly-once notification processing** section above.\n\n\nAlternatives\n============\n\n- [Celery](https://docs.celeryq.dev/en/stable/search.html?q=ampq): The canonical distributed message processing library for django based applications. This can handle large volumes of throughput and is well tested in production.\n  It is however operationally quite heavy to maintain and set-up.\n\n- [Procrastinate](https://procrastinate.readthedocs.io/): This was a library we discovered whilst developing ``pgpubsub`` which also implements a distributed message processing library using the Postgres ``LISTEN/NOTIFY`` protocol. Whilst ``Procrastinate`` is well tested and offers several features which are not currently offered by ``pgpubsub``, we believe that the interface of ``pgpubsub`` coupled with the integration with django and Postgres triggers make our library a good alternative for certain use cases.\n\nQuick start\n===========\n\nPrerequisites\n-------------\n\nBefore using this library, you must be running Django 2.2 (or later) on top\nof a (single) PostgreSQL 11 (or later) database.\n\n\nInstalling\n----------\n\n    pip install django-pgpubsub\n\n``django-pgpubsub`` ships with a ``Notification`` model. This table must\nbe added to the app's database via the usual django ``migrate`` command.\nWe should also add `pgpubsub` and `pgtrigger` into `INSTALLED_APPS`.\nAdditionally, if we wish to run the `pgpubsub` tests, we need to add\n`pgpubsub.tests` into `INSTALLED_APPS` too.\n\nMinimal Example\n---------------\n\nLet's get a brief overview of how to use ``pgpubsub`` to asynchronously\ncreate a ``Post`` row whenever an ``Author`` row is inserted into the\ndatabase. For this example, our notifying event will come from a\npostgres trigger, but this is not a requirement for all notifying events.\nA more detailed version of this example, and an example which\ndoes not use a postgres trigger, can be found in the\n**Documentation (by Example)** section below.\n\n**Define a Channel**\n\nChannels are the medium through which we send notifications.\nWe define our channel in our app's ``channels.py`` file as a dataclass\nas follows:\n\n```python\nfrom dataclasses import dataclass\n\nfrom pgpubsub.channel import TriggerChannel\nfrom pgpubsub.tests.models import Author\n\n\n@dataclass\nclass AuthorTriggerChannel(TriggerChannel):\n    model = Author\n```\n\n**Define a Listener**\n\nA *listener* is the function which processes notifications sent through a channel.\nWe define our listener in our app's ``listeners.py`` file as follows:\n\n```python\nimport datetime\n\nimport pgpubsub\nfrom pgpubsub.tests.channels import AuthorTriggerChannel\nfrom pgpubsub.tests.models import Author, Post\n\n\n@pgpubsub.post_insert_listener(AuthorTriggerChannel)\ndef create_first_post_for_author(old: Author, new: Author):\n    print(f'Creating first post for {new.name}')\n    Post.objects.create(\n        author_id=new.pk,\n        content='Welcome! This is your first post',\n        date=datetime.date.today(),\n    )\n```\n\n**Note that since ``AuthorTriggerChannel`` is a trigger-based channel, we need\nto perform a ``migrate`` command after first defining the above listener\nso as to install the underlying trigger in the database.**\n\nFinally, we must also ensure  that this listeners.py module is imported into the app's config\nclass. In this example, our app is calls \"tests\":\n\n```python\n# tests/apps.py\nfrom django.apps import AppConfig\n\n\nclass TestsConfig(AppConfig):\n    name = 'tests'\n\n    def ready(self):\n        import pgpubsub.tests.listeners\n```\n\n\n**Start Listening**\n\nTo have our listener function listen for notifications on the ``AuthorTriggerChannel``,\nwe use the ``listen`` management command:\n\n\n    ./manage.py listen\n\n\nNow whenever an ``Author`` is inserted into our database, our listener process creates\na ``Post`` object referencing that ``Author``:\n\nhttps://user-images.githubusercontent.com/18212082/165683416-b5cbeca1-ea94-4cd4-a5a1-81751e1b0feb.mov\n\n\nDocumentation (by Example)\n==========================\n\nIn this section we give a brief overview of how to use\n``pgpubsub`` to add asynchronous message processing functionality\nto an existing django application.\n\n\nOur Test Application\n--------------------\nSuppose we have the following basic django models (\na fully executable version of this example can be\nfound in ``pgpubsub.tests``):\n\n```python\n# models.py\nclass Author(models.Model):\n    user = models.ForeignKey(User, on_delete=models.PROTECT, null=True)\n    name = models.TextField()\n\n\nclass Post(models.Model):\n    content = models.TextField()\n    date = models.DateTimeField()\n    author = models.ForeignKey(\n        Author, null=True, on_delete=models.SET_NULL, related_name='entries'\n    )\n```\n\nGiven these models, we'll describe the mechanics of using the ``pgpubsub`` library\nto achieve the following aims (which are for illustrative purposes only):\n\n* To asynchronously maintain a cache of how frequently ``Post`` objects are\n  read per day.\n\n* To define a postgres-trigger to ensure that, whenever an ``Author`` object is created, a ``Post`` object is\n  asynchronously created for that author with the title \"Test Post\".\n\n\nChannels\n---------\n\nChannels are the medium through which messages are sent.\nA channel is defined as a dataclass, where the dataclass fields define the accepted\nnotification payload. A channel must be declared in your app's ``channels.py`` file.\n\n\nFor our first example, the data required to update the aforementioned post-reads-per-day cache\nis a date and a ``Post`` id. This payload defines the fields of our first channel dataclass,\nthrough which notifications will be sent to update the post-reads-per-day cache:\n\n\n```python\n# channels.py\nfrom dataclasses import dataclass\nimport datetime\n\nfrom pgpubsub.channel import Channel\n\n\n@dataclass\nclass PostReads(Channel):\n    model_id: int\n    date: datetime.date\n```\nNote the accepted dataclass field types for classes inheriting from\n``Channel`` are iterables (lists, tuples, dicts, sets) of:\n* python primitive types\n* (naive) datetime.date objects\n\n\nIn our second example we wish to have a channel through which\nnotifications sent whenever a postgres-trigger is invoked by the creation\nof an ``Author`` object. To achieve this, we define our channel like so (\nalso in our apps ``channels.py`` module):\n\n```python\nfrom dataclasses import dataclass\n\nfrom pgpubsub.channel import TriggerChannel\nfrom pgpubsub.tests.models import Author\n\n@dataclass\nclass AuthorTriggerChannel(TriggerChannel):\n    model = Author\n```\n\nNote that the key difference between this and the previous example is that\nthis channel inherits from ``TriggerChannel``, which defines the payload for\nall trigger-based notifications:\n\n```python\n@dataclass\nclass TriggerChannel(_Channel):\n    model = NotImplementedError\n    old: django.db.models.Model\n    new: django.db.models.Model\n```\n\nHere the ``old`` and ``new`` parameters are the (unsaved) versions of what the\ntrigger invoking instance looked like before and after the trigger was invoked.\nIn this example, ``old`` would refer to the state of our ``Author`` object\npre-creation (and would hence be ``None``) and ``new`` would refer to a copy of\nthe newly created ``Author`` instance. This payload is inspired by the ``OLD``\nand ``NEW`` values available in the postgres ``CREATE TRIGGER`` statement\n(https://www.postgresql.org/docs/9.1/sql-createtrigger.html). The only custom\nlogic we need to define on a trigger channel is the ``model`` class-level\nattribute.\n\n\nListeners\n--------\n\nIn the ``pgpubsub`` library, a *listener* is the function\nwhich processes notifications sent through some particular channel.\n\nA listener must be defined in our app's ``listeners.py`` file and must\nbe declared using one of the decorators in ``pgpubsub.listen.py``.\nThese decorators are also responsible for pointing a listener function\nto listen to a particular channel. When a function is associated to a channel\nin this way, we say that function \"listening\" to that channel.\n\nContinuing with the example whereby we maintain a cache of post reads,\nwe implement a listener function like so:\n\n```python\n# tests/listeners.py\nfrom collections import defaultdict\nimport datetime\n\nimport pgpubsub\nfrom pgpubsub.tests.channels import PostReads\n\n# Simple cache for illustrative purposes only\npost_reads_per_date_cache = defaultdict(dict)\nauthor_reads_cache = dict()\n\n@pgpubsub.listener(PostReads)\ndef update_post_reads_per_date_cache(model_id: int, date: datetime.date):\n    print(f'Processing update_post_reads_per_date with '\n          f'args {model_id}, {date}')\n    print(f'Cache before: {post_reads_per_date_cache}')\n    current_count = post_reads_per_date_cache[date].get(model_id, 0)\n    post_reads_per_date_cache[date][model_id] = current_count + 1\n    print(f'Cache after: {post_reads_per_date_cache}')\n```\n\nA few notes on the above:\n\n* As we may expect, the channel we associate to a listener also\n  defines the signature of the listener function.\n* The notification payload is deserialized\n  in such a way that the input arguments to the listener function\n  have the same type as was declared on the ``PostReads`` channel.\n* It is possible to have multiple\n  listeners to a single channel and the signatures of those listeners\n  can vary by arguments declared as optional on their common channel -\n  see ``pgpubsub.tests.listeners.py`` for an example.\n\nNext we implement the listener which is used to asynchronously\ncreate a ``Post`` object whenever a new ``Author`` object is created.\nFor this listener, we can use the pre-defined ``post_insert_listener``\ndecorator:\n\n```python\n# tests/listeners.py\nimport datetime\n\nimport pgpubsub\nfrom pgpubsub.tests.channels import AuthorTriggerChannel\nfrom pgpubsub.tests.models import Author, Post\n\n\n@pgpubsub.post_insert_listener(AuthorTriggerChannel)\ndef create_first_post_for_author(old: Author, new: Author):\n    print(f'Creating first post for {new.name}')\n    Post.objects.create(\n        author_id=new.pk,\n        content='Welcome! This is your first post',\n        date=datetime.date.today(),\n    )\n```\n\nAny listener associated to a trigger-based channel (one inheriting from\n``TriggerChannel``) necessarily has a signature consisting of the ``old``\nand ``new`` payload described in the previous section. Note that\ndeclaring a trigger-based listener in the manner above *actually\nwrites a postgres-trigger to our database*. This is achieved by\nleveraging the ``django-pgtrigger`` library to write a pg-trigger\nwhich will send a payload using the postgres ``NOTIFY`` command\nwhenever an ``Author`` object is inserted into the database. Note that\nas with all triggers defined using ``django-pgtrigger``, this trigger\nis first written to the database after a migration.\n\n**Thus, we must perform a django `migrate` command after adding (or changing)\na listener on a trigger channel as above.**\n\nFinally, we must also ensure that this ``listeners.py`` module is imported\ninto the app's config class (similar to how one would use django signals):\n\n```python\n# tests/apps.py\nfrom django.apps import AppConfig\n\n\nclass TestsConfig(AppConfig):\n    name = 'tests'\n\n    def ready(self):\n        import pgpubsub.tests.listeners\n```\n\nListening\n---------\n\nTo have our listener functions \"listen\" for\nincoming notifications on their associated channel, we can make use\nof the ``listen`` management command provided by the ``pgpubsub`` library:\n\n    ./manage.py listen\n\nWhen a process started in this manner encounters an exception, ``pgpubsub``\nwill automatically spins up a secondary process to continue listening before the\nexception ends the initial process. This means that we do not have to worry about\nrestarting our listening processes any time a listener incurs a python level exception.\n\nThe ``listen`` command accepts three optional arguments:\n\n* ``--channels``: a space separated list of the\n  full module paths of the channels we wish to listen to.\n  When no value is supplied, we default to listening to all registered channels\n  in our project. For example,\n  we can use the following command to listen to notifications coming through\n  the ``PostReads`` channel only:\n\n\n    ./manage.py listen --channels 'pgpubsub.tests.channels.PostReads'\n\n\n* ``--processes``: an integer which denotes the number of concurrent processes\n  we wish to dedicate to listening to the specified channels. When no value is\n  supplied, we default to using a single process. Note that if multiple processes\n  are listening to the same channel then by default both processes will act on\n  each notification. To prevent this and have each notification be acted upon\n  by exactly one listening process, we need to add ``lock_notifications = True``\n  to our channel. See the \"Lockable Notifications and Exactly-Once Messaging\"\n  section below for more.\n\n* ``--recover``: when supplied, we process all *stored* notifications for any\n   of the selected channels. When no `channels` argument is supplied with `recover`,\n   we process notifications of all registered channels with `lock_notifications=True`.\n   See the *Recovery* section below for more.\n\nHere's an example of using all three options in one command:\n```\n./manage.py listen --channels 'pgpubsub.tests.channels.AuthorTriggerChannel' --processes 2 --recover\n```\n\nNotifications\n-------------\n\nWith our listener's listening on our channels, all that remains is to define where\nour notifications are sent from.\n\nFor our first example, we need to send a notification through the ``PostReads`` channel\nwhenever a ``Post`` object is read. To achieve this, we can make use of the\n``pgpubsub.notify.notify`` function. In our example, we create a ``fetch`` classmethod\non the ``Post`` model which is used to retrieve a ``Post`` instance from the database\nand also send a notification via the ``PostReads`` channel to asynchronously invoke the\n``update_post_reads_per_date_cache`` listener. This `fetch` method could then\nof course be utilised in whatever API call is used when a user reads a post:\n\n```python\n# tests/models.py\nimport datetime\n\nfrom django.db import models\n\nimport pgpubsub\n\nclass Post(models.Model):\n    ...\n    @classmethod\n    def fetch(cls, post_id):\n        post = cls.objects.get(pk=post_id)\n        pgpubsub.notify(\n            'pgpubsub.tests.channels.PostReads',\n            model_id=post_id,\n            date=datetime.date.today(),\n        )\n        return post\n```\n\n\nA few notes on the above implementation:\n\n* Under the hood, this python function is making use of the postgres\n  ``NOTIFY`` command to send the payload as a JSON object.\n* The first argument to the `notify` function can either be the full module\n  path of a channel or the channel class itself. The following keyword\n  arguments should match the dataclass fields of the channel we're notifying\n  (up to optional kwargs).\n* Using ``pgpubsub.notify.notify`` is the appropriate choice for any non-postgres trigger\n  based notification.\n\n\nFor trigger based channels, notifications are sent purely at the database\nlayer whenever the corresponding trigger is invoked. To understand this in a bit\nmore detail, let's consider our example above:\n\n```python\nimport datetime\n\nimport pgpubsub\nfrom pgpubsub.tests.channels import AuthorTriggerChannel\nfrom pgpubsub.tests.models import Author, Post\n\n@pgpubsub.post_insert_listener(AuthorTriggerChannel)\ndef create_first_post_for_author(old: Author, new: Author):\n    print(f'Creating first post for {new.name}')\n    Post.objects.create(\n        author_id=new.pk,\n        content='Welcome! This is your first post',\n        date=datetime.date.today(),\n    )\n```\n\nAs explained above, if we write this function and perform a migration\n, the ``post_insert_listener`` decorator ensures that a trigger function\nis written to the database. Then, after any ``Author`` row is inserted to the\ndatabase, the ``post_insert_listener`` also ensures that that database-level trigger\nfunction is invoked, firing a notification with a JSON payload consisting\nof the ``OLD`` and ``NEW`` values of the ``Author`` instance before and after the\nits creation. Associating the channel like so\n\n```python\npost_insert_listener(AuthorTriggerChannel)\n```\n\nensures that the notification is sent via the ``AuthorTriggerChannel`` and hence ends up being\nprocessed by the ``create_first_post_for_author`` listener. To examine the internals of the trigger functions used to send notifications at the database level,\nsee ``pgpubsub.triggers.py``.\n\nNote that postgres ensures that notifications sent via ``NOTIFY`` are only sent *after* the commit which\ncreated them is committed, we can be sure that in our example our newly\ncreated ``Author`` will be safely in the database before the listener process attempts to\nassociate a ``Post`` to it.\n\n\nLockable Notifications and Exactly-Once Messaging\n-------------------------------------------------\n\nIn the default implementation of the Postgres ``LISTEN/NOTIFY`` protocol,\nmultiple processes listening to the same channel will result in each process acting upon\neach notification sent through that channel. This behaviour is often undesirable, so\n``pgpubsub`` offers users the option to define channels which allow one, and only one,\nlistening process to act upon each notification. We can achieve this simply by defining\n``lock_notifications=True`` on our channel object. This is the desired notification\nprocessing behaviour for our ``AuthorTriggerChannel``, where we want to create exactly one\n``Post`` whenever an ``Author`` row is inserted:\n\n```python\nfrom dataclasses import dataclass\n\nfrom pgpubsub.channel import TriggerChannel\nfrom pgpubsub.tests.models import Author\n\n@dataclass\nclass AuthorTriggerChannel(TriggerChannel):\n    model = Author\n    lock_notifications = True\n```\n**Note that when we change the value of `lock_notifications` on a trigger based\nchannel, we must perform a `migrate` command after the change.**\n\nEnabling ``lock_notifications`` on a channel has the following effect:\n\n1. Whenever a notification is sent through that channel\n   (either via the ``pgpubsub.notify`` function or the ``pgpubsub.triggers.Notify`` trigger),\n   a ``pgpubsub.models.Notification`` object is inserted into the database. This stored notification\n   contains the same JSON payload as the transient Postgres notification. Note that\n   since Postgres notify events are atomic with respect to their transaction, the notification\n   is sent if and only if a ``Notification`` is stored.\n2. When a process listening to that channel detects an incoming Postgres notification,\n   it fetches and *obtains a lock upon* any stored ``Notification`` object with the same\n   payload. This is achieved as follows:\n\n    ```python\n\n        notification = (\n                Notification.objects.select_for_update(\n                        skip_locked=True).filter(\n                            channel=self.notification.channel,\n                            payload=self.notification.payload,\n                    ).first()\n                )\n    ```\n\n    The fact that ``select_for_update`` in the above applies a lock on ``notification``\n    ensures that no other process listening to the same channel can retrieve this notification\n    object. Moreover, the use of ``skip_locked=True`` means that any process which\n    cannot obtain the lock does not wait for the lock to release. This allows other processes\n    to freely skip this notification and poll for others, whilst the one which\n    did obtain the lock continues carries on to pass its notification into the\n    listener callback. If the callback then successfully completes, the stored\n    ``Notification`` is removed from the database.\n\n\nRecovery\n------------\n\nIn the default implementation of the Postgres ``LISTEN/NOTIFY`` protocol, if a notification\nis sent via a channel and no process is listening on that channel at that time, the\nnotification is lost forever. As described in the previous section,\nenabling ``lock_notifications`` on our channel means we store a ``Notification`` object\nin the database. Thus, if we happen to \"lose\" a notification on such a channel in the\naforementioned way (e.g. if all of our listener processes were down when a notification was sent), we still have a stored copy\nof the payload in our database.\n\n``pgpubsub`` provides a function ``pgpubsub.process_stored_notifications`` which fetches\nall stored ``Notifications`` from the database and sends them to their respective channels\nto be processed. This allows to recover from scenarios like the one in the paragraph described\nabove.\n\nNote that this recovery option can be enabled whenever we use the `listen` management command\nby supplying it with the `--recover` option. This will tell the listening processes to replay\nany missed stored notifications automatically when it starts up.\n\n\nLive Demos\n==========\n\n`bulk_create` over several processes\n------------------------------------\n\nIn the below example we show how `pgpubsub` handles a bulk creation\nof ``Author`` objects when several processes are listening to the\n``AuthorTriggerChannel`` channel. For the sake of the below demonstration,\nwe added a `time.sleep(3)` statement into the `create_first_post_for_author`\nlistener function. Note how only one processes is able to process any given\nnotification:\n\nhttps://user-images.githubusercontent.com/18212082/165823588-df91e84a-47f2-4220-8999-8556665e3de3.mov\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Opus10/django-pgpubsub",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-pgpubsub",
+    "package_url": "https://pypi.org/project/django-pgpubsub/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/django-pgpubsub/",
+    "project_urls": {
+      "Documentation": "https://django-pgpubsub.readthedocs.io",
+      "Homepage": "https://github.com/Opus10/django-pgpubsub",
+      "Repository": "https://github.com/Opus10/django-pgpubsub"
+    },
+    "release_url": "https://pypi.org/project/django-pgpubsub/1.0.2/",
+    "requires_dist": [
+      "django (>=2)",
+      "django-pgtrigger (>=2.4.0)"
+    ],
+    "requires_python": ">=3.7.0,<4",
+    "summary": "A distributed task processing framework for Django built on top of the Postgres NOTIFY/LISTEN protocol.",
+    "version": "1.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16668379,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46aebe991a213e5418453849ca4545ae74ea071579ab57174078a20791d910bc",
+          "md5": "be97a9d0cce6d245d66dbd7932ec81ef",
+          "sha256": "c56d7b05d8a2cd4436654e2ab7af135bd8e03d8671b025775f5856caa1667a63"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "be97a9d0cce6d245d66dbd7932ec81ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 21932,
+        "upload_time": "2022-05-09T12:51:35",
+        "upload_time_iso_8601": "2022-05-09T12:51:35.835826Z",
+        "url": "https://files.pythonhosted.org/packages/46/ae/be991a213e5418453849ca4545ae74ea071579ab57174078a20791d910bc/django_pgpubsub-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3495fd77007abcdf3fd85050f22992b58b1f3584b6d44d6101f7c6ea0bf42eb2",
+          "md5": "db088c6b13da258dac54b567dce18a69",
+          "sha256": "12ec1b8f2a5a00e58c4da40e6e0d3645fd52dd129c294af032047de1f317a403"
+        },
+        "downloads": -1,
+        "filename": "django-pgpubsub-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db088c6b13da258dac54b567dce18a69",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 27108,
+        "upload_time": "2022-05-09T12:51:38",
+        "upload_time_iso_8601": "2022-05-09T12:51:38.850819Z",
+        "url": "https://files.pythonhosted.org/packages/34/95/fd77007abcdf3fd85050f22992b58b1f3584b6d44d6101f7c6ea0bf42eb2/django-pgpubsub-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "024f467ee6dccaf4a672f02e42655bacfee17dd1d99a4c10cc0ae271ca868a6e",
+          "md5": "a45fd8daa50fca756e2c7a7cba694130",
+          "sha256": "5eadaa8b966012ccb43598b804a93a9c2b5e9f83be0a0cadeaa31d018dab47be"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a45fd8daa50fca756e2c7a7cba694130",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 21934,
+        "upload_time": "2022-05-09T13:13:48",
+        "upload_time_iso_8601": "2022-05-09T13:13:48.508610Z",
+        "url": "https://files.pythonhosted.org/packages/02/4f/467ee6dccaf4a672f02e42655bacfee17dd1d99a4c10cc0ae271ca868a6e/django_pgpubsub-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef6208b7dcfa81ccab941b4d26f54307c858f19958b10c8632a8e25ac03cdb17",
+          "md5": "46614d140889e8b6378823b60f35b13f",
+          "sha256": "89f12fdcd9bda2aa13f694f665bfcff3637c1902cdea01d92d2381eb7d636103"
+        },
+        "downloads": -1,
+        "filename": "django-pgpubsub-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "46614d140889e8b6378823b60f35b13f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 27113,
+        "upload_time": "2022-05-09T13:13:50",
+        "upload_time_iso_8601": "2022-05-09T13:13:50.678677Z",
+        "url": "https://files.pythonhosted.org/packages/ef/62/08b7dcfa81ccab941b4d26f54307c858f19958b10c8632a8e25ac03cdb17/django-pgpubsub-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0dd0dc8d9c8e99f4711a44c8ff531b86378b60120207e4df4143613d50d83a60",
+          "md5": "85da0e8fe4eda315709b0e46a3472309",
+          "sha256": "d3ff3cfea82251753e78b2af9233495da180c96b499759f16366aa2d3a05ac67"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "85da0e8fe4eda315709b0e46a3472309",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 21925,
+        "upload_time": "2022-05-09T13:17:04",
+        "upload_time_iso_8601": "2022-05-09T13:17:04.118705Z",
+        "url": "https://files.pythonhosted.org/packages/0d/d0/dc8d9c8e99f4711a44c8ff531b86378b60120207e4df4143613d50d83a60/django_pgpubsub-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41bfdb0cdc00e92f8060b593eba105922614dedf9ee9314ea3acacfcf30c8afb",
+          "md5": "0cc1781d2a49abde16ffe6e442a6d595",
+          "sha256": "1aa553fa6dcf20050bb7b9613400e50b94e3638a71efc721dbd3ff1511c45d67"
+        },
+        "downloads": -1,
+        "filename": "django-pgpubsub-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0cc1781d2a49abde16ffe6e442a6d595",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 27112,
+        "upload_time": "2022-05-09T13:17:06",
+        "upload_time_iso_8601": "2022-05-09T13:17:06.158365Z",
+        "url": "https://files.pythonhosted.org/packages/41/bf/db0cdc00e92f8060b593eba105922614dedf9ee9314ea3acacfcf30c8afb/django-pgpubsub-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96da2532660d1dfa19ddb0643c4fa56ca11f1f9cf294b11253b1e75965e53752",
+          "md5": "31b88c6c7ce5c22d79606ddaced51004",
+          "sha256": "4ebaa865473138ef3741f37ddb0aa1bd2b206467bd9557e8dbb11fce142b963a"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "31b88c6c7ce5c22d79606ddaced51004",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22024,
+        "upload_time": "2022-05-24T18:54:14",
+        "upload_time_iso_8601": "2022-05-24T18:54:14.736617Z",
+        "url": "https://files.pythonhosted.org/packages/96/da/2532660d1dfa19ddb0643c4fa56ca11f1f9cf294b11253b1e75965e53752/django_pgpubsub-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71dbc49bfe8c728de3f84b76403b72d8786fb3dd13b07c4e65be8993763326b5",
+          "md5": "013b8f959d084968cc51728e56170a21",
+          "sha256": "585dc4f0b6fba5ed033b0867eb082c5c4d4dc62133f9da6f8e926873dcc4bfee"
+        },
+        "downloads": -1,
+        "filename": "django-pgpubsub-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "013b8f959d084968cc51728e56170a21",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 27401,
+        "upload_time": "2022-05-24T18:54:16",
+        "upload_time_iso_8601": "2022-05-24T18:54:16.932968Z",
+        "url": "https://files.pythonhosted.org/packages/71/db/c49bfe8c728de3f84b76403b72d8786fb3dd13b07c4e65be8993763326b5/django-pgpubsub-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d9a07d7095608d37ff3863a07f059d90190c61f1abec9eb0cbfb107aa3d33f76",
+          "md5": "653aae85be8984bc178f3ad55051393c",
+          "sha256": "13d0c66438a4f36dc496dae23fac08043da38d6ee11fb9ee0998b0bccc1c02c4"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "653aae85be8984bc178f3ad55051393c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22698,
+        "upload_time": "2022-05-25T14:29:03",
+        "upload_time_iso_8601": "2022-05-25T14:29:03.741412Z",
+        "url": "https://files.pythonhosted.org/packages/d9/a0/7d7095608d37ff3863a07f059d90190c61f1abec9eb0cbfb107aa3d33f76/django_pgpubsub-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee0f3c3263bce30dd9634cdc971de53d50bdedc78fab492b542bd3a7d1ad8dbe",
+          "md5": "2dd018e6708853b19d5d8ea7e924abbe",
+          "sha256": "14fe2afd3dcf4fa138d634c31ce2aa241a4c94258bcf7217feecb507a73be68b"
+        },
+        "downloads": -1,
+        "filename": "django-pgpubsub-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2dd018e6708853b19d5d8ea7e924abbe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 28344,
+        "upload_time": "2022-05-25T14:29:05",
+        "upload_time_iso_8601": "2022-05-25T14:29:05.565001Z",
+        "url": "https://files.pythonhosted.org/packages/ee/0f/3c3263bce30dd9634cdc971de53d50bdedc78fab492b542bd3a7d1ad8dbe/django-pgpubsub-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "927ac5d522850d5d3d3c1626edbd44f3b948b1aeb150df65079257beba58a074",
+          "md5": "9d8a5f51f224687966759d960c10fa13",
+          "sha256": "9a025da1fb6c53710645f14530bd681ba78653c4510eb09cca160c6848b559b4"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9d8a5f51f224687966759d960c10fa13",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22752,
+        "upload_time": "2022-11-05T17:35:22",
+        "upload_time_iso_8601": "2022-11-05T17:35:22.553857Z",
+        "url": "https://files.pythonhosted.org/packages/92/7a/c5d522850d5d3d3c1626edbd44f3b948b1aeb150df65079257beba58a074/django_pgpubsub-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97677a00be04bfae237f9164ee7b40ef40ab281e13ea87a858b31e90bf0f358c",
+          "md5": "59b5948e313764e14e1b0e6581c3c390",
+          "sha256": "cb1b1be10d10cf2a27e7fcd3d74b875b41f58f1d1d7ca9ea8dd02e593aa39d3f"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "59b5948e313764e14e1b0e6581c3c390",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 28266,
+        "upload_time": "2022-11-05T17:35:24",
+        "upload_time_iso_8601": "2022-11-05T17:35:24.502260Z",
+        "url": "https://files.pythonhosted.org/packages/97/67/7a00be04bfae237f9164ee7b40ef40ab281e13ea87a858b31e90bf0f358c/django_pgpubsub-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea687ddb9ccb7cbc31ce4c5e4619b648ca2d5987a98819cc6accd35d276d57a5",
+          "md5": "f7f9c79fcba04e5aa84e95ae1774d5fb",
+          "sha256": "607fa1cbe3995c3d0d214409e5d904c123263febb912fd0611f96d77d067485d"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f7f9c79fcba04e5aa84e95ae1774d5fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22767,
+        "upload_time": "2022-11-05T19:49:07",
+        "upload_time_iso_8601": "2022-11-05T19:49:07.742490Z",
+        "url": "https://files.pythonhosted.org/packages/ea/68/7ddb9ccb7cbc31ce4c5e4619b648ca2d5987a98819cc6accd35d276d57a5/django_pgpubsub-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e8978b2e28bc37edf47959102e82393cdaac91edf6ed579f9ea92957f1a7ffe",
+          "md5": "81fcc4df0caad532f1db45ee559bb379",
+          "sha256": "dff851f54b7971b1654f3441189ba2f19c24b193a3cafa7cf729170861f887ee"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81fcc4df0caad532f1db45ee559bb379",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 28276,
+        "upload_time": "2022-11-05T19:49:10",
+        "upload_time_iso_8601": "2022-11-05T19:49:10.101850Z",
+        "url": "https://files.pythonhosted.org/packages/1e/89/78b2e28bc37edf47959102e82393cdaac91edf6ed579f9ea92957f1a7ffe/django_pgpubsub-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "106ac4d342ad1c6a5feed71b7e7cf05d01268f3b81dbad364d90f577721f8e9d",
+          "md5": "e55036bf827d857fb608eee43c212b83",
+          "sha256": "4e5f245da3f28236e28a2f0a69ec0e305e3a338a52e18cd46caf95c419e04950"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e55036bf827d857fb608eee43c212b83",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22769,
+        "upload_time": "2022-11-26T18:41:42",
+        "upload_time_iso_8601": "2022-11-26T18:41:42.325307Z",
+        "url": "https://files.pythonhosted.org/packages/10/6a/c4d342ad1c6a5feed71b7e7cf05d01268f3b81dbad364d90f577721f8e9d/django_pgpubsub-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "28a02d914f2089425f4d9b099eb9de445f4375d30b960238e891feb889a4d490",
+          "md5": "a20fe80d036ef2949da85263adbd8ae4",
+          "sha256": "515895e7a6c2b3558f5b401abdbd8a0e84964232c23118573b2e13365894cf7f"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a20fe80d036ef2949da85263adbd8ae4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 28280,
+        "upload_time": "2022-11-26T18:41:44",
+        "upload_time_iso_8601": "2022-11-26T18:41:44.753292Z",
+        "url": "https://files.pythonhosted.org/packages/28/a0/2d914f2089425f4d9b099eb9de445f4375d30b960238e891feb889a4d490/django_pgpubsub-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f791afb20b1d7a81484adbb00d6f205f22f615391214aba1578f9ed54e9e2e7",
+          "md5": "ab99c3cb659faf5bd3f58e72191c0002",
+          "sha256": "db7551474bfae0f4056277dd62bb04feb7a6fe9ddacd4a0ab03e17881f0eefa5"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ab99c3cb659faf5bd3f58e72191c0002",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 22957,
+        "upload_time": "2023-01-10T19:38:51",
+        "upload_time_iso_8601": "2023-01-10T19:38:51.831694Z",
+        "url": "https://files.pythonhosted.org/packages/6f/79/1afb20b1d7a81484adbb00d6f205f22f615391214aba1578f9ed54e9e2e7/django_pgpubsub-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf928a12b4b0caf1ba4f71ca50bba452892ff01b04e62646322b7114c7cce639",
+          "md5": "f1a409359976958e28a3a599b7d1ba57",
+          "sha256": "240d18b1832a73ac711aa4336722e0281e5966e6221a4242302716929d700d76"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f1a409359976958e28a3a599b7d1ba57",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 28421,
+        "upload_time": "2023-01-10T19:38:54",
+        "upload_time_iso_8601": "2023-01-10T19:38:54.203235Z",
+        "url": "https://files.pythonhosted.org/packages/cf/92/8a12b4b0caf1ba4f71ca50bba452892ff01b04e62646322b7114c7cce639/django_pgpubsub-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46672d07a57c82a750709d06cc328b2b054e67e53b59393983489248a232df94",
+          "md5": "83a3158879346df4287ed41944decc3d",
+          "sha256": "1b274935ebb43d9cb08eb27acce965554d188184e61411afc769072b6b129b28"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "83a3158879346df4287ed41944decc3d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0,<4",
+        "size": 25092,
+        "upload_time": "2023-02-02T16:23:10",
+        "upload_time_iso_8601": "2023-02-02T16:23:10.462325Z",
+        "url": "https://files.pythonhosted.org/packages/46/67/2d07a57c82a750709d06cc328b2b054e67e53b59393983489248a232df94/django_pgpubsub-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3d76e0fb6a6ae47d03c9d04250f60dd3d47582f597c7f17fab47bf5821311ff1",
+          "md5": "2bac79ef27014df3cfa803b33dc2de35",
+          "sha256": "34809f3b6e48e3a5554b49ee689353919281c6d297ac4c401580942b8bd936fa"
+        },
+        "downloads": -1,
+        "filename": "django_pgpubsub-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2bac79ef27014df3cfa803b33dc2de35",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0,<4",
+        "size": 29009,
+        "upload_time": "2023-02-02T16:23:12",
+        "upload_time_iso_8601": "2023-02-02T16:23:12.434003Z",
+        "url": "https://files.pythonhosted.org/packages/3d/76/e0fb6a6ae47d03c9d04250f60dd3d47582f597c7f17fab47bf5821311ff1/django_pgpubsub-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "46672d07a57c82a750709d06cc328b2b054e67e53b59393983489248a232df94",
+        "md5": "83a3158879346df4287ed41944decc3d",
+        "sha256": "1b274935ebb43d9cb08eb27acce965554d188184e61411afc769072b6b129b28"
+      },
+      "downloads": -1,
+      "filename": "django_pgpubsub-1.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "83a3158879346df4287ed41944decc3d",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7.0,<4",
+      "size": 25092,
+      "upload_time": "2023-02-02T16:23:10",
+      "upload_time_iso_8601": "2023-02-02T16:23:10.462325Z",
+      "url": "https://files.pythonhosted.org/packages/46/67/2d07a57c82a750709d06cc328b2b054e67e53b59393983489248a232df94/django_pgpubsub-1.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3d76e0fb6a6ae47d03c9d04250f60dd3d47582f597c7f17fab47bf5821311ff1",
+        "md5": "2bac79ef27014df3cfa803b33dc2de35",
+        "sha256": "34809f3b6e48e3a5554b49ee689353919281c6d297ac4c401580942b8bd936fa"
+      },
+      "downloads": -1,
+      "filename": "django_pgpubsub-1.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "2bac79ef27014df3cfa803b33dc2de35",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7.0,<4",
+      "size": 29009,
+      "upload_time": "2023-02-02T16:23:12",
+      "upload_time_iso_8601": "2023-02-02T16:23:12.434003Z",
+      "url": "https://files.pythonhosted.org/packages/3d/76/e0fb6a6ae47d03c9d04250f60dd3d47582f597c7f17fab47bf5821311ff1/django_pgpubsub-1.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,326 @@
+{
+  "info": {
+    "author": null,
+    "author_email": "Bluenix <bluenixdev@gmail.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Internet",
+      "Topic :: Internet :: WWW/HTTP",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules",
+      "Typing :: Typed"
+    ],
+    "description": "# Discord gateway\n\nSans-I/O Python implementation of the Discord gateway.\n\nSans-I/O means that this implements no I/O (network) and operates purely on the\nbytes given using `wsproto`.\n\nIt means that this implementation can be reused for libraries implemented in a\nthreading fashion or asyncio/trio/curio.\n\n## Reference Implementation\n\nFor a reference implementation see\n[wumpy-gateway](https://github.com/Bluenix2/wumpy/blob/main/library/wumpy-gateway/wumpy/gateway/shard.py).\nIt is designed to handle all sort of network failures and race conditions.\n\n## Quickstart\n\nHere's a very minimal implementation using the `socket` library and `threading`\nfor the heartbeating (it does not handle reconnecting or any form of\nunexpected disconnections):\n\n```python\nimport socket\nimport ssl\nimport threading\nimport time\nfrom sys import platform\n\nimport certifi\nfrom discord_gateway import DiscordConnection\n\n\nTOKEN = 'YOUR_VERY.WELL.HIDDEN_TOKEN'\nRECV_SIZE = 65536\nSERVER_NAME = 'gateway.discord.gg'\n\n\ndef heartbeat(conn, sock):\n    while True:\n        sock.send(conn.heartbeat())\n        time.sleep(conn.heartbeat_interval)\n\n\ndef recv_event(conn, sock):\n    while True:\n        for event in conn.events():\n            return event\n\n        for to_send in conn.receive(sock.recv(RECV_SIZE)):\n            sock.send(to_send)\n\n\ndef main():\n    # Setup the socket and SSL for the WebSocket Secure connection.\n    conn = DiscordConnection(SERVER_NAME, encoding='json')\n    ctx = ssl.create_default_context(cafile=certifi.where())\n    sock = socket.create_connection(conn.destination)\n    sock = ctx.wrap_socket(sock, server_hostname=SERVER_NAME)\n\n    sock.send(conn.connect())  # Convert to a WebSocket\n\n    # Receive the very first HELLO event.\n    hello = recv_event(conn, sock)\n\n    # Send RESUME or IDENTIFY depending on state (will always be False\n    # when initially connecting, but may be different when reconnecting).\n    if conn.should_resume:\n        sock.send(conn.resume(TOKEN))\n    else:\n        sock.send(conn.identify(\n            token=TOKEN,\n            intents=65535,\n            properties={\n                '$os': platform,\n                '$browser': 'discord-gateway',\n                '$device': 'discord-gateway'\n            },\n        ))\n\n    heartbeater = threading.Thread(target=heartbeat, args=(conn,sock))\n    heartbeater.start()\n\n    try:\n        while True:\n            event = recv_event(conn, sock)\n            print('Received:', event)\n    finally:\n        sock.shutdown(socket.SHUT_WR)\n        sock.close()\n\nif __name__ == '__main__':\n    main()\n```\n\n## Comprehensive Guide\n\n### Connecting\n\nThe very first thing required to use the Discord Gateway is to connect using a\nTCP socket with TLS enabled.\n\nStart by creating an instance of `DiscordConnection`, passing in the URI and\nencoding to use (most likely `'json'`), assign it to a variable called `conn`.\n\nNow, connect a TCP socket to `conn.destination` (this is a property that\nreturns a tuple with the host and port to use - as often used when connecting)\nand wrap it with TLS. Using the built-in `socket` and `ssl` module with\n`certifi` that looks like this:\n\n```python\nSERVER_NAME = 'gateway.discord.gg'\n\n\nconn = DiscordConnection(SERVER_NAME, encoding='json')\nsock = socket.create_connection(conn.destination)\n\nctx = ssl.create_default_context(cafile=certifi.where())\nsock = ctx.wrap_socket(sock, server_hostname=SERVER_NAME)\n```\n\nAfter the connection is established, generate a HTTP 101 Switching Protocols\nrequest by calling `conn.connect()` and sending it over the socket.\n\n### Bootstrapping and HELLOs\n\nIt is now time to communicate over the WebSocket - or almost!\n\nYou have yet to receive anything over the socket, not even the response to the\nHTTP request made. Create a while-loop that will iterate until a full event\nhas been received, but it is important to wrap it in a try/except statement\nthat catches the `ConnectionRejected` in-case Discord rejects the WebSocket\nupgrade.\n\nIn each iteration the data from the socket should be passed to\n`conn.receive()`, which then returns a list of bytes that should be sent back\nto the socket. The code should roughly look like this:\n\n```python\nhello = None\nwhile hello is None:\n    try:\n        for to_send in conn.receive(sock.recv(65535)):\n            sock.send(to_send)\n    except ConnectionRejected:\n        print('Discord rejected the connection!')\n        raise\n\n    for hello in conn.events():\n        # After this has been executed, the hello variable will no longer\n        # be set to None and the while-loop will exit.\n        break\n```\n\nWhen this loop has exited all internal state of discord-gateway should be ready\nto IDENTIFY or RESUME depending on `conn.should_resume` (which is always\nfalsely during startup - but useful during reconnections).\n\n### Heartbeating\n\nThe next part is maintaining the connection established, this is done by\nlaunching a concurrent thread/task (depending on how concurrency is handled).\n\nThe only purpose of this concurrent heartbeater is to periodically generate\na HEARTBEAT commands and sleep:\n\n```python\ndef heartbeater(conn: DiscordConnection, sock: socket.socket) -> typing.NoReturn:\n    # Discord recommends sleeping this random amount of time before the first\n    # heartbeat, this is to relieve Discord's servers when they are starting\n    # up again after downtimes.\n    time.sleep(random.random() * conn.heartbeat_interval)\n\n    while True:\n        sock.send(conn.heartbeat())\n        time.sleep(conn.heartbeat_interval)\n```\n\nAfter this, you are now fully connected and can receive events similar to how\nyou received the HELLO event.\n\n### Disconnecting\n\n#### Expected Disconnections\n\nWhen disconnecting you need to follow the WebSocket protocol, to start off\ngenerate a closing frame using `conn.close()` and send it over the socket.\n\nAfterwards, receive data until discord-gateway raises `CloseDiscordConnection`\nand send the `data` attribute over the socket. Lastly shutdown the write end\nof the socket using `sock.shutdown(socket.SHUT_WR)` and then fully close the\nsocket. In code that would look like this:\n\n```python\nsock.send(conn.close())\n\ntry:\n    while True:\n        for data in conn.receive(socket.recv(65535)):\n            sock.send(data)\nexcept CloseDiscordConnection as err:\n    if err.data is not None:\n        sock.send(err.data)\n\n# Shutdown the socket now that the WebSocket is closed\nsock.shutdown(socket.SHUT_WR)\n\nreceived = None\nwhile received != b'':\n    received = sock.recv(65535)\n\nsock.close()\n```\n\n#### Unexpected Disconnections\n\nDiscord-gateway automatically schedules for reconnections in cases such as\nun-acknowledged heartbeats and RECONNECT events. That said, discord-gateway\nstill needs your help to actually reconnect the underlying socket.\n\nLike with expected disconnections discord-gateway raises\n`CloseDiscordConnection` when the closing handshake is being made, just follow\nwhat was done for expected disconnects and then reconnect but do not create a\nnew `DiscordConnection` instance. Doing so looses information such as why the\nreconnection is happening in the first place. Instead call the `reconnect()`\nmethod to reset the internal state.\n\n`reconnect()` returns an integer representing the amount of seconds to wait\nbefore retrying, this will expotentially increase until a successful HELLO\nevent is received. To take advantage of this, you should structure a retry loop\nlike this:\n\n```python\nwhile True:\n    time.sleep(conn.reconnect())\n\n    try:\n        # Connect to the socket as normal, see \"Bootstrapping and HELLOs\" above\n        ...\n    except EOFError:\n        # Note that in some implementations an empty bytes object is returned\n        # to signal this. It essentially means that the socket closed. Don't\n        # forget to clean up the socket in all of these except-clauses.\n        ...\n        continue\n\n    except ConnectionRejected as err:\n        ...\n        continue\n    else:\n        # If the bootstrapping succeeded and we received a HELLO event, then\n        # we can finally exit this loop.\n        break\n```\n\nUse the `should_reconnect()` function to determine whether to reconnect, if it\nreturns `False` that signals that the connection **must not** be reconnected.\nIt is recommended to raise an error or similar in this case.\n\n### Race conditions\n\nBecause of the concurrent heartbeater there are potential race conditions,\nprimarily when reconnecting.\n\nThe easiest way to fix this is to use a lock that is held when reconnecting,\nthe heartbeater has to acquire it everytime it tries to send a heartbeat.\n\nAnother potential issue is sending a heartbeat while the closing handshake is\nin progress - that is, the client has sent one closing frame but not yet\nreceived it from the other end. Discord-gateway provides a simple property\ncalled `closed`, if this is set just skip sending anything and sleep again.\n\nFollowing the theme of `socket`s and threads here is an example of an improved\nheartbeater:\n\n```python\nlock = ...\n\n\ndef heartbeater(conn, sock):\n    # Discord recommends sleeping this random amount of time before the first\n    # heartbeat, this is to relieve Discord's servers when they are starting\n    # up again after downtimes.\n    time.sleep(random.random() * conn.heartbeat_interval)\n\n    while True:\n        with lock:\n            if not conn.closing:\n                sock.send(conn.heartbeat())\n        time.sleep(conn.heartbeat_interval)\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": null,
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": null,
+    "keywords": "discord,discord-api,discord-bot,discord-api-wrapper,discord-gateway,python-3",
+    "license": null,
+    "maintainer": null,
+    "maintainer_email": null,
+    "name": "discord-gateway",
+    "package_url": "https://pypi.org/project/discord-gateway/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/discord-gateway/",
+    "project_urls": {
+      "homepage": "https://github.com/Bluenix2/discord-gateway/",
+      "repository": "https://github.com/Bluenix2/discord-gateway/"
+    },
+    "release_url": "https://pypi.org/project/discord-gateway/0.4.0/",
+    "requires_dist": [
+      "wsproto >= 1.0.0, <2"
+    ],
+    "requires_python": ">=3.6.2",
+    "summary": "Sans-I/O implementation of the Discord gateway",
+    "version": "0.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14618405,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1353b81e12c7cff319b0fbd5226bb3760de29405e349ae931a79a35948ff4d93",
+          "md5": "8aef9b3562eed1c6e7fb501541627ca2",
+          "sha256": "cf33995d32ee3db3e5bcb52eb0a3a86c8a27cf6baa4e190ce5bffff10a5b2e94"
+        },
+        "downloads": -1,
+        "filename": "discord_gateway-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8aef9b3562eed1c6e7fb501541627ca2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2",
+        "size": 10178,
+        "upload_time": "2021-11-28T15:17:14",
+        "upload_time_iso_8601": "2021-11-28T15:17:14.166060Z",
+        "url": "https://files.pythonhosted.org/packages/13/53/b81e12c7cff319b0fbd5226bb3760de29405e349ae931a79a35948ff4d93/discord_gateway-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a26d5e0718a5dfe344b732bbc6d5c8b55800f4bcd32e7b460cf7384a509e6012",
+          "md5": "2f599ed62df094ea16c25dfd84f5a8aa",
+          "sha256": "f2b9f5a1a85090a3ed3278ec3601e8b61b7d7cfd3316e6cfde9abb3898109152"
+        },
+        "downloads": -1,
+        "filename": "discord-gateway-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f599ed62df094ea16c25dfd84f5a8aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2",
+        "size": 10638,
+        "upload_time": "2021-11-28T15:17:26",
+        "upload_time_iso_8601": "2021-11-28T15:17:26.988151Z",
+        "url": "https://files.pythonhosted.org/packages/a2/6d/5e0718a5dfe344b732bbc6d5c8b55800f4bcd32e7b460cf7384a509e6012/discord-gateway-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "af898f3422109a34af1fedda6b9935ef084a4e4bead40e8a5096f9bea44bb4bf",
+          "md5": "b1b061bbd9dee0cfacf80d04d3b80029",
+          "sha256": "c98964b2a1f9e147af12e25b9c23cb487ba0bed0b68793904bc903347990e599"
+        },
+        "downloads": -1,
+        "filename": "discord_gateway-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1b061bbd9dee0cfacf80d04d3b80029",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2",
+        "size": 12255,
+        "upload_time": "2021-11-30T21:42:32",
+        "upload_time_iso_8601": "2021-11-30T21:42:32.951410Z",
+        "url": "https://files.pythonhosted.org/packages/af/89/8f3422109a34af1fedda6b9935ef084a4e4bead40e8a5096f9bea44bb4bf/discord_gateway-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c85a7b79c9e08c6c9cafbdd59eef91616ee1f5a7404ed13db795feac3dd2ee8a",
+          "md5": "7c480d39ce65021effac5347827f1074",
+          "sha256": "635e894a967998316723003fc2a6ce460a90efee2bd1878ca1f89ab101bfab61"
+        },
+        "downloads": -1,
+        "filename": "discord-gateway-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7c480d39ce65021effac5347827f1074",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2",
+        "size": 14306,
+        "upload_time": "2021-11-30T21:42:40",
+        "upload_time_iso_8601": "2021-11-30T21:42:40.948427Z",
+        "url": "https://files.pythonhosted.org/packages/c8/5a/7b79c9e08c6c9cafbdd59eef91616ee1f5a7404ed13db795feac3dd2ee8a/discord-gateway-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e216947fbc3fb8a0b868e1eb34701fd2baea6c561c3a07c6ab5479bca4339180",
+          "md5": "feb126ea032bc32de17d2ac7afa99718",
+          "sha256": "6f5a88f1c20c8b694bcf9132c3a7271d9f69f5055f1135fa1bf918f34a2954dc"
+        },
+        "downloads": -1,
+        "filename": "discord_gateway-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "feb126ea032bc32de17d2ac7afa99718",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2",
+        "size": 15213,
+        "upload_time": "2022-01-30T00:35:27",
+        "upload_time_iso_8601": "2022-01-30T00:35:27.465709Z",
+        "url": "https://files.pythonhosted.org/packages/e2/16/947fbc3fb8a0b868e1eb34701fd2baea6c561c3a07c6ab5479bca4339180/discord_gateway-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2146dbd03950dba8ded3fa5e8c41affe430c9ccf5357292ac83bcd2315d5b44d",
+          "md5": "e153571640cb2575eb97dc437d5e7860",
+          "sha256": "beb5b6b559eb9f261a1e008dee0288f3864a45ec5f7cc2a94154684f7c0afb3f"
+        },
+        "downloads": -1,
+        "filename": "discord-gateway-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e153571640cb2575eb97dc437d5e7860",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2",
+        "size": 17437,
+        "upload_time": "2022-01-30T00:35:36",
+        "upload_time_iso_8601": "2022-01-30T00:35:36.688988Z",
+        "url": "https://files.pythonhosted.org/packages/21/46/dbd03950dba8ded3fa5e8c41affe430c9ccf5357292ac83bcd2315d5b44d/discord-gateway-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b2f6de41470be4704b0fdcaa0f426149c0969734141fc998f7bc33409c9ee5e",
+          "md5": "5ceef44dd18d9c7f8ed38ca9643bd8c1",
+          "sha256": "99e1f6a34d375ab10cbb1ea27a95c36daf7fa77f4cad91eebdeb0964171b9c6b"
+        },
+        "downloads": -1,
+        "filename": "discord_gateway-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5ceef44dd18d9c7f8ed38ca9643bd8c1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2",
+        "size": 15295,
+        "upload_time": "2022-03-05T00:40:28",
+        "upload_time_iso_8601": "2022-03-05T00:40:28.322770Z",
+        "url": "https://files.pythonhosted.org/packages/4b/2f/6de41470be4704b0fdcaa0f426149c0969734141fc998f7bc33409c9ee5e/discord_gateway-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9370105d4b15d2e9e368073b68c66e96e5cf8375375d6a9885216bee599920c8",
+          "md5": "60c834d3c1f4a630e7575bab69eaa6f0",
+          "sha256": "92d02ff0b393b8fe3e2ec4d2d74e1acf4946ed18715db6ca0f61ca1b4d280d3c"
+        },
+        "downloads": -1,
+        "filename": "discord-gateway-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "60c834d3c1f4a630e7575bab69eaa6f0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2",
+        "size": 17533,
+        "upload_time": "2022-03-05T00:40:34",
+        "upload_time_iso_8601": "2022-03-05T00:40:34.887013Z",
+        "url": "https://files.pythonhosted.org/packages/93/70/105d4b15d2e9e368073b68c66e96e5cf8375375d6a9885216bee599920c8/discord-gateway-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "46938acb07f4eefc430498d77fb1e4662ffa056d1e519ddaaf3c76724175bd0e",
+          "md5": "20b0cda105e93e2666b13732580363a0",
+          "sha256": "34639458936b5e47597f4f540505f418a491fc75d4e88222f10088623bcf606a"
+        },
+        "downloads": -1,
+        "filename": "discord_gateway-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "20b0cda105e93e2666b13732580363a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2",
+        "size": 15536,
+        "upload_time": "2022-08-01T22:54:32",
+        "upload_time_iso_8601": "2022-08-01T22:54:32.347045Z",
+        "url": "https://files.pythonhosted.org/packages/46/93/8acb07f4eefc430498d77fb1e4662ffa056d1e519ddaaf3c76724175bd0e/discord_gateway-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "a9a62c1480dbc869aaef820955f5209f04c42b0f4141329c46bd5090164380e3",
+          "md5": "2926c4d51b1bf2cfc5a41e68f3d157af",
+          "sha256": "c6f4abe5621f5b5644826db5a4b7d5f13d613ad54197580c757cdbb207469ed6"
+        },
+        "downloads": -1,
+        "filename": "discord-gateway-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2926c4d51b1bf2cfc5a41e68f3d157af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2",
+        "size": 17754,
+        "upload_time": "2022-08-01T22:54:42",
+        "upload_time_iso_8601": "2022-08-01T22:54:42.052463Z",
+        "url": "https://files.pythonhosted.org/packages/a9/a6/2c1480dbc869aaef820955f5209f04c42b0f4141329c46bd5090164380e3/discord-gateway-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": null,
+      "digests": {
+        "blake2b_256": "46938acb07f4eefc430498d77fb1e4662ffa056d1e519ddaaf3c76724175bd0e",
+        "md5": "20b0cda105e93e2666b13732580363a0",
+        "sha256": "34639458936b5e47597f4f540505f418a491fc75d4e88222f10088623bcf606a"
+      },
+      "downloads": -1,
+      "filename": "discord_gateway-0.4.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "20b0cda105e93e2666b13732580363a0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6.2",
+      "size": 15536,
+      "upload_time": "2022-08-01T22:54:32",
+      "upload_time_iso_8601": "2022-08-01T22:54:32.347045Z",
+      "url": "https://files.pythonhosted.org/packages/46/93/8acb07f4eefc430498d77fb1e4662ffa056d1e519ddaaf3c76724175bd0e/discord_gateway-0.4.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": null,
+      "digests": {
+        "blake2b_256": "a9a62c1480dbc869aaef820955f5209f04c42b0f4141329c46bd5090164380e3",
+        "md5": "2926c4d51b1bf2cfc5a41e68f3d157af",
+        "sha256": "c6f4abe5621f5b5644826db5a4b7d5f13d613ad54197580c757cdbb207469ed6"
+      },
+      "downloads": -1,
+      "filename": "discord-gateway-0.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "2926c4d51b1bf2cfc5a41e68f3d157af",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6.2",
+      "size": 17754,
+      "upload_time": "2022-08-01T22:54:42",
+      "upload_time_iso_8601": "2022-08-01T22:54:42.052463Z",
+      "url": "https://files.pythonhosted.org/packages/a9/a6/2c1480dbc869aaef820955f5209f04c42b0f4141329c46bd5090164380e3/discord-gateway-0.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

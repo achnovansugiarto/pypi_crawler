@@ -1,0 +1,148 @@
+{
+  "info": {
+    "author": "Horacio G. de Oro",
+    "author_email": "hgdeoro@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Framework :: Django :: 2.2",
+      "Framework :: Django :: 3.0",
+      "Framework :: Django :: 3.1",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Internet :: WWW/HTTP",
+      "Topic :: Internet :: WWW/HTTP :: Dynamic Content"
+    ],
+    "description": "===========================\ndjango-simple-trigger-audit\n===========================\n\nCreates an audit log of the modifications made to models, by using triggers.\n\n* Only PostgreSql supported.\n* Models to audit are configured in ``AppConfig``\n* Triggers are applied automatically when running ``python manage.py migrate``\n* The whole row is saved by the trigger by using PostgreSql's ``row_to_json(NEW)``\n\nNext versions will add support to:\n\n* associate logged in user to audit log (work in progress)\n* use table as initial storage (to take advantage of TX and triggers), but move\n  data to cloud to keep the table small.\n\n\nQuick start\n-----------\n\n1. Add \"simple_trigger_audit\" to your INSTALLED_APPS setting like this::\n\n    INSTALLED_APPS = [\n        ...\n        'simple_trigger_audit',\n\n        'your.app1.App1Config',\n        'your.app2.App2Config',\n        'your.app3.App3Config',\n    ]\n\n2. Register the models you want to audit in your ``AppConfig`` instances::\n\n    from django.apps import AppConfig\n    class MyAppConfig(AppConfig):\n        name = \"myapp\"\n        trigger_audit_models = (\n            'Model1',\n            'Model2',\n            'Model3',\n        )\n\n3. Run ``python manage.py migrate`` to create the triggers.\n\n4. Optional: configure middleware to store the logged in in user in audit entries ::\n\n    MIDDLEWARE = [\n        ...\n        \"simple_trigger_audit.middleware.TriggerAuditMiddleware\",\n    ]\n\n\n5. Optional: use the Django Admin to list and search ``TriggerAuditEntry``::\n\n    from simple_trigger_audit.admin import TriggerAuditEntryAdmin\n    from simple_trigger_audit.models import TriggerAuditEntry\n\n    admin.register(TriggerAuditEntry, TriggerAuditEntryAdmin)\n\nSecurity of audit entries\n+++++++++++++++++++++++++\n\nDBA should correctly configure permissions, in a way that the user used to\nconnect to the database from Django has permissions to INSERT rows in the\n``trigger_audit_entries`` table, but NO permissions to UPDATE / DELETE them.\n\nIf security is not important and you just want to avoid deleting the audit\nentries by accident, a solution could be\nhttps://docs.djangoproject.com/en/3.1/topics/db/multi-db/#automatic-database-routing\n\n\nHow it works\n------------\n\n#. A trigger is executed with each insert/update/delete operation\n\n   * the database trigger is created by ``python manage.py migrate``.\n   * only for the tables associated to the models that are explicitly\n     specified in your ``AppConfig``.\n   * a pre-save and pre-delete signal is used to track which user is associated\n     with each request / transaction: ``set_config()``` is used to set a config\n     associated to the current transaction, and that value can be read from\n     the trigger.\n\n#. The trigger creates a new row in ``trigger_audit_entries`` table containing:\n\n   * ``object_table``: table where the modification happened (one of your models)\n   * ``object_pk``: primary key of your model\n   * ``object_payload``: JSON representation of the whole row (after modification)\n   * ``audit_entry_created``: timestamp\n   * ``audit_txid_current``: PostgreSql TXID in which the modification occurred\n     (not used at the moment, but will be used soon to associate the Django user\n     that caused that modification)\n   * ``audit_operation``: operation: ``INSERT``, ``UPDATE``, ``DELETE``\n   * ``audit_request_info``: stores information about user that originated\n     the audit entry.\n\n\nTrigger\n+++++++\n\nThe solution is very simple in terms of code running in PostgreSQL: just a trigger\nthat calls a function.\n\nThe trigger just invokes the function for each ``INSERT``, ``UPDATE``, ``DELETE`` ::\n\n    CREATE TRIGGER trigger_audit_entry_creator_trigger\n        AFTER INSERT OR UPDATE OR DELETE ON {table_name}\n        FOR EACH ROW EXECUTE FUNCTION trigger_audit_entry_creator_func();\n\nThe function just serializes the row into a JSON and insert it in the audit table::\n\n    CREATE FUNCTION trigger_audit_entry_creator_func_v1() RETURNS TRIGGER AS $scr$\n        DECLARE\n            object_pk       integer;\n            object_payload  varchar;\n            request_info    text;\n        BEGIN\n            request_info := current_setting('django_simple_trigger.request_info', TRUE);\n\n            IF (TG_OP = 'INSERT') THEN\n                object_pk       = NEW.id;\n                object_payload  = row_to_json(NEW);\n            ELSIF (TG_OP = 'UPDATE') THEN\n                object_pk       = OLD.id;\n                object_payload  = row_to_json(NEW);\n            ELSIF (TG_OP = 'DELETE') THEN\n                object_pk       = OLD.id;\n                object_payload  = row_to_json(OLD);\n            ELSE\n                RAISE EXCEPTION 'Unexpected TG_OP = %', TG_OP;\n            END IF;\n\n            INSERT INTO trigger_audit_entries_v1 (\n                    object_table,\n                    object_pk,\n                    object_payload,\n                    audit_entry_created,\n                    audit_txid_current,\n                    audit_operation,\n                    audit_version,\n                    audit_request_info\n                )\n                SELECT\n                    TG_TABLE_NAME,\n                    object_pk,\n                    object_payload,\n                    now(),\n                    txid_current(),\n                    TG_OP,\n                    1,\n                    request_info;\n            RETURN NULL;\n        END;\n    $scr$ LANGUAGE plpgsql;\n\nTest\n----\n\nTested on:\n\n* Python 3.7, 3.8, 3.9\n* Django 2.2, 3.0, 3.1\n* PostgreSql 11, 12, 13 (it doesn't work with PostgreSql 10)\n\nResults of ``make tox``::\n\n    py37-django22-postgres11: commands succeeded\n    py37-django22-postgres12: commands succeeded\n    py37-django22-postgres13: commands succeeded\n    py37-django30-postgres11: commands succeeded\n    py37-django30-postgres12: commands succeeded\n    py37-django30-postgres13: commands succeeded\n    py37-django31-postgres11: commands succeeded\n    py37-django31-postgres12: commands succeeded\n    py37-django31-postgres13: commands succeeded\n    py38-django22-postgres11: commands succeeded\n    py38-django22-postgres12: commands succeeded\n    py38-django22-postgres13: commands succeeded\n    py38-django30-postgres11: commands succeeded\n    py38-django30-postgres12: commands succeeded\n    py38-django30-postgres13: commands succeeded\n    py38-django31-postgres11: commands succeeded\n    py38-django31-postgres12: commands succeeded\n    py38-django31-postgres13: commands succeeded\n    py39-django22-postgres11: commands succeeded\n    py39-django22-postgres12: commands succeeded\n    py39-django22-postgres13: commands succeeded\n    py39-django30-postgres11: commands succeeded\n    py39-django30-postgres12: commands succeeded\n    py39-django30-postgres13: commands succeeded\n    py39-django31-postgres11: commands succeeded\n    py39-django31-postgres12: commands succeeded\n    py39-django31-postgres13: commands succeeded\n    congratulations :)\n\n\n\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.com/hgdeoro/django-simple-trigger-audit",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-simple-trigger-audit",
+    "package_url": "https://pypi.org/project/django-simple-trigger-audit/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-simple-trigger-audit/",
+    "project_urls": {
+      "Homepage": "https://gitlab.com/hgdeoro/django-simple-trigger-audit"
+    },
+    "release_url": "https://pypi.org/project/django-simple-trigger-audit/0.0.6/",
+    "requires_dist": [
+      "django (<3.2)"
+    ],
+    "requires_python": "",
+    "summary": "A Django app to keep audit log based on PostgreSql triggers",
+    "version": "0.0.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8984996,
+  "releases": {
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c8cea69f14f0f7338137bb86fad87f8aed40a2044829321eee304645a8f1c1bd",
+          "md5": "1ec4839db3cc871a7b1d7884550bb255",
+          "sha256": "637a6591662305dfe0aa59f3461cd48b18d3b427c47d9e0442b99024f465d967"
+        },
+        "downloads": -1,
+        "filename": "django_simple_trigger_audit-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ec4839db3cc871a7b1d7884550bb255",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11770,
+        "upload_time": "2020-12-25T18:30:46",
+        "upload_time_iso_8601": "2020-12-25T18:30:46.279587Z",
+        "url": "https://files.pythonhosted.org/packages/c8/ce/a69f14f0f7338137bb86fad87f8aed40a2044829321eee304645a8f1c1bd/django_simple_trigger_audit-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f66a9e6542fe8f039fce729556ca3cc23624199460be46975e2105fdfa2e953",
+          "md5": "433e910615f985ee3202f6d79c103f13",
+          "sha256": "84a26b999e074bfe91b343a80e365257bd522460c8bd360d509fbf97bdc0506e"
+        },
+        "downloads": -1,
+        "filename": "django-simple-trigger-audit-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "433e910615f985ee3202f6d79c103f13",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8532,
+        "upload_time": "2020-12-25T18:30:47",
+        "upload_time_iso_8601": "2020-12-25T18:30:47.933522Z",
+        "url": "https://files.pythonhosted.org/packages/4f/66/a9e6542fe8f039fce729556ca3cc23624199460be46975e2105fdfa2e953/django-simple-trigger-audit-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c8cea69f14f0f7338137bb86fad87f8aed40a2044829321eee304645a8f1c1bd",
+        "md5": "1ec4839db3cc871a7b1d7884550bb255",
+        "sha256": "637a6591662305dfe0aa59f3461cd48b18d3b427c47d9e0442b99024f465d967"
+      },
+      "downloads": -1,
+      "filename": "django_simple_trigger_audit-0.0.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "1ec4839db3cc871a7b1d7884550bb255",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 11770,
+      "upload_time": "2020-12-25T18:30:46",
+      "upload_time_iso_8601": "2020-12-25T18:30:46.279587Z",
+      "url": "https://files.pythonhosted.org/packages/c8/ce/a69f14f0f7338137bb86fad87f8aed40a2044829321eee304645a8f1c1bd/django_simple_trigger_audit-0.0.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4f66a9e6542fe8f039fce729556ca3cc23624199460be46975e2105fdfa2e953",
+        "md5": "433e910615f985ee3202f6d79c103f13",
+        "sha256": "84a26b999e074bfe91b343a80e365257bd522460c8bd360d509fbf97bdc0506e"
+      },
+      "downloads": -1,
+      "filename": "django-simple-trigger-audit-0.0.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "433e910615f985ee3202f6d79c103f13",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 8532,
+      "upload_time": "2020-12-25T18:30:47",
+      "upload_time_iso_8601": "2020-12-25T18:30:47.933522Z",
+      "url": "https://files.pythonhosted.org/packages/4f/66/a9e6542fe8f039fce729556ca3cc23624199460be46975e2105fdfa2e953/django-simple-trigger-audit-0.0.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

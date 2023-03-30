@@ -1,0 +1,1297 @@
+{
+  "info": {
+    "author": "Patrick McClory",
+    "author_email": "patrick@mcclory.io",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Framework :: Django :: 3.1",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Natural Language :: English",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Django Dynamic Storages\n\nI'll fill this in with more detail later, but the basic reasoning for this project is that I needed something I could use to extend the already excellent [`django-storages`](https://github.com/jschneier/django-storages) project such that the storage field on any given [`FileField`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#filefield) was a callable I could source a model instance value from. I've also included an abstract class for holding a configuration that stores (securely via [django-fernet-fields](https://github.com/orcasgit/django-fernet-fields)) the access configuration for a given storage backend as well.  \n\n## Goals\n\nI wanted a way to:\n\n* dynamically/at runtime, assign a [`django-storages`](https://github.com/jschneier/django-storages) backend to a given [`FileField`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#filefield) in a model\n* dynamically/at runtime, manage the encryption/decryption of the contents of the aforementioned [`FileField`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#filefield)\n* Ideally, I'd like to be able to achieve this following idiomatic patterns from [`django-storages`](https://github.com/jschneier/django-storages) in terms of using callable kwargs to achieve this so that the consumer of these components had as much control over details as possible with the least amount of overhead.\n    * I took the [`upload_to`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#django.db.models.FileField.upload_to) implementation as inspiration for how to implement the above.\n\n## Components\n\n### Fields\n\n#### `dynamic_storages.fields.dynamic_storage`\n\n`DynamicStorageFileField` and `DynamicStorageImageField` are extensions each of the built-in Django [`FileField`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#filefield) and [`ImageField`](https://docs.djangoproject.com/en/3.1/ref/models/fields/#integerfield) which utilizes the storage backends provided by [django-storages](https://django-storages.readthedocs.io/en/latest/). Rather than setting the `storage` kwarg at the field level, we're using a kwarg we named `storage_instance_callable` to manage the callable function workflow for determining the backend to use. This is, primarily, due to Django 3.0 allowing a callable to be passed in for the `storage` kwarg, however it does not pass the callable function any context - we simply sidestep that issue by using a different kwarg and then use that to set the storage value.\n\n\nFOr the sake of providing an example, the following is a real-world usage of this process using a callable function which takes the model instance in as an argument. It identifies if a 'team' is attached to the instance and then finds the `TeamStorageTarget` (a separate model derived from `dynamic_storages.models.AbstractStorageTarget`)\n\n```python\ndef get_storage(instance):\n    if instance and getattr(instance, \"team\", None):\n        tst = TeamStorageTarget.for_team(instance.team)\n        if tst:\n            return tst.storage_backend\n    return default_storage\n```\n\n#### `dynamic_storages.fields.encrypted_content`\n\n`EncryptedFileField` and `EncryptedImageField` are extensions each of `DynamicStorageFileField` and `DynamicStorageImageField` with the main difference being that these new field definitions encapsulate the process of encrypting and decrypting content for their files at runtime. Two callables are needed to do this, both of which will receive the `instance` object when called:\n\n* `fernet` - the callable assigned to this should return a [`cryptography.fernet.Fernet`](https://cryptography.io/en/latest/fernet.html?highlight=fernet#cryptography.fernet.Fernet) or [`cryptography.fernet.MultiFernet`](https://cryptography.io/en/latest/fernet.html?highlight=fernet#cryptography.fernet.Fernet) for the handling of encryption operations\n\n\n* `get_url` - the callable assigned to this should return a URL which is configured/designed to decrypt the content and serve it to the end user as appropriate (i.e. security is baked into your views, not into this field directly). An example of what a view might look like for this is located in ['dynamic_storages/views.py'](dynamic_storages/views.py).\n\nIn a real-world application, your callable for `get_url` might take multiple values from the instance the file belongs to and construct a url to return:\n\n```python\ndef file_content_url(instance):\n    return reverse_lazy(\"api:team-files-contents\", args=[instance.file.team.slug, instance.team.id, instance.team.file.name.split(\".\")[-1]])\n```\n\nThe view that gets exposed for this `get_url` might be a custom action within a Django Rest Framework Viewset such as:\n\n```python\nclass FileViewSet(viewsets.ModelViewSet):\n    \"\"\"other implementation details not included...\"\"\"\n\n    @action(detail=True, methods=[\"GET\"], name=\"Get File Contents\", url_path=\"contents.<str:file_ext>\")\n    def contents(self, request, **kwargs):\n        user = request.user\n        try:\n            if request.user.is_authenticated():\n                team = get_object_or_404(Team, slug=kwargs.get(\"parent_lookup_team__slug\"))\n                file_ext = self.kwargs[\"file_ext\"]\n                if user_can_access_team(user, team):\n                    f = get_object_or_404(File, team=team, pk=kwargs[\"pk\"])\n                    content = f.file.get_decrypted().read()\n                    return HttpResponse(\n                        content,\n                        content_type=magic.Magic(mime=True).from_buffer(content),\n                    )\n                else:\n                    log.warn(\"User {} is not allowed to access resources for team {}\".format(user.username, team.name))\n            else:\n                log.warn(\"User is not authenticated for request to file with {}\".format(self.kwargs))\n        except Exception as ex:\n            log.warn(\"Failed to get property for request: {}\".format(ex))\n        raise Http404\n```\n\n#### `dynamic_storages.fields.encrypted_json`\n\nThe `EncryptedJSONField` is meant to be useful in handling the storage of things like storage credentials within a database. It was useful in our testing and we've found that even though it follows an older pattern in the Django community around JSONFields (given that Django 3 has them built in now), this setup serves well for credential storage.  It leverages the [`django-fernet-fields`](https://github.com/orcasgit/django-fernet-fields) [`EncryptedTextField`](https://github.com/orcasgit/django-fernet-fields/blob/master/fernet_fields/fields.py#L109) as its storage medium and we're simply marshaling it back and forth from dictionary to string.  \n\n\n### Other Stuff\n\n### Running Tests\n\nThis project has test-level models... as such, to run the tests built into this project, you'll want to run Django from the `./runtests.py` script which simply adds the test application to the `INSTALLED_APPS` list.\n\n```bash\n./runtests.py test\n```\n\n\n## To-Do\n\n* [ ] Update the `.models.AbstractStorageTarget` model to include credential checking\n* [ ] Create async task for handling credential checking periodically for `AbstractStorageTarget`-based storage\n* [ ] look into further extending `django-storages` to handle google drive (since it already supports dropbox)\n* [X] simplify and validate usage of the generic ~`AbstractSecureFileContents`~ `GenericFileContentsView` view\n* [X] write more tests around the `default_storage` provider (`0.4.1`)\n\n## Revisions\n\n* `0.5.3` (Mon Nov 23 01:26:23 PM PST 2020) - missed a reference to a variable I'd pulled out/renamed where I was determining mimetype for the file download\n* `0.5.2` (Mon Nov 23 01:00:08 PM PST 2020) - so I had to take a dependency on [django-rest-framework](https://www.django-rest-framework.org/) but it made the generic views for retrieving encrypted content a lot easier to deal with. New tests and tweaks to the generic views and we're in business!\n* `0.5.1` (Mon Nov 23 12:!5:14 PM PST 2020) - Renaming Abstract views to 'Generic' and layering them in so that they can be extended/used more easily\n* `0.5.0` (Mon Nov 23 11:42:33 AM PST 2020) - fixing formatting, ran `isort` and added some logging to the `AbstractStorageTarget` process which constructs the backend classes.\n* `0.4.5` (Mon Nov 23 11:24:18 AM PST 2020) - updates to generic/abstract view to pull `mime_type` from a model field if it's specified... adding common logger for all components.\n* `0.4.2` (Fri Nov 20 07:04:43 PM PST 2020) - wrote more tests around storage providers, object create (for file and img fields) as well as some tidying up around the edges\n* `0.4.0` (Mon Nov 16 09:50:48 AM PST 2020) - readme updates, documentation fixes, more clarity/examples, added some todo's\n* `0.3.8` (Mon Nov 16 09:22:41 AM PST 2020) - docstring updates and some changes to the order of operations re: generating a download url for a file via callables\n* `0.3.7` (Mon Nov 16 09:05:32 AM PST 2020) - Fixing typo\n* `0.3.6` (Fri Nov 13 10:01:38 AM PST 2020) - consistency issues with get_url call again... mirroring process from the fernet setup\n* `0.3.5` (Thu Nov 12 03:53:03 PM PST 2020) - fixes to my `get_url` stuff - dumb misses\n* `0.3.4` (Thu Nov 12 11:42:21 AM PST 2020) - minor update to allow for a callable function to be passed in for an `EncryptedFileField` so that you can externally control the view/url that needs to be used to get the contents of this file.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/mcclory/django-dynamic-storages",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-dynamic-storages",
+    "package_url": "https://pypi.org/project/django-dynamic-storages/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-dynamic-storages/",
+    "project_urls": {
+      "Homepage": "https://github.com/mcclory/django-dynamic-storages",
+      "Repository": "https://github.com/mcclory/django-dynamic-storages"
+    },
+    "release_url": "https://pypi.org/project/django-dynamic-storages/0.5.3/",
+    "requires_dist": [
+      "django (>=3.1.0,<4.0.0)",
+      "django-storages[libcloud,azure,sftp,dropbox,google,boto3] (>=1.10.1,<2.0.0)",
+      "django-fernet-fields (>=0.6,<0.7)",
+      "django-appconf (>=1.0.4,<2.0.0)",
+      "Pillow (>=8.0.0,<9.0.0)",
+      "google-cloud (>=0.34.0,<0.35.0)",
+      "apache-libcloud (>=3.2.0,<4.0.0)",
+      "azure-storage-blob (>=1.3.1,<12.0.0)",
+      "boto3 (>=1.16.8,<2.0.0)",
+      "dropbox (>=10.8.0,<11.0.0)",
+      "google-cloud-storage (>=1.32.0,<2.0.0)",
+      "paramiko (>=2.7.2,<3.0.0)",
+      "python-magic (>=0.4.18,<0.5.0)",
+      "djangorestframework (>=3.12.2,<4.0.0)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "A collection of file fields and associated components to allow for dynamic configuration of storage properties for file-based fields within Django models.",
+    "version": "0.5.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8731579,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "490ddeb58b8c65cfbf90e5cbb4a0aaf5884c4535ebd9ada1a33b99d82e577e17",
+          "md5": "20ea435d8e537f5e8b016a309913836b",
+          "sha256": "b77734453fea040c87dfe450a807e62f6e3f97a4853f9672ff102bc44412a2f8"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "20ea435d8e537f5e8b016a309913836b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10994,
+        "upload_time": "2020-10-15T20:05:41",
+        "upload_time_iso_8601": "2020-10-15T20:05:41.910780Z",
+        "url": "https://files.pythonhosted.org/packages/49/0d/deb58b8c65cfbf90e5cbb4a0aaf5884c4535ebd9ada1a33b99d82e577e17/django_dynamic_storages-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "955ecef0d7f9b4cfffe0ffe47a62242556ecf45daec66cf000c1bc5358df8694",
+          "md5": "b0f23cb31271dcd1ab49b1fd8c264b2e",
+          "sha256": "c45d855a5b179345eb92d15193762322f15911ef90f146be4db08ff9489efd32"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b0f23cb31271dcd1ab49b1fd8c264b2e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 7449,
+        "upload_time": "2020-10-15T20:05:38",
+        "upload_time_iso_8601": "2020-10-15T20:05:38.979588Z",
+        "url": "https://files.pythonhosted.org/packages/95/5e/cef0d7f9b4cfffe0ffe47a62242556ecf45daec66cf000c1bc5358df8694/django-dynamic-storages-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c13e59a0152b24671f489db5c96e886300c6d22cd5c4476cff58cf02c631d322",
+          "md5": "57ae20805ddd07d33437964968f8f649",
+          "sha256": "dc9dcef4be4f0fe24f011f5858a088acc4c832dd165e17ff8c7d979c1bc27b71"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "57ae20805ddd07d33437964968f8f649",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 11210,
+        "upload_time": "2020-10-15T20:32:47",
+        "upload_time_iso_8601": "2020-10-15T20:32:47.729143Z",
+        "url": "https://files.pythonhosted.org/packages/c1/3e/59a0152b24671f489db5c96e886300c6d22cd5c4476cff58cf02c631d322/django_dynamic_storages-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b0dd79a1f5f7a1654e1fbab9b768908dc56adb10b3517dafbd7497bb369cf96",
+          "md5": "a0df871c618362fa450cadf968dc5bfe",
+          "sha256": "492eed5f87eb382bc905691ce3fa3aef23a7a6a14ad7d5bafc85ccd7d8a840f2"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a0df871c618362fa450cadf968dc5bfe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 7803,
+        "upload_time": "2020-10-15T20:32:46",
+        "upload_time_iso_8601": "2020-10-15T20:32:46.556867Z",
+        "url": "https://files.pythonhosted.org/packages/7b/0d/d79a1f5f7a1654e1fbab9b768908dc56adb10b3517dafbd7497bb369cf96/django-dynamic-storages-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e38227b52691145ecfad08a416da174d73f7bbbc8272a4fbdf4793b15e2387dc",
+          "md5": "8693b4843685a0fbeff14114e79e3192",
+          "sha256": "8758e992ef1cb9c7a6fbb83b0c1910e081e8be8c7d9a992851c7fe283f872d7c"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8693b4843685a0fbeff14114e79e3192",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 11217,
+        "upload_time": "2020-10-15T20:34:12",
+        "upload_time_iso_8601": "2020-10-15T20:34:12.998786Z",
+        "url": "https://files.pythonhosted.org/packages/e3/82/27b52691145ecfad08a416da174d73f7bbbc8272a4fbdf4793b15e2387dc/django_dynamic_storages-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f91222e74c685788ac21c65e7a2f4ffab81221c4e5ba8d30c271045073efa5f1",
+          "md5": "520b784a32258e193c0176778143bda9",
+          "sha256": "b4898a12051303476329553860764e042f0c20cd5e78ea9fec91187a3658901e"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "520b784a32258e193c0176778143bda9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 7798,
+        "upload_time": "2020-10-15T20:34:11",
+        "upload_time_iso_8601": "2020-10-15T20:34:11.740964Z",
+        "url": "https://files.pythonhosted.org/packages/f9/12/22e74c685788ac21c65e7a2f4ffab81221c4e5ba8d30c271045073efa5f1/django-dynamic-storages-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e5e20776ae966f196e649bb745e53784350a8e9d3cf4115af2d45a894b398cd",
+          "md5": "155039714db693733996220e16b6691e",
+          "sha256": "49b467893a0a71a8b566df047609e80c7518639d51e7fe4420aa9a751d8bed93"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "155039714db693733996220e16b6691e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 11221,
+        "upload_time": "2020-10-15T20:43:54",
+        "upload_time_iso_8601": "2020-10-15T20:43:54.020428Z",
+        "url": "https://files.pythonhosted.org/packages/6e/5e/20776ae966f196e649bb745e53784350a8e9d3cf4115af2d45a894b398cd/django_dynamic_storages-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "52ba8bdaa2789cdfe1ac7aefaacfabbe3bcdea83ca7419e16b2dbba628a9bce9",
+          "md5": "b1dab8b9276cf7fff5c12a94e7d76fab",
+          "sha256": "fbe1dd87db1a96fd59ed00c32fc6b3c22053744997f2fc1510e3b256fbf2faaf"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b1dab8b9276cf7fff5c12a94e7d76fab",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 7810,
+        "upload_time": "2020-10-15T20:43:52",
+        "upload_time_iso_8601": "2020-10-15T20:43:52.618999Z",
+        "url": "https://files.pythonhosted.org/packages/52/ba/8bdaa2789cdfe1ac7aefaacfabbe3bcdea83ca7419e16b2dbba628a9bce9/django-dynamic-storages-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3c3e7a5e9778e231b752428f9c0b20c9a9494fcf75a0ab6d28a58d2ece7e928b",
+          "md5": "89b2dd00c8d2a57c722948accfa1262c",
+          "sha256": "96f4d91334c37a569217afd2f45feb8504e1873c285912ee430c9ae099221d53"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "89b2dd00c8d2a57c722948accfa1262c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 11531,
+        "upload_time": "2020-10-15T20:45:23",
+        "upload_time_iso_8601": "2020-10-15T20:45:23.523059Z",
+        "url": "https://files.pythonhosted.org/packages/3c/3e/7a5e9778e231b752428f9c0b20c9a9494fcf75a0ab6d28a58d2ece7e928b/django_dynamic_storages-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d2225259be49408669104a68324aafd350fabdc7d9f98bd04a21503c5d61fc9",
+          "md5": "dd0d723ee119f4a701b4dcc65de4e49c",
+          "sha256": "d12097438435a239e21f07dfc0ff716a0a6ed0b670a473e5a0e23a02f052c0c3"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dd0d723ee119f4a701b4dcc65de4e49c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 8433,
+        "upload_time": "2020-10-15T20:45:21",
+        "upload_time_iso_8601": "2020-10-15T20:45:21.767060Z",
+        "url": "https://files.pythonhosted.org/packages/8d/22/25259be49408669104a68324aafd350fabdc7d9f98bd04a21503c5d61fc9/django-dynamic-storages-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f4d374e61c0c14e2cf0425cf9b96292279e31de30ace38813074d4942c1a586",
+          "md5": "2ef5742c955437fc1a31154ebbce263e",
+          "sha256": "1ef537afa3a2ad1d02366b90c85292c5cedf4180bfa0d7f878bd5fe565c15bf2"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2ef5742c955437fc1a31154ebbce263e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14292,
+        "upload_time": "2020-10-16T17:59:56",
+        "upload_time_iso_8601": "2020-10-16T17:59:56.744170Z",
+        "url": "https://files.pythonhosted.org/packages/3f/4d/374e61c0c14e2cf0425cf9b96292279e31de30ace38813074d4942c1a586/django_dynamic_storages-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5baeb750c85e3de98baca86057bca336fa20a0c5661be29344a46899c7ea060",
+          "md5": "d929b36221beb8d41788152d26251ad3",
+          "sha256": "d271ef630cbfee52171906ceebb0d21a39e7797e623f8dcda1ecb83a07fc240f"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d929b36221beb8d41788152d26251ad3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9431,
+        "upload_time": "2020-10-16T17:59:55",
+        "upload_time_iso_8601": "2020-10-16T17:59:55.040733Z",
+        "url": "https://files.pythonhosted.org/packages/b5/ba/eb750c85e3de98baca86057bca336fa20a0c5661be29344a46899c7ea060/django-dynamic-storages-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0bf972627dfcf9f8d18b3517bd2ef8570248c2b249171d21f3871d170a4108c1",
+          "md5": "4aec31e120718adfe533b5467bd271b8",
+          "sha256": "4faa9a5d8e26d26ffc64a5bc37fa9a6fa2211c98459f3c691a0065a56027a3fc"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4aec31e120718adfe533b5467bd271b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14374,
+        "upload_time": "2020-10-17T00:14:37",
+        "upload_time_iso_8601": "2020-10-17T00:14:37.298622Z",
+        "url": "https://files.pythonhosted.org/packages/0b/f9/72627dfcf9f8d18b3517bd2ef8570248c2b249171d21f3871d170a4108c1/django_dynamic_storages-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7be9e4dd33767152c2a3ad9d225879e67b60aa882c008685fd045b66a2ed649",
+          "md5": "59599b986681fd918d13f4da3234b7ff",
+          "sha256": "18bacdbcf02fc71c2365b5809b510f24a520431e3f16d0fd8b48e0c7626e88a1"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "59599b986681fd918d13f4da3234b7ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9385,
+        "upload_time": "2020-10-17T00:14:35",
+        "upload_time_iso_8601": "2020-10-17T00:14:35.824531Z",
+        "url": "https://files.pythonhosted.org/packages/a7/be/9e4dd33767152c2a3ad9d225879e67b60aa882c008685fd045b66a2ed649/django-dynamic-storages-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3607c3c630b65974bcf1144d3597ba206c89daac5c278a7761c44a54524cac35",
+          "md5": "327166409fe7bb6fb2f24fcbe3495e1b",
+          "sha256": "9ef09f3f652113becd7850010ea9ed0f4d90f8fc31c0ead470cda15d03a64f1b"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "327166409fe7bb6fb2f24fcbe3495e1b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14440,
+        "upload_time": "2020-10-17T01:06:30",
+        "upload_time_iso_8601": "2020-10-17T01:06:30.490834Z",
+        "url": "https://files.pythonhosted.org/packages/36/07/c3c630b65974bcf1144d3597ba206c89daac5c278a7761c44a54524cac35/django_dynamic_storages-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "200105f7774900419f8f7b3c0d3a5dda71269187a12bf8341511bee81846c211",
+          "md5": "72b4d7a22a9f332b625de3d23fb1418d",
+          "sha256": "f445bd96bcdc47c73f502f7b1298bb04ea2fc57a5633bc6e8aede378df8024bf"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72b4d7a22a9f332b625de3d23fb1418d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9458,
+        "upload_time": "2020-10-17T01:06:28",
+        "upload_time_iso_8601": "2020-10-17T01:06:28.967706Z",
+        "url": "https://files.pythonhosted.org/packages/20/01/05f7774900419f8f7b3c0d3a5dda71269187a12bf8341511bee81846c211/django-dynamic-storages-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "89c85d8a568844fc575485c3fe28d336c64ef79cdeb21aa33a45b86035f0c2e3",
+          "md5": "69d30d4eaba647bd1f8c1d7c6c2aac01",
+          "sha256": "49c508e86a69e258bd06a12424e4f2208bf02ed8767aaca0a00a3ee913a2fe24"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "69d30d4eaba647bd1f8c1d7c6c2aac01",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14483,
+        "upload_time": "2020-10-17T19:34:56",
+        "upload_time_iso_8601": "2020-10-17T19:34:56.189319Z",
+        "url": "https://files.pythonhosted.org/packages/89/c8/5d8a568844fc575485c3fe28d336c64ef79cdeb21aa33a45b86035f0c2e3/django_dynamic_storages-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a85cb6c9b81a8d6da8974575dc6759bd4e6bf4bf4eb6d868164364c81ee39384",
+          "md5": "8dff7ebbf1b7f81be0449f1d9c56b9c1",
+          "sha256": "89e9aae4bb15c90321cf381adaae73e0b5e6c9e044eb9a163a31a5cd1a1ef425"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8dff7ebbf1b7f81be0449f1d9c56b9c1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9506,
+        "upload_time": "2020-10-17T19:34:54",
+        "upload_time_iso_8601": "2020-10-17T19:34:54.836260Z",
+        "url": "https://files.pythonhosted.org/packages/a8/5c/b6c9b81a8d6da8974575dc6759bd4e6bf4bf4eb6d868164364c81ee39384/django-dynamic-storages-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09f7abdca3cb6eade06ec90c7022c47c5126c7f6981514b7e3901bfd6424af76",
+          "md5": "ca917709b392167cbba34074f39cc6c9",
+          "sha256": "f1d14262ad440e730b737f09b84cc2223d0c15d66ceb5449a0589a036f76d10e"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ca917709b392167cbba34074f39cc6c9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14922,
+        "upload_time": "2020-10-19T02:34:59",
+        "upload_time_iso_8601": "2020-10-19T02:34:59.146648Z",
+        "url": "https://files.pythonhosted.org/packages/09/f7/abdca3cb6eade06ec90c7022c47c5126c7f6981514b7e3901bfd6424af76/django_dynamic_storages-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a73b0c008d63f23530f157031a075c32578305878e3bdd15371e94a3ffa786ff",
+          "md5": "c5bb69c4a653a956fa6e8ea8fe4be0ce",
+          "sha256": "4699c666be5edbdc0b1f011154db6f1b9758a78cd2a7cd032e9c47907152adfc"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c5bb69c4a653a956fa6e8ea8fe4be0ce",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9636,
+        "upload_time": "2020-10-19T02:34:57",
+        "upload_time_iso_8601": "2020-10-19T02:34:57.915889Z",
+        "url": "https://files.pythonhosted.org/packages/a7/3b/0c008d63f23530f157031a075c32578305878e3bdd15371e94a3ffa786ff/django-dynamic-storages-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d76f047c694d6ed56e89b2d19b66cce99ab0ae9993ab841bba8ab45da7803fe4",
+          "md5": "4ca9974bce3022f37d39b474ea1ed39a",
+          "sha256": "98b681a3bdae48637e53c9272dcab67ce34c5764d7954e0d968a335f8d7871c6"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4ca9974bce3022f37d39b474ea1ed39a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15036,
+        "upload_time": "2020-10-22T01:06:48",
+        "upload_time_iso_8601": "2020-10-22T01:06:48.697744Z",
+        "url": "https://files.pythonhosted.org/packages/d7/6f/047c694d6ed56e89b2d19b66cce99ab0ae9993ab841bba8ab45da7803fe4/django_dynamic_storages-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f01f38453ae867f1a1e1646175d082d61cd71bd0cdaa1dd6fbaedc0a751263d",
+          "md5": "e68e789bc9d7e55170149439ee821d93",
+          "sha256": "88020b54213309774ada4ff4cac6c20c4711ffb3140c560f8acff27648efb13b"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e68e789bc9d7e55170149439ee821d93",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9742,
+        "upload_time": "2020-10-22T01:06:47",
+        "upload_time_iso_8601": "2020-10-22T01:06:47.162958Z",
+        "url": "https://files.pythonhosted.org/packages/6f/01/f38453ae867f1a1e1646175d082d61cd71bd0cdaa1dd6fbaedc0a751263d/django-dynamic-storages-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2df75cc66114727b42117d95be94532df0c52113fce5ca01269983a2514aa4e",
+          "md5": "85baba6c6a01618b400a602b61bd0876",
+          "sha256": "22c3467d09bdf5a48f3abff8f1e4f744f6afc3412252a94d7846ac7c92bb3f26"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "85baba6c6a01618b400a602b61bd0876",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15503,
+        "upload_time": "2020-10-24T18:08:33",
+        "upload_time_iso_8601": "2020-10-24T18:08:33.962832Z",
+        "url": "https://files.pythonhosted.org/packages/f2/df/75cc66114727b42117d95be94532df0c52113fce5ca01269983a2514aa4e/django_dynamic_storages-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b3e653c2a1c10c382d8bf0161f0539dbf67b36d1443b169ae298246df5e0d0e8",
+          "md5": "8a31ab627b604157f8fc0feb47d5cdc9",
+          "sha256": "72925054107ed23cd9111a78beb65e8b69aa5cedf6cf9fed638106e1e2e0e4b3"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8a31ab627b604157f8fc0feb47d5cdc9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9700,
+        "upload_time": "2020-10-24T18:08:32",
+        "upload_time_iso_8601": "2020-10-24T18:08:32.498976Z",
+        "url": "https://files.pythonhosted.org/packages/b3/e6/53c2a1c10c382d8bf0161f0539dbf67b36d1443b169ae298246df5e0d0e8/django-dynamic-storages-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "483538e53d54d2b16c4011db6fa1141697b840218795a9ae2a2e86ba506d0f09",
+          "md5": "2c5b15fb45e3e581f43423cf05ed86b2",
+          "sha256": "e88f5a165cbd8e59f596b0e739a9fb519350da3aed054f7aedb2fb5fdbfb419b"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2c5b15fb45e3e581f43423cf05ed86b2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15561,
+        "upload_time": "2020-10-25T17:32:40",
+        "upload_time_iso_8601": "2020-10-25T17:32:40.075322Z",
+        "url": "https://files.pythonhosted.org/packages/48/35/38e53d54d2b16c4011db6fa1141697b840218795a9ae2a2e86ba506d0f09/django_dynamic_storages-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d47a36c8a5fb44e90264b596936b58a2dd94fc6924d6edb0a5ae61d09ccc051",
+          "md5": "779b1f2bb9141cae6810d6883c15d410",
+          "sha256": "6451c884c9106928a5801654219ad83f52823767a8134b96fd187ace4ea45be2"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "779b1f2bb9141cae6810d6883c15d410",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9751,
+        "upload_time": "2020-10-25T17:32:38",
+        "upload_time_iso_8601": "2020-10-25T17:32:38.982791Z",
+        "url": "https://files.pythonhosted.org/packages/1d/47/a36c8a5fb44e90264b596936b58a2dd94fc6924d6edb0a5ae61d09ccc051/django-dynamic-storages-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4336839a16f0d16536de43a490daa18c442c1903406fe09b541bf996d1b190d",
+          "md5": "596bea57f791470de415b5bbb4e0dd76",
+          "sha256": "430ca0e5fa126a03121f8aca4b58a178fe2965ef572fc7fc3da85de669e1a6e6"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.2.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "596bea57f791470de415b5bbb4e0dd76",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15705,
+        "upload_time": "2020-10-28T18:53:28",
+        "upload_time_iso_8601": "2020-10-28T18:53:28.347305Z",
+        "url": "https://files.pythonhosted.org/packages/d4/33/6839a16f0d16536de43a490daa18c442c1903406fe09b541bf996d1b190d/django_dynamic_storages-0.2.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8828fb808c6e0847e0706271f5c742c96bcf5eba0ffbd46ff6e0d52088dcb8dc",
+          "md5": "0965bb4756ce55d380ab433fd4254d05",
+          "sha256": "4f5a57576ddd32ab79e1fb36f8471d2e33ec90e914895d61b0c564033d28159d"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0965bb4756ce55d380ab433fd4254d05",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9824,
+        "upload_time": "2020-10-28T18:53:26",
+        "upload_time_iso_8601": "2020-10-28T18:53:26.951727Z",
+        "url": "https://files.pythonhosted.org/packages/88/28/fb808c6e0847e0706271f5c742c96bcf5eba0ffbd46ff6e0d52088dcb8dc/django-dynamic-storages-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d58d32b4d14f60946f6b4f871d0bbd81b14657d3af87a182b31b615177a1da6c",
+          "md5": "07a5a84b5932435e5ebd366d211f0b35",
+          "sha256": "f14933a4af10041eb0ffd3c6d59d99e85007601c9bffa9a433c595f6525cbb1a"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "07a5a84b5932435e5ebd366d211f0b35",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15703,
+        "upload_time": "2020-10-28T19:01:54",
+        "upload_time_iso_8601": "2020-10-28T19:01:54.316430Z",
+        "url": "https://files.pythonhosted.org/packages/d5/8d/32b4d14f60946f6b4f871d0bbd81b14657d3af87a182b31b615177a1da6c/django_dynamic_storages-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b7f195016ae06eaa27cae42bc60e4683d613c8fcb0e655b26d6153ff68d0b993",
+          "md5": "e1c7216c44404ae6089258a7f9adcab9",
+          "sha256": "e70841d2fe1ebd75ef2ebddfc192e6e9443e1f2202eea3c79523abeed97754d0"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e1c7216c44404ae6089258a7f9adcab9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9871,
+        "upload_time": "2020-10-28T19:01:51",
+        "upload_time_iso_8601": "2020-10-28T19:01:51.650780Z",
+        "url": "https://files.pythonhosted.org/packages/b7/f1/95016ae06eaa27cae42bc60e4683d613c8fcb0e655b26d6153ff68d0b993/django-dynamic-storages-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6bf53c9d47a7dcc9e42b7ebb72d0300eb64fdef34f4af469278a97e010dbc86f",
+          "md5": "c72594b775d2ed37f2ac7736a715b828",
+          "sha256": "10f1ba2c450c0493f78c4ea182137bad717e536d4e08cfc5eca48209675aa9fa"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c72594b775d2ed37f2ac7736a715b828",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15716,
+        "upload_time": "2020-10-30T15:52:50",
+        "upload_time_iso_8601": "2020-10-30T15:52:50.490791Z",
+        "url": "https://files.pythonhosted.org/packages/6b/f5/3c9d47a7dcc9e42b7ebb72d0300eb64fdef34f4af469278a97e010dbc86f/django_dynamic_storages-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3c97897576d7749c4187f204fe18a72eee3e1173ba3e1130b3f34db2d076bc6",
+          "md5": "aafafc6ce68d82fe022e7f4d3f5b977b",
+          "sha256": "657a31c9fd9d9d0d1f830c29728c73f7fb7ad3dac41692dba81b3641aa2bba27"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aafafc6ce68d82fe022e7f4d3f5b977b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9909,
+        "upload_time": "2020-10-30T15:52:49",
+        "upload_time_iso_8601": "2020-10-30T15:52:49.037798Z",
+        "url": "https://files.pythonhosted.org/packages/a3/c9/7897576d7749c4187f204fe18a72eee3e1173ba3e1130b3f34db2d076bc6/django-dynamic-storages-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "74c115d9bb5a6d09857a4e5633e9f3dcb866715f7b952dda3e2342c9222344f2",
+          "md5": "a1c9a2f091a3aa5a60f186b4157565a8",
+          "sha256": "a1c7c4a98066bb18d6ab4976ac0193232fc8509f8ae30184464c36728ac7dcfc"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a1c9a2f091a3aa5a60f186b4157565a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15791,
+        "upload_time": "2020-10-30T16:05:43",
+        "upload_time_iso_8601": "2020-10-30T16:05:43.190327Z",
+        "url": "https://files.pythonhosted.org/packages/74/c1/15d9bb5a6d09857a4e5633e9f3dcb866715f7b952dda3e2342c9222344f2/django_dynamic_storages-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c807ceab0cb8b4cd813de9dbcbab5bae96968876c894540b2200711b3840e62a",
+          "md5": "dc1ef540962f8e067c9e5d27e80da28c",
+          "sha256": "edc6ac28bba27d8c6d53c8cda7872108ff60d32bbc97ffffc69419ba0bb17465"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dc1ef540962f8e067c9e5d27e80da28c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10071,
+        "upload_time": "2020-10-30T16:05:41",
+        "upload_time_iso_8601": "2020-10-30T16:05:41.718164Z",
+        "url": "https://files.pythonhosted.org/packages/c8/07/ceab0cb8b4cd813de9dbcbab5bae96968876c894540b2200711b3840e62a/django-dynamic-storages-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d5b38c2bb00c1eaf902e9af7ffa33e59ebc21dfc4cccff565313a8e1c1a2171",
+          "md5": "a81498fc18666964eccc846801592eeb",
+          "sha256": "49d118e765e12e187d9f36ffb00d7ebb405d9f50c067d1d0813104ca6b681a01"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a81498fc18666964eccc846801592eeb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15695,
+        "upload_time": "2020-11-12T19:43:09",
+        "upload_time_iso_8601": "2020-11-12T19:43:09.390181Z",
+        "url": "https://files.pythonhosted.org/packages/0d/5b/38c2bb00c1eaf902e9af7ffa33e59ebc21dfc4cccff565313a8e1c1a2171/django_dynamic_storages-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39346ab389796f20838c97332c06f962e0cc7df5650bd3eb071daafb6ead21e4",
+          "md5": "da22c61e49d6d0131e3248832aeac7b0",
+          "sha256": "c3ea4ed7c85407c1c219439128d345faf7bdd9134bc4933b591c63572491b9e4"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "da22c61e49d6d0131e3248832aeac7b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9983,
+        "upload_time": "2020-11-12T19:43:07",
+        "upload_time_iso_8601": "2020-11-12T19:43:07.408674Z",
+        "url": "https://files.pythonhosted.org/packages/39/34/6ab389796f20838c97332c06f962e0cc7df5650bd3eb071daafb6ead21e4/django-dynamic-storages-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea68b0be2edce0c743b73245853cb7d3609e80f70fa7cdebdbcdce2ddaedb717",
+          "md5": "b3f8b6e3e92fd061711cd16b45efbb8f",
+          "sha256": "412e76f7a1fdb8b239f042b04f8a255bc3986f22ba95fbc9bf4959bf174510a8"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b3f8b6e3e92fd061711cd16b45efbb8f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15694,
+        "upload_time": "2020-11-12T23:53:45",
+        "upload_time_iso_8601": "2020-11-12T23:53:45.633075Z",
+        "url": "https://files.pythonhosted.org/packages/ea/68/b0be2edce0c743b73245853cb7d3609e80f70fa7cdebdbcdce2ddaedb717/django_dynamic_storages-0.3.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "815e33bda679304023e138a3378ea0e412868e2fac77f9136ed23ea1c6f5ade7",
+          "md5": "3b70a953157be750fa9dea73ed74a3fa",
+          "sha256": "55d21a14bc0fd5351ba77b98580943e2fd493428f885e3b6418c26b81cee2703"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b70a953157be750fa9dea73ed74a3fa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9978,
+        "upload_time": "2020-11-12T23:53:44",
+        "upload_time_iso_8601": "2020-11-12T23:53:44.511453Z",
+        "url": "https://files.pythonhosted.org/packages/81/5e/33bda679304023e138a3378ea0e412868e2fac77f9136ed23ea1c6f5ade7/django-dynamic-storages-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bcabe283c6d7ed259dd3a8eaddd2ab202dc0a7ec4420bb0e53c643d9a1bd93fa",
+          "md5": "b532d51bb0a06d6c42293317747c5c2d",
+          "sha256": "18a600c7ce3fdb727117e77ba0bf6719031a93dbaf27c38b4b07f638b25212ba"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b532d51bb0a06d6c42293317747c5c2d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15702,
+        "upload_time": "2020-11-13T18:02:33",
+        "upload_time_iso_8601": "2020-11-13T18:02:33.739645Z",
+        "url": "https://files.pythonhosted.org/packages/bc/ab/e283c6d7ed259dd3a8eaddd2ab202dc0a7ec4420bb0e53c643d9a1bd93fa/django_dynamic_storages-0.3.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "870d9b03b808d2a9f6349a818c9a3d91450b4b9516e5497cbdad70aa359e2854",
+          "md5": "1cb14639ae983b4b43d05c43aa9f5b4e",
+          "sha256": "e24eecfb9b0448ee16677c8883a298b57329e0de82043f6a4d3b4482146ef330"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1cb14639ae983b4b43d05c43aa9f5b4e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9994,
+        "upload_time": "2020-11-13T18:02:32",
+        "upload_time_iso_8601": "2020-11-13T18:02:32.751389Z",
+        "url": "https://files.pythonhosted.org/packages/87/0d/9b03b808d2a9f6349a818c9a3d91450b4b9516e5497cbdad70aa359e2854/django-dynamic-storages-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e6d86663113f6939631683389e5036c52e74726fa49fbae6d1d008b486fdb179",
+          "md5": "432c3b85d5f6c20a6347d2b099935a60",
+          "sha256": "e5c9f9a1b4f5cb2037645110322b452fd9142f5b489cd710c28d9700363355b8"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.3.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "432c3b85d5f6c20a6347d2b099935a60",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15705,
+        "upload_time": "2020-11-16T17:06:12",
+        "upload_time_iso_8601": "2020-11-16T17:06:12.413231Z",
+        "url": "https://files.pythonhosted.org/packages/e6/d8/6663113f6939631683389e5036c52e74726fa49fbae6d1d008b486fdb179/django_dynamic_storages-0.3.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a633f731354000e0b934ac1de364493893f5ea0e9091340e66536e0e00c8ebdb",
+          "md5": "2d0af66a73601ee7d3b040a763939228",
+          "sha256": "4c442286a9a635141db88e4717efa196c522508f6bf9e1a1ebaf351e9a13dcdc"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2d0af66a73601ee7d3b040a763939228",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 9986,
+        "upload_time": "2020-11-16T17:06:11",
+        "upload_time_iso_8601": "2020-11-16T17:06:11.113281Z",
+        "url": "https://files.pythonhosted.org/packages/a6/33/f731354000e0b934ac1de364493893f5ea0e9091340e66536e0e00c8ebdb/django-dynamic-storages-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a12897b62c09351ddb113401396538dae9aafaa7974ab5f04b50aeae67b0d16b",
+          "md5": "a701a91911cb795b7c6e5f7f3219144c",
+          "sha256": "b0e47bf5de78db47e9617e1197b6d445e643cbcc17d0d7955cebaac6584fe76b"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a701a91911cb795b7c6e5f7f3219144c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 16286,
+        "upload_time": "2020-11-16T17:58:03",
+        "upload_time_iso_8601": "2020-11-16T17:58:03.286163Z",
+        "url": "https://files.pythonhosted.org/packages/a1/28/97b62c09351ddb113401396538dae9aafaa7974ab5f04b50aeae67b0d16b/django_dynamic_storages-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e42ddecf24efb8434fa57e8900f0bd35b35e1995710d08aea093257b25a4d70b",
+          "md5": "558e49fdbea1d9327218d80ff4352e22",
+          "sha256": "4aaf47aea609891a3c24569ad695d6adbde98fce1a788f17bdfe6576259a930f"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "558e49fdbea1d9327218d80ff4352e22",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10528,
+        "upload_time": "2020-11-16T17:58:02",
+        "upload_time_iso_8601": "2020-11-16T17:58:02.200372Z",
+        "url": "https://files.pythonhosted.org/packages/e4/2d/decf24efb8434fa57e8900f0bd35b35e1995710d08aea093257b25a4d70b/django-dynamic-storages-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f08fea5c4c1298c1ab4c8c6bdd0484b36bc59eef2a7356a5cb128ac63e27ca7",
+          "md5": "2cde046e241c1827a557cc40196495dd",
+          "sha256": "3fa03f33b758401f8f8b75d74dcb67124b472fac832bd20cd30b0506fd9e6ba8"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2cde046e241c1827a557cc40196495dd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19815,
+        "upload_time": "2020-11-18T17:17:39",
+        "upload_time_iso_8601": "2020-11-18T17:17:39.207422Z",
+        "url": "https://files.pythonhosted.org/packages/3f/08/fea5c4c1298c1ab4c8c6bdd0484b36bc59eef2a7356a5cb128ac63e27ca7/django_dynamic_storages-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98e8076e622ab5d72f83bff0b5efe6684f9866ba555a9654aa36c8f85352a50f",
+          "md5": "5bf07be0c69836b56eea323988eb63c2",
+          "sha256": "556aad6ba2a42ab077cf2aef4b8eb8f6bed2f1960536e050063a29fd3f2a1258"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5bf07be0c69836b56eea323988eb63c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17127,
+        "upload_time": "2020-11-18T17:17:37",
+        "upload_time_iso_8601": "2020-11-18T17:17:37.773422Z",
+        "url": "https://files.pythonhosted.org/packages/98/e8/076e622ab5d72f83bff0b5efe6684f9866ba555a9654aa36c8f85352a50f/django-dynamic-storages-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca565e777462b64ec6dfb7dfa7cdfba9cf4600b33e998c5f4c5923cd298e779e",
+          "md5": "c7034c84d172e2f74f7d72c01f353122",
+          "sha256": "e86c7275106fd5d10d51be3f96aa5b05b2b95fe0dca1c6e459262a7fd696303a"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c7034c84d172e2f74f7d72c01f353122",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3232455,
+        "upload_time": "2020-11-21T03:09:18",
+        "upload_time_iso_8601": "2020-11-21T03:09:18.408039Z",
+        "url": "https://files.pythonhosted.org/packages/ca/56/5e777462b64ec6dfb7dfa7cdfba9cf4600b33e998c5f4c5923cd298e779e/django_dynamic_storages-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5cc23ad4613e568ad480c3d298d28ba96a258b52e0ad644ad65f316ed2ba8fad",
+          "md5": "b284e94a9e090cca0e7d3b86f02026f1",
+          "sha256": "4d3518d23d9957abb4d93a934a3913590cd876a074ffca55a593637d46cece4d"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b284e94a9e090cca0e7d3b86f02026f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3226987,
+        "upload_time": "2020-11-21T03:09:15",
+        "upload_time_iso_8601": "2020-11-21T03:09:15.653882Z",
+        "url": "https://files.pythonhosted.org/packages/5c/c2/3ad4613e568ad480c3d298d28ba96a258b52e0ad644ad65f316ed2ba8fad/django-dynamic-storages-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0852b578968188f0738203a01534ee17f7a591eb573b0b73ba1d4cd9d882f179",
+          "md5": "ddb9f586de9700f141b110d1ce3c0ee9",
+          "sha256": "ffca9e22b55f87e24313262511a063195eeb34a34eefc2989dee13412bdff1bc"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ddb9f586de9700f141b110d1ce3c0ee9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3236616,
+        "upload_time": "2020-11-23T19:43:37",
+        "upload_time_iso_8601": "2020-11-23T19:43:37.901397Z",
+        "url": "https://files.pythonhosted.org/packages/08/52/b578968188f0738203a01534ee17f7a591eb573b0b73ba1d4cd9d882f179/django_dynamic_storages-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6eef22ac3b4407522ea2620d1c0eaa0c97d9e9fbf61a3773c835600511781701",
+          "md5": "33a290e1615ba89e1a67d8f96f12d0ae",
+          "sha256": "a025df0756b104f4a802b6c94667d973e56a711a6d4fd283199716cdc60370e6"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33a290e1615ba89e1a67d8f96f12d0ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3233551,
+        "upload_time": "2020-11-23T19:43:34",
+        "upload_time_iso_8601": "2020-11-23T19:43:34.743618Z",
+        "url": "https://files.pythonhosted.org/packages/6e/ef/22ac3b4407522ea2620d1c0eaa0c97d9e9fbf61a3773c835600511781701/django-dynamic-storages-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "35d12bc4bf7624b45dfe3feb830b5a0881f7425833bdc75d6bc8cd42daff6fe5",
+          "md5": "6c229de58afce1e2d7c8474201cef13f",
+          "sha256": "d94a6dcdaa3541402b022203cc930c54fd030125a62c38cd41a85d9171837ef2"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6c229de58afce1e2d7c8474201cef13f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3243168,
+        "upload_time": "2020-11-23T21:02:33",
+        "upload_time_iso_8601": "2020-11-23T21:02:33.275747Z",
+        "url": "https://files.pythonhosted.org/packages/35/d1/2bc4bf7624b45dfe3feb830b5a0881f7425833bdc75d6bc8cd42daff6fe5/django_dynamic_storages-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96860353edc69b88fd96aea0dbb961973747aa527ac64724b6dbfbe1567f8c21",
+          "md5": "d099b96354cb14f11a95bb5a8a166d87",
+          "sha256": "c17f59e070c4d1a4ae51a84d875a0ac80b3a1c5eb819045c3e90dbdef3f1d6aa"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d099b96354cb14f11a95bb5a8a166d87",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3238883,
+        "upload_time": "2020-11-23T21:02:30",
+        "upload_time_iso_8601": "2020-11-23T21:02:30.870407Z",
+        "url": "https://files.pythonhosted.org/packages/96/86/0353edc69b88fd96aea0dbb961973747aa527ac64724b6dbfbe1567f8c21/django-dynamic-storages-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d27ba3a8685d049b7a56bb50f6a322c51e1d4e2813a899b03f82af16beea94be",
+          "md5": "9dcc20294d545380662495d7eb6bf74e",
+          "sha256": "1b2779d9345397f74bc38c9b40350a0489aab69f519a0f61ef644f26d6982082"
+        },
+        "downloads": -1,
+        "filename": "django_dynamic_storages-0.5.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9dcc20294d545380662495d7eb6bf74e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3243230,
+        "upload_time": "2020-11-23T21:28:07",
+        "upload_time_iso_8601": "2020-11-23T21:28:07.639531Z",
+        "url": "https://files.pythonhosted.org/packages/d2/7b/a3a8685d049b7a56bb50f6a322c51e1d4e2813a899b03f82af16beea94be/django_dynamic_storages-0.5.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8007f6ea29cf052fa3ba5fd4c4d75e1e3d230bed7865eee0085a2091a80e035b",
+          "md5": "65ed678afae5a338254503291f468af6",
+          "sha256": "2950bceb61845db3346d1225e41267243c6c4dc48a663a1ac9cea96b2608db08"
+        },
+        "downloads": -1,
+        "filename": "django-dynamic-storages-0.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65ed678afae5a338254503291f468af6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 3239000,
+        "upload_time": "2020-11-23T21:28:05",
+        "upload_time_iso_8601": "2020-11-23T21:28:05.169629Z",
+        "url": "https://files.pythonhosted.org/packages/80/07/f6ea29cf052fa3ba5fd4c4d75e1e3d230bed7865eee0085a2091a80e035b/django-dynamic-storages-0.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d27ba3a8685d049b7a56bb50f6a322c51e1d4e2813a899b03f82af16beea94be",
+        "md5": "9dcc20294d545380662495d7eb6bf74e",
+        "sha256": "1b2779d9345397f74bc38c9b40350a0489aab69f519a0f61ef644f26d6982082"
+      },
+      "downloads": -1,
+      "filename": "django_dynamic_storages-0.5.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "9dcc20294d545380662495d7eb6bf74e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 3243230,
+      "upload_time": "2020-11-23T21:28:07",
+      "upload_time_iso_8601": "2020-11-23T21:28:07.639531Z",
+      "url": "https://files.pythonhosted.org/packages/d2/7b/a3a8685d049b7a56bb50f6a322c51e1d4e2813a899b03f82af16beea94be/django_dynamic_storages-0.5.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8007f6ea29cf052fa3ba5fd4c4d75e1e3d230bed7865eee0085a2091a80e035b",
+        "md5": "65ed678afae5a338254503291f468af6",
+        "sha256": "2950bceb61845db3346d1225e41267243c6c4dc48a663a1ac9cea96b2608db08"
+      },
+      "downloads": -1,
+      "filename": "django-dynamic-storages-0.5.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "65ed678afae5a338254503291f468af6",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 3239000,
+      "upload_time": "2020-11-23T21:28:05",
+      "upload_time_iso_8601": "2020-11-23T21:28:05.169629Z",
+      "url": "https://files.pythonhosted.org/packages/80/07/f6ea29cf052fa3ba5fd4c4d75e1e3d230bed7865eee0085a2091a80e035b/django-dynamic-storages-0.5.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

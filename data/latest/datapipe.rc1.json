@@ -1,0 +1,88 @@
+{
+  "info": {
+    "author": "Jay Young(yjmade)",
+    "author_email": "dev@yjmade.net",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers"
+    ],
+    "description": "DataPipe\n========\n\n*a framework let you build data processing procedure for production both\neasy and robust, and help you to deal with parallels, performancing,\nerror handling, debugging and data reprocessing*\n\nWhat for\n--------\n\nWhen building a procedure to process data, we are facing some\nchallenges:\n\n-  Collect data from different data source and process it in real time.\n-  Different procedure for different type of data.\n-  The processing code should structured in a clean and elegant form, to\n   make it easy to write, easy to read, and easy to extend.\n-  Reprocess the data and clean up the out result easily\n-  Easy to debug by collecting the unhandled exception, and reprocess\n   the data when bugs fixed.\n-  Do not missing one data.\n-  Run in parallels, and easily to scale up.\n-  Monitoring ongoing process status.\n\nThis framework is build to solve all these problems. It has been up and\nrunning at my company for 2 years.\n\nPrerequest\n----------\n\n1. datapipe is made as a Django reusable module\n2. ``Postgres`` 9.4 or above is required as we need the ``jsonb`` field\n   type.\n3. ```Celery`` <http://celeryproject.org>`__ is required for concurrent\n   processing.\n\nInstallation\n------------\n\n.. code:: bash\n\n    pip install datapipe\n\nThen add ``datapipe`` and ``django-errorlog`` to ``INSTALLED_APPS`` of\nDjango's settings.\n\nNow you can write pipes at pipes.py under each apps.\n\nTo start celery worker to run pipeline in parallels, check out the `docs\nof\nCelery <http://docs.celeryproject.org/en/latest/django/first-steps-with-django.html#django-first-steps>`__.\n\nTerminology\n-----------\n\n-  ``Pipe`` is a single data processing step\n-  ``Pipeline`` is the assemble of multiple pipes.\n-  ``Session`` is in charge of managing the running Pipelines.\n\nHow it works\n------------\n\nIn the project of my company, there is a MQ(message queue), and the\ndatapipe running inside Celery workers which listen to the MQ. Then when\nany data source put data in the MQ, datapipe will start to processing.\nSay here is a piece of code:\n\n.. code:: python\n\n    source_list=[...]  # a list of numbers\n    # prepare\n    results=[]\n    total=0\n    discount=0.99\n    for source in source_list:  # process\n        total+=source  # GradulSum\n        results.append(total) # Save\n        total*=0.99  # DiscountSum\n\nAnd following is the equavilent pipeline:\n`source <https://github.com/yjmade/datapipe/blob/master/tests/simple/pipes/__init__.py>`__\n\n.. code:: python\n\n    # -*- coding: utf-8 -*-\n    from ..models import SourceItem, ResultItem\n    from datapipe.pipe import Pipe, pipeline\n\n\n    class GradualSum(Pipe):\n        \"\"\"initialize total and add number for each item to it\"\"\"\n\n        def prepare(self, items):\n            assert isinstance(items[0], SourceItem)\n            self.context.total = 0\n            return super(GradualSum, self).prepare(items)\n\n        def process(self):\n            item = super(GradualSum, self).process()\n            self.context.total += item.number\n            self.total = self.context.total\n            return item\n\n\n    class DiscountSum(GradualSum):\n        \"\"\"discount the total\"\"\"\n        discount = 0.99\n\n        def process(self):\n            item = super(DiscountSum, self).process()\n\n            self.context.total *= self.discount\n            return item\n\n\n    @pipeline(\"discount_sum\")  # register the last pipe with a name, that is the pipeline\n    class Save(DiscountSum):\n        \"\"\"save current total to result\"\"\"\n        \n        result_model = ResultItem\n\n        def process(self):\n            item = super(Save, self).process()\n\n            self.add_to_save(self.result_model(number=self.total))\n            return item\n\n``SourceItem`` is the input items, and the result will be put into\n``ResultItem``. Both of them are django Model with only an integer field\nnamed ``number``.\n\nIn above code piece, we build a pipeline named ``discount_sum``,\ncontains three pipes, which is ``GradualSum``, ``DiscountSum`` and\n``Save``.\n\nTo run the pipeline:\n\n.. code:: python\n\n    from datapipe import get_session\n    sess=get_session()  # create the session instance\n    sess.run(\"discount_sum\",SourceItem.objects.all())  # run discount_sum pipeline to all the SourceItems\n\nRun it in parallels with celery worker:\n\n.. code:: python\n\n    from datapipe import get_session\n    sess=get_session()\n    sess.run_in_celery(\"discount_sum\",SourceItem.objects.all(),queue=QUEUE_NAME)\n\nExplaination\n------------\n\nThink about a ``Pipeline`` as the real assembly line.\n\n.. figure:: https://upload.wikimedia.org/wikipedia/commons/2/29/Ford_assembly_line_-_1913.jpg\n   :alt: Pipeline\n\n   Pipeline\n\nExecute flow\n~~~~~~~~~~~~\n\n-  At runtime, a list of input items will be feed into pipeline.\n\n-  Method ``pipe.prepare(items)`` will be called with all the input\n   items, it returns a list of items to be processed. It's like there's\n   person stand before the conveyor belt to do some check of the items\n   and filter the bad input.\n\n-  Method ``pipe.process(item)`` will run with the items\n   ``prepare(items)`` returned one by one.\n\n-  Non-None return of the ``pipe.process(item)`` will be collected, and\n   be sent to ``pipe.finish(results)`` after all input item\n   ``process()`` finished.\n\nFollowing pseudo code shows how this processing go:\n\n.. code:: python\n\n    def run(pipeline, items):\n        prepared_item = pipeline().prepare(items)\n        results=[]\n        for item in prepared_items:\n            result=pipeline().process(item)\n            if result is not None:\n                results.append(result)\n        pipeline().finish(results)\n               \n\n-  In ``process()``,when processing one item, you can control the flow\n   by throwing the following exceptions:\n\n   -  ``PipeContinue``: stop the processing of current item, continue\n      processing next item;\n   -  ``PipeIgnore``: stop the processing of current item, rollback to\n      the beginning of this item, continue processing next item;\n   -  ``PipeBreak``: stop the processing of current item, rollback to\n      the beginning of this item, stop processing the rest items;\n   -  ``PipeError``: stop processing, rollback all the items.\n\nPipeline assemble\n~~~~~~~~~~~~~~~~~\n\n-  The whole assembly line sequence is a ``Pipeline``, numbers of\n   worker(\\ ``Pipe``) which do specific work are included.\n\n-  The work of each worker has dependency. In datapipe, dependency\n   relationship represented by inheritance of the pipes.\n\n-  The side effect of pipe inheritance is that methods and properties\n   written under each ``Pipe`` can be accessed by all other connected\n   pipes. It's suggested to name the methods and properties of the pipe\n   with 2 beginning underscores, to avoid unintention name collision.\n\n-  Python allow multiple inheritance, which perfectly emulate the branch\n   nature of the data processing. So one ``Pipe`` can be inherited from\n   multiple pipes, You have to make sure you have call the same method\n   of the super class in the ``prepare``/``process``/``finish`` methods,\n   and return the result properly. The executing order is compling to\n   the `C3\n   algorithm <https://www.python.org/download/releases/2.3/mro/>`__ of\n   python.\n\n-  For convinience of development, each pipe can be running seperately,\n   ``output=Pipe.eval(item)``.\n\n*At the first version of datapipe, I was using a list of Pipe classes to\nstand for different steps, and session instace pass the output of one\npipe to the next one as the input. But soon I find it's not flexable\nenough, and hard to share variables.*\n\nPipeline Chaining\n~~~~~~~~~~~~~~~~~\n\n-  depends: if you need to do some pre-processing of items in batch, you\n   can define a depends in the ``Pipe``, for example\n\n.. code:: python\n\n    @pipeline('main')\n    class Main(Pipe):\n       depends=[\"being_depend\"]  # **to specify the depends**\n       \n       def process(self):\n           item=super(Main,self).process()\n           print \"main\", item, item*1./self.context.depends_total\n           \n\n    @pipeline(\"being_depend\")\n    class Depends(Pipe):\n        def prepare(items):\n            items=super(Depends).prepare(items)\n            self.context.depends_total=0\n            return items\n            \n        def process(self):\n            item=super(Depends,self).process()\n            print \"depend\", item\n            self.context.depends_total+=item\n            return item\n            \n    sess=get_session()\n    sess.run([1,2],\"main\")\n    # depend 1\n    # depend 2\n    # main 1, 0.33333333\n    # main 2, 0.66666667\n\nThe ``BeingDepends`` get the same items as input and puts the result in\n``self.context`` then ``Main`` can access it.\n\n-  trigger: one pipeline needs to run right after some other pipeline\n   finished and also has to run standalone in some time.\n\n.. code:: python\n\n    @pipeline(\"news.import\")\n    class NewsImport(Pipe):\n        def process(raw_item_store):\n            content=self.do_some_stuff_here(raw_item_store)\n            result_news=self.add_to_save(News(content=content))\n            return result_news\n            \n\n    @pipeline(\"news.link.tags\", trigger=\"news_import\")\n    class NewsTag(Pipe):\n        def process(news):\n            tags_text=self.do_some_stuff_here()\n            self.add_to_save(*[NewsTag(news=news,tag=tag_text) for tag_text in tags_text])\n            return news \n            \n            \n    sess=get_session()\n    sess.run([news1,news2],\"news.link.tags\")  # run standalone\n    # or\n    sess.run([raw_item_store1, raw_item_store2],\"news.import\") # news.link.tags will run after news.import finished\n\nVarible Sharing\n~~~~~~~~~~~~~~~\n\nIn assembly line there are containers for people to store some half\nproducts, which will be used later.\n\nIn datapipe, in the ``Pipe``, there are three containers with different\nlife span you can put varible by set attribute.\n\n-  ``self`` lives for only this one specific item;\n-  ``self.local`` lives for all the items, and be cleaned at\n   ``finish()``;\n-  ``self.context`` shared with all the chained pipeline.\n\nYou can make an analogy with the assembly line, the variable put in\n``self`` is like there is a bucket together with the item on the\nconveyor belt, workers can put some stuff in it and these stuff can be\nused by other person, but after the process of the item has finished,\nthis bucket will gone. ``self.local`` is like a big table, every people\ncan put thing on it and be shared, but it will be clean up when all the\nbatch of items finished. ``self.context`` is another table next\n``self.local``, what different is the stuff on it will be pack together\nwith the output and send together to the next ``Pipeline`` be chained.\n\nResult and Error Handling\n~~~~~~~~~~~~~~~~~~~~~~~~~\n\n-  Pipe provide a method ``pipe.add_to_save(result_item)`` to let you\n   put a to be saved Django Model object in the buffer, ``Session`` will\n   periodically do the save in batch for the sake of performance. Also\n   the object put in the ``add_to_save`` will be tracked for reparse.\n\n-  Reparse: When pipeline see one input item that has been processed\n   before, it will remove the result item tracked by add\\_to\\_save from\n   database before do the processing again. This feature is usedful when\n   you changed the code of pipes and the output is also changed, then\n   you just need to run this pipeline with old items, the old results\n   will be removed and the new results will be saved.\n\n-  Exception Handler: In assembly line, if some person gets an error,\n   which he has no idea how to deal with in current situation(uncatched\n   exception), he will take the item out of the conveyor belt, clean the\n   related intermediate outputs(rollback the database to the savepoint\n   before starting this item), and put it in some other bucket with a\n   note of the situation(\\ ``PipelineError`` Collector). **Then he moves\n   on to the next item.** Periodically the engeneers will come to check\n   the error colletor bucket and figure out what has happened and teach\n   the worker how to deal with it(You fix the code). Then all the\n   collected items will be put in the pipeline again.\n\n-  Concurrent:\n   ``sess.run_in_celery(items,pipeline_name,[celery_chunksize=10, queue=None])``\n   will split the input items into chunks, the size of chunk is control\n   by celery\\_chunksize. Then it will send each chunk to celery worker\n   asynchronously, and celery will run the pipeline in parallels.\n\nTODO\n----\n\nget the reparse entity in the pipe\n",
+    "description_content_type": null,
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/yjmade/datapipe",
+    "keywords": "data processing pipeline",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "datapipe",
+    "package_url": "https://pypi.org/project/datapipe/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/datapipe/",
+    "project_urls": {
+      "Homepage": "https://github.com/yjmade/datapipe"
+    },
+    "release_url": "https://pypi.org/project/datapipe/0.1.0/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Data Processing Framework that allow you to processing data like building blocks",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 2522429,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4ea937502f1f36d9bf5bc8431a345b61e7d9109693ec146289b6d881733563cd",
+          "md5": "188d6de254ef0f9e1817844108f6f008",
+          "sha256": "ee1934002b5d5f9c685d6abc8ba884978932862f23a28fee9f9e4a6370ac65ab"
+        },
+        "downloads": -1,
+        "filename": "datapipe-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "188d6de254ef0f9e1817844108f6f008",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16524,
+        "upload_time": "2016-12-16T02:46:04",
+        "upload_time_iso_8601": "2016-12-16T02:46:04.710042Z",
+        "url": "https://files.pythonhosted.org/packages/4e/a9/37502f1f36d9bf5bc8431a345b61e7d9109693ec146289b6d881733563cd/datapipe-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4ea937502f1f36d9bf5bc8431a345b61e7d9109693ec146289b6d881733563cd",
+        "md5": "188d6de254ef0f9e1817844108f6f008",
+        "sha256": "ee1934002b5d5f9c685d6abc8ba884978932862f23a28fee9f9e4a6370ac65ab"
+      },
+      "downloads": -1,
+      "filename": "datapipe-0.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "188d6de254ef0f9e1817844108f6f008",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 16524,
+      "upload_time": "2016-12-16T02:46:04",
+      "upload_time_iso_8601": "2016-12-16T02:46:04.710042Z",
+      "url": "https://files.pythonhosted.org/packages/4e/a9/37502f1f36d9bf5bc8431a345b61e7d9109693ec146289b6d881733563cd/datapipe-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

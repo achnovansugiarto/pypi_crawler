@@ -1,0 +1,630 @@
+{
+  "info": {
+    "author": "YunoJuno",
+    "author_email": "code@yunojuno.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Framework :: Django :: 3.1",
+      "Framework :: Django :: 3.2",
+      "Framework :: Django :: 4.0",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Django Visitor Pass\n\nDjango app for managing temporary session-based users.\n\n### Support\n\nThis project currently supports Python 3.8+, Django 3.1+.\n\n### Background\n\nThis package has been extracted out of `django-request-token` as a specific use\ncase - that of temporary site \"visitors\". It enables a type of ephemeral user\nwho is neither anonymous nor authenticated, but somewhere in between - known for\nthe duration of their session.\n\n### Motivation\n\nWe've been using `django-request-token` for a while, and have issued over\n100,000 tokens. A recent analysis showed two main use cases - single-use \"magic\nlinks\" for logging people in, and a more involved case where we invite\nunregistered users on to the platform to perform some action - providing a\nreference perhaps, or collaborating on something with (registered) users. The\nformer we have extracted out into `django-magic-links` - and this package\naddresses the latter.\n\n### What is a \"visitor\"?\n\nIn the standard Django model you have the concept of an `AnonymousUser`, and an\nauthenticated `User` - someone who has logged in. We have a third, intermediate,\ntype of user - which we have historically referred to as a \"Temp User\", which is\nsomeone we know _of_, but who has not yet registered.\n\nThe canonical example of this is leaving a reference: user A on the site invites\nuser B to leave a reference for them. They (A) give us B's name and email, we\ninvite them to click on a link and fill out a form. That's it. We store their\nname and email so that we can contact them, but it's ephemeral - we don't need\nit, and we don't use it. Storing this data in the User table made sense (as it\nhas name and email fields), but it led to a lot of `user_type=TEMP` munging to\ndetermine who is a 'real' user on the site.\n\nWhat we really want is to 'stash' this information somewhere outside of the auth\nsystem, and to enable these temp users to have restricted access to specific\nareas of the application, for a limited period, after which we can forget about\nthem and clear out the data.\n\nWe call these users \"visitors\".\n\n### Use Case - request a reference\n\nFred is a registered user on the site, and would like a reference from Ginger,\nhis dance partner.\n\n1. Fred fills out the reference request form:\n\n```\n   Name: Ginger\n   Email: ginger@[...].com\n   Message: ...\n   Scope: REFERENCE_REQUEST [hidden field]\n```\n\n2. We save this information, and generate a unique link which we send to Ginger,\n   along with the message.\n\n3. Ginger clicks on the link, at which point we recognise that this is someone\n   we know about - a \"visitor\" - but who is in all other respects an\n   `AnonymousUser`.\n\n4. We stash the visitor info in the standard session object - so that even\n   though Ginger is not authenticated, we know who she is, and more importantly\n   we know why she's here (REFERENCE_REQUEST).\n\n5. Ginger submits the reference - which may be a multi-step process, involving\n   GETs and POSTs, all of which are guarded by a decorator that restricts access\n   to visitors with the appropriate Scope (just like `django-request-token`).\n\n6. At the final step we can (optionally) choose to clear the session info\n   immediately, effectively removing all further access.\n\n### Implementation\n\nThis code has been extracted out of `django-request-token` and simplified. It\nstores the visitor data in the `Visitor` model, and on each successful first\nrequest (where the token is 'processed' and the session filled) we record a\n`VisitorLog` record. This includes HTTP request info (session_key, referer,\nclient IP, user-agent). This information is for analytics only - for instance\ndetermining whether links are being shared.\n\nThe app works by adding some attributes to the `request` and `request.user`\nobjects. The user has a boolean `user.is_visitor` property, and the request has\na `request.visitor` property which is the relevant `Visitor` object.\n\nThis is done via two bits of middleware, `VisitorRequestMiddleware` and\n`VisitSessionMiddleware`.\n\n#### `VisitorRequestMiddleware`\n\nThis middleware looks for a visitor token (uuid) on the incoming request\nquerystring. If it finds a token, it will look up the `Visitor` object, add it\nto the request, and then set the `request.user.is_visitor` attribute. It sets\nthe properties from the request, and has no interaction with the session. This\nhappens in the second piece of middleware.\n\n#### `VisitorSessionMiddleware`\n\nThis middleware must come after the `VisitorRequestMiddleware` (it will blow up\nif it can't access `request.visitor`). It has two responsibilities:\n\n1. If the request object has a visitor object on it, then it _must_ have been\n   set by the request middleware on the current request - so it's a new visitor,\n   and we immediately stash it in the `request.session`.\n\n1. If `request.visitor` is None, then we don't have a _new_ visitor, but there\n   may be one already stashed in the `request.session`, in which case we want to\n   add it on the to the request.\n\nNote: splitting this in two seems over-complicated, but because we are moving\nvalues from request-into-session-into-request it's a lot simpler to run two\ncompletely separate passes.\n\n### Configuration\n\n#### Django Settings\n\n1. Add `visitors` to `INSTALLED_APPS`\n1. Add `visitors.middleware.VisitorRequestMiddleware` to `MIDDLEWARE`\n1. Add `visitors.middleware.VisitorSessionMiddleware` to `MIDDLEWARE`\n\n#### Environment Settings\n\n* `VISITOR_SESSION_KEY`: session key used to stash visitor info (default:\n  `visitor:session`)\n\n* `VISITOR_SESSION_EXPIRY`: session expiry in seconds (default: 0 - meaning\n    that it will expire when the browser is closed.) This settings applies\n    as the default for all new visitor objects, but can be overridden on a\n    per-object basis.\n\n* `VISITOR_QUERYSTRING_KEY`: querystring param used on tokenised links (default:\n  `vuid`)\n\n### Usage\n\nOnce you have the package configured, you can use the `user_is_visitor`\ndecorator to protect views that you want to restricted to visitors only. The\ndecorator requires a `scope` kwarg, which must match the `Visitor.scope` value\nset when the `Visitor` object is created.\n\n```python\n@user_is_visitor(scope=\"foo\")\ndef protected_view(request):\n   pass\n```\n\nBy default the decorator will allow visitors with the correct scope only. If you\nwant more control over the access, you can pass a callable as the `bypass_func`\nparam:\n\n```python\n# allow authenticated users as well as visitors\n@user_is_visitor(scope=\"foo\", bypass_func=lambda r: r.user.is_staff)\ndef allow_visitors_and_staff(request):\n   pass\n```\n\nIf you don't care about the scope (you should), you can use `\"*\"` to allow all\nvisitors access:\n\n```python\n@user_is_visitor(scope=\"*\")  # see also SCOPE_ANY\ndef allow_all_scopes(request):\n   pass\n```\n\nAlternatively, for more complex use cases, you can ignore the decorator and just\ninspect the request itself:\n\n```python\ndef complicated_rules(request):\n   if request.user.is_visitor:\n      pass\n   elif is_national_holiday():\n      pass\n   elif is_sunny_day():\n      pass\n   else:\n      raise PermissionDenied\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/yunojuno/django-visitor-pass",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "YunoJuno",
+    "maintainer_email": "code@yunojuno.com",
+    "name": "django-visitor-pass",
+    "package_url": "https://pypi.org/project/django-visitor-pass/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/django-visitor-pass/",
+    "project_urls": {
+      "Documentation": "https://github.com/yunojuno/django-visitor-pass",
+      "Homepage": "https://github.com/yunojuno/django-visitor-pass",
+      "Repository": "https://github.com/yunojuno/django-visitor-pass"
+    },
+    "release_url": "https://pypi.org/project/django-visitor-pass/0.8/",
+    "requires_dist": [
+      "django (>=3.1,<5.0)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "Django app for managing temporary session-based users.",
+    "version": "0.8",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15709605,
+  "releases": {
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07ac483ca37e5de3b639088cd71f4538e8206cd3991677fe230a853c29bca8ee",
+          "md5": "5a4e8127a22f0b67dbf6a732d824ea5b",
+          "sha256": "5effd39dd52259e3b571c740f804f83c302ffa392551ed79f67b0890facccfe1"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5a4e8127a22f0b67dbf6a732d824ea5b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 12957,
+        "upload_time": "2021-01-02T15:37:44",
+        "upload_time_iso_8601": "2021-01-02T15:37:44.539325Z",
+        "url": "https://files.pythonhosted.org/packages/07/ac/483ca37e5de3b639088cd71f4538e8206cd3991677fe230a853c29bca8ee/django_visitor_pass-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bfd53e3570c42b7bc4e841e6e4ebdbd2d092125b729d1d0c24dc6d59597f11a6",
+          "md5": "7b5b99bb78f15bc2fe72276401843a8f",
+          "sha256": "c96cc4dde964c7e5945adff469b913f79a5d1705afd1a2d190d3866ac5ebc621"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7b5b99bb78f15bc2fe72276401843a8f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 13433,
+        "upload_time": "2021-01-02T15:37:43",
+        "upload_time_iso_8601": "2021-01-02T15:37:43.303842Z",
+        "url": "https://files.pythonhosted.org/packages/bf/d5/3e3570c42b7bc4e841e6e4ebdbd2d092125b729d1d0c24dc6d59597f11a6/django-visitor-pass-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0914c420b338b3d55c8a0a74e7aaeb0f99b58fe9805e929e0002a2ca31f5a3f",
+          "md5": "398c229489ebb37ce4381ca9f897cf72",
+          "sha256": "6b02a26a42b439717a3bfac2e8c37edbf9ce842086cc817902963c36e94e2145"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "398c229489ebb37ce4381ca9f897cf72",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 15929,
+        "upload_time": "2021-01-03T13:55:49",
+        "upload_time_iso_8601": "2021-01-03T13:55:49.454157Z",
+        "url": "https://files.pythonhosted.org/packages/c0/91/4c420b338b3d55c8a0a74e7aaeb0f99b58fe9805e929e0002a2ca31f5a3f/django_visitor_pass-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a502fb24941ebde425b2918f72e88c8609572f3464848d36f36d7326a5b1707d",
+          "md5": "9d89f3f43061deee1463b3c21cda01c3",
+          "sha256": "f902c0672d69c369253a756a77e24a945e7a8bcdfef204ca090a1b70a1919790"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9d89f3f43061deee1463b3c21cda01c3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 15239,
+        "upload_time": "2021-01-03T13:55:48",
+        "upload_time_iso_8601": "2021-01-03T13:55:48.144621Z",
+        "url": "https://files.pythonhosted.org/packages/a5/02/fb24941ebde425b2918f72e88c8609572f3464848d36f36d7326a5b1707d/django-visitor-pass-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9859073f00b6ae4f0b3a6e6ec2cc0be99633d1bc8bc3241a188d82d73286a96b",
+          "md5": "851fc783a042c1a790b8e3984991fbe9",
+          "sha256": "20da7019d4c7a2c2186e33d01e01b653ae594d781d1f1f43266f32b9e966686d"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "851fc783a042c1a790b8e3984991fbe9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 16128,
+        "upload_time": "2021-02-14T14:47:24",
+        "upload_time_iso_8601": "2021-02-14T14:47:24.131551Z",
+        "url": "https://files.pythonhosted.org/packages/98/59/073f00b6ae4f0b3a6e6ec2cc0be99633d1bc8bc3241a188d82d73286a96b/django_visitor_pass-0.3-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": "Wrong commit pushed - pls use 0.3.1"
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3ca6a5ea4cab1577a20cd4d5f0c1408c2363d99c3ff0521c83a5a03abd1c5e57",
+          "md5": "d44ea66aa6a353ecddae31d31b4cd507",
+          "sha256": "b0263d67a910870c49a04b646348edb37e9133d874a8ee3bdece8bd37747a889"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d44ea66aa6a353ecddae31d31b4cd507",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 15260,
+        "upload_time": "2021-02-14T14:47:23",
+        "upload_time_iso_8601": "2021-02-14T14:47:23.012637Z",
+        "url": "https://files.pythonhosted.org/packages/3c/a6/a5ea4cab1577a20cd4d5f0c1408c2363d99c3ff0521c83a5a03abd1c5e57/django-visitor-pass-0.3.tar.gz",
+        "yanked": true,
+        "yanked_reason": "Wrong commit pushed - pls use 0.3.1"
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da076c6a95dbd6f1250701c451c6c8adf02f5310ac6241d4dd4d534eef1dafd8",
+          "md5": "fa380885dfe4324c7e874ef720313e28",
+          "sha256": "a63c1bd7dde83fc2c4b17c3898df159954a54ff4d072ef58836d90b0a02438d7"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fa380885dfe4324c7e874ef720313e28",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 16147,
+        "upload_time": "2021-02-14T14:49:48",
+        "upload_time_iso_8601": "2021-02-14T14:49:48.753197Z",
+        "url": "https://files.pythonhosted.org/packages/da/07/6c6a95dbd6f1250701c451c6c8adf02f5310ac6241d4dd4d534eef1dafd8/django_visitor_pass-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7dc910ca7cbe318f315c4c5d0f65ec8e2d76df5229c786e2cafc0db7ca4796d8",
+          "md5": "2d78d242426566d00093d936e9ee7994",
+          "sha256": "a5afffc169a944f951ecaf7336bca7a47afbef554bb01691ecc4eb534cf6e54c"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2d78d242426566d00093d936e9ee7994",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 15241,
+        "upload_time": "2021-02-14T14:49:47",
+        "upload_time_iso_8601": "2021-02-14T14:49:47.301232Z",
+        "url": "https://files.pythonhosted.org/packages/7d/c9/10ca7cbe318f315c4c5d0f65ec8e2d76df5229c786e2cafc0db7ca4796d8/django-visitor-pass-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7300ed590ab4e2a73acacb6cd3c078e12d9977ca73987a4ef5223615362b8008",
+          "md5": "b6f982c5015f9a5ca123815c014890c7",
+          "sha256": "91217e8a0298030a6cc83b5e2367a7cea7f1eb2a9c8c8da3e2cf73566116159a"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b6f982c5015f9a5ca123815c014890c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20728,
+        "upload_time": "2021-07-28T09:18:43",
+        "upload_time_iso_8601": "2021-07-28T09:18:43.747690Z",
+        "url": "https://files.pythonhosted.org/packages/73/00/ed590ab4e2a73acacb6cd3c078e12d9977ca73987a4ef5223615362b8008/django_visitor_pass-0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df0d5ba264bc242dd8c0a89686dfee0930e8b72ec4f78b57c10bccc295538c02",
+          "md5": "5e635b51b785049376c86725b589a195",
+          "sha256": "9cab0da8d0462e7a0232ff0e6ff63a15f3963bcde3b4f7d081e0bafe46cf9112"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5e635b51b785049376c86725b589a195",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17548,
+        "upload_time": "2021-07-28T09:18:42",
+        "upload_time_iso_8601": "2021-07-28T09:18:42.331398Z",
+        "url": "https://files.pythonhosted.org/packages/df/0d/5ba264bc242dd8c0a89686dfee0930e8b72ec4f78b57c10bccc295538c02/django-visitor-pass-0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4b0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a2383f42ef2526e71a433450caf41283cab67da015e869631c396021056481e",
+          "md5": "cc87f08b9e6c91b229640f2ee35ac5b8",
+          "sha256": "55c905f31db1139885e19b399df975bd14be20dcaff511c24a9d95df6c1d6b56"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.4b0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cc87f08b9e6c91b229640f2ee35ac5b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20237,
+        "upload_time": "2021-06-23T11:51:21",
+        "upload_time_iso_8601": "2021-06-23T11:51:21.487498Z",
+        "url": "https://files.pythonhosted.org/packages/5a/23/83f42ef2526e71a433450caf41283cab67da015e869631c396021056481e/django_visitor_pass-0.4b0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "991a5613fffb03cd81368d493cff3996639a9701764dd3e66e9a915aa752de73",
+          "md5": "8918e01d0fd609f1b97a2ace3c3448a0",
+          "sha256": "661a6dd1a7e25d8f2990fd3c5a878e974c54472eed390f64fb5db345f9abe1b1"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.4b0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8918e01d0fd609f1b97a2ace3c3448a0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17409,
+        "upload_time": "2021-06-23T11:51:19",
+        "upload_time_iso_8601": "2021-06-23T11:51:19.717629Z",
+        "url": "https://files.pythonhosted.org/packages/99/1a/5613fffb03cd81368d493cff3996639a9701764dd3e66e9a915aa752de73/django-visitor-pass-0.4b0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75213d29f4549164a0a6b03c1c43be754e8729750d993ae5590e7f30becfefd6",
+          "md5": "278dd617ce3b282959b583aaef2d29b1",
+          "sha256": "6441b5f9bd239b3ed6d0b490b1646698e621685db2a6aa040b9b3a31d3e6d6b8"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "278dd617ce3b282959b583aaef2d29b1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20311,
+        "upload_time": "2021-09-23T14:41:01",
+        "upload_time_iso_8601": "2021-09-23T14:41:01.182959Z",
+        "url": "https://files.pythonhosted.org/packages/75/21/3d29f4549164a0a6b03c1c43be754e8729750d993ae5590e7f30becfefd6/django_visitor_pass-0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a81ae5b5544e3c65d0c451c453fe81f82958fc8e68406445ce59cacb4e86504d",
+          "md5": "31079142ae9c7afba66d4d5093e45243",
+          "sha256": "1899d24bc45728038bbac9971bc23072025c042aa3a12ed5d8f96b68df5a203b"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "31079142ae9c7afba66d4d5093e45243",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17482,
+        "upload_time": "2021-09-23T14:40:59",
+        "upload_time_iso_8601": "2021-09-23T14:40:59.983475Z",
+        "url": "https://files.pythonhosted.org/packages/a8/1a/e5b5544e3c65d0c451c453fe81f82958fc8e68406445ce59cacb4e86504d/django-visitor-pass-0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fa577b0b856faaa9d147d8c0bdc61a0717b6ce11897b74885d3f405a767826ae",
+          "md5": "682a3b937f6e11ceafbd044a96551cf3",
+          "sha256": "2a83e15e3831a0e074e0814a13bd7bd64e8bd3ada0514393ad92c6a7f1eb3664"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "682a3b937f6e11ceafbd044a96551cf3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20794,
+        "upload_time": "2021-09-24T12:10:55",
+        "upload_time_iso_8601": "2021-09-24T12:10:55.529693Z",
+        "url": "https://files.pythonhosted.org/packages/fa/57/7b0b856faaa9d147d8c0bdc61a0717b6ce11897b74885d3f405a767826ae/django_visitor_pass-0.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "591592c34eba609d6245fce2d00aff792b3dd615c8352422bb379a88f34e0ac0",
+          "md5": "b87418743b6c35c832ea2e75b390d306",
+          "sha256": "99a856696465b65e97a3f29397811757c898a4f907541939f16019652d3fca66"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b87418743b6c35c832ea2e75b390d306",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17617,
+        "upload_time": "2021-09-24T12:10:53",
+        "upload_time_iso_8601": "2021-09-24T12:10:53.991351Z",
+        "url": "https://files.pythonhosted.org/packages/59/15/92c34eba609d6245fce2d00aff792b3dd615c8352422bb379a88f34e0ac0/django-visitor-pass-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d037ce78b9d09035b5aaf66cb7b3c8978b823941b6e0681f5204df52d883a88b",
+          "md5": "461b4e708088d7df0378b627e8a044fa",
+          "sha256": "57fc43716c020afbcfbf3b0992b60e63a65e5944deef33eb0f1d56eb80a1e470"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "461b4e708088d7df0378b627e8a044fa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20798,
+        "upload_time": "2021-09-29T19:14:31",
+        "upload_time_iso_8601": "2021-09-29T19:14:31.920879Z",
+        "url": "https://files.pythonhosted.org/packages/d0/37/ce78b9d09035b5aaf66cb7b3c8978b823941b6e0681f5204df52d883a88b/django_visitor_pass-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b038330a91fd57c33c8d7d0f344b3644c2384ac8e7b76345105c48f293a0a1f",
+          "md5": "eb1aa8c0501e4dc46f5a365131f3a6f6",
+          "sha256": "6b484222494515fab704c3bea5c976f1f80e5c2af280618496ba6098ee43a46b"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eb1aa8c0501e4dc46f5a365131f3a6f6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17569,
+        "upload_time": "2021-09-29T19:14:29",
+        "upload_time_iso_8601": "2021-09-29T19:14:29.936200Z",
+        "url": "https://files.pythonhosted.org/packages/5b/03/8330a91fd57c33c8d7d0f344b3644c2384ac8e7b76345105c48f293a0a1f/django-visitor-pass-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ebb0dc1ebf2ca8676e16edc0a32646fe2703ef13f2e58069b0da2e8c105bd0c5",
+          "md5": "0659ca1c8bfe23404f0b267832ea03a2",
+          "sha256": "88634f932924b5b1413549a12d05598607b8bab1323c8a729d4be2f506346ef2"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0659ca1c8bfe23404f0b267832ea03a2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 21374,
+        "upload_time": "2022-07-06T11:53:26",
+        "upload_time_iso_8601": "2022-07-06T11:53:26.994895Z",
+        "url": "https://files.pythonhosted.org/packages/eb/b0/dc1ebf2ca8676e16edc0a32646fe2703ef13f2e58069b0da2e8c105bd0c5/django_visitor_pass-0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8810ae9801fade6b1738d327d4c992ef7a4dfe9392d8b255028263c6e7552f8b",
+          "md5": "656c16ba3196d5f9ec61b4b8888c4a5c",
+          "sha256": "796e008746156d6cc92513b5593e52d32e1b9b351f012a4a635c73361f213351"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "656c16ba3196d5f9ec61b4b8888c4a5c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 18200,
+        "upload_time": "2022-07-06T11:53:24",
+        "upload_time_iso_8601": "2022-07-06T11:53:24.478050Z",
+        "url": "https://files.pythonhosted.org/packages/88/10/ae9801fade6b1738d327d4c992ef7a4dfe9392d8b255028263c6e7552f8b/django-visitor-pass-0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dcc96081a03d2b7868ab252214caaf232b87bcf8c2ff112e7f450aee6eda5e08",
+          "md5": "97a9040c4c9fa68ee6263c98985b5245",
+          "sha256": "f5c90d74e425761e0e407e09ae88893d37421a6198bad1405b2d54e1058a9cb4"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "97a9040c4c9fa68ee6263c98985b5245",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 22062,
+        "upload_time": "2022-07-26T10:21:05",
+        "upload_time_iso_8601": "2022-07-26T10:21:05.486107Z",
+        "url": "https://files.pythonhosted.org/packages/dc/c9/6081a03d2b7868ab252214caaf232b87bcf8c2ff112e7f450aee6eda5e08/django_visitor_pass-0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2be20c39bea386669a3ae9463d15fbdf3b0bde2dc4e69478d528753ae50a8af7",
+          "md5": "36e59396449a0dd683aacc89adeacbb2",
+          "sha256": "66e09caa04218d9927215129353632a6b066b9894a8dfd8114bef31fb9c9ea1e"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "36e59396449a0dd683aacc89adeacbb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 18668,
+        "upload_time": "2022-07-26T10:21:03",
+        "upload_time_iso_8601": "2022-07-26T10:21:03.094087Z",
+        "url": "https://files.pythonhosted.org/packages/2b/e2/0c39bea386669a3ae9463d15fbdf3b0bde2dc4e69478d528753ae50a8af7/django-visitor-pass-0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b1a9177fc742f778fd4cfa89d3ec542224d3a07a465f9674ab90fd55bc6abd73",
+          "md5": "ee494c941e6baf9c0c29769e25c167e7",
+          "sha256": "b38812bafbdeb55bbba64c14f8c79e6b19eb75b8472463730acb0c9501cf5d95"
+        },
+        "downloads": -1,
+        "filename": "django_visitor_pass-0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ee494c941e6baf9c0c29769e25c167e7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21840,
+        "upload_time": "2022-07-26T17:16:44",
+        "upload_time_iso_8601": "2022-07-26T17:16:44.160880Z",
+        "url": "https://files.pythonhosted.org/packages/b1/a9/177fc742f778fd4cfa89d3ec542224d3a07a465f9674ab90fd55bc6abd73/django_visitor_pass-0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e30f15c9be00d84196d790779bdd08039031c93b568c93a6efa846e1c052024",
+          "md5": "eb61537cdb5ad771077bdf98ab396fec",
+          "sha256": "494d2be4fba141f722228f8d5cd688e2dd9de6b1d43d3c115968acebdb4554c2"
+        },
+        "downloads": -1,
+        "filename": "django-visitor-pass-0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eb61537cdb5ad771077bdf98ab396fec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18629,
+        "upload_time": "2022-07-26T17:16:40",
+        "upload_time_iso_8601": "2022-07-26T17:16:40.753800Z",
+        "url": "https://files.pythonhosted.org/packages/6e/30/f15c9be00d84196d790779bdd08039031c93b568c93a6efa846e1c052024/django-visitor-pass-0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b1a9177fc742f778fd4cfa89d3ec542224d3a07a465f9674ab90fd55bc6abd73",
+        "md5": "ee494c941e6baf9c0c29769e25c167e7",
+        "sha256": "b38812bafbdeb55bbba64c14f8c79e6b19eb75b8472463730acb0c9501cf5d95"
+      },
+      "downloads": -1,
+      "filename": "django_visitor_pass-0.8-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ee494c941e6baf9c0c29769e25c167e7",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 21840,
+      "upload_time": "2022-07-26T17:16:44",
+      "upload_time_iso_8601": "2022-07-26T17:16:44.160880Z",
+      "url": "https://files.pythonhosted.org/packages/b1/a9/177fc742f778fd4cfa89d3ec542224d3a07a465f9674ab90fd55bc6abd73/django_visitor_pass-0.8-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6e30f15c9be00d84196d790779bdd08039031c93b568c93a6efa846e1c052024",
+        "md5": "eb61537cdb5ad771077bdf98ab396fec",
+        "sha256": "494d2be4fba141f722228f8d5cd688e2dd9de6b1d43d3c115968acebdb4554c2"
+      },
+      "downloads": -1,
+      "filename": "django-visitor-pass-0.8.tar.gz",
+      "has_sig": false,
+      "md5_digest": "eb61537cdb5ad771077bdf98ab396fec",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 18629,
+      "upload_time": "2022-07-26T17:16:40",
+      "upload_time_iso_8601": "2022-07-26T17:16:40.753800Z",
+      "url": "https://files.pythonhosted.org/packages/6e/30/f15c9be00d84196d790779bdd08039031c93b568c93a6efa846e1c052024/django-visitor-pass-0.8.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

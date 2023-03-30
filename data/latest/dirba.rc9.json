@@ -1,0 +1,396 @@
+{
+  "info": {
+    "author": "Mansur Izert",
+    "author_email": "izertmi@uriit.ru",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Dirba\n\nНабор утилит для работы с ML моделями и их запуском в kafka.\n\n## Содержание\n\n1. [Установка](#установка)\n2. [Работа с kafka](#работа-с-kafka)\n    1. [Что такое kafka](#что-такое-kafka)\n    2. [Consumer](#consumer)\n        1. [Конфигурация](#конфигурация)\n    3. [Producer](#producer)\n    4. [Runner для моделей](#runner-для-моделей)\n        1. [Model](#model)\n        2. [AbstractBaseKafkaRunner](#abstractBaseKafkaRunner)\n        3. [StrictRunner](#strictRunner)\n        4. [AbstractKafkaRunner](#abstractKafkaRunner)\n3. [Запуск моделей через API](#запуск-моделей-через-API)\n4. [Работа с каталогами](#работа-с-каталогами)\n    1. [Асинхронный API](#асинхронный-API)\n    2. [Синхронный API](#синхронный-API)\n5. [Работа с источниками данных](#работа-с-источниками-данных)\n6. [Валидация моделей](#валидация-моделей)\n\n## Установка\n\nДанный модуль подразумевает несколько вариантов установки\n\n1. Стандартный `pip install dirba`. Подразумевает установку базовых библиотек. Позволяет пользоваться\n   каталогами и работать с источниками данных\n2. Для работы с kafka. В таком случае `pip install dirba[kafka]` установит все необходимые зависимости\n3. Для работы с валидацией потребуется выполнить `pip install dirba[validation]`\n\n## Работа с kafka\n\n### Что такое kafka\n\nApache Kafka — распределённый программный брокер сообщений. Основное его назначение – организация асинхронного\nвзаимодействия между различными сервисами с гарантиями доставки.\n\nЕсли проще, то это промежуточное приложение, для общения различных приложений. Вполне логичный вопрос, который\nможет возникнуть – \"зачем нужно это промежуточное приложение ?\"\nНа деле, при реализации взаимодействия между различными приложениями, встаёт ряд проблем:\n\n- что делать, если одно из приложений будет недоступно\n- как распределить нагрузку между несколькими экземплярами приложения (для увеличения производительности)\n- как хранить историю сообщений (чтобы можно было что-то отладить/посмотреть)\n- как гарантировать обработку сообщения\n\nПри прямой схеме взаимодействия (например, по HTTP протоколу) решение вышеперечисленных проблем потребует\nреализации дополнительного кода для каждого из приложений, что замедляет разработку и увеличивает вероятность\nошибок.\n\nKafka же, использует асинхронный подход во взаимодействии различных сервисов. Она принимает сообщение и хранит\nего до тех пор, пока другое приложение не заберёт предназначенное для него сообщение.\n\n![схема работы apache kafka](https://www.cloudamqp.com/img/blog/kafka-setup.png)\n\nВ такой схеме работы есть несколько ключевых понятий, которые стоит уточнить:\n\n- **Producer** – внешнее приложение, *отправляющее* сообщение *в* kafka\n- **Consumer** – внешнее приложение, *получающее* сообщение *из* kafka\n- **Broker** – экземпляр (инстанс) приложения `Apache Kafka` (обычно их запускают от 3х штук, на разных\n  серверах, чтобы обеспечить бесперебойную работу (ведь без kafka приложение не смогут общаться)). В\n  совокупности превращаются в **Kafka Cluster**, с которым, фактически, и общаются ваши приложения (любое\n  приложение может переключиться на активный инстанс или работать сразу с несколькими)\n- **Topic** – \"тема\", определённый ключ, с которым ассоциируются отправляемые в kafka сообщения. Этот же ключ\n  используется для получения сообщений\n- **Partition** – \"часть топика\", логическая единица, для записи информации из *топика*. Кол-во партиций\n  связано с максимальным кол-вом приложений-consumer'ов (в одном *топике* не могут параллельно писать **\n  консьюмеров** больше, чем кол-во *партиций*). Как было сказано, партиция – логическая единица, которая могут\n  быть расположены в произвольном порядке на экземплярах приложения `Apache Kafka`\n\nИтого мы имеем:\n\n0. В рамках нашей системы у нас есть некоторый `Kafka Cluster`, к которому мы можем подключиться\n1. У нас есть наше приложение-producer, отправляющее сообщения с данными в конкретный `Topic` на этом\n   кластере.\n2. Другое приложение-consumer считывает сообщения из этого `Topic` и обрабатывает их согласно своей\n   бизнес-логике. При обработке сообщения приложением, оно подтверждает факт обработки, отправкой специального\n   commit-сигнала (как правило реализуется драйвером для kafka, но можно выполнять и самостоятельно).\n\n#### Как consumer понимает, какое сообщение брать\n\nЕсли вы внимательно прочитали главу выше, то вы должны были подметить, что там ни слова не сказано о том, как\nконсьюмер понимает, какие данные ему брать из kafka. Да, есть топик, которые разграничивает разные по виду\nсообщения, но что если их в kafka накопилось несколько сотен или даже тысяч ? Для решения этой проблемы в\nkafka существует механизм **групп** (`group`) и **сдвигов** (offset).\n\n- Группа – это обобщение для определённого приложения. Подразумевает выдачу некоторого общего идентификатора.\n  Такой идентификатор называют `group_id`.\n- Сдвиг – обозначение № сообщения, на котором находится та или иная группа.\n\nДавайте рассмотрим следующий пример.\n\nМы организовываем работу в некотором банке. Понятно, что почти все приложения банка – высоконагруженные, а\nпотеря данных в них недопустима. Поэтому мы само собой вспоминаем про kafka и радостно её берём.\n\nДля обработки всех транзакций (информации о платежах), мы выставляем 3 экземпляра написанного нами\nприложения `acquiring`. Скорее всего это приложение представляет собой REST или gRPC API, которое\nвзаимодействует с клиентским приложением, принимает транзакцию и тут же отправляет её в kafka, **а это значит\nчто приложение acquiring – Producer**. В принципе, нам не важно, как приложение будет это делать, главное\nчтобы приложения имели одну структуру, в независимости от экземпляра. Но на всякий случай мы **выдадим всем\nэкземплярам одинаковый group_id**, чтобы явно идентифицировать приложение.\n\n![пример работы в kafka](kafka_work_example.png)\n\nПосле того как данные оказались в kafka, можно выдохнуть. Как минимум, мы уже их не потеряем, если что-то\nнавернётся. Значит, можно начать обрабатывать наши транзакции. Обработка транзакций – сложный процесс с кучей\nлогики, поэтому для них у нас поднято несколько экземпляров (на рисунке 2, а в реальности может быть и сильно\nбольше). Экземпляры приложения `business logic` **является Consumer'ами**, т.к. достают данные из kafka, мы их\nтоже пометим отдельным `group_id`. В данном случае, одинаковый `group_id` **обязателен** для экземпляров **\nодного и того же приложения**. Так мы гарантируем, что одно и то же сообщение не будет обработано более 1\nраза.\n\nНу и осталось приложение `logger`, которое также **является Consumer'ом**. Для него у нас всего-лишь 1\nэкземпляр, т.к. логирование нам не к спеху и пригодится только при инцидентах. Ему мы **выставим\nдругой** `group_id`, отличный от `business logic`. Тем самым, мы и логгеру и бизнес логике позволим прочитать\nодни и те же сообщения (ведь мы хотим все сообщения и обработать и залоггировать).\n\n### Consumer\n\nДля того чтобы реализовать свой Consumer, вам необходимо унаследовать абстрактный\nкласс `runners.kafka_runner.AbstractKafkaConsumer`.\n\nДля этого вам необходимо:\n\n- указать формат входной модели (подразумевается, что все сообщения в кафке хранятся в формате `json`).\n  Входная модель – `pydantic` модель, описывающая перечень полей в `json` сообщении. за входную модель\n  отвечает поле класса `InputModel`\n- реализовать метод `on_startup`\n- реализовать метод `process`\n- ??????\n- PROFIT!!!\n\nДавайте посмотрим на пример такого сервиса\n\n```python\nimport os\n\nimport aiomisc\n\nimport dirba.logging_utils\nfrom dirba.runners import kafka as kafka_runner\n\n\nclass ExampleConsumer(kafka_runner.AbstractKafkaConsumer):\n    InputModel = kafka_runner.topic_schemas.LoaderMessage\n\n    async def on_startup(self):\n        print('started up')\n\n    async def process(self, message: InputModel):\n        print('message', message.uid_loaded_data, 'consumed')\n\n\nif __name__ == '__main__':\n    config = kafka_runner.KafkaConfig(input_topic='loaded_data', group_id='example_dirba_consumer',\n                                      bootstrap_servers=os.environ['BOOTSTRAP_SERVERS'])\n    consumer = ExampleConsumer(config, from_topic_begin=False)\n\n    with aiomisc.entrypoint(consumer) as loop:\n        dirba.logging_utils.set_logging(sentry_url=os.environ['SENTRY_URL'])\n\n        loop.run_forever()\n```\n\nВ данном случае у нас получится echo сервис, который будет выводить содержимое полученного из kafka сообщения.\n\n#### Конфигурация\n\nДля подключения к kafka вам необходимо заполнить `KafkaConfig`. Он содержит информацию о:\n\n- топике `input_topic`, из которого будут считаны сообщения\n- идентификаторе приложения `group_id` (должен быть уникален для каждого приложения)\n- адресах подключения `bootstrap_servers` (`<ip1>:<port1>,<ip2>:<port2>`, т.е. адреса для подключения к\n  инстансам, через запятую)\n\nТакже, для отслеживания работы сервиса, необходимо сконфигурировать логирование с помощью\n\n```\ndirba.logging_utils.set_logging(sentry_url=os.environ['SENTRY_URL'])\n```\n\nГде, `os.environ['SENTRY_URL']` – url для отправки информации в sentry сервис (для PRODUCTION – обязательно,\nдля локальной разработки – по желанию)\n\n#### Особенности сервиса\n\nЧто под капотом делает сервис:\n\n- сериализует данные из kafka\n- валидирует данные по указанной схеме\n- обеспечивает работоспособность сервиса при ошибках.\n- отправляет информацию об ошибках в sentry\n- отсылает информацию о производительности в sentry\n\nЧто **не гарантирует сервис**:\n\n- `commit` после каждого сообщения (атомарность для обработки сообщений)\n- повторную обработку сообщения при ошибке\n\nОсновной кейс использования – потоковая обработка большого кол-ва сообщений, с допущением на частичную потерю\nданных (в наших реалиях это менее 0,0001% от всех данных, но вы всё ещё можете повторить обработку, отследив\nсообщения через sentry).\n\n### Producer\n\nПо реализации, очень похож на Consumer~~, однако, как правило, сам по себе бесполезен~~.\n\nДля запуска вам необходимо:\n\n- указать формат выходной (output) модели (подразумевается, что все сообщения в кафке хранятся в формате json)\n  . Входная модель – pydantic модель, описывающая перечень полей в json сообщении. за выходную модель отвечает\n  поле класса OutputModel\n- реализовать метод `on_startup`\n- реализовать метод `pack` для сериализации данных в выходную модель\n- переопределить метод `start`, добавив необходимую логику\n\n```python\nimport os\nfrom typing import Any\n\nimport aiomisc\nimport pydantic\n\nimport dirba.logging_utils\nfrom dirba.runners import kafka as kafka_runner\n\n\nclass ExampleMessageSchema(pydantic.BaseModel):\n    id: int\n    message: str\n\n\nclass ExampleProducer(kafka_runner.AbstractKafkaProducer):\n    OutputModel = ExampleMessageSchema\n\n    def pack(self, data: Any) -> OutputModel:\n        return data\n\n    async def on_startup(self):\n        print('started up')\n\n    async def start(self, trigger_start=True):\n        await super(ExampleProducer, self).start(trigger_start=True)\n        for i in range(10):\n            message = ExampleMessageSchema(id=i, message=f'test {i}')\n            await self.send_message(message)\n            print('sent', message)\n\n\nif __name__ == '__main__':\n    config = kafka_runner.KafkaConfig(None, group_id='example_dirba_producer',\n                                      bootstrap_servers=os.environ['BOOTSTRAP_SERVERS'],\n                                      output_topic='test__dirba')\n    producer = ExampleProducer(config)\n\n    with aiomisc.entrypoint(producer) as loop:\n        dirba.logging_utils.set_logging(sentry_url=os.environ['SENTRY_URL'])\n        loop.run_forever()\n```\n\nВ данном примере мы просто немного поспамим сообщениями в kafka.\n\nНа самом деле класс `AbstractKafkaProducer` является скорее промежуточным (поэтому тут нужно переопределять\nметод `start`) и предполагается, что он будет использоваться в множественном наследовании или будет запущен в\nпараллель с другим сервисом (смотри `/examples/example_producer.py` в репозитории).\n\nДанный сервис лишь гарантирует robust'ное (устойчивое к сбоям) соединение с kafka, однако никоим образом не\nобрабатывает ошибки, которые могут возникнуть в вашей логике.\n\nКонфиг заполняется так же, как и в [producer'e](#producer), но вместо `input_topic`, необходимо\nуказать `output_topic`, в который будут отправляться сообщения.\n\n### Runner для моделей\n\n**Если** вы реализуете **ML** модель, **то вам сюда**\n\nRunner'ы – семейство классов, обеспечивающие абстракцию различного уровня для потоковой работы с kafka (принял\nсообщение, создал новое сообщение).\n\nВсе Runner'ы работают с базовой абстракцией – `Model`\n\n#### Model\n\nModel – сущность обеспечивающая обработку входных данных, с получением вероятностной оценки о принадлежности к\nкому-либо классу. Иначе говоря – обёртка для классификаторов.\n\nК сожалению, Model, имеет достаточно строгий API и приспособить его для другой задачи будет довольно\nпроблематично. Поэтому давайте посмотрим на то, как его реализовать.\n\n##### AbstractProhibitedModel\n\n`AbstractProhibitedModel` – частный случай `AbstractModel`. Единственное отличие – явная привязка к некоторому\nкаталогу. Подразумевается, что любая выдаваемая оценка от такой модели, должна быть для **категории,\nсуществующей в** [каталоге](#работа-с-каталогами).\n\n```python\nclass DamboInput(pydantic.BaseModel):\n    text: str\n\n\nclass DamboModel(AbstractProhibitedModel):\n    def __init__(self, category_catalog: CategoryCatalog):\n        super().__init__(category_catalog)\n        self.category_catalog.load_catalog_sync()\n\n    def predict(self, features: DamboInput) -> List[Predict]:\n        return [Predict(score=1, category=i) for i in self.category_catalog.catalog_values]\n\n    def preprocess(self, features: LoaderMessage) -> DamboInput:\n        return DamboInput(text='dambooooooooooooo')\n\n    def author(self) -> Author:\n        return Author(name='dambo', version='0.0.1')\n\n```\n\nМодель подразумевает отдельную функцию для предварительной обработки входного сообщения, и функцию по\nполучению вероятностей принадлежности к классу.\n\n**Советы**\n\n- если модель не отнесла входной материал к какой-либо категории, то нужно возвращать **пустой список**\n- валидацию данных лучше оставить вне логики модели\n- лучше избегать многопроцессорной обработки. Т.к. предполагается запуск через kafka, гораздо проще будет\n  увеличить кол-во инстансов, чем мучиться с последствиями многопоточности.\n\n#### AbstractBaseKafkaRunner\n\nБазовый класс для обработки данных из kafka моделью. Подразумевает следующий порядок работы:\n\n- получение сообщения из kafka\n- валидация по входной модели\n- передача данных модели\n- отправка результирующего сообщения в kafka\n\nПо своей сути – небольшая обёртка над [Consumer](#consumer) и [Producer](#producer), с добавлением вызова\nмодели\n\n**Не стоит использовать данный класс для деплоя модели, если не хотите писать много кода**\n\n```python\nimport os\nimport uuid\nfrom typing import Optional\n\nimport aiomisc\n\nfrom dirba.models.abc import Predict\nfrom dirba.models.dambo import DamboModel\nfrom dirba.runners.kafka_runners import AbstractBaseKafkaRunner, KafkaConfig\nfrom dirba.runners.kafka_runners.topic_schemas import LoaderMessage, AnalysisMessage, AnalysisResult,\n\nModelOutput\nfrom dirba.utils.catalogs import CategoryCatalog\n\n\nclass DamboBaseKafkaRunner(AbstractBaseKafkaRunner):\n    InputModel = LoaderMessage\n    OutputModel = AnalysisMessage\n\n    def pack_model_answer(self, message: InputModel, predict: Predict) -> Optional[OutputModel]:\n        input_data = message.dict(include={\"uid_query\", \"query_id\", \"driver_id\", \"category_id\", \"type_id\",\n                                           \"uid_search\", \"uid_filter_link\", \"uid_loader\",\n                                           \"uid_loaded_data\", \"uid_analysis\", })\n\n        model_answer = ModelOutput(category=predict.category, estimate=predict.score)\n        result = AnalysisResult(content_ref=message.result,\n                                model=model_answer,\n                                type_content=message.type_content)\n\n        packed = self.OutputModel(uid_analysis=uuid.uuid4(),\n                                  author=self.model.author(),\n                                  result=result,\n                                  **input_data)\n        return packed\n\n    def is_adorable(self, input_message: InputModel) -> bool:\n        return input_message.type_content == 'text'\n\n    async def on_startup(self):\n        print('started_up')\n\n\nif __name__ == '__main__':\n    config = KafkaConfig(input_topic='loaded_data',\n                         output_topic='dirba_simple_runner_test',\n                         group_id='example_dirba_consumer',\n                         bootstrap_servers=os.environ['BOOTSTRAP_SERVERS'])\n\n    category_catalog = CategoryCatalog(os.environ['CATALOG_URL'])\n    model = DamboModel(category_catalog)\n    runner = DamboBaseKafkaRunner(model, config, from_topic_begin=True)\n\n    with aiomisc.entrypoint(runner) as loop:\n        loop.run_forever()\n```\n\n#### StrictRunner\n\nТот же `AbstractRunner`, однако привязан к определённому формату данных. При получении сообщения делает\nпроверку на наличие категории в переданном каталоге.\n\n**Не стоит использовать данный класс для деплоя модели, если не хотите писать много кода**\n\n```python\nimport logging\nimport os\nfrom random import random\nfrom typing import List\n\nimport aiomisc\n\nfrom dirba.models.abc import Predict\nfrom dirba.models.dambo import DamboModel, DamboInput\nfrom dirba.runners.kafka_runners import AbstractStrictBaseKafkaRunner, KafkaConfig\nfrom dirba.utils.catalogs import CategoryCatalog\n\n\nclass DumbModel(DamboModel):\n    def predict(self, features: DamboInput) -> List[Predict]:\n        if random() > 0.5:\n            return [Predict(score=1, category=i) for i in self.category_catalog.catalog_values]\n        else:\n            return [Predict(score=1, category=-20)]\n\n\nclass DambKafkaRunner(AbstractStrictBaseKafkaRunner):\n\n    def is_adorable(self, input_message: AbstractStrictBaseKafkaRunner.InputModel) -> bool:\n        return input_message.type_content == 'text'\n\n    async def on_startup(self):\n        print('started_up')\n\n\nif __name__ == '__main__':\n    config = KafkaConfig(input_topic='loaded_data',\n                         output_topic='dirba_simple_runner_test',\n                         group_id='example_dirba_consumer',\n                         bootstrap_servers=os.environ['BOOTSTRAP_SERVERS'])\n\n    category_catalog = CategoryCatalog(os.environ['CATALOG_URL'])\n    model = DumbModel(category_catalog)\n    runner = DambKafkaRunner(model, config, from_topic_begin=True,\n                             category_catalog=category_catalog,\n                             produce_incorrect_categories=True)\n\n    with aiomisc.entrypoint(runner, log_level=logging.DEBUG) as loop:\n        loop.run_forever()\n```\n\n#### AbstractKafkaRunner\n\n**Основной класс для использования**\n\nИз коробки содержит:\n\n- мониторинг через sentry\n- выгрузка метрик в prometheus (роут `/metrics/`)\n\nВот пример его использования\n\n```python\nimport os\nimport time\nfrom random import random\nfrom typing import Iterable\n\nimport aiomisc\n\nimport dirba\nfrom dirba.models.abc import Predict\nfrom dirba.models.dambo import DamboModel, DamboInput\nfrom dirba.runners.kafka_runners import KafkaConfig\nfrom dirba.runners.kafka_runners.runner import AbstractKafkaRunner\nfrom dirba.utils.catalogs import CategoryCatalog\nfrom dirba.utils.metrics.prometheus_exporter import PrometheusExporter\n\n\nclass ExampleRunner(AbstractKafkaRunner):\n    InputModel = AbstractKafkaRunner.InputModel\n    OutputModel = AbstractKafkaRunner.OutputModel\n\n    def is_adorable(self, input_message: InputModel) -> bool:\n        return input_message.type_content == 'text'\n\n    async def on_startup(self):\n        print('started up')\n\n\nclass DumbModel(DamboModel):\n    def predict(self, features: DamboInput) -> Iterable[Predict]:\n        # для использования дополнительных метрик они должны быть сконфигурированы\n        self.metric.add_label_values(ora='jojo', muda='dio')\n        time.sleep(1)\n        # в тех ситуациях, когда нужно прокинуть разные значения метрик для каждого predict'a,\n        # можно возвращать их с помощью генератора\n        for i in self.category_catalog.catalog_values:\n            if random() > 0.3:\n                self.metric.add_label_values(ora=f'jojo_{i}', muda='dio')\n                yield Predict(score=1, category=i)\n\n\nif __name__ == '__main__':\n    config = KafkaConfig(input_topic='loaded_data',\n                         output_topic='dirba_simple_runner_test',\n                         group_id='example_dirba_runner',\n                         bootstrap_servers=os.environ['BOOTSTRAP_SERVERS'])\n\n    # т.к. это \"строгий\" runner (как и модель), они должны взаимодействовать с каталогом\n    category_catalog = CategoryCatalog(os.environ['CATALOG_URL'])\n    model = DumbModel(category_catalog)\n\n    # from_topic_begin - отладочный вариант запуска. В проде он должен быть выставлен в False\n    runner = ExampleRunner(model, config, from_topic_begin=True, category_catalog=category_catalog)\n    # для прокидывания метрик также необходимо запустить экспортёр\n    exporter = PrometheusExporter(port=int(os.environ['PORT']), address='0.0.0.0')\n\n    # после инциализации runner'a можно сконфигурировать доп. набор метрик, при необходимости\n    runner.material_metric.register_labels('ora', 'muda')\n\n    # конфигурация логирования\n    dirba.logging_utils.set_logging(sentry_url=os.environ['SENTRY_URL'])\n\n    with aiomisc.entrypoint(runner, exporter) as loop:\n        loop.run_forever()\n```\n\nИз отличий – добавился ещё один сервис `PrometheusExporter`, который отвечает за выгрузку метрик. Метрики\nможно получить по адресу, который был передан экспортёру, и роуту `/metrics/`. И да, экспортёр можно и не\nзапускать, но в таком случае и метрики выведены не будут. Однако это никоим образом не сломает раннер.\n\nТакже в примере продемонстрирована возможность добавления label'ов к метрике prometheus.\n\n## Запуск моделей через API\n\nWIP\n\n## Работа с каталогами\n\nТ.к. все модели ориентированы на получение вероятности принадлежности к категории, то мы где-то должны эти\nкатегории брать. Хардкод – дело неблагодарное, поэтому у нас есть общий сервис, в котором содержится\nинформация о всех категориях. Раз это сервис, то, наверное, хотелось бы иметь обвязку для обращения к нему, да\nещё и с кэшом желательно.\n\nДля этого у нас есть `utils.catalogs.abc.AbstractCatalog`. Сам класс представляет собой простенькую обвязку\nдля обращения к стороннему HTTP сервису.\n\nЕсли вы захотите поработать именно с `AbstractCatalog`, то вам необходимо:\n\n- Определить `pydantic` модель данных для данных каталога\n- Переопределить метод `parse_catalog_response` для сериализации данных каталога в словарь, для последующей\n  обработки\n\nПример вы можете найти в обвязке вокруг конкретного каталога *категорий* в `utils.catalogs.category`.\n\nУ каталога есть 2 варианта API – синхронный и асинхронный.\n\n### Асинхронный API\n\n```python\nimport asyncio\nimport os\nimport time\nimport logging\n\nfrom dirba.utils.catalogs import CategoryCatalog\n\nlogging.basicConfig(level=logging.DEBUG)\n\ncatalog = CategoryCatalog(os.environ['CATALOG_URL'])\n\n\nasync def async_example():\n    # демонстрация работы кэша\n    start_time = time.time()\n    count = 20\n    for i in range(count):\n        val = await catalog.get_value(catalog_id=14)\n    print(count, 'requests ended up in', time.time() - start_time, 'seconds')\n    print(val)\n\n    await catalog.get_catalog_data()\n\n    # в том числе и для несуществующих значений\n    for i in range(800, 810):\n        val = await catalog.get_value(catalog_id=i)\n        # все последующие обращения берутся из кэша\n        val = await catalog.get_value(catalog_id=i)\n        val = await catalog.get_value(catalog_id=i)\n\n\nif __name__ == '__main__':\n    asyncio.run(async_example())\n```\n\nОсновная функция для взаимодействия – `get_value`. Под капотом, она самостоятельно обновляет кэш значений из\nкаталога (если вы запрашиваете несуществующее значение, то каталоги будут обновлены, а дальше вступит в силу\nкэш). Можно работать с результирующим словарём каталога напрямую *крайне не рекомендуется*.\n\nИ в синхронном варианте это будет выглядеть как-то так\n\n### Синхронный API\n\n```python\nimport os\nimport time\nimport logging\n\nfrom dirba.utils.catalogs import CategoryCatalog\n\nlogging.basicConfig(level=logging.DEBUG)\n\ncatalog = CategoryCatalog(os.environ['CATALOG_URL'])\n\n\ndef sync_example():\n    # демонстрация работы кэша\n    start_time = time.time()\n    count = 20\n    for i in range(count):\n        val = catalog.get_value_sync(catalog_id=14)\n    print(count, 'sync requests ended up in', time.time() - start_time, 'seconds')\n    print(val)\n\n    # в том числе и для несуществующих значений\n    for i in range(800, 810):\n        val = catalog.get_value_sync(catalog_id=i)\n        # все последующие обращения берутся из кэша\n        val = catalog.get_value_sync(catalog_id=i)\n        val = catalog.get_value_sync(catalog_id=i)\n\n\nif __name__ == '__main__':\n    sync_example()\n```\n\nРазницы по скорости между ними нет, однако в зависимости от вашего контекста исполнения, вам могут\nпонадобиться синхронный или асинхронный варианты.\n\nБолее подробную информацию вы можете найти в документации методов и самого класса\n\n## Работа с источниками данных\n\nЕсли вы разрабатываете ML модель, то у вас скорее всего встанет ещё один вопрос, как достать данные для их\nпрогона через модель, ведь вам приходит лишь идентификатор.\n\nДля работы с данными есть набор классов в `utils.data_loader`. Останавливаться на подробностях\nимплементации `AbstractDataLoader` смысла не вижу (т.к. все реализации уже готовы). Скажу лишь, что из коробки\nтам прописана `retry` политика для HTTP запросов, чтобы вам поменьше страдать.\n\nИспользуются классы для данных максимально просто:\n\n- выбираете нужный по названию сущности\n- указываете URL до сервиса\n- получаете данные по идентификатору сущности, который вы получили\n\n```python\nimport os\n\nfrom dirba.utils.data_loader import TextLoader, HtmlLoader, ImageLoader\n\nif __name__ == '__main__':\n    service_url = os.environ['SERVICE_URL']\n\n    text_loader = TextLoader(service_url)\n    print(text_loader.get_content(entity_id=1))\n\n    html_loader = HtmlLoader(service_url)\n    print(html_loader.get_content(entity_id=1))\n\n    image_loader = ImageLoader(service_url)\n    image = image_loader.get_content(entity_id=1)\n    with open('./tempo.jpg', 'wb') as f:\n        f.write(image[1].content)\n\n```\n\n## Валидация моделей\n\nWIP\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.uriit.ru/CIAS/dirba",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "dirba",
+    "package_url": "https://pypi.org/project/dirba/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/dirba/",
+    "project_urls": {
+      "Homepage": "https://gitlab.uriit.ru/CIAS/dirba"
+    },
+    "release_url": "https://pypi.org/project/dirba/0.1.3/",
+    "requires_dist": [
+      "requests",
+      "fastapi (>=0.63.0)",
+      "pydantic (>=1.8.1)",
+      "python-multipart (>=0.0.5)",
+      "uvicorn (>=0.11.3)",
+      "aiomisc (>=12.1.0)",
+      "aiohttp (<4.0.0,>3.7.0)",
+      "aiohttp-asgi (>=0.3.1)",
+      "orjson (>=3.5.1)",
+      "sentry-sdk (>=0.19.0)",
+      "cachetools (>=4.2.1)",
+      "asyncache (>=0.1.1)",
+      "prometheus-client (<0.11.0,>=0.10.1)",
+      "aiokafka (<0.8.0,>=0.7.0) ; extra == 'kafka'",
+      "scikit-learn (<0.24,>=0.21.0.1) ; extra == 'validation'",
+      "pandas (>=1.0.1) ; extra == 'validation'"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Small ML boilerplate",
+    "version": "0.1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10740314,
+  "releases": {
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ae7a22007c86b39364e1f30b21943e1528506e0aa39687430ff795364195b5d",
+          "md5": "37c2b40b3f4fac23771e5945ae50cecb",
+          "sha256": "04b325d77096415fb5c1d8221bb58843865e4faf6bdd7bd836b24d3984a8ab35"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "37c2b40b3f4fac23771e5945ae50cecb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11634,
+        "upload_time": "2021-01-26T10:41:12",
+        "upload_time_iso_8601": "2021-01-26T10:41:12.353762Z",
+        "url": "https://files.pythonhosted.org/packages/7a/e7/a22007c86b39364e1f30b21943e1528506e0aa39687430ff795364195b5d/dirba-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aad80b3845fb9a4d7adabede823c86f261a9ab6fc3fec57d8e32e9ff898c2e2e",
+          "md5": "1204d3e10017343352520db5db7305a8",
+          "sha256": "c2fb64a93cd9371998da3c8a55fcf4959d039b328de79f743b33f8788dc5a197"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.0.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1204d3e10017343352520db5db7305a8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11604,
+        "upload_time": "2021-01-26T10:41:13",
+        "upload_time_iso_8601": "2021-01-26T10:41:13.671107Z",
+        "url": "https://files.pythonhosted.org/packages/aa/d8/0b3845fb9a4d7adabede823c86f261a9ab6fc3fec57d8e32e9ff898c2e2e/dirba-0.0.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "83f46075daccf0ee73b5bb4128df9c5bcee57a60bb6f312f2afb899699539ffa",
+          "md5": "6a98511365b5c407cad038cf4e2425cc",
+          "sha256": "b7d22fd2f6770f05de1d70ccf45fcb3f9669d33d075f99a03e8325ff5edc77a6"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.0.2-py3.7.egg",
+        "has_sig": false,
+        "md5_digest": "6a98511365b5c407cad038cf4e2425cc",
+        "packagetype": "bdist_egg",
+        "python_version": "3.7",
+        "requires_python": ">=3.6",
+        "size": 21674,
+        "upload_time": "2021-01-26T10:41:14",
+        "upload_time_iso_8601": "2021-01-26T10:41:14.876440Z",
+        "url": "https://files.pythonhosted.org/packages/83/f4/6075daccf0ee73b5bb4128df9c5bcee57a60bb6f312f2afb899699539ffa/dirba-0.0.2-py3.7.egg",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb0a640307c03a321727a267011bf2d80724d526837a794e8b3702a808476759",
+          "md5": "0b7a0be37a682d1ca9446f107b9dc70b",
+          "sha256": "f37a39b66335b108d17c3e21762081fd6a52989bd40c2194ccca04fb7c99a93a"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0b7a0be37a682d1ca9446f107b9dc70b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 22349,
+        "upload_time": "2021-04-16T12:23:02",
+        "upload_time_iso_8601": "2021-04-16T12:23:02.974789Z",
+        "url": "https://files.pythonhosted.org/packages/cb/0a/640307c03a321727a267011bf2d80724d526837a794e8b3702a808476759/dirba-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0b4f4087f85134744fd1faecbf7b1ed693378e38736c625ba494b60dc3e661c",
+          "md5": "73bb934e1b6c3bacd0e835683d4709cd",
+          "sha256": "315328e6eb03ff780f38ba4e39be03bbf6a3a7edab5a9ac188332ba176ae4ce5"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "73bb934e1b6c3bacd0e835683d4709cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 22379,
+        "upload_time": "2021-04-19T06:00:56",
+        "upload_time_iso_8601": "2021-04-19T06:00:56.326877Z",
+        "url": "https://files.pythonhosted.org/packages/d0/b4/f4087f85134744fd1faecbf7b1ed693378e38736c625ba494b60dc3e661c/dirba-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a9ac7f9be7bc2ffc96cf64992ee8a6a29fc862c31394c2e33ceaca3cfbe8ac87",
+          "md5": "cb6c345bd73c6c1a0669beb3500bd04e",
+          "sha256": "4b214fceed0a5aab15e630b431623d6540ff73a640019481add447e155736df4"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cb6c345bd73c6c1a0669beb3500bd04e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 45054,
+        "upload_time": "2021-06-25T06:07:52",
+        "upload_time_iso_8601": "2021-06-25T06:07:52.930491Z",
+        "url": "https://files.pythonhosted.org/packages/a9/ac/7f9be7bc2ffc96cf64992ee8a6a29fc862c31394c2e33ceaca3cfbe8ac87/dirba-0.1.2.dev1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3c423f0b4baef4b4daf3c2eea698a8ce764737f6a4ec2fc900be2a522410d04d",
+          "md5": "fece247ce5c781a65abddacfdef77780",
+          "sha256": "2669f2e5f2a03cc7d812d40a452ea615c79ac7e11231cdd02a1a62307d27f2cb"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fece247ce5c781a65abddacfdef77780",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 50269,
+        "upload_time": "2021-06-25T06:07:56",
+        "upload_time_iso_8601": "2021-06-25T06:07:56.418559Z",
+        "url": "https://files.pythonhosted.org/packages/3c/42/3f0b4baef4b4daf3c2eea698a8ce764737f6a4ec2fc900be2a522410d04d/dirba-0.1.2.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2.dev2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4709d4d732b0fbb4bd7965debc053404789ad774f74641d73359ef3e50dae5ce",
+          "md5": "2cd327a9dafe14d42e549bdf9ae33c39",
+          "sha256": "dd61ed97a391c6887d36055b6561f3d0debeed3639993e2cc7b723b3bcb23b50"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2cd327a9dafe14d42e549bdf9ae33c39",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 45026,
+        "upload_time": "2021-06-25T06:21:47",
+        "upload_time_iso_8601": "2021-06-25T06:21:47.070046Z",
+        "url": "https://files.pythonhosted.org/packages/47/09/d4d732b0fbb4bd7965debc053404789ad774f74641d73359ef3e50dae5ce/dirba-0.1.2.dev2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "070b77cbd61c9d6c41566f7252854872eeb3754ca65f923ea7548fb2dfd8dcb0",
+          "md5": "ab6de649441d917dfdaa7e19b4000119",
+          "sha256": "7e347c6c2af33c14eb255b69c208a38446298f77747585467912a118237b762e"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ab6de649441d917dfdaa7e19b4000119",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 50248,
+        "upload_time": "2021-06-25T06:21:51",
+        "upload_time_iso_8601": "2021-06-25T06:21:51.783430Z",
+        "url": "https://files.pythonhosted.org/packages/07/0b/77cbd61c9d6c41566f7252854872eeb3754ca65f923ea7548fb2dfd8dcb0/dirba-0.1.2.dev2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2.dev3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0fdc8d47ab7b99d751f3a1f549160217fa9c337510389dc6664078885215fa7",
+          "md5": "93c6b757b7aede0f061e9a7a2a8c10a8",
+          "sha256": "37af73e7bac55bccee95965ba6990416f88b6dda8f29d9044f3df36870c15b33"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "93c6b757b7aede0f061e9a7a2a8c10a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 45053,
+        "upload_time": "2021-06-25T06:34:32",
+        "upload_time_iso_8601": "2021-06-25T06:34:32.221491Z",
+        "url": "https://files.pythonhosted.org/packages/f0/fd/c8d47ab7b99d751f3a1f549160217fa9c337510389dc6664078885215fa7/dirba-0.1.2.dev3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ccc60017708194fc22c8649d4a58332acd81ebad8ed31b589061e15e55786c49",
+          "md5": "89a522275dffa6694a4321743b889a2d",
+          "sha256": "79d137bf59c7b6f84342569c68a337f2274df3ae1a6f940e8eb799606c4d9a29"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.2.dev3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89a522275dffa6694a4321743b889a2d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 50395,
+        "upload_time": "2021-06-25T06:34:33",
+        "upload_time_iso_8601": "2021-06-25T06:34:33.994798Z",
+        "url": "https://files.pythonhosted.org/packages/cc/c6/0017708194fc22c8649d4a58332acd81ebad8ed31b589061e15e55786c49/dirba-0.1.2.dev3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ebfa79037fd92f0603c82ef7a1a6928ae4188126695bdae12da755f09d502b0",
+          "md5": "491387e8939f9cbadd5b20ef7e087e5b",
+          "sha256": "eef68dbb99009a7128c866077e0b42c3ea66839fb3c03eb1286ada8e35b13ca2"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "491387e8939f9cbadd5b20ef7e087e5b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 45002,
+        "upload_time": "2021-06-25T06:44:33",
+        "upload_time_iso_8601": "2021-06-25T06:44:33.559690Z",
+        "url": "https://files.pythonhosted.org/packages/5e/bf/a79037fd92f0603c82ef7a1a6928ae4188126695bdae12da755f09d502b0/dirba-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e97b481322cd4a130083b926cee2e018556f2b795ece09bc054e67a05157baf3",
+          "md5": "e84e83cfdded2d6f5be025b637b340fe",
+          "sha256": "a4256bfe5f88194f9724ede5972cc28c15da4d5821996fadeee327a08debab62"
+        },
+        "downloads": -1,
+        "filename": "dirba-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e84e83cfdded2d6f5be025b637b340fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 50403,
+        "upload_time": "2021-06-25T06:44:36",
+        "upload_time_iso_8601": "2021-06-25T06:44:36.065605Z",
+        "url": "https://files.pythonhosted.org/packages/e9/7b/481322cd4a130083b926cee2e018556f2b795ece09bc054e67a05157baf3/dirba-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5ebfa79037fd92f0603c82ef7a1a6928ae4188126695bdae12da755f09d502b0",
+        "md5": "491387e8939f9cbadd5b20ef7e087e5b",
+        "sha256": "eef68dbb99009a7128c866077e0b42c3ea66839fb3c03eb1286ada8e35b13ca2"
+      },
+      "downloads": -1,
+      "filename": "dirba-0.1.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "491387e8939f9cbadd5b20ef7e087e5b",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 45002,
+      "upload_time": "2021-06-25T06:44:33",
+      "upload_time_iso_8601": "2021-06-25T06:44:33.559690Z",
+      "url": "https://files.pythonhosted.org/packages/5e/bf/a79037fd92f0603c82ef7a1a6928ae4188126695bdae12da755f09d502b0/dirba-0.1.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e97b481322cd4a130083b926cee2e018556f2b795ece09bc054e67a05157baf3",
+        "md5": "e84e83cfdded2d6f5be025b637b340fe",
+        "sha256": "a4256bfe5f88194f9724ede5972cc28c15da4d5821996fadeee327a08debab62"
+      },
+      "downloads": -1,
+      "filename": "dirba-0.1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "e84e83cfdded2d6f5be025b637b340fe",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 50403,
+      "upload_time": "2021-06-25T06:44:36",
+      "upload_time_iso_8601": "2021-06-25T06:44:36.065605Z",
+      "url": "https://files.pythonhosted.org/packages/e9/7b/481322cd4a130083b926cee2e018556f2b795ece09bc054e67a05157baf3/dirba-0.1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

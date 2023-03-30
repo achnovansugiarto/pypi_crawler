@@ -1,0 +1,706 @@
+{
+  "info": {
+    "author": "Matthieu Gallet",
+    "author_email": "github@19pouces.net",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Framework :: Django :: 2.2",
+      "Framework :: Django :: 3.0",
+      "Framework :: Django :: 3.1",
+      "License :: OSI Approved :: CEA CNRS Inria Logiciel Libre License, version 2.1 (CeCILL-2.1)",
+      "Operating System :: MacOS :: MacOS X",
+      "Operating System :: Microsoft :: Windows",
+      "Operating System :: POSIX :: BSD",
+      "Operating System :: POSIX :: Linux",
+      "Operating System :: Unix",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "df_websockets\n=============\n\n`df_websockets` extends [django-channels](https://channels.readthedocs.io) to simplify communications between \nclients and servers and to process heavy tasks in background processes.\n\n`df_websockets` is based on two main concepts:\n\n* _signals_, that are functions triggered both on the server or the browser  window by either the server or the client,\n* _topics_ to allow the server to send signals to any group of browser windows.\n\nSignals are exchanged between the browser window and the server using a single websocket.\nSignals that are triggered by the browser on the server are processed as background tasks (so the websocket endpoint does almost nothing).\nSignals that are triggered by the server can be processed as background tasks on the serveur and as Javascript functions on the browser.\n\nBackground processes can use [celery](https://docs.celeryproject.org/en/stable/), [channels](https://pypi.org/project/channels/) workers, or simply different processes or threads.\n\n\nRequirements and installation\n-----------------------------\n\n`df_websockets` works with:\n\n  * [Python](https://www.python.org) >= 3.6,\n  * [django](https://pypi.org/project/Django/) >= 2.0,\n  * [channels](https://pypi.org/project/channels/) >= 2.0.\n\n\nFor production use or any multiprocess setup (even in development mode), you also need:\n\n  * [redis](https://redis.io) >= 5.0,\n  * [channels_redis](https://pypi.org/project/channels-redis/) >= 3.3.\n\nIf you want to process signals in Celery tasks rather in Channel workers, you need to setup a Celery infrastructure:\n[Celery setup](https://docs.celeryproject.org/en/stable/django/first-steps-with-django.html).\n\n```bash\npython -m pip install df_websockets\n```\n\nIn your settings, you must add the following values:\n```python\n# the ASGI application to use with gunicorn or daphne\nASGI_APPLICATION = \"df_websockets.routing.application\"\n# add the required Middleware\nMIDDLEWARES = [..., \"df_websockets.middleware.WebsocketMiddleware\", ...]\nINSTALLED_APPS = [..., \"channels\", \"df_websockets\", ...]\nWEBSOCKET_WORKERS = \"thread\"\n# a channel layer, required by channels_redis\nCHANNEL_LAYERS = {\n    'default': {\n        'BACKEND': 'channels_redis.core.RedisChannelLayer',\n        'CONFIG': {\n            \"hosts\": [('localhost', 6379)],\n        },\n    },\n}\n```\n\nIf you use `df_config` and you use a local Redis, you have nothing to do: settings are automatically set and everything is working as soon as a Redis is running on your machine.\n\nNow, include `js/df_websockets.min.js` in your HTML and call `df_websockets.tasks.set_websocket_topics(request)` somewhere in the Django view.\nA bidirectionnal websocket connection will be established in your page.\n\nYou can start the development server:\n```bash\npython manage.py runserver\n```\n\n\nIf you use Channels workers (WEBSOCKET_WORKERS = \"channels\"), you also need to start a Channel worker:\n```bash\npython manage.py run_worker celery\n```\nIf you use Celery (WEBSOCKET_WORKERS = \"celery\"), you also need to start a Celery worker:\n```bash\npython manage.py worker -Q celery\n```\n\nbasic usage\n-----------\n\nA _signal_ is a string attached to Python or Javascript functions. When this signal is triggered, all these functions are called.\nOf course, you can target the platforms on which the functions will be executed: the server (for Python code) or chosen browser windows.\n\nFirst, we connect our code to the signal `\"myproject.first_signal\"`.\n```python\nfrom df_websockets.decorators import everyone, signal\nimport time\n\n@signal(path=\"myproject.first_signal\", is_allowed_to=everyone, queue=\"celery\")\ndef my_first_signal(window_info, content=None):\n    print(content)\n\n@signal(path=\"myproject.first_signal\", is_allowed_to=everyone, queue=\"slow\")\ndef my_first_signal_slow(window_info, content=None):\n    time.sleep(100)\n    print(content)\n```\n\n```javascript\n/* static file \"js/df_websockets.min.js\" must be included first */\ndocument.addEventListener(\"DOMContentLoaded\", () => {\n    window.DFSignals.connect('myproject.first_signal', (opts) => {\n        console.warn(opts.content);\n    });\n});\n```\n\nNow, we can trigger this signal to call this functions.\nIn both cases, both functions will be called on the server and in the browser window.\n```javascript\nwindow.DFSignals.call('myproject.first_signal', {content: \"Hello from browser\"});\n```\n\n```python\nfrom df_websockets.tasks import WINDOW, trigger, SERVER\nfrom df_websockets.decorators import everyone, signal\nfrom django.http.response import HttpResponse\n\ndef any_view(request):  # this is a standard Django view\n    trigger(request, 'myproject.first_signal', to=[SERVER, WINDOW], content=\"hello from a view\")\n    return HttpResponse()\n\n@signal(path=\"myproject.second_signal\", is_allowed_to=everyone, queue=\"slow\")\ndef second_signal(window_info):\n    trigger(window_info, 'myproject.first_signal', to=[SERVER, WINDOW], content=\"hello from Celery\")\n```\n\nIn this case, the `to` parameter targets both the server and the window.\nYou can even open a shell and call `df_websockets.tasks.trigger(None, 'myproject.first_signal', to=[BROADCAST], content=\"hello from a shell\")`.\nAll open windows will react.\n\nTopics\n------\n\nYou can select the set of connected browser windows that receive a signal triggered by the server, in addition of processing this signal on the server.\n\nA Django view using this signal system must call `set_websocket_topics` to add some ”topics” to this view.\nWhen you trigger a signal on the server, you can target any set topic. All windows featuring this topic will receive this signal.\n\n_For example, assume that multiple clients open a specific article on a blog. At any time, you can open Python shell in a terminal and trigger a signal on all these windows._  \n\n\n```python\nfrom df_websockets.tasks import set_websocket_topics\n\ndef any_view(request):  # this is a standard Django view\n    # useful code\n    obj1 = MyModel.objects.get(id=42)\n    set_websocket_topics(request, [obj1])\n    return TemplateResponse(\"my/template.html\", {})  # do not forget to add `js/df_websockets.min.js` to this HTML\n```\n\n`obj1` must be a Python object that is handled by the `WEBSOCKET_TOPIC_SERIALIZER` function. By default, any string and Django models are valid.\nEach window also has a unique identifier that is automatically added to this list, as well as the connected user id and the `BROADCAST`.\n\nThe following code will call the JS function on every browser window having the `obj` topic and to the displayed window.\n```python\nfrom df_websockets.tasks import WINDOW, trigger\nfrom df_websockets.tasks import set_websocket_topics\n\ndef another_view(request, obj_id):\n    obj = MyModel.objects.get(id=42)\n    trigger(request, 'myproject.first_signal', to=[WINDOW, obj], content=\"hello from a view\")\n    set_websocket_topics(request, [other_topics])\n    return HttpResponse()\n```\n\nThere are three special values:\n\n* `df_websockets.tasks.WINDOW`: the original browser window,\n* `df_websockets.tasks.USER`: all windows currently displayed by the connected user,\n* `df_websockets.tasks.BROADCAST`: all active windows.\n\nSome information about the original window (like its unique identifier or the connected user) must be provided to the triggered Python code, allowing it to trigger JS events on any selected window.  \nThese data are stored in the `WindowInfo` object, automatically built from the HTTP request by the trigger function and provided as first argument to the triggered code.\nThe `trigger` function accepts `WindowInfo` or `HTTPRequest` objects as first argument.\n\n\nHTML forms\n----------\n\n`df_websockets` comes with some helper functions when you signals to be trigger on the server when a form is submitted or changed.\nAssuming that you have a `signals.py` file that contains:\n```python\nfrom df_websockets.decorators import signal\nfrom df_websockets.tasks import WINDOW, trigger\nfrom df_websockets.utils import SerializedForm\nfrom django import forms\n\n\nclass MyForm(forms.Form): \n    title = forms.CharField()\n\n@signal(path='signal.name')\ndef my_signal_function(window_info, form_data: SerializedForm(MyForm)=None, title=None, id=None):\n    print(form_data and form_data.is_valid())\n    trigger(window_info, 'myproject.first_signal', to=WINDOW, title=title)\n\n@signal(path='signal.name')\ndef my_signal_function_raw(window_info, form_data=None, title=None, id=None):\n    print(form_data and form_data.is_valid())\n    trigger(window_info, 'myproject.first_signal', to=WINDOW, title=title)\n```\n\n\nUsing on a HTML form:\n```html\n<form data-df-signal='[{\"name\": \"signal.name\", \"on\": \"change\", \"form\": \"form_data\", \"opts\": {\"id\": 42} }]'>\n    <input type=\"text\" name=\"title\" value=\"df_websockets\">\n</form>\n```\n\nor, using the Django templating system:\n\n```html\n{% load websockets %}\n<form {% js_call \"signal.name\" on=\"change\" form=\"form_data\" id=42 %}>\n    <input type=\"text\" name=\"title\" value=\"df_websockets\">\n</form>\n```\n\nWhen the field \"title\" is modified, `my_signal_function(window_info, form_data = [{\"name\": \"title\", \"value\": \"df_websockets\"}], id=43)` is called.\n\n\n\nUsing on a HTML form input field:\n```html\n<form>\n    <input type=\"text\" name=\"title\" data-df-signal='[{\"name\": \"signal.name\", \"on\": \"change\", \"value\": \"title\", \"opts\": {\"id\": 42} }]'>\n</form>\n```\n\nor, using the Django templating system:\n\n```html\n{% load websockets %}\n<form>\n    <input type=\"text\" name=\"title\" {% js_call \"signal.name\" on=\"change\" value=\"title\" id=42 %}>\n</form>\n```\n\nWhen the field \"title\" is modified, `my_signal_function(window_info, title=\"new title value\", id=43)` is called.\n\n\n\nTesting signals\n---------------\n\nIn production, the signal framework requires a working Redis and worker processes.\nHowever, if you only want to check if a signal has been called in unitary tests, you can use :class:`df_websockets.utils.SignalQueue`.\nBoth server-side and client-side signals are kept into memory:\n\n* `df_websockets.testing.SignalQueue.ws_signals`,\n\n    * keys are the serialized topics\n    * values are lists of tuples `(signal name, arguments as dict)`\n\n* `df_websockets.testing.SignalQueue.python_signals`\n\n    * keys are the name of the queue\n    * values are lists of `(signal_name, window_info_dict, kwargs=None, from_client=False, serialized_client_topics=None, to_server=False, queue=None)`\n\n      * `signal_name` is … the name of the signal\n      * `window_info_dict` is a WindowInfo serialized as a dict,\n      * `kwargs` is a dict representing the signal arguments,\n      * `from_client` is `True` if this signal has been emitted by a web browser,\n      * `serialized_client_topics` is not `None` if this signal must be re-emitted to some client topics,\n      * `to_server` is `True` if this signal must be processed server-side,\n      * `queue` is the name of the selected Celery queue.\n\n```python\nfrom df_websockets.tasks import trigger, SERVER\nfrom df_websockets.window_info import WindowInfo\nfrom df_websockets.testing import SignalQueue\n\nfrom df_websockets.decorators import signal\n# noinspection PyUnusedLocal\n@signal(path='test.signal', queue='demo-queue')\ndef test_signal(window_info, value=None):\n  print(value)\n\nwi = WindowInfo()\nwith SignalQueue() as fd:\n  trigger(wi, 'test.signal1', to=[SERVER, 1], value=\"value1\")\n  trigger(wi, 'test.signal2', to=[SERVER, 1], value=\"value2\")\n\n# fd.python_signals looks like {'demo-queue': [ ['test.signal1', {…}, {'value': 'value1'}, False, None, True, None], \n# # ['test.signal2', {…}, {'value': 'value2'}, False, None, True, None]]}\n# fd.ws_signals looks like {'-int.1': [('test.signal1', {'value': 'value1'}), ('test.signal2', {'value': 'value2'})]}\n```\n\nJavaScript signals\n------------------\n\nMany [JS signals](https://github.com/d9pouces/df_websockets/blob/master/npm/df_websockets/base.js) are available out-of-the-box.\nThese signals can be triggered either by the JS code or by the Python code.\nFor example, you can update the content of a HTML node with the following lines:\n\n```python\nfrom df_websockets.tasks import trigger, WINDOW\nfrom df_websockets.decorators import signal\n\n@signal(path='test.signal', queue='demo-queue')\ndef test_signal(window_info, word=\"hellow\"):\n    trigger(window_info, 'html.content', to=WINDOW, selector=\"#obj\", content= \"<span>%s</span>\" % word)\n```\n\n```javascript\nwindow.DFSignals.call('html.content', {selector: \"#obj\", content: \"<span>hello</span>\"});\n```\n\nPlease read the content of `npm/df_websockets/base.js` for the whole list of available signals. \nYou can also create some shortcuts for the most common signals.\n\n\nChecklist \n---------\n\nEverything must be correctly setup to have working signals.\n\nThe first step is to test tasks from the command-line:\n\n1. Redis is running and accepting connections\n2. Celery is working\n2. at least one worker is running with all required queues\n3. the triggered signal is exists\n4. open a console `python manage.py shell` and manually trigger a task\n```python\nfrom df_websockets.tasks import trigger, SERVER\nfrom df_websockets.window_info import WindowInfo\ntrigger(WindowInfo(), 'test.signal', to=[SERVER], value=\"value2\")\n```\n\n\nThe second step is to check the web part:\n\n1. the web server must be running and accepting connections\n2. Celery is working\n2. at least one worker is running with all required queues\n3. the triggered signal exists\n3. `df_websockets.middleware.WebsocketMiddleware` is included\n4. check the used domain name, since tokens are passed through cookies: **\"localhost\" is different than \"127.0.0.1\"**\n5. `df_websockets.tasks.set_websocket_topics` is used somewhere in the view\n6. `static/js/df_websockets.min.js` is included in the page\n7. check if the WS tries to connect\n8. check if the WS is connected\n4. open a console `python manage.py shell` and manually trigger a task\n```python\nfrom df_websockets.tasks import trigger, BROADCAST\nfrom df_websockets.window_info import WindowInfo\ntrigger(WindowInfo(), 'html.text', to=[BROADCAST], selector=\"body\", content= \"<span>hello</span>\")\n```\n\nDo not hesitate to use a verbose logging:\n```python\nLOGGING = {\n    \"version\": 1,\n    \"disable_existing_loggers\": True,\n    \"formatters\": {\n        \"verbose\": {\n            \"format\": (\n                \"%(asctime)s [%(process)d] [%(levelname)s] \"\n                + \"pathname=%(pathname)s lineno=%(lineno)s \"\n                + \"funcname=%(funcName)s %(message)s\"\n            ),\n            \"datefmt\": \"%Y-%m-%d %H:%M:%S\",\n        },\n        \"django.server\": {\n            \"()\": \"django.utils.log.ServerFormatter\",\n        },\n        \"nocolor\": {\n            \"()\": \"logging.Formatter\",\n            \"fmt\": \"%(asctime)s [%(name)s] [%(levelname)s] %(message)s\",\n            \"datefmt\": \"%Y-%m-%d %H:%M:%S\",\n        },\n    },\n    \"filters\": {\n    },\n    \"handlers\": {\n        \"stdout.info\": {\n            \"class\": \"logging.StreamHandler\",\n            \"level\": \"DEBUG\",\n            \"stream\": \"ext://sys.stdout\",\n            \"formatter\": \"verbose\",\n        },\n        \"stderr.debug.django.server\": {\n            \"class\": \"logging.StreamHandler\",\n            \"level\": \"DEBUG\",\n            \"stream\": \"ext://sys.stderr\",\n            \"formatter\": \"django.server\",\n        },\n    },\n    \"loggers\": {\n        \"django\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"django.db\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"django.db.backends\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"django.request\": {\"handlers\": [], \"level\": \"DEBUG\", \"propagate\": True},\n        \"django.security\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"df_websockets.signals\": {\"handlers\": [], \"level\": \"DEBUG\", \"propagate\": True},\n        \"gunicorn.error\": {\"handlers\": [], \"level\": \"DEBUG\", \"propagate\": True},\n        \"pip.vcs\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"py.warnings\": {\n            \"handlers\": [],\n            \"level\": \"INFO\",\n            \"propagate\": True,\n        },\n        \"daphne\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"mail.log\": {\"handlers\": [], \"level\": \"INFO\", \"propagate\": True},\n        \"aiohttp.access\": {\n            \"handlers\": [\"stderr.debug.django.server\"],\n            \"level\": \"INFO\",\n            \"propagate\": False,\n        },\n        \"django.server\": {\n            \"handlers\": [\"stderr.debug.django.server\"],\n            \"level\": \"INFO\",\n            \"propagate\": False,\n        },\n        \"django.channels.server\": {\n            \"handlers\": [\"stderr.debug.django.server\"],\n            \"level\": \"INFO\",\n            \"propagate\": False,\n        },\n        \"gunicorn.access\": {\n            \"handlers\": [\"stderr.debug.django.server\"],\n            \"level\": \"INFO\",\n            \"propagate\": False,\n        },\n    },\n    \"root\": {\"handlers\": [\"stdout.info\"], \"level\": \"DEBUG\"},\n}\n\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/d9pouces/df_websockets",
+    "keywords": "",
+    "license": "CeCILL-B",
+    "maintainer": "Matthieu Gallet",
+    "maintainer_email": "github@19pouces.net",
+    "name": "df-websockets",
+    "package_url": "https://pypi.org/project/df-websockets/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/df-websockets/",
+    "project_urls": {
+      "Homepage": "https://github.com/d9pouces/df_websockets"
+    },
+    "release_url": "https://pypi.org/project/df-websockets/1.0.0/",
+    "requires_dist": [
+      "asgiref",
+      "channels",
+      "channels-redis",
+      "django",
+      "hiredis (<2.0)",
+      "pyasn1 (>=0.4.8)",
+      "redis"
+    ],
+    "requires_python": "",
+    "summary": "Websocket integration for Django",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14927846,
+  "releases": {
+    "0.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "429f1b5edb91d6b9876e3d0dd357d269b5c0fc1d5174a942f62cc7363d82bb0d",
+          "md5": "fc15f2efe26e78b986921d55011442ab",
+          "sha256": "b629b6327f5371cc2367188c8c05672c6a0bb2bc65fad39655184172f3ca3f2d"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fc15f2efe26e78b986921d55011442ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 52976,
+        "upload_time": "2020-09-09T09:05:50",
+        "upload_time_iso_8601": "2020-09-09T09:05:50.122060Z",
+        "url": "https://files.pythonhosted.org/packages/42/9f/1b5edb91d6b9876e3d0dd357d269b5c0fc1d5174a942f62cc7363d82bb0d/df_websockets-0.10.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de7432db5f3eaa6a10a774ba1782134f50444f3082f7554f3a3d979adf4e781c",
+          "md5": "525362f7268991f83225371ff981a17a",
+          "sha256": "1e42a37bc22ac5da55c2ab92272a6ddff81106b361fed37ef44d9debe810fe91"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "525362f7268991f83225371ff981a17a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 45489,
+        "upload_time": "2020-09-09T09:05:52",
+        "upload_time_iso_8601": "2020-09-09T09:05:52.130223Z",
+        "url": "https://files.pythonhosted.org/packages/de/74/32db5f3eaa6a10a774ba1782134f50444f3082f7554f3a3d979adf4e781c/df_websockets-0.10.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "77278632fcfde698ff44b158165684540618544650252d7fd37c2cb77b5ecea7",
+          "md5": "633e37b2aeaaee67dc990e660a9502be",
+          "sha256": "16f3892da2a3faf30c5ccf470262ebb67bbd74c76dd490b48d56b2759c5cea90"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "633e37b2aeaaee67dc990e660a9502be",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 52965,
+        "upload_time": "2020-09-09T20:16:52",
+        "upload_time_iso_8601": "2020-09-09T20:16:52.619127Z",
+        "url": "https://files.pythonhosted.org/packages/77/27/8632fcfde698ff44b158165684540618544650252d7fd37c2cb77b5ecea7/df_websockets-0.10.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b5a5b19e96a6e1276ebfe11d2f65a2db16fb753c4e201aee107535e4e72247f",
+          "md5": "62845b3800bde29caa68dd1f3510cbd8",
+          "sha256": "b94d42a31ec0b80bb883fd98204742d4d436847ce9f334ed9a6448d928a73867"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "62845b3800bde29caa68dd1f3510cbd8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 45505,
+        "upload_time": "2020-09-09T20:16:54",
+        "upload_time_iso_8601": "2020-09-09T20:16:54.518778Z",
+        "url": "https://files.pythonhosted.org/packages/8b/5a/5b19e96a6e1276ebfe11d2f65a2db16fb753c4e201aee107535e4e72247f/df_websockets-0.10.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c77e659331af23c008d55a681924ee0f3690c99db13a36d66f1b81b3b22b9a2",
+          "md5": "415e5079e7f212c36438698dc11a9040",
+          "sha256": "45458b3a05e6a232bb2c4a8a99f10f8e0478a0a2ba8bfc84357879275a79f50c"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "415e5079e7f212c36438698dc11a9040",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 84596,
+        "upload_time": "2022-08-29T19:51:52",
+        "upload_time_iso_8601": "2022-08-29T19:51:52.936397Z",
+        "url": "https://files.pythonhosted.org/packages/1c/77/e659331af23c008d55a681924ee0f3690c99db13a36d66f1b81b3b22b9a2/df_websockets-0.10.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e351a3bff694f221356721e68cca9976fa0d8c3a252468214d774564ac546bc",
+          "md5": "5336825b50c572a7c22eae5397d77845",
+          "sha256": "be20e7870c57cea3e2ace48d9d69284d434741fd7e39079c52e2456bc6fdd6c7"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5336825b50c572a7c22eae5397d77845",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 117065,
+        "upload_time": "2022-08-29T19:51:55",
+        "upload_time_iso_8601": "2022-08-29T19:51:55.072884Z",
+        "url": "https://files.pythonhosted.org/packages/0e/35/1a3bff694f221356721e68cca9976fa0d8c3a252468214d774564ac546bc/df_websockets-0.10.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "efcbbe5d12e8f156e8d99209c0eae3a5fb63c89f2b5be637c96274f31714e35d",
+          "md5": "20038c905eb275e27d6e0d9be3c68b7e",
+          "sha256": "1477a5c63e71ef0f64001e804d1a4072525fef8a15af9f7a0d3e809ce09dff67"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.2-py2-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "20038c905eb275e27d6e0d9be3c68b7e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2",
+        "requires_python": null,
+        "size": 52987,
+        "upload_time": "2020-10-04T15:17:35",
+        "upload_time_iso_8601": "2020-10-04T15:17:35.088508Z",
+        "url": "https://files.pythonhosted.org/packages/ef/cb/be5d12e8f156e8d99209c0eae3a5fb63c89f2b5be637c96274f31714e35d/df_websockets-0.10.2-py2-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b52772d87b7d971ba323ea278c208aadbc3f6b05ef82c09b2059cb23cbb45cda",
+          "md5": "fd56134588157bbf6f9dd11112f1688f",
+          "sha256": "f75b6f328d6b202a11fc73c67a0c49bce7a0276b29c0f0b2f08168dd29012df8"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd56134588157bbf6f9dd11112f1688f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46760,
+        "upload_time": "2020-10-04T15:17:47",
+        "upload_time_iso_8601": "2020-10-04T15:17:47.749924Z",
+        "url": "https://files.pythonhosted.org/packages/b5/27/72d87b7d971ba323ea278c208aadbc3f6b05ef82c09b2059cb23cbb45cda/df_websockets-0.10.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "08c60a629cc7649de86f6f5cf62687f43df83d975dca09484fcf9b6c606386eb",
+          "md5": "cf17234f89b98012928d4d7ca896211d",
+          "sha256": "48ecfd9f43f30e73fc59d3f877c9ab3d5bab67c05f452aa9beb18ee0a5c5d659"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cf17234f89b98012928d4d7ca896211d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 53013,
+        "upload_time": "2020-10-24T15:32:49",
+        "upload_time_iso_8601": "2020-10-24T15:32:49.920298Z",
+        "url": "https://files.pythonhosted.org/packages/08/c6/0a629cc7649de86f6f5cf62687f43df83d975dca09484fcf9b6c606386eb/df_websockets-0.10.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "498b157eeb904d88a5cf010f8748ee2ba756ca11f673146516dd81aa1ee57de3",
+          "md5": "5281a35a93cb60664dddaf4a4eb05475",
+          "sha256": "439181d0549be02304216dba7430bc8baa9a27f0525cd664a259f7847421fcd4"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5281a35a93cb60664dddaf4a4eb05475",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 45559,
+        "upload_time": "2020-10-24T15:32:56",
+        "upload_time_iso_8601": "2020-10-24T15:32:56.710705Z",
+        "url": "https://files.pythonhosted.org/packages/49/8b/157eeb904d88a5cf010f8748ee2ba756ca11f673146516dd81aa1ee57de3/df_websockets-0.10.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9efdb7f8682438c464bb783a35eec179a3d66e2b71b5f329898fb9646cbf5e57",
+          "md5": "8faebe0c6a5ece9cf84ac54360326d8c",
+          "sha256": "a8e5617630a5b29ccce361e47d8c7797681cb543dec56d5c8fe820320f3bd7a4"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8faebe0c6a5ece9cf84ac54360326d8c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 53096,
+        "upload_time": "2020-11-10T14:30:22",
+        "upload_time_iso_8601": "2020-11-10T14:30:22.643938Z",
+        "url": "https://files.pythonhosted.org/packages/9e/fd/b7f8682438c464bb783a35eec179a3d66e2b71b5f329898fb9646cbf5e57/df_websockets-0.10.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd2830ed935f86c53b49fc16805095fc0b971f181041e26526da7d2f644ce782",
+          "md5": "fb0fbe0b6c0e11b3e71ee26f9de9b6ff",
+          "sha256": "34cb162474a7cb51933384da03979f066759aaf49ffdc6e3f6c27a3bce5b0327"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fb0fbe0b6c0e11b3e71ee26f9de9b6ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 45512,
+        "upload_time": "2020-11-10T14:30:24",
+        "upload_time_iso_8601": "2020-11-10T14:30:24.907809Z",
+        "url": "https://files.pythonhosted.org/packages/cd/28/30ed935f86c53b49fc16805095fc0b971f181041e26526da7d2f644ce782/df_websockets-0.10.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f8a45ba622a2b89476c5218d61ce6fcba80952dd09e4c96d4e54e35d4fd40299",
+          "md5": "3d65f3f691a2b12d38a024fa1c9bc056",
+          "sha256": "da1f0f1edaee3a45e8e6067cb50cd698107bdf26c23fdda5240cea4301360d0d"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3d65f3f691a2b12d38a024fa1c9bc056",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 55442,
+        "upload_time": "2020-11-21T14:50:14",
+        "upload_time_iso_8601": "2020-11-21T14:50:14.327003Z",
+        "url": "https://files.pythonhosted.org/packages/f8/a4/5ba622a2b89476c5218d61ce6fcba80952dd09e4c96d4e54e35d4fd40299/df_websockets-0.10.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3376a5cd6abc2c38f9f7388218e3136d607e1c5ec295b0c2f094176758687a6",
+          "md5": "96647ec0f0da9a74f8e76db41364ef6b",
+          "sha256": "9b97db9369bb72034a391bb4c86d11d0994d14d6066bc41ab8fe15f230f29858"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "96647ec0f0da9a74f8e76db41364ef6b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 48917,
+        "upload_time": "2020-11-21T14:50:17",
+        "upload_time_iso_8601": "2020-11-21T14:50:17.176361Z",
+        "url": "https://files.pythonhosted.org/packages/f3/37/6a5cd6abc2c38f9f7388218e3136d607e1c5ec295b0c2f094176758687a6/df_websockets-0.10.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c151451964c0283d9578642d5bc77af5f95b3343bc6ca48b4beb79bdfd3f5cd8",
+          "md5": "641ad1a04e38ba70996941e3db48be88",
+          "sha256": "232f1be64fe4e374dbc2677284b3dd2336c68737e31614939ae054cc28ae478c"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "641ad1a04e38ba70996941e3db48be88",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 55303,
+        "upload_time": "2020-11-22T08:18:30",
+        "upload_time_iso_8601": "2020-11-22T08:18:30.452569Z",
+        "url": "https://files.pythonhosted.org/packages/c1/51/451964c0283d9578642d5bc77af5f95b3343bc6ca48b4beb79bdfd3f5cd8/df_websockets-0.10.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0970a80930c7f26afb3aa5b1d58a5692a6445dd59348de51c633fd1c2ec236e9",
+          "md5": "5a65e27f2371eafab5df4b3d5fa4f891",
+          "sha256": "b63e376180c74b87ad6432f22798fb286eef157bb7bd1ee579d398c7b24db735"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5a65e27f2371eafab5df4b3d5fa4f891",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 48790,
+        "upload_time": "2020-11-22T08:18:32",
+        "upload_time_iso_8601": "2020-11-22T08:18:32.470785Z",
+        "url": "https://files.pythonhosted.org/packages/09/70/a80930c7f26afb3aa5b1d58a5692a6445dd59348de51c633fd1c2ec236e9/df_websockets-0.10.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fc220751c35e4639bbf780703a146c7fbbd33a3aa978cd31a35c5f4b0e9b54f",
+          "md5": "1bd3d9afdfaf41618f5a13c80c4aac9f",
+          "sha256": "f370bf31dd96a24f603601c8d9ba6baef58614c4912b04bd94f494fb489f77eb"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1bd3d9afdfaf41618f5a13c80c4aac9f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 55421,
+        "upload_time": "2021-01-12T22:00:09",
+        "upload_time_iso_8601": "2021-01-12T22:00:09.541425Z",
+        "url": "https://files.pythonhosted.org/packages/6f/c2/20751c35e4639bbf780703a146c7fbbd33a3aa978cd31a35c5f4b0e9b54f/df_websockets-0.10.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "35159efea878d6b03ddc1d761d08253e90dea75161628baff925fb51f978ef68",
+          "md5": "6c01660949476503eabce206ef48549d",
+          "sha256": "407abc6dc9318de84b0f3543c029d92f2afecf1902f353a00ef33340b266fb7e"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6c01660949476503eabce206ef48549d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 48952,
+        "upload_time": "2021-01-12T22:00:11",
+        "upload_time_iso_8601": "2021-01-12T22:00:11.940482Z",
+        "url": "https://files.pythonhosted.org/packages/35/15/9efea878d6b03ddc1d761d08253e90dea75161628baff925fb51f978ef68/df_websockets-0.10.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f043f92c227e95217f6f3b02db8401976a89926507d463108c4b7777205a97c5",
+          "md5": "d51d92feddb992e3dafb56c07559f5df",
+          "sha256": "6a4415223e9f889746625bb3a4ff50a36efd9474cc2eae6d0d0e90cd965287f4"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d51d92feddb992e3dafb56c07559f5df",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 80369,
+        "upload_time": "2021-04-16T08:51:00",
+        "upload_time_iso_8601": "2021-04-16T08:51:00.285603Z",
+        "url": "https://files.pythonhosted.org/packages/f0/43/f92c227e95217f6f3b02db8401976a89926507d463108c4b7777205a97c5/df_websockets-0.10.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f35fffa7ddef16a7815aba34d2bb4799c3339adbfe4f154c5b3a65b766fba935",
+          "md5": "09ea9d9187c58e1f83a29d9c4d636cef",
+          "sha256": "8ec442665692eb41ea75d3e62bd271d53b177ccb4ae053410309ee79afb30e81"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.10.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09ea9d9187c58e1f83a29d9c4d636cef",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 115732,
+        "upload_time": "2021-04-16T08:51:02",
+        "upload_time_iso_8601": "2021-04-16T08:51:02.702274Z",
+        "url": "https://files.pythonhosted.org/packages/f3/5f/ffa7ddef16a7815aba34d2bb4799c3339adbfe4f154c5b3a65b766fba935/df_websockets-0.10.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be4c48bccda6fdb8b274239ee5ab2979fec506d33928d89350851c132312c5e5",
+          "md5": "9b993d2d33e1ca3f235c328d3b9c65ec",
+          "sha256": "bab7ee0dab41b43f671a95f1becb68a7c2a4b069e681273c8e0061a49ac50c2f"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9b993d2d33e1ca3f235c328d3b9c65ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43661,
+        "upload_time": "2020-05-21T12:14:21",
+        "upload_time_iso_8601": "2020-05-21T12:14:21.179081Z",
+        "url": "https://files.pythonhosted.org/packages/be/4c/48bccda6fdb8b274239ee5ab2979fec506d33928d89350851c132312c5e5/df_websockets-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a500bb29c3a2f8e8a0ef490a31307926070016384ad9a2d16b8b7313ac0b8f1",
+          "md5": "a10a08d7d5ca376af7ac97d96753366c",
+          "sha256": "5bb5a3d7815965bd4dec7b6dd6cfd33b53687ce23154f44a1e7b1ac3bb47b01f"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a10a08d7d5ca376af7ac97d96753366c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43714,
+        "upload_time": "2020-06-01T20:52:46",
+        "upload_time_iso_8601": "2020-06-01T20:52:46.523102Z",
+        "url": "https://files.pythonhosted.org/packages/8a/50/0bb29c3a2f8e8a0ef490a31307926070016384ad9a2d16b8b7313ac0b8f1/df_websockets-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b505632225011c7c9482ad6e27903d77a81315debf48bb3e5087c4ac9fba42c3",
+          "md5": "4bd4fcce152243ee00123cdf1c45598a",
+          "sha256": "9c6b05d66adcd06fda23da4b631d86b5586a997ea1863d5df2d4cf31631a5847"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-0.9.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bd4fcce152243ee00123cdf1c45598a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43745,
+        "upload_time": "2020-06-22T20:42:18",
+        "upload_time_iso_8601": "2020-06-22T20:42:18.486625Z",
+        "url": "https://files.pythonhosted.org/packages/b5/05/632225011c7c9482ad6e27903d77a81315debf48bb3e5087c4ac9fba42c3/df_websockets-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99c78b84a7e8a8ee61c5fa6cbd364b66741b6e4bd4e0fd1d426dd55c7e5a0afc",
+          "md5": "135da537829a3900a985fc46c7ae14ed",
+          "sha256": "bd170cb103349998f41e233e6ae3febee28b2f7f6a5b87d07fbcf4f96374162c"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "135da537829a3900a985fc46c7ae14ed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 86188,
+        "upload_time": "2022-01-09T14:50:12",
+        "upload_time_iso_8601": "2022-01-09T14:50:12.112171Z",
+        "url": "https://files.pythonhosted.org/packages/99/c7/8b84a7e8a8ee61c5fa6cbd364b66741b6e4bd4e0fd1d426dd55c7e5a0afc/df_websockets-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "af3ae7478318cda10dad09ffb977982506709b3014e34c3e3f95370cd665ba0d",
+          "md5": "83e870f2a02267ad2a060a50d48bcf68",
+          "sha256": "3712a36bc2366e0b30d0f0d58daa00fa979525f6dac123fc6f48c2a5a72226f6"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "83e870f2a02267ad2a060a50d48bcf68",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 119680,
+        "upload_time": "2022-01-09T14:50:14",
+        "upload_time_iso_8601": "2022-01-09T14:50:14.377781Z",
+        "url": "https://files.pythonhosted.org/packages/af/3a/e7478318cda10dad09ffb977982506709b3014e34c3e3f95370cd665ba0d/df_websockets-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0b1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "745a2e5ac3a1606c3ab4688ef3cbf0937c57df6f2119a6831d3d44c56a53e1cc",
+          "md5": "9da658d365b23e40739ab6235b6db4d1",
+          "sha256": "4772f453c273a2c9c2a92c4ce5904174a7d76d012bef93bb16b5e5cab245c00f"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-1.0.0b1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9da658d365b23e40739ab6235b6db4d1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 87032,
+        "upload_time": "2022-08-29T19:52:26",
+        "upload_time_iso_8601": "2022-08-29T19:52:26.283655Z",
+        "url": "https://files.pythonhosted.org/packages/74/5a/2e5ac3a1606c3ab4688ef3cbf0937c57df6f2119a6831d3d44c56a53e1cc/df_websockets-1.0.0b1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba311730adcab0961ab0b980e10b14a6ef1854f8368ae529a3796c8ab9d974da",
+          "md5": "3a31b26b9afe6496d79eff2e9b5e0965",
+          "sha256": "c5ee761c9cb36b25660428526acb5be16f280434dc17f849055297000f7659d4"
+        },
+        "downloads": -1,
+        "filename": "df_websockets-1.0.0b1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3a31b26b9afe6496d79eff2e9b5e0965",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 119780,
+        "upload_time": "2022-08-29T19:52:27",
+        "upload_time_iso_8601": "2022-08-29T19:52:27.946153Z",
+        "url": "https://files.pythonhosted.org/packages/ba/31/1730adcab0961ab0b980e10b14a6ef1854f8368ae529a3796c8ab9d974da/df_websockets-1.0.0b1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "99c78b84a7e8a8ee61c5fa6cbd364b66741b6e4bd4e0fd1d426dd55c7e5a0afc",
+        "md5": "135da537829a3900a985fc46c7ae14ed",
+        "sha256": "bd170cb103349998f41e233e6ae3febee28b2f7f6a5b87d07fbcf4f96374162c"
+      },
+      "downloads": -1,
+      "filename": "df_websockets-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "135da537829a3900a985fc46c7ae14ed",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 86188,
+      "upload_time": "2022-01-09T14:50:12",
+      "upload_time_iso_8601": "2022-01-09T14:50:12.112171Z",
+      "url": "https://files.pythonhosted.org/packages/99/c7/8b84a7e8a8ee61c5fa6cbd364b66741b6e4bd4e0fd1d426dd55c7e5a0afc/df_websockets-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "af3ae7478318cda10dad09ffb977982506709b3014e34c3e3f95370cd665ba0d",
+        "md5": "83e870f2a02267ad2a060a50d48bcf68",
+        "sha256": "3712a36bc2366e0b30d0f0d58daa00fa979525f6dac123fc6f48c2a5a72226f6"
+      },
+      "downloads": -1,
+      "filename": "df_websockets-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "83e870f2a02267ad2a060a50d48bcf68",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 119680,
+      "upload_time": "2022-01-09T14:50:14",
+      "upload_time_iso_8601": "2022-01-09T14:50:14.377781Z",
+      "url": "https://files.pythonhosted.org/packages/af/3a/e7478318cda10dad09ffb977982506709b3014e34c3e3f95370cd665ba0d/df_websockets-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,272 @@
+{
+  "info": {
+    "author": "Kamil Mierzejewski",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# django-native-search\n\n[![PyPI](https://img.shields.io/pypi/v/django-native-search.svg)](https://pypi.org/project/django-native-search/)\n\ndjango-native-search implements basic full-text search engine for Django models.\n\nThe engine itself uses Django ORM to manage its index, so no additional backend is needed for searching to work. Just create a model for index, run `makemigrations` and `migrate` and you are ready to feed it with data and search.\n\n## Installation\n\nInstall the package from PyPi:\n```\npip install django-native-search\n```\n\nThe package will be installed with all its dependencies including `django-expression-index`.\n\n## Setup\nSetting up the search in basic configuration is quite simple.\n### 1. Register the app\nAdd `django_native_search` to `INSTALLED_APPS` in your settings:\n\n```python\nINSTALLED_APPS = [\n    ...\n    'django_native_search.apps.DjangoNativeSearch',\n    ...\n]\n```\n### 2. Define your Index Model\nCreate a new app or in existing app, in your `models.py`, define an index model. In this example we are creating a simple index for `books.Book` model:\n```python\nfrom django_native_search.models import IndexEntry\n\nclass BookIndexEntry(IndexEntry):\n    object = models.OneToOneField('books.Book', on_delete=models.CASCADE)\n    search_template='search_index/book.txt'\n```\nThe `object` field defines a relation to a model which is being indexed. \nThe engine uses `search_template` to render the text with `object` variable in template context. \nBy default the rendered text is tokenized with by `re.searchall(r'[^\\s\"]+', text)`. \nYou can change this behavior by overriding `tokenize` class method in your index model. \nAll extracted tokens are stored in the index of respective indexed model instance.\n```python\nimport re\n\nclass BookIndexEntry(IndexEntry):\n    ...\n    @classmethod\n    def tokenize(self, text):\n        return re.findall(r\"[^\\W_]+(['_]?[^\\W_]+)*\", text)\n```\n#### Index for multiple models\nIt is also possible to create index for multiple models by using model inheritance. Create a single concrete descendant model of `IndexEntry` with multiple descendants for each indexed model. \n\nYou can add some common fields to this model to be used for filtering the entries, but do not add `objects` field. Then create descendants of your IndexEntry model. Each of the derived classes should have `object` field which points to a model to be indexed and a `search_template`.\n\nI would advise to put some additional fields to your root index model, to be able to filter entries of any kind or display the results without additional query for descendant models. You can fill the fields with data by overriding your `save` method in your index model.\n\nIt should also be possible to use `GenericForeignKey` to define the `object` field, but I haven't tried it.\n\n#### Multiple indexes\nEach direct descendant of `IndexEntry` is a separate index, so you can have multiple independent \nindexes in your site.\n### 3. Prepare the database\nRun the well known commands:\n```\nmanage.py makemigrations\nmanage.py migrate\n```\nThe index was tested with `sqlite` and `PostreSQL`.\n## Usage\nUsually you use your index to do full-text seach within your data. Just remember to fill it with data first.\n### Feeding the index with data\nThe only thing you need to do is to create your `IndexEntry` descendant model instance and save it. \n```python\nfrom book_index.models import BookIndexEntry\nfrom books.models import Book\n\nfor book in Book.objects.all():\n    BookIndexEntry(object=book).save()\n```\n\nThere is a convenient shortcut for indexing querysets:\n```python\nfrom book_index.models import BookIndexEntry\nBookIndexEntry.objects.rebuild()\n```\nYou can override `get_index_queryset` method in your class to do `select_related` or `filter` \nor anything you need, before passing the queryset for indexing. \n\nYou can call the `rebuild` method on your index model root class manager, to rebuild all descendant \nindex models.\n\nProbably you would like to create you own management command to run the indexing, but actually \nyou would not use it...\n\n#### Runtime index updates\nThe indexing should be fast enough to be executed in runtime on every save of the indexed model. \nJust connect a handler to `post_save` signal:\n```python\nfrom django.db.models.signals import post_save\n\nclass BookIndexEntry(IndexEntry):\n    ...\n    @classmethod\n    def update_index(cls, instance, **kwargs):\n        cls.objects.refresh([instance])\n        \npost_save.connect(BookIndexEntry.update_index, sender=Book)\n```\nNow your index will be always up-to-date.\n\n### Searching\nYou can search the index by calling the manager's `search` method. The query is tokenized using \nthe same `tokenize` method as when indexing. All tokens must be found in a document to consider it \nmatched:\n```python\nqs = BookIndexEntry.objects.search('Monty Python')\n```\nThis will return a `QuerySet` of `BookIndexEntry` which contain both \"Monty\" and \"Python\" case \nsensitively. If you want your search to be case-insensitive, then provide the query in lowercase:\n```python\nqs = BookIndexEntry.objects.search('circus')\n```\nYou can filter the search results, just as any other `QuerySet`:\n```python\nqs = BookIndexEntry.objects.search('circus').filter(object__release_date__year__gt=1970)\n```\nBy default search returns matches only for whole words. If there is a single keyword in a query, \nthe engine does a substring search, so search results may contain documents with words matching \nthe keyword or containing it.\n\nFor example searching for \"yth\" may return documents containing \"python\", \"pythonic\", \"myth\", \n\"demythologization\".\n\nSubstring search works fine in `sqlite`. In `PostgreSQL` there is a problem with using the db index,\nso the searching might be too slow.\n\nPutting multiple words inside quotes forces searching for colocation of these words.\n```python\nqs = BookIndexEntry.objects.search('\"Monty Python\\'s Flying Circus\"')\n```\nThis will return a `QuerySet` of `BookIndexEntry` which contain word \"Monty\" followed by \"Python's\", \nfollowed by \"Flying\", followed by \"Circus\".\n\n### Search form\nThere is `SearchFormMixin` available to easily to create your search view:\n```python\nfrom django.views.generic.base import TemplateView\nfrom book_index.models import BookIndexEntry\nfrom django_native_search.forms import SearchFormMixin, searchform_factory\n\nclass SearchView(SearchFormMixin, TemplateView):\n    template_name = \"books_index/search.html\"\n    form_class = searchform_factory(BookIndexEntry)\n```\nThe `searchform_factory` function will use all fields with `db_index = True` in `BookIndexEntry` \nto create `MultipleChoiceField` in your form. The fields can be used to filter the results. \nEach filtering field in your form will contain all possible values of the field in the database.\n\n### Search template\nThe templated referred by `template_name` is rendered with `form` containing the form instance and \n`results` containing the queryset of search results if form is valid. \n```django\n{% block content %}\n    <h2>Search</h2>\n    <form method=\"get\" action=\".\">\n        <table>\n            {{ form }}\n            <tr>\n                <td>&nbsp;</td>\n                <td>\n                    <input type=\"submit\" value=\"Search\" class=\"btn\"/>\n                </td>\n            </tr>\n        </table>\n    </form>\n    {% if form.is_valid %}\n        <br/>\n        <h3>Found {{ results.count }} results</h3>\n        <ul>\n            {% for result in results %}\n                <li class = \"search-result\">\n                    <ul>\n                        <li class=\"result-link\">\n                            <a href=\"{{result.object.get_absolute_url}}\">{{ result.object.title }}</a>\n                        </li>\n                        <li class=\"result-excerpt'>\n                            {{result.excerpt}}\n                        </li>\n                    </ul>\n                </li>\n            {% endfor %}\n        </ul>\n    {% endif %}\n{% endblock %}\n```\nThe `excerpt` member of index entry instance returns a fragment of the indexed document with \noccurrences of search keywords hihghted with `<em>`.\n### Settings\nThere are serveral settings to tweak the search engine.\n#### `SEARCH_MIN_SUBSTR_LENGTH`\nDefault : `2`\n\nMinimum number of characters in keyword to run substring search.\n#### `SEARCH_MAX_SUBTSTR_COUNT_IN_QUERY`\nDefault : `300`\n\nMaximum number of indexed words containing the substring to run substring search.\n#### `SEARCH_MAX_EXCERPT_FRAGMENTS`\nDefault : `5`\n\nMaximum number of fragments containing keywords to be returned in excerpt.\n#### `SEARCH_EXCERPT_FRAGMENT_START_OFFSET`\nDefault : `-2`\n\nOffset of excerpt fragment start.\n#### `SEARCH_EXCERPT_FRAGMENT_END_OFFSET`\nDefault : `5`\n\nOffset of excerpt fragment end.\n#### `SEARCH_MAX_RANKING_KEYWORDS_COUNT`\nDefault : `3`\n\nMaximum number of keywords to be used for ranking the results. If the query contains more keywords, \nonly the first ones will be used to calculate the ranking of results. \n### Search API\nTo be described...\n\nLook into the code to check what you can do with it.\n### Performance\nDespite the naive design, the index performs surpsisingly well, even with quite large datasets. \nIt can search through 100k documents containing 10M words in a fraction of a second.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/kmierzeje/django-native-search",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-native-search",
+    "package_url": "https://pypi.org/project/django-native-search/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-native-search/",
+    "project_urls": {
+      "Homepage": "https://github.com/kmierzeje/django-native-search"
+    },
+    "release_url": "https://pypi.org/project/django-native-search/0.6/",
+    "requires_dist": [
+      "django (>=3.2)",
+      "django-expression-index (>=0.1.0)"
+    ],
+    "requires_python": "",
+    "summary": "A simple search engine using native django database backend.",
+    "version": "0.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12411471,
+  "releases": {
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dec6d863a0c48a03e39f06a9dc69c53bc17e8497d75bef61be9d1aa658333430",
+          "md5": "d279f37544cb09a65aa8093c93af57cc",
+          "sha256": "41898c72cbe4c5c2bb16303c102301a3c52f8a6544905e5bd04c2f4a07c1a475"
+        },
+        "downloads": -1,
+        "filename": "django_native_search-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d279f37544cb09a65aa8093c93af57cc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 14438,
+        "upload_time": "2020-09-28T12:18:58",
+        "upload_time_iso_8601": "2020-09-28T12:18:58.010784Z",
+        "url": "https://files.pythonhosted.org/packages/de/c6/d863a0c48a03e39f06a9dc69c53bc17e8497d75bef61be9d1aa658333430/django_native_search-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07e9eceaa728afa5777feed24ca3c797c3540e7988d962660ff842c55b2c26b1",
+          "md5": "89400aa086ab67364c2e51fda0ac11e7",
+          "sha256": "47fa3a3481980d7b08b4da2b70679c9a9d33ce8ef42ba3298617ed9741175294"
+        },
+        "downloads": -1,
+        "filename": "django-native-search-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89400aa086ab67364c2e51fda0ac11e7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14662,
+        "upload_time": "2020-09-28T12:18:59",
+        "upload_time_iso_8601": "2020-09-28T12:18:59.137957Z",
+        "url": "https://files.pythonhosted.org/packages/07/e9/eceaa728afa5777feed24ca3c797c3540e7988d962660ff842c55b2c26b1/django-native-search-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a06405f52e9e9db84f7dd4886ab1cbe6021bdfb4e3d3ed650bf6563d15662f92",
+          "md5": "79ac8273209d711b2df285544506d4b8",
+          "sha256": "84109c0080c9740436dc8c3f792d4cd06ec0d31ebe11d9f9c2f6c4b057d4c58d"
+        },
+        "downloads": -1,
+        "filename": "django_native_search-0.5.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "79ac8273209d711b2df285544506d4b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 14509,
+        "upload_time": "2020-11-23T09:21:00",
+        "upload_time_iso_8601": "2020-11-23T09:21:00.910745Z",
+        "url": "https://files.pythonhosted.org/packages/a0/64/05f52e9e9db84f7dd4886ab1cbe6021bdfb4e3d3ed650bf6563d15662f92/django_native_search-0.5.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a259893b468d13a3b7e8f6c6b1075bd67cd1f0456f3446f6b4a97d8f03a59449",
+          "md5": "f75db648e8b33aa6cd61dc6d67b09cb0",
+          "sha256": "709deb9025ce40b61c58e6a709cbf3df5529c463aae9aca1b4f658e7895298c8"
+        },
+        "downloads": -1,
+        "filename": "django-native-search-0.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f75db648e8b33aa6cd61dc6d67b09cb0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14779,
+        "upload_time": "2020-11-23T09:21:02",
+        "upload_time_iso_8601": "2020-11-23T09:21:02.298421Z",
+        "url": "https://files.pythonhosted.org/packages/a2/59/893b468d13a3b7e8f6c6b1075bd67cd1f0456f3446f6b4a97d8f03a59449/django-native-search-0.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9160113d83f6d913d07534ff3d662914759309bbf1b603aa2b40f7cb358f7d4a",
+          "md5": "76abc963312a469e50be35b57434413a",
+          "sha256": "130bdda781342e3188847b1569d803834335138128452ab318a29c5be6f9b785"
+        },
+        "downloads": -1,
+        "filename": "django_native_search-0.5.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76abc963312a469e50be35b57434413a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 15838,
+        "upload_time": "2021-05-07T22:22:00",
+        "upload_time_iso_8601": "2021-05-07T22:22:00.656166Z",
+        "url": "https://files.pythonhosted.org/packages/91/60/113d83f6d913d07534ff3d662914759309bbf1b603aa2b40f7cb358f7d4a/django_native_search-0.5.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "65f708216d8d0c12eb8d950eac812375f0fa9e1c2a5a0cde79475d2dec45e453",
+          "md5": "0e412ee2a40e83112c585d84f1e5c871",
+          "sha256": "45c14d72af22fbc051a6d0d648f058ca699bf6f55389d62cd562182f4d64fce8"
+        },
+        "downloads": -1,
+        "filename": "django-native-search-0.5.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0e412ee2a40e83112c585d84f1e5c871",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16970,
+        "upload_time": "2021-05-07T22:22:02",
+        "upload_time_iso_8601": "2021-05-07T22:22:02.135738Z",
+        "url": "https://files.pythonhosted.org/packages/65/f7/08216d8d0c12eb8d950eac812375f0fa9e1c2a5a0cde79475d2dec45e453/django-native-search-0.5.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a2ac8a0fdf587c3e64f22f3e51bc7fe2e09776cb59aee9c6c518d23f98744ce",
+          "md5": "367f4bc46a40788b94271a0a883d6560",
+          "sha256": "995f0d2e87269cdc30ef7f2488174baa8942b7ffdfac836814e14b1305945ddf"
+        },
+        "downloads": -1,
+        "filename": "django_native_search-0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "367f4bc46a40788b94271a0a883d6560",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16154,
+        "upload_time": "2021-12-27T01:04:46",
+        "upload_time_iso_8601": "2021-12-27T01:04:46.884920Z",
+        "url": "https://files.pythonhosted.org/packages/9a/2a/c8a0fdf587c3e64f22f3e51bc7fe2e09776cb59aee9c6c518d23f98744ce/django_native_search-0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b0547a9127d597d0b786c64b60cb173cd022c5c37a18e62d2f7b85910a59bf2d",
+          "md5": "f45f15df10b24e6f764ba6105846044c",
+          "sha256": "6bbd2e8a005c941cd52aeef4dfe80509a9dfdbebad0b1c8eb78974ab472b9b52"
+        },
+        "downloads": -1,
+        "filename": "django-native-search-0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f45f15df10b24e6f764ba6105846044c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16667,
+        "upload_time": "2021-12-27T01:04:48",
+        "upload_time_iso_8601": "2021-12-27T01:04:48.271435Z",
+        "url": "https://files.pythonhosted.org/packages/b0/54/7a9127d597d0b786c64b60cb173cd022c5c37a18e62d2f7b85910a59bf2d/django-native-search-0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9a2ac8a0fdf587c3e64f22f3e51bc7fe2e09776cb59aee9c6c518d23f98744ce",
+        "md5": "367f4bc46a40788b94271a0a883d6560",
+        "sha256": "995f0d2e87269cdc30ef7f2488174baa8942b7ffdfac836814e14b1305945ddf"
+      },
+      "downloads": -1,
+      "filename": "django_native_search-0.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "367f4bc46a40788b94271a0a883d6560",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 16154,
+      "upload_time": "2021-12-27T01:04:46",
+      "upload_time_iso_8601": "2021-12-27T01:04:46.884920Z",
+      "url": "https://files.pythonhosted.org/packages/9a/2a/c8a0fdf587c3e64f22f3e51bc7fe2e09776cb59aee9c6c518d23f98744ce/django_native_search-0.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b0547a9127d597d0b786c64b60cb173cd022c5c37a18e62d2f7b85910a59bf2d",
+        "md5": "f45f15df10b24e6f764ba6105846044c",
+        "sha256": "6bbd2e8a005c941cd52aeef4dfe80509a9dfdbebad0b1c8eb78974ab472b9b52"
+      },
+      "downloads": -1,
+      "filename": "django-native-search-0.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f45f15df10b24e6f764ba6105846044c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 16667,
+      "upload_time": "2021-12-27T01:04:48",
+      "upload_time_iso_8601": "2021-12-27T01:04:48.271435Z",
+      "url": "https://files.pythonhosted.org/packages/b0/54/7a9127d597d0b786c64b60cb173cd022c5c37a18e62d2f7b85910a59bf2d/django-native-search-0.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

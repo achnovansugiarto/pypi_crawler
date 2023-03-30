@@ -1,0 +1,1203 @@
+{
+  "info": {
+    "author": "YunoJuno",
+    "author_email": "code@yunojuno.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: Web Environment",
+      "Framework :: Django",
+      "Framework :: Django :: 3.1",
+      "Framework :: Django :: 3.2",
+      "Framework :: Django :: 4.0",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Django Frozen Field\n\nDjango model custom field for storing a frozen snapshot of an object.\n\n## Principles\n\n* Behaves like a `ForeignKey` but the data is detached from the related object\n* Transparent to the client - it looks like the original object\n* The frozen object cannot be edited\n* The frozen object cannot be saved\n* Works even if original model is updated or deleted\n\n### Why not use DRF / Django serializers?\n\nThis library has one specific requirement that makes using the existing\nsolutions hard - to be able to decouple the frozen data from the model,\nsuch that the underlying model can be altered or even deleted, and the\ndata can still be used as it was at the point of freezing. We use the\nmodel itself only once, when we first set the data - from that point on\nthe field has no dependency on the original model, using intermediate\ndynamic dataclasses that represent the model as it was when the data was\nsaved. This package does reference a lot of the principles in both DRF\nand Django itself - and the structure of the serialized data is similar\nto that exported from the queryset serializer.\n\n### Why not just store frozen data as JSON and be done with it?\n\nThis is probably a good / safe option for most codebases coming to the\nfreezing of data for the first time, and we have a lot of ephemeral data\nstored in `JSONField` fields ourselves. However, migrating an existing\nproject from `ForeignKey` to `JSONField`, along with all references to\nthe data, templates, etc., is painful. This package is designed to make\nthe migration from 'fresh' to 'frozen' as simple as possible.\n\n## Package internals\n\nThe package includes three core modules, `serializers`, `models`, and\n`fields`, that together control the serialization process.\n\n#### `frozen_field.models`\n\nThis module contains the engine of the package, which is a\n`FrozenObjectMeta` dataclass that is responsible for parsing Django\nmodel attributes, extracting data and and creating the dynamic\ndataclasses used to represent a Django Model.\n\nYou should not need to use this module in your application.\n\n#### `frozen_field.serializers`\n\nThis module contains the `freeze_object` and `unfreeze_object` functions\nthat are responsible for marshalling the serialized data between a\nDjango Model instance, a dynamic dataclass, and the serialized JSON..\n\nOn set:\n\n    # model >> dataclass\n\nOn save:\n\n    dataclass >> dict\n\nOn refresh:\n\n    dict >> dataclass\n\nYou should not need to use this module in your application.\n\n#### `frozen_field.fields`\n\nThis module contains the `FrozenObjectField` itself - it is the only part of the\npackage that should need to use yourself.\n\n#### Evolution of `FrozenObjectField`\n\nThe easiest way to understand why the field is structured as it is is to\nfollow the history:\n\n1. The first implementation serialized just non-related object fields (i.e.\n   excluded `ForeignKey` and `OneToOneField` attrs)\n1. The `include` and `exclude` arguments were added to control which fields were\n   serialized\n1. The `select_related` argument was added to enable the serialization of\n   top-level related objects (`ForeignKey` / `OneToOneField`)\n1. The `select_properties` argument was added to enable the serialization of\n   simple model properties (`@property`)\n1. Support was added for ORM-style paths (using the `__` delimiter) to enable\n   deep serialization beyond the top-level\n1. The `converters` argument was added to enable fine-tuning of the\n   deserialization process.\n\n## Usage\n\nA frozen field can be declared like a `ForeignKey`:\n\n```python\nclass Profile(Model):\n\n    address = FrozenObjectField(\n        Address,                         # The model being frozen\n        include=[],                      # defaults to all\n        exclude=[\"line_2\"],              # defaults to none\n        select_related=[]                # add related fields\n        select_properties=[\"attr_name\"]  # add model properties\n        converters={\"field_name\": func}  # custom deserializer\n    )\n\n...\n\n>>> profile.address = Address.objects.get(...)\n>>> type(profile.address)\ntypes.FrozenAddress\n>>> profile.save()\n>>> profile.refresh_from_db()\n>>> type(profile.address)\ntypes.FrozenAddress\n>>> profile.address.id\n1\n>>> profile.address.line_1\n\"29 Acacia Avenue\"\n>>> profile.address.since\ndatetime.date(2011, 6, 4)\n>>> dataclasses.asdict(profile.address)\n{\n    \"_meta\": {\n        \"pk\": 1,\n        \"model\": \"Address\",\n        \"frozen_at\": \"2021-06-04T18:10:30.549Z\",\n        \"fields\": {\n            \"id\": \"django.db.models.AutoField\",\n            \"line_1\": \"django.db.models.CharField\",\n            \"since\": \"django.db.models.DateField\"\n        },\n        \"properties\": [\"attr_name\"]\n    },\n    \"id\": 1,\n    \"line_1\": \"29 Acacia Avenue\",\n    \"since\": \"2011-06-04T18:10:30.549Z\"\n    \"attr_name\": \"hello\"\n}\n>>> profile.address.json_data()\n{\n    \"id\": 1,\n    \"line_1\": \"29 Acacia Avenue\",\n    \"since\": \"2011-06-04T18:10:30.549Z\",\n    \"attr_name\": \"hello\"\n}\n>>> profile.address.id = 2\nFrozenInstanceError: cannot assign to field 'id'\n>>> profile.address.save()\nAttributeError: 'FrozenAddress' object has no attribute 'save'\n```\n\n### Controlling serialization\n\nBy default only top-level attributes of an object are frozen - related\nobjects (`ForeignKey`, `OneToOneField`) are ignored. This is by design -\nas deep serialization of recursive relationships can get very complex\nvery quickly, and a deep serialization of an object tree is not\nrecommended. This library is designed for the simple 'freezing' of basic\ndata. The recommended pattern is to flatten out the parts of the object\ntree that you wish to record. You can control which top-level fields are\nincluded in the frozen data using the `include` and `exclude` arguments.\nNote that these are mutually exclusive - by default both are an empty\nlist, which results in all top-level non-related attributes being\nserialized. If `included` is not empty, then *only* the fields in the\nlist are serialized. If `excluded` is not empty then all fields *except*\nthose in the list are serialized.\n\nThat said, there is support for related object capture using the\n`select_related` argument.\n\nThe `select_properties` argument can be used to add model properties\n(e.g. methods decorated with `@property`) to the serialization. NB this\ncurrently does no casting of the value when deserialized (as it doesn't\nknow what the type is), so if your property is a date, it will come back\nas a string (isoformat). If you want it to return a `date` you will want\nto use converters.\n\nThe `converters` argument is used to override the default conversion of\nthe JSON back to something more appropriate. A typical use case would be\nthe casting of a property which has no default backing field to use. In\nthis case you could use the builtin Django `parse_date` function\n\n```python\nfield = FrozenObjectField(\n    Profile,\n    include=[],\n    exclude=[],\n    select_related=[],\n    select_properties=[\"date_registered\"],\n    converters={\"date_registered\": parse_date}\n)\n```\n\n## How it works\n\nThe internal wrangling of a Django model to a JSON string is done using dynamic\ndataclasses, created on the fly using the `dataclasses.make_dataclass` function.\nThe new dataclass contains one fixed property, `meta`, which is itself an\ninstance of a concrete dataclass, `FrozenObjectMeta`. This ensures that each\nserialized blob contains enough original model field metadata to be able to\ndeserialize the JSONField back into something that resembles the original. This\nis required because the process of serializing the data as JSON will convert\ncertain unsupported datatypes (e.g. `Decimal`, `float`, `date`, `datetime`,\n`UUID`) to string equivalents, and in order to deserialize these values we need\nto know what type the original value was. This is very similar to how Django's\nown `django.core.serializers` work.\n\n#### Running tests\n\nThe tests use `pytest` as the test runner. If you have installed the `poetry`\nevironment, you can run them using:\n\n```\n$ poetry run pytest\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/yunojuno/django-frozen-field",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "YunoJuno",
+    "maintainer_email": "code@yunojuno.com",
+    "name": "django-frozen-field",
+    "package_url": "https://pypi.org/project/django-frozen-field/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-frozen-field/",
+    "project_urls": {
+      "Documentation": "https://github.com/yunojuno/django-frozen-field",
+      "Homepage": "https://github.com/yunojuno/django-frozen-field",
+      "Repository": "https://github.com/yunojuno/django-frozen-field"
+    },
+    "release_url": "https://pypi.org/project/django-frozen-field/0.1.1/",
+    "requires_dist": [
+      "django (>=3.2,<5.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "Django model field used to store snapshot of data.",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15709589,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b5b290adb6ecb73fa1ff9e9234845d6ea42ff2d31a1d0e6edf1dadde139f7ed",
+          "md5": "565509322ea2a769ea9710994bfa7cd7",
+          "sha256": "22d07d544f9b5f86cb7ceb6aafc4936fc16445178c7298c74528a3a63b2b6ddb"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "565509322ea2a769ea9710994bfa7cd7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13929,
+        "upload_time": "2021-12-07T13:27:30",
+        "upload_time_iso_8601": "2021-12-07T13:27:30.678615Z",
+        "url": "https://files.pythonhosted.org/packages/3b/5b/290adb6ecb73fa1ff9e9234845d6ea42ff2d31a1d0e6edf1dadde139f7ed/django_frozen_field-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f551f867fb8e5b9e672df056f2a9a71e8101025c4bc6e967adfc7a51580d6768",
+          "md5": "142f42f68f41c568f663051050ee4cd6",
+          "sha256": "a7af7ee2bac269c7013daaee7e6fc54cbed4d9d4d6ab2ded874dfe4ccebd92a1"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "142f42f68f41c568f663051050ee4cd6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 15036,
+        "upload_time": "2021-12-07T13:27:28",
+        "upload_time_iso_8601": "2021-12-07T13:27:28.932557Z",
+        "url": "https://files.pythonhosted.org/packages/f5/51/f867fb8e5b9e672df056f2a9a71e8101025c4bc6e967adfc7a51580d6768/django-frozen-field-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1348d044c93099beccfaa2406c8c53509f092c156a9f04cc8ccec8d995e4047f",
+          "md5": "16dfe0de97a000552968fac8985759ed",
+          "sha256": "2284b4175d0fb6c9702f4e12fdbffc126c27d11a7ba07fed2f5628546ac502d3"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "16dfe0de97a000552968fac8985759ed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13931,
+        "upload_time": "2021-12-07T13:30:01",
+        "upload_time_iso_8601": "2021-12-07T13:30:01.929155Z",
+        "url": "https://files.pythonhosted.org/packages/13/48/d044c93099beccfaa2406c8c53509f092c156a9f04cc8ccec8d995e4047f/django_frozen_field-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32dc0567f5d1857ddc7cef5ac12e1be0801091a184e7ae24a1028d152625b2ec",
+          "md5": "fc950036087c96c6f7c38d63f791a5d9",
+          "sha256": "99be86c1eedc43152f35f0ca2a7d960e7d05eac99c4c2c2b2df68b4b459b9df7"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fc950036087c96c6f7c38d63f791a5d9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 15061,
+        "upload_time": "2021-12-07T13:30:00",
+        "upload_time_iso_8601": "2021-12-07T13:30:00.318085Z",
+        "url": "https://files.pythonhosted.org/packages/32/dc/0567f5d1857ddc7cef5ac12e1be0801091a184e7ae24a1028d152625b2ec/django-frozen-field-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ea652008ba191140e406c064d7b548a386a81239cea1417cbb2d029d22a414e",
+          "md5": "e0c5c645cf99cb9d0ee4fc19adb0912b",
+          "sha256": "aeba752359552d2ae7464e793722b01dcb920318d2046f0c51b8367aa74f28e4"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0c5c645cf99cb9d0ee4fc19adb0912b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9342,
+        "upload_time": "2021-06-02T20:44:24",
+        "upload_time_iso_8601": "2021-06-02T20:44:24.360797Z",
+        "url": "https://files.pythonhosted.org/packages/9e/a6/52008ba191140e406c064d7b548a386a81239cea1417cbb2d029d22a414e/django_frozen_field-0.1a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8330f01633376fea73a845edbf22da9bdb537919651c3ad87bbb4ee09f93da80",
+          "md5": "05ec31510c1fe808fd6874f7bad8c7bd",
+          "sha256": "ce74dad533cd30c9c01a53d317c3b040c6b90054866ee2e1b9bd0505bcf0dbb6"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05ec31510c1fe808fd6874f7bad8c7bd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9713,
+        "upload_time": "2021-06-02T20:44:22",
+        "upload_time_iso_8601": "2021-06-02T20:44:22.845403Z",
+        "url": "https://files.pythonhosted.org/packages/83/30/f01633376fea73a845edbf22da9bdb537919651c3ad87bbb4ee09f93da80/django-frozen-field-0.1a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3bc76accbf285943a7d772cbc08bacc4f2dda6f7e55cbb8b7c5565da7690b074",
+          "md5": "30d784e71e58ef05d3e18d3fba7a5346",
+          "sha256": "1bd64b7796369c52cdcb218386cb6d4ec33813b8358db11759db62cf7fe58087"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "30d784e71e58ef05d3e18d3fba7a5346",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9421,
+        "upload_time": "2021-06-02T21:23:32",
+        "upload_time_iso_8601": "2021-06-02T21:23:32.154072Z",
+        "url": "https://files.pythonhosted.org/packages/3b/c7/6accbf285943a7d772cbc08bacc4f2dda6f7e55cbb8b7c5565da7690b074/django_frozen_field-0.1a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e471dbf47d26a5905874a75cfb8b1796962edf62bc7963908cb855197e5e3987",
+          "md5": "372c3fe04bb0999076064880f7010eaf",
+          "sha256": "d93587ccea4d6f3b4c40a4b3fb2c7940175e1c9975468c70a2aece27310a8456"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "372c3fe04bb0999076064880f7010eaf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9804,
+        "upload_time": "2021-06-02T21:23:30",
+        "upload_time_iso_8601": "2021-06-02T21:23:30.265740Z",
+        "url": "https://files.pythonhosted.org/packages/e4/71/dbf47d26a5905874a75cfb8b1796962edf62bc7963908cb855197e5e3987/django-frozen-field-0.1a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50ec6a4a4b5a9d349977709eef4a7ac49d0ef004ba12d3a3f520d68daff0f30a",
+          "md5": "4310826c307d91f231df4ada2d5c39c6",
+          "sha256": "641a83987273ca6a04912efb56cccc5b0c7432333998fe85b866f7d3456d7280"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4310826c307d91f231df4ada2d5c39c6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10066,
+        "upload_time": "2021-06-03T10:03:33",
+        "upload_time_iso_8601": "2021-06-03T10:03:33.150997Z",
+        "url": "https://files.pythonhosted.org/packages/50/ec/6a4a4b5a9d349977709eef4a7ac49d0ef004ba12d3a3f520d68daff0f30a/django_frozen_field-0.1a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86a3b14e8eb21c34b0e87aa26e0004c00b4262c416be13f938f7e029366fa1ae",
+          "md5": "4b53a89370c297db58ce0db8c9fd6c50",
+          "sha256": "132492ed4f545f68ee8cf0f38d9c112bcc12ef758c271edc9e11a9128834b701"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4b53a89370c297db58ce0db8c9fd6c50",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10464,
+        "upload_time": "2021-06-03T10:03:31",
+        "upload_time_iso_8601": "2021-06-03T10:03:31.757204Z",
+        "url": "https://files.pythonhosted.org/packages/86/a3/b14e8eb21c34b0e87aa26e0004c00b4262c416be13f938f7e029366fa1ae/django-frozen-field-0.1a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc6932c9dfd0a114c24df4063b97d881c0120072ebf1ae6ef2cbfc9583e6bd75",
+          "md5": "38686f9030262e720dabd835faa0abc8",
+          "sha256": "0505ed31de0cbe01a06345647e461a6d15f890b3d990829db2efea29f3d06183"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "38686f9030262e720dabd835faa0abc8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10369,
+        "upload_time": "2021-06-03T11:34:31",
+        "upload_time_iso_8601": "2021-06-03T11:34:31.452978Z",
+        "url": "https://files.pythonhosted.org/packages/cc/69/32c9dfd0a114c24df4063b97d881c0120072ebf1ae6ef2cbfc9583e6bd75/django_frozen_field-0.1a4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cee40e7841c875ca47065b59a96024df03ebf1a76a09255604e9c18793bd4931",
+          "md5": "d3f4d313fa7cfd8f0e231b8f70e7a676",
+          "sha256": "e527e194c6d0b475582faac7572131a78b434dfd7edc3781afa6da4c2d1ae340"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d3f4d313fa7cfd8f0e231b8f70e7a676",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10695,
+        "upload_time": "2021-06-03T11:34:30",
+        "upload_time_iso_8601": "2021-06-03T11:34:30.013125Z",
+        "url": "https://files.pythonhosted.org/packages/ce/e4/0e7841c875ca47065b59a96024df03ebf1a76a09255604e9c18793bd4931/django-frozen-field-0.1a4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75395465f1bbc72d26dffd8488487680bc23c8707908cd119caf43af8d4bc3ab",
+          "md5": "8124d9f12939aaf4068f4ac5ee5f80bc",
+          "sha256": "380e2b2a4c90eac4de08f4954fc585f22de0e625f9570ef3ca8bdc914273bbce"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8124d9f12939aaf4068f4ac5ee5f80bc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10433,
+        "upload_time": "2021-06-03T13:18:07",
+        "upload_time_iso_8601": "2021-06-03T13:18:07.982528Z",
+        "url": "https://files.pythonhosted.org/packages/75/39/5465f1bbc72d26dffd8488487680bc23c8707908cd119caf43af8d4bc3ab/django_frozen_field-0.1a5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a309b674a243e07de79fcad4d9760adfe5c2cd888cae0724874e01f45b5ce677",
+          "md5": "d11872facfc1e23d2f012ae6db87e296",
+          "sha256": "7fcc047bf29eb8e92e5771b349c3dc9850543d338c456381642c9cd9a5480b6c"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d11872facfc1e23d2f012ae6db87e296",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10756,
+        "upload_time": "2021-06-03T13:18:06",
+        "upload_time_iso_8601": "2021-06-03T13:18:06.718708Z",
+        "url": "https://files.pythonhosted.org/packages/a3/09/b674a243e07de79fcad4d9760adfe5c2cd888cae0724874e01f45b5ce677/django-frozen-field-0.1a5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5fb2f39379e4710e7ba12b67c444f01933c176204fb28e2f1a43cee5fba5c854",
+          "md5": "1fc1ab3de8851d8989cdeebc0ccb6d3e",
+          "sha256": "909fb5334ec74a727036a5d3bb7ea03055e2d10067bc3959c146f071456f6ad2"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1fc1ab3de8851d8989cdeebc0ccb6d3e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10480,
+        "upload_time": "2021-06-04T08:49:51",
+        "upload_time_iso_8601": "2021-06-04T08:49:51.275868Z",
+        "url": "https://files.pythonhosted.org/packages/5f/b2/f39379e4710e7ba12b67c444f01933c176204fb28e2f1a43cee5fba5c854/django_frozen_field-0.1a6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "814f480914296a2cca039b0320fc70e22c3260a7f6c99f240a69ce54cb5731ff",
+          "md5": "483a4df9b2d46baf0693dbcbaf53e625",
+          "sha256": "fd8e045cf9c54703be31ffde2d3016dbba76735e829f1bc9c28de2908bcd798a"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "483a4df9b2d46baf0693dbcbaf53e625",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10765,
+        "upload_time": "2021-06-04T08:49:43",
+        "upload_time_iso_8601": "2021-06-04T08:49:43.498903Z",
+        "url": "https://files.pythonhosted.org/packages/81/4f/480914296a2cca039b0320fc70e22c3260a7f6c99f240a69ce54cb5731ff/django-frozen-field-0.1a6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3325c6c738298dfccb0196084fe2d296f7e7578718d916ed39c020cca793ebe2",
+          "md5": "68ea62b98efc74579e263ba163dd8564",
+          "sha256": "5bfbefeb4f945d6eb0a7033a3beb0e1c4be509c2d528bb249b96eed9005c82d0"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1a7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "68ea62b98efc74579e263ba163dd8564",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9992,
+        "upload_time": "2021-06-04T13:38:23",
+        "upload_time_iso_8601": "2021-06-04T13:38:23.110097Z",
+        "url": "https://files.pythonhosted.org/packages/33/25/c6c738298dfccb0196084fe2d296f7e7578718d916ed39c020cca793ebe2/django_frozen_field-0.1a7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c5377d9dc44d9a44ccd05c0dbe1d8f6e0e53e806aa47f40b5b2c0e95aa80b8f",
+          "md5": "ce5a7cf2895a693c7e5ddcf847c79396",
+          "sha256": "d41830b5db1eca4eb9a8cc73e4c1678b8d4284a401469ab5e63d492e1796dfcc"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1a7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ce5a7cf2895a693c7e5ddcf847c79396",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10466,
+        "upload_time": "2021-06-04T13:38:21",
+        "upload_time_iso_8601": "2021-06-04T13:38:21.786136Z",
+        "url": "https://files.pythonhosted.org/packages/7c/53/77d9dc44d9a44ccd05c0dbe1d8f6e0e53e806aa47f40b5b2c0e95aa80b8f/django-frozen-field-0.1a7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e75dec96c038535b93bc3cf9cc83971faf390bb8cd13f01694e2c03f2b3c408f",
+          "md5": "9ee989eae34e54b83242d9b02eb2f2b8",
+          "sha256": "461c4f057997b053b0d0bbec6a4580bf8d60ca7037a8fef1c04db462b85a73b2"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9ee989eae34e54b83242d9b02eb2f2b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9922,
+        "upload_time": "2021-06-04T19:35:17",
+        "upload_time_iso_8601": "2021-06-04T19:35:17.686792Z",
+        "url": "https://files.pythonhosted.org/packages/e7/5d/ec96c038535b93bc3cf9cc83971faf390bb8cd13f01694e2c03f2b3c408f/django_frozen_field-0.1b1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d90f82a6f57ae37ef7f8642eaad80e88b02b7ab71516fdbd38579da91250b004",
+          "md5": "c955de7879f588f8d20276a6e46ee79e",
+          "sha256": "8422949d3f8ac58341078dce948037c4d9609a4536dee5abbb9b4ad4b8e87a31"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c955de7879f588f8d20276a6e46ee79e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10420,
+        "upload_time": "2021-06-04T19:35:16",
+        "upload_time_iso_8601": "2021-06-04T19:35:16.449310Z",
+        "url": "https://files.pythonhosted.org/packages/d9/0f/82a6f57ae37ef7f8642eaad80e88b02b7ab71516fdbd38579da91250b004/django-frozen-field-0.1b1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d0e40e60f81a170c09deee6334bf28c4e397f1e73aa8703154cfa70a219b257",
+          "md5": "949989b85bc56fe0beeff3454be0b79b",
+          "sha256": "134831fdd1c95c9043c36478073defb01f99682cdc35c850981aa647d9d27832"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "949989b85bc56fe0beeff3454be0b79b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13289,
+        "upload_time": "2021-06-09T10:53:57",
+        "upload_time_iso_8601": "2021-06-09T10:53:57.023941Z",
+        "url": "https://files.pythonhosted.org/packages/1d/0e/40e60f81a170c09deee6334bf28c4e397f1e73aa8703154cfa70a219b257/django_frozen_field-0.1b10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b516475cc4b7ba6e5a0ae584e526a4e8af062d9f1060a4a36a06764ebdc4ffd1",
+          "md5": "df13521dfc4c19e6bf3a567bbddf9152",
+          "sha256": "1e377e455db7410d53347bff7e4613c9de22317132302fc2b9633783e34f05f8"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "df13521dfc4c19e6bf3a567bbddf9152",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14574,
+        "upload_time": "2021-06-09T10:53:55",
+        "upload_time_iso_8601": "2021-06-09T10:53:55.364446Z",
+        "url": "https://files.pythonhosted.org/packages/b5/16/475cc4b7ba6e5a0ae584e526a4e8af062d9f1060a4a36a06764ebdc4ffd1/django-frozen-field-0.1b10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "469635c7807f8d414cd4ec6c0bbf0d4be38d658b88ee7f308765c06566419008",
+          "md5": "c6632e20b55e9edfddb227ec6fe9d28b",
+          "sha256": "632fc6cb0c365ad03243e09847940259e71dc1051a1853b29e5380e91d3d7af3"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c6632e20b55e9edfddb227ec6fe9d28b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13654,
+        "upload_time": "2021-06-09T21:51:58",
+        "upload_time_iso_8601": "2021-06-09T21:51:58.022204Z",
+        "url": "https://files.pythonhosted.org/packages/46/96/35c7807f8d414cd4ec6c0bbf0d4be38d658b88ee7f308765c06566419008/django_frozen_field-0.1b11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68a06bbe6d2b299fafe19e5da54f5dfcfc6a6440f8f765d11b500d2d5b30ebe6",
+          "md5": "db6c9396dbddf4bcbc48209a86e480e8",
+          "sha256": "a4bf0d84b275cf41705fc5008dab917ce90bd573766ff3f071a05c724a33db7c"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db6c9396dbddf4bcbc48209a86e480e8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14872,
+        "upload_time": "2021-06-09T21:51:56",
+        "upload_time_iso_8601": "2021-06-09T21:51:56.489752Z",
+        "url": "https://files.pythonhosted.org/packages/68/a0/6bbe6d2b299fafe19e5da54f5dfcfc6a6440f8f765d11b500d2d5b30ebe6/django-frozen-field-0.1b11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b06a39fe8e5485bcaf350d0d3bbb5457f617fab67f61a7c8007384e53d3968d2",
+          "md5": "f3e47ec73878988ef39b420df516b888",
+          "sha256": "01b04a02ce68a88dced9720287dbe61851790b63d1a208f04060d19da3d3ad39"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f3e47ec73878988ef39b420df516b888",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13701,
+        "upload_time": "2021-06-27T17:02:07",
+        "upload_time_iso_8601": "2021-06-27T17:02:07.823651Z",
+        "url": "https://files.pythonhosted.org/packages/b0/6a/39fe8e5485bcaf350d0d3bbb5457f617fab67f61a7c8007384e53d3968d2/django_frozen_field-0.1b12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c028a1e9a5897faea138011030a1c66f226e6ad66e93b59615e37f8ce14c3625",
+          "md5": "f7d57e2e3a10ee94d7408262b44ab239",
+          "sha256": "0c43f4bc89d6f400948cb7edf758cff75b648d05a4f2a8d880d4ff9a9c173f20"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f7d57e2e3a10ee94d7408262b44ab239",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14908,
+        "upload_time": "2021-06-27T17:02:06",
+        "upload_time_iso_8601": "2021-06-27T17:02:06.497967Z",
+        "url": "https://files.pythonhosted.org/packages/c0/28/a1e9a5897faea138011030a1c66f226e6ad66e93b59615e37f8ce14c3625/django-frozen-field-0.1b12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d655879bf6566e4a547261f5fda8ee1c4bdbe28718182df06c0a78a77a9749e2",
+          "md5": "d0d109570fab23a8aeb5c3901d1118d7",
+          "sha256": "92c1bb572a5ffbc5f0d055480b26e2e432576f5578d3fb20b809dfc7d1e30608"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d0d109570fab23a8aeb5c3901d1118d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13704,
+        "upload_time": "2021-09-11T13:54:55",
+        "upload_time_iso_8601": "2021-09-11T13:54:55.461051Z",
+        "url": "https://files.pythonhosted.org/packages/d6/55/879bf6566e4a547261f5fda8ee1c4bdbe28718182df06c0a78a77a9749e2/django_frozen_field-0.1b13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b70fa46e9f063aa534b8e4f2f2efc7b21f503f14032b978c143f24d0426a709f",
+          "md5": "65ddb8798b873365587ec52950562abd",
+          "sha256": "b1b5317015f826c6e1a8d33536a8113166f01f66fbc1225d27d783ae17209a0c"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65ddb8798b873365587ec52950562abd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14935,
+        "upload_time": "2021-09-11T13:54:54",
+        "upload_time_iso_8601": "2021-09-11T13:54:54.241300Z",
+        "url": "https://files.pythonhosted.org/packages/b7/0f/a46e9f063aa534b8e4f2f2efc7b21f503f14032b978c143f24d0426a709f/django-frozen-field-0.1b13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e84424753b1b743aa169dc7a0438355706226d410737907f7e3ba4042fc2ab3",
+          "md5": "754eb9cef0381f439eaccb769ffe1bd4",
+          "sha256": "c870b22ee6d5897586ac48973251b40c3c5d2711d1030bca72a35a2723986131"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "754eb9cef0381f439eaccb769ffe1bd4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13778,
+        "upload_time": "2021-09-11T14:07:34",
+        "upload_time_iso_8601": "2021-09-11T14:07:34.154150Z",
+        "url": "https://files.pythonhosted.org/packages/1e/84/424753b1b743aa169dc7a0438355706226d410737907f7e3ba4042fc2ab3/django_frozen_field-0.1b14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "80af9dea34d688cbec6ff4f6943f3caf34ed6ed034bca9baf4be5be764ea3e69",
+          "md5": "b4a9277b1a43ebc07fdb1baee022dd01",
+          "sha256": "bf5f4f9266be70a9f42d4f72b1f3006bb8160fe8206a5370d2ebe105e1b06712"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b4a9277b1a43ebc07fdb1baee022dd01",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14898,
+        "upload_time": "2021-09-11T14:07:32",
+        "upload_time_iso_8601": "2021-09-11T14:07:32.478784Z",
+        "url": "https://files.pythonhosted.org/packages/80/af/9dea34d688cbec6ff4f6943f3caf34ed6ed034bca9baf4be5be764ea3e69/django-frozen-field-0.1b14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38f327e8ae6e68c6dcb6876a73a09601323f252128d099d52010649e046b079a",
+          "md5": "db4f91bd7885a6c23813bcd1fb621e80",
+          "sha256": "3ba2ace7040df887f5ad97d56584521af6e208563adce7640656581f3b2866af"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "db4f91bd7885a6c23813bcd1fb621e80",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14054,
+        "upload_time": "2021-09-12T16:47:45",
+        "upload_time_iso_8601": "2021-09-12T16:47:45.771048Z",
+        "url": "https://files.pythonhosted.org/packages/38/f3/27e8ae6e68c6dcb6876a73a09601323f252128d099d52010649e046b079a/django_frozen_field-0.1b15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e8cee4a465f2f1180e869dc8fdd2cc1b817bdc8ba92067552cdf828e6e6445c0",
+          "md5": "b01c68018ee5d1bb388debddfd8a501e",
+          "sha256": "e68b45966ca538d28eeb40d2917fa4e091f6aca3cba5766ca70bd69ca06665f4"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b01c68018ee5d1bb388debddfd8a501e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 15174,
+        "upload_time": "2021-09-12T16:47:44",
+        "upload_time_iso_8601": "2021-09-12T16:47:44.130134Z",
+        "url": "https://files.pythonhosted.org/packages/e8/ce/e4a465f2f1180e869dc8fdd2cc1b817bdc8ba92067552cdf828e6e6445c0/django-frozen-field-0.1b15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4885743e9bae31645975c9bf6fd8faceae1cb465738ce0cb1b90bb7dc44cda6",
+          "md5": "9cee66ba07c24daf6f06368c172eac0f",
+          "sha256": "db8b40244ca5cc7303635f30eaf6016df0e90334eb4133aefb963b3c4b5f2b8c"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9cee66ba07c24daf6f06368c172eac0f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13931,
+        "upload_time": "2021-09-13T09:35:12",
+        "upload_time_iso_8601": "2021-09-13T09:35:12.070778Z",
+        "url": "https://files.pythonhosted.org/packages/d4/88/5743e9bae31645975c9bf6fd8faceae1cb465738ce0cb1b90bb7dc44cda6/django_frozen_field-0.1b16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c7b35c5e873ba459f994f115b01c43d2a7b36571b14386363432224a7b233e2",
+          "md5": "c0893023c708ebf86a09e57c97fe230a",
+          "sha256": "92d531664bd4bc4919b666708ae75860439af3c349c0ce8f944c9bd01595abd5"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c0893023c708ebf86a09e57c97fe230a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 15033,
+        "upload_time": "2021-09-13T09:35:10",
+        "upload_time_iso_8601": "2021-09-13T09:35:10.858786Z",
+        "url": "https://files.pythonhosted.org/packages/2c/7b/35c5e873ba459f994f115b01c43d2a7b36571b14386363432224a7b233e2/django-frozen-field-0.1b16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be3be84b2e34fe731ea7669b0ce09d6353b07b782bcd6297b469992434ed6fce",
+          "md5": "561fd4134bc62d8e6a3158508a6ffbc6",
+          "sha256": "39a11bbb0541fa8640a4e68d7033b2e2ab6abdc2e223667aa104975477a7bd81"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "561fd4134bc62d8e6a3158508a6ffbc6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9860,
+        "upload_time": "2021-06-05T00:06:55",
+        "upload_time_iso_8601": "2021-06-05T00:06:55.051248Z",
+        "url": "https://files.pythonhosted.org/packages/be/3b/e84b2e34fe731ea7669b0ce09d6353b07b782bcd6297b469992434ed6fce/django_frozen_field-0.1b2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39e4bad03abc39449fb5df59e1ac04eccecdf01bcb013aad7a5f36d500b0253e",
+          "md5": "2e1256d5c8fa52aaf19a0d80d82978b3",
+          "sha256": "328020aafc3df654b0ac72fdc3f81349fcdf8de807ada7eaf52c2ee174812471"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2e1256d5c8fa52aaf19a0d80d82978b3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10355,
+        "upload_time": "2021-06-05T00:06:53",
+        "upload_time_iso_8601": "2021-06-05T00:06:53.997472Z",
+        "url": "https://files.pythonhosted.org/packages/39/e4/bad03abc39449fb5df59e1ac04eccecdf01bcb013aad7a5f36d500b0253e/django-frozen-field-0.1b2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc1748905af6aad419033ea4227e22ad0b36325b6d1723010e82d37d5191619a",
+          "md5": "c9115592a855b11490cc2978f30f88cb",
+          "sha256": "096720872c797393980cb7d2224c21060441b4015d94a726c427f80d9fd95d7f"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c9115592a855b11490cc2978f30f88cb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10348,
+        "upload_time": "2021-06-05T13:09:28",
+        "upload_time_iso_8601": "2021-06-05T13:09:28.083341Z",
+        "url": "https://files.pythonhosted.org/packages/fc/17/48905af6aad419033ea4227e22ad0b36325b6d1723010e82d37d5191619a/django_frozen_field-0.1b3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c7cafd17a977d7177ec1e8d621a87a6f071e1c68d1c9c4c4f889581fa6c81c9",
+          "md5": "06397a029f6f82d7784f4168683a906e",
+          "sha256": "2d3d9fb532cfc0b8f48c42eb7638f46259409d89675a8e334501e830c84408f3"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06397a029f6f82d7784f4168683a906e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11032,
+        "upload_time": "2021-06-05T13:09:26",
+        "upload_time_iso_8601": "2021-06-05T13:09:26.772293Z",
+        "url": "https://files.pythonhosted.org/packages/1c/7c/afd17a977d7177ec1e8d621a87a6f071e1c68d1c9c4c4f889581fa6c81c9/django-frozen-field-0.1b3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "102fe7162e477a4e6aa488bffeed6d27936c9871619f37c786928f87d6db61e2",
+          "md5": "78a9a4ee58af5703e213f387564526bc",
+          "sha256": "cdc9b06f2e5ea748bf3ebc9cfda23d4aaaf2c3e3e5190c15be473d81e4b3e5bf"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "78a9a4ee58af5703e213f387564526bc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11109,
+        "upload_time": "2021-06-05T15:24:54",
+        "upload_time_iso_8601": "2021-06-05T15:24:54.398984Z",
+        "url": "https://files.pythonhosted.org/packages/10/2f/e7162e477a4e6aa488bffeed6d27936c9871619f37c786928f87d6db61e2/django_frozen_field-0.1b4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "936fa6d17d0826deee9f7c6dd3df92f89faa7242e092e9399dc11273448a3afd",
+          "md5": "fd81ce8db69a763249488b4ece69165c",
+          "sha256": "1db9b2e6c4995abdd809ba600a6ff492fa674cd495de00c6c4c00ab82eb3be30"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd81ce8db69a763249488b4ece69165c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11752,
+        "upload_time": "2021-06-05T15:24:52",
+        "upload_time_iso_8601": "2021-06-05T15:24:52.966375Z",
+        "url": "https://files.pythonhosted.org/packages/93/6f/a6d17d0826deee9f7c6dd3df92f89faa7242e092e9399dc11273448a3afd/django-frozen-field-0.1b4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84158c6464c106b48184ed4fc5d4d9771485ec34b144efe56897b3a22552aec5",
+          "md5": "6d8ec6f1e8af6117f440d7137d68c9a0",
+          "sha256": "be4e5622fe497ca9dcec5d7b93a6ccbd34d7dac85b7923eaacbff642bd5c06fe"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6d8ec6f1e8af6117f440d7137d68c9a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11240,
+        "upload_time": "2021-06-06T12:10:33",
+        "upload_time_iso_8601": "2021-06-06T12:10:33.315382Z",
+        "url": "https://files.pythonhosted.org/packages/84/15/8c6464c106b48184ed4fc5d4d9771485ec34b144efe56897b3a22552aec5/django_frozen_field-0.1b5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ccfbf0af61101aa24a063acc9b19f03afaf06af799ad335d17c250f7ca19d93e",
+          "md5": "b1efdd656912bffc6c2f48989776a960",
+          "sha256": "7bd7471cb5629f4295afd7ebbf2a3db2f38afb3e9de4f2601cecb3bad72f6491"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b1efdd656912bffc6c2f48989776a960",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11628,
+        "upload_time": "2021-06-06T12:10:32",
+        "upload_time_iso_8601": "2021-06-06T12:10:32.101939Z",
+        "url": "https://files.pythonhosted.org/packages/cc/fb/f0af61101aa24a063acc9b19f03afaf06af799ad335d17c250f7ca19d93e/django-frozen-field-0.1b5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "652b3eb037f410cf7eac4ac20350a3c4990484e39b9b976cf2dc28f2977ff133",
+          "md5": "cd8d8667f78af9771cb82239f1572e1d",
+          "sha256": "e94e5700f01efa036a52b452e0363ca6d389f213e0b25b9782b71cb1e9db7152"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cd8d8667f78af9771cb82239f1572e1d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11360,
+        "upload_time": "2021-06-06T13:45:35",
+        "upload_time_iso_8601": "2021-06-06T13:45:35.741337Z",
+        "url": "https://files.pythonhosted.org/packages/65/2b/3eb037f410cf7eac4ac20350a3c4990484e39b9b976cf2dc28f2977ff133/django_frozen_field-0.1b6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7905eaa69626142980d1b7947ab7a72fdeae31cdcdc0c966d69d4959e5fb08f8",
+          "md5": "9c82c023c470acfcad8c512752c7e9db",
+          "sha256": "857643f3db7df054768e8d4a2de0b212abbc17a7a03fcdee5afeda6bbbd72cc1"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9c82c023c470acfcad8c512752c7e9db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11729,
+        "upload_time": "2021-06-06T13:45:34",
+        "upload_time_iso_8601": "2021-06-06T13:45:34.188717Z",
+        "url": "https://files.pythonhosted.org/packages/79/05/eaa69626142980d1b7947ab7a72fdeae31cdcdc0c966d69d4959e5fb08f8/django-frozen-field-0.1b6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69da9f75b3880c5a10441282f5980dbd7832e9ac93c8296759bdfa59af6bc30e",
+          "md5": "cc7af0d08d095d87c61dc2949682b7c8",
+          "sha256": "a4e279d67d0c0b6ef4f06855879decc5d9b4c8052572d893ebc5b740d1240ace"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cc7af0d08d095d87c61dc2949682b7c8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11359,
+        "upload_time": "2021-06-06T13:51:26",
+        "upload_time_iso_8601": "2021-06-06T13:51:26.187120Z",
+        "url": "https://files.pythonhosted.org/packages/69/da/9f75b3880c5a10441282f5980dbd7832e9ac93c8296759bdfa59af6bc30e/django_frozen_field-0.1b7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a5d9a56f0418ec90a04c0fec97454619896602abcceea0b485c70653aaf00bf2",
+          "md5": "cb239631dcb406fdeb872e7d533231ee",
+          "sha256": "b3729e7a769ed35171d33929b67eefd9f75e8bd43f94a421e7a8318425f64aa9"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb239631dcb406fdeb872e7d533231ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 11716,
+        "upload_time": "2021-06-06T13:51:24",
+        "upload_time_iso_8601": "2021-06-06T13:51:24.840419Z",
+        "url": "https://files.pythonhosted.org/packages/a5/d9/a56f0418ec90a04c0fec97454619896602abcceea0b485c70653aaf00bf2/django-frozen-field-0.1b7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b359d48041dd641baf79fee21d0f0b61676372d6743846737c4df6b08a533759",
+          "md5": "a0fa15801688da9418808c3c1df96c47",
+          "sha256": "a4f6f7d354cf99b6e8e111af9829dfce290bb91d53c6288c60e6800dcbf56a9c"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a0fa15801688da9418808c3c1df96c47",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12466,
+        "upload_time": "2021-06-06T18:14:42",
+        "upload_time_iso_8601": "2021-06-06T18:14:42.130031Z",
+        "url": "https://files.pythonhosted.org/packages/b3/59/d48041dd641baf79fee21d0f0b61676372d6743846737c4df6b08a533759/django_frozen_field-0.1b8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "593a410246467f5d4ec325091e60cdc2d1acde692efb646300ddd546065ebbdf",
+          "md5": "22edf561927ffe45c629b90ccadf82e2",
+          "sha256": "82e42220c05c04e4b17d15f17094fd064b38b1675aedef5c1a840b65a1d74830"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22edf561927ffe45c629b90ccadf82e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14028,
+        "upload_time": "2021-06-06T18:14:40",
+        "upload_time_iso_8601": "2021-06-06T18:14:40.679042Z",
+        "url": "https://files.pythonhosted.org/packages/59/3a/410246467f5d4ec325091e60cdc2d1acde692efb646300ddd546065ebbdf/django-frozen-field-0.1b8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1b9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04da31731fe5ad0855b8fa2501ffad829268f5bdae0538f67785749a69db7f3b",
+          "md5": "47e777c6b08ce071134ce0c4c42ade6e",
+          "sha256": "3c03a54a8ec3a20abd71674440da21c1b9823d98b4026777029c614b6d014063"
+        },
+        "downloads": -1,
+        "filename": "django_frozen_field-0.1b9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "47e777c6b08ce071134ce0c4c42ade6e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13433,
+        "upload_time": "2021-06-08T16:03:30",
+        "upload_time_iso_8601": "2021-06-08T16:03:30.850852Z",
+        "url": "https://files.pythonhosted.org/packages/04/da/31731fe5ad0855b8fa2501ffad829268f5bdae0538f67785749a69db7f3b/django_frozen_field-0.1b9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dae93f1417f8d31829e367584f3b22152ae4bd55254497f796008a589960ed71",
+          "md5": "72daec5456d3c4265e5bb560f4ca1dfb",
+          "sha256": "a82ebfd46de2578879f30c840e5b72d46c7fb80e5f5591035ea6b9572fd37b17"
+        },
+        "downloads": -1,
+        "filename": "django-frozen-field-0.1b9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72daec5456d3c4265e5bb560f4ca1dfb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 14781,
+        "upload_time": "2021-06-08T16:03:29",
+        "upload_time_iso_8601": "2021-06-08T16:03:29.523791Z",
+        "url": "https://files.pythonhosted.org/packages/da/e9/3f1417f8d31829e367584f3b22152ae4bd55254497f796008a589960ed71/django-frozen-field-0.1b9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1348d044c93099beccfaa2406c8c53509f092c156a9f04cc8ccec8d995e4047f",
+        "md5": "16dfe0de97a000552968fac8985759ed",
+        "sha256": "2284b4175d0fb6c9702f4e12fdbffc126c27d11a7ba07fed2f5628546ac502d3"
+      },
+      "downloads": -1,
+      "filename": "django_frozen_field-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "16dfe0de97a000552968fac8985759ed",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 13931,
+      "upload_time": "2021-12-07T13:30:01",
+      "upload_time_iso_8601": "2021-12-07T13:30:01.929155Z",
+      "url": "https://files.pythonhosted.org/packages/13/48/d044c93099beccfaa2406c8c53509f092c156a9f04cc8ccec8d995e4047f/django_frozen_field-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "32dc0567f5d1857ddc7cef5ac12e1be0801091a184e7ae24a1028d152625b2ec",
+        "md5": "fc950036087c96c6f7c38d63f791a5d9",
+        "sha256": "99be86c1eedc43152f35f0ca2a7d960e7d05eac99c4c2c2b2df68b4b459b9df7"
+      },
+      "downloads": -1,
+      "filename": "django-frozen-field-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "fc950036087c96c6f7c38d63f791a5d9",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 15061,
+      "upload_time": "2021-12-07T13:30:00",
+      "upload_time_iso_8601": "2021-12-07T13:30:00.318085Z",
+      "url": "https://files.pythonhosted.org/packages/32/dc/0567f5d1857ddc7cef5ac12e1be0801091a184e7ae24a1028d152625b2ec/django-frozen-field-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

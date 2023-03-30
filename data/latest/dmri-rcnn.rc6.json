@@ -1,0 +1,361 @@
+{
+  "info": {
+    "author": "Matthew Lyon",
+    "author_email": "matthewlyon18@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Operating System :: MacOS",
+      "Operating System :: Microsoft :: Windows :: Windows 10",
+      "Operating System :: Unix",
+      "Programming Language :: Python"
+    ],
+    "description": "# Angular Super-Resolution in Diffusion MRI with a 3D Recurrent Convolutional Autoencoder\n\n![Model Architecture](resources/rcnn_dmri_model.png)\n\n[![PyPI version](https://badge.fury.io/py/dmri-rcnn.svg)](https://badge.fury.io/py/dmri-rcnn)\n\nThis project enhances the angular resolution of dMRI data through the use of a Recurrent CNN.\n\n## Table of contents\n* [Installation](#installation)\n* [Inference](#inference)\n* [Training](#training)\n* [Docker](#docker)\n* [Spherical Harmonic Baseline](#spherical-harmonic-baseline)\n\n## Installation\n`dMRI-RCNN` can be installed by via pip:\n```bash\npip install dmri-rcnn\n```\n\n### Requirements\n`dMRI-RCNN` uses [TensorFlow](https://www.tensorflow.org/) as the deep learning architecture. To enable [GPU usage within TensorFlow](https://www.tensorflow.org/install/gpu), you should ensure the appropriate prerequisites are installed.\n\nListed below are the requirements for this package.\n- `tensorflow>=2.6.0`\n- `numpy`\n- `einops`\n- `nibabel`\n- `tqdm`\n\n## Inference\nOnce installed, use `run_dmri_rcnn.py` to perform inference of new dMRI volumes. Below lists the data requirements to use the script, and the commandline arguments available for inference.\n\n### Data\nTo run this script, dMRI data is required in the following format:\n- Context dMRI file. The dMRI data used as context within the model to infer other volumes\n  - File format: `NIfTI`\n  - Single-shell: containing only one b-value.\n  - Dimensions: `(i, j, k, q_in)`.\n    - `(i, j, k)` are the spatial dimensions of the data\n    - `q_in` number of samples within the q-space dimension. This can either be `6`, `10`, or `30` and will affect which of the trained models is used.\n- Context b-vector file. The corresponding b-vectors for the context dMRI file.\n  - File format: text file, whitespace delimited.\n  - `3` rows corresponding to the `x, y, z` co-ordinates of q-space\n  - `q_in` columns corresponding to the q-space directions sampled. `q_in` must either be `6`, `10`, or `30`.\n- Target b-vector file. The corresponding b-vectors for the inferred dMRI data.\n  - File format: text file, whitespace delimited.\n  - `3` rows corresponding to the `x, y, z` co-ordinates of q-space\n  - `q_out` columns corresponding to the q-space directions sampled.\n- Brain mask file. Binary brain mask file for dMRI data.\n  - File format: `NIfTI`\n  - Dimensions: `(i, j, k)`. Same spatial dimensions as used in the dMRI data.\n\nThe script will create the following data:\n- Inferred dMRI file. dMRI volumes inferred from the model as defined by the target b-vectors.\n  - File format: `NIfTI`\n  - Dimensions: `(i, j, k, q_out)`.\n    - `q_out` number of samples within the q-space dimension. This can any number, though using higher numbers will require more GPU memory if using.\n\n### Commandline\nBring up the following help message via `run_dmri_rcnn.py -h`:\n```\nusage: `run_dmri_rcnn.py` [-h] -dmri_in DMRI_IN -bvec_in BVEC_IN -bvec_out BVEC_OUT -mask MASK -dmri_out DMRI_OUT -s {1000,2000,3000} [-m {1,3}] [-c] [-b BATCH_SIZE]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  -dmri_in DMRI_IN      Context dMRI NIfTI volume. Must be single-shell and contain q_in 3D volumes\n  -bvec_in BVEC_IN      Context b-vector text file. Whitespace delimited with 3 rows and q_in columns\n  -bvec_out BVEC_OUT    Target b-vector text file. Whitespace delimited with 3 rows and q_out columns\n  -mask MASK            Brain mask NIfTI volume. Must have space spatial dimensions as dmri_in.\n  -dmri_out DMRI_OUT    Inferred dMRI NIfTI volume. This will contain q_out inferred volumes.\n  -s {1000,2000,3000}, --shell {1000,2000,3000}\n                        Shell to perform inference with. Must be same shell as context/target dMRI and b-vectors\n  -m {1,3}, --model-dim {1,3}\n                        Model dimensionality, choose either 1 or 3. Default: 3.\n  -c, --combined        Use combined shell model. Currently only applicable with 3D model and 10 q_in.\n  -n, --norm            Perform normalisation using 99 percentile of data. Only implemented with --combined flag, and only for q_in = 10\n  -b BATCH_SIZE, --batch-size BATCH_SIZE\n                        Batch size to run model inference with.\n```\n\n***N.B.** Weights are downloaded and stored within `~/.dmri_rcnn` by default. To store weights in a different directory, set environment variable `DMRI_RCNN_DIR=\"/your/custom/directory\"`*\n\n\n#### Example\nThe following example performs `b = 1000` inference with the 3D dMRI RCNN on **HCP data**.\n```\n$ run_dmri_rcnn.py -dmri_in context_dmri.nii.gz -bvec_in context_bvecs -bvec_out target_bvecs -mask brain_mask.nii.gz -dmri_out inferred_dmri.nii.gz -s 1000 -m 3\n```\nThis example would take ~2 minutes to infer 80 volumes on an `NVIDIA RTX 3080`.\n\nTo perform inference on data outside of the HCP dataset, use the flags `-c` and `-n`. This is currently only implemented for $q_{in} = 10$.\n\n## Training\nBelow are details on how to train a given model, and the preprocessing steps involved.\n\n### Data Pre-Processing\nA training dataset is typically too large to fit into memory all at once. To overcome this, this project uses TensorFlow's `.tfrecord` file format and the\n[tf.data.Dataset](https://www.tensorflow.org/api_docs/python/tf/data/Dataset) API. Therefore training data should be saved in this format before starting. Below is an example on how to do this using the `dMRI-RCNN` project.\n\n```python\nimport numpy as np\n\nfrom dmri_rcnn.core import io\nfrom dmri_rcnn.core.processing import save_tfrecord_data\n\n# First load a subject into memory\ndmri, _ = io.load_nifti('/path/to/dmri/data.nii.gz')\nmask, _ = io.load_nifti('/path/to/brain/mask.nii.gz', dtype=np.int8)\nbvecs = io.load_bvec('/path/to/dmri/bvecs') # bvecs & bvals should be in FSL format\nbvals = io.load_bval('/path/to/dmri/bvals')\n\n# Optionally crop image data\ndmri, mask = io.autocrop_dmri(dmri, mask)\n\n# .tfrecord format uses a maximum filesize of 2 GiB, therefore for high\n# resolution dMRI data, the image may need to be split into smaller parts\n# to do this use the function below. It is recommended to first try to save\n# each subject as a whole before splitting the image into separate files.\ndmri_list = io.split_image_to_octants(dmri)\nmask_list = io.split_image_to_octants(mask)\n\n# Now save data in .tfrecord format\nsave_tfrecord_data(dmri, bvecs, bvals, mask, '/path/to/saved/data.tfrecord')\n\n# Alternatively save the list of image parts if dmri is too large\nfor i in range(len(dmri_list)):\n  save_tfrecord_data(dmri_list[i], bvecs, bvals, mask_list[i], '/path/to/saved/data' + str(i) + '.tfrecord')\n```\n\n### Training a Model\nOnce pre-processing is complete, you can then train a model.\n\n```python\nfrom dmri_rcnn.core.weights import get_weights\nfrom dmri_rcnn.core.model import get_1d_autoencoder, get_3d_autoencoder\nfrom dmri_rcnn.core.processing import TrainingProcessor, TrainingProcessorNorm\n\n# If we want to fine-tune the model we can load the previously obtained weights.\n# In this example we'll load the weights for the 3D RCNN trained on the b = 1000\n# shell and 6 q-space samples per input.\nweights = get_weights(model_dim=3, shell=1000, q_in=6)\n\n# Now we can instantiate the pre-compiled 3D model\nmodel = get_3d_autoencoder(weights) # Omit the weights argument to load without pre-trained weights\n\n# Instantiate the training processor\nprocessor = TrainingProcessor(shells=[1000], q_in=6)\n\n# If using non-HCP data, the TrainingProcessorNorm should be used instead.\nprocessor = TrainingProcessorNorm(shells=[1000], q_in=6)\n\n# Important: Here our q_in = 6, and the processor uses a default q_out = 10, therefore our dmri data must\n# contain at least 16 volumes.\n\n# Load dataset mapping\ntrain_data = processor.load_data(['/path/to/train_data0.tfrecord', '/path/to/train_data1.tfrecord'])\nvalidation_data = processor.load_data(['/path/to/val_data0.tfrecord'], validation=True)\n\n# Begin training\nmodel.fit(train_data, epochs=10, validation_data=validation_data)\n```\n\n## Docker\nYou can also use `dMRI-RCNN` directly via [Docker](https://www.docker.com/). Both a CPU and GPU version of the project are available.\n\n### CPU\nTo use `dMRI-RCNN` with the CPU only, use:\n```bash\nsudo docker run -v /absolute/path/to/my/data/directory:/data -it -t mlyon93/dmri-rcnn-cpu:latest\n```\n\n### GPU\nTo use `dMRI-RCNN` with the GPU, first ensure the [appropriate NVIDIA prerequisites](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker) have been installed. Then use:\n```bash\nsudo docker run --gpus all -v /absolute/path/to/my/data/directory:/data -it -t mlyon93/dmri-rcnn-gpu:latest\n```\n\n## Spherical Harmonic Baseline\nTo run the Spherical Harmonic baseline model used in the paper, first ensure `dipy` is installed. You can install `dipy` directly via `pip` or by installing this project using the following prompt.\n\n```\npip install dmri-rcnn[sh]\n```\n\n### Commandline\nBring up the following help message via `dmri_sh_baseline.py -h`:\n\n```\nusage: dMRI Spherical Harmonic Baseline Inference [-h] -dmri_in DMRI_IN -bvec_in BVEC_IN -bvec_out BVEC_OUT -dmri_out DMRI_OUT -s SHELL\n\noptional arguments:\n  -h, --help            show this help message and exit\n  -dmri_in DMRI_IN      Context dMRI NIfTI volume. Must be single-shell and contain q_in 3D volumes\n  -bvec_in BVEC_IN      Context b-vectory text file. Whitespace delimited with 3 rows and q_in columns\n  -bvec_out BVEC_OUT    Target b-vector text file. Whitespace delimited with 3 rows and q_out columns\n  -dmri_out DMRI_OUT    Inferred dMRI NIfTI volume. This will contain q_out inferred volumes.\n  -s SHELL, --shell SHELL\n                        Shell to perform inference on. Must be same shell as context/target dMRI and b-vecs\n```\n\n#### Example\n\nThe following example performs `b = 1000` spherical harmonic inference.\n```\n$ dmri_sh_baseline.py -dmri_in context_dmri.nii.gz -bvec_in context_bvecs -bvec_out target_bvecs -dmri_out inferred_dmri.nii.gz -s 1000\n```\n\nThe use or inspect the spherical harmonic model, the code can be found within `dmri_rcnn.core.processing.sph_harmonic`.\n\n\n## Roadmap\nFuture Additions & Improvements:\n- Plot functionality\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://https://github.com/m-lyon/dMRI-RCNN/archive/v0.4.0.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://https://github.com/m-lyon/dMRI-RCNN",
+    "keywords": "ai,cv,computer-vision,mri,dmri,super-resolution,cnn",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "dmri-rcnn",
+    "package_url": "https://pypi.org/project/dmri-rcnn/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/dmri-rcnn/",
+    "project_urls": {
+      "Download": "https://https://github.com/m-lyon/dMRI-RCNN/archive/v0.4.0.tar.gz",
+      "Homepage": "https://https://github.com/m-lyon/dMRI-RCNN"
+    },
+    "release_url": "https://pypi.org/project/dmri-rcnn/0.4.0/",
+    "requires_dist": [
+      "tensorflow (>=2.6.0)",
+      "numpy",
+      "einops",
+      "nibabel",
+      "tqdm",
+      "dipy ; extra == 'sh'"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Diffusion MRI Recurrent CNN for Angular Super-resolution.",
+    "version": "0.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13866544,
+  "releases": {
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a5535804525c4b8f04587d4d60044b1168aca0d6c1fda319f00e65f341888e67",
+          "md5": "6c4a2160c824be04af21446fe30c1538",
+          "sha256": "8b5d4fb509be26a9dc9ee084b25bebe1f6a46dd0f6a5b60cb22417e2df218445"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6c4a2160c824be04af21446fe30c1538",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 35972,
+        "upload_time": "2022-03-31T12:26:06",
+        "upload_time_iso_8601": "2022-03-31T12:26:06.357669Z",
+        "url": "https://files.pythonhosted.org/packages/a5/53/5804525c4b8f04587d4d60044b1168aca0d6c1fda319f00e65f341888e67/dmri_rcnn-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b880a656bba09ce6f033fb15badf59cd324fc1a986e73b1304bbd99c9f7f40a1",
+          "md5": "1c56923411e1725fc90729d0074a1aff",
+          "sha256": "20526e59a2cc42901c7ce9a11c6f1484a3cfc2e411419c1706e5f03aa1df1f95"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1c56923411e1725fc90729d0074a1aff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28055,
+        "upload_time": "2022-03-31T12:26:07",
+        "upload_time_iso_8601": "2022-03-31T12:26:07.601869Z",
+        "url": "https://files.pythonhosted.org/packages/b8/80/a656bba09ce6f033fb15badf59cd324fc1a986e73b1304bbd99c9f7f40a1/dmri-rcnn-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03af3b6132718c6e6b6d3a02382d775d36f1202c3e51d22b76ae46994a87831b",
+          "md5": "78df94c444457abf2be80ce92fb98459",
+          "sha256": "9f9f1494972eb93e83948cbc7ddbef679ef7fbd3d32673a70d5ba3eb46189d37"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "78df94c444457abf2be80ce92fb98459",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 37293,
+        "upload_time": "2022-04-05T11:23:53",
+        "upload_time_iso_8601": "2022-04-05T11:23:53.704145Z",
+        "url": "https://files.pythonhosted.org/packages/03/af/3b6132718c6e6b6d3a02382d775d36f1202c3e51d22b76ae46994a87831b/dmri_rcnn-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3987742f6511a29ea211b30f798e353d0ea34b6af8b8c7fc1425ae5fbff4508",
+          "md5": "0a138996d63036ec501f701cd27c77be",
+          "sha256": "a13c7da9d3b4cfdbb743b60fbb2ff4800908eeee44e8b783ea50ca8f1da84d9d"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0a138996d63036ec501f701cd27c77be",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 29023,
+        "upload_time": "2022-04-05T11:23:55",
+        "upload_time_iso_8601": "2022-04-05T11:23:55.785199Z",
+        "url": "https://files.pythonhosted.org/packages/f3/98/7742f6511a29ea211b30f798e353d0ea34b6af8b8c7fc1425ae5fbff4508/dmri-rcnn-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "455f0c416149b3e7fcbfcd81f948ad4a0a74d387f22ce4470cac93219fac328b",
+          "md5": "2b86345f72fec7f017abd41a6092809a",
+          "sha256": "c8dd13aee0758b3acfd6f562c05fdda35a5468d98fb34a2020e4e2f2868b3caa"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2b86345f72fec7f017abd41a6092809a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 37305,
+        "upload_time": "2022-04-05T13:15:51",
+        "upload_time_iso_8601": "2022-04-05T13:15:51.718305Z",
+        "url": "https://files.pythonhosted.org/packages/45/5f/0c416149b3e7fcbfcd81f948ad4a0a74d387f22ce4470cac93219fac328b/dmri_rcnn-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "589f06427dcac12d5d16bf1768361a88ced3df11bcb5f5ec49410b09d4a3ed34",
+          "md5": "9b0a6a5c2eec422ff45739c926dc31d4",
+          "sha256": "846154ded31866a7981086858d49a5f0d62cdaecdefbbe32f3a32b1123d18bd8"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9b0a6a5c2eec422ff45739c926dc31d4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 29035,
+        "upload_time": "2022-04-05T13:15:53",
+        "upload_time_iso_8601": "2022-04-05T13:15:53.784925Z",
+        "url": "https://files.pythonhosted.org/packages/58/9f/06427dcac12d5d16bf1768361a88ced3df11bcb5f5ec49410b09d4a3ed34/dmri-rcnn-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f57b43712322c78adc946e31bb0a74c54fefa424d2ed7c40a0107c650966007",
+          "md5": "69d387040c0cf04f2b39a31fbd43b5e6",
+          "sha256": "3778a438a4dc45839393acc791616fc5e322adb8d61b5b9bf20dd53f7bc322d6"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "69d387040c0cf04f2b39a31fbd43b5e6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 38460,
+        "upload_time": "2022-04-08T17:20:21",
+        "upload_time_iso_8601": "2022-04-08T17:20:21.721499Z",
+        "url": "https://files.pythonhosted.org/packages/1f/57/b43712322c78adc946e31bb0a74c54fefa424d2ed7c40a0107c650966007/dmri_rcnn-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fbce7c836f54d37628e1cb6b7125c944d7359b77e02407f3b93028884a7258d",
+          "md5": "020050068430d46b27d3d70f3bbaa367",
+          "sha256": "9fe39e900d6cfaba109cec3ee9921585f3968777309bee6e7872f633bf51dbb5"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "020050068430d46b27d3d70f3bbaa367",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 30189,
+        "upload_time": "2022-04-08T17:20:22",
+        "upload_time_iso_8601": "2022-04-08T17:20:22.728349Z",
+        "url": "https://files.pythonhosted.org/packages/8f/bc/e7c836f54d37628e1cb6b7125c944d7359b77e02407f3b93028884a7258d/dmri-rcnn-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "28fab07b3867d7ba06328a9356adbde2748f3ad2a17204822eb5060df55982a3",
+          "md5": "e2c724ecc0b248bd69984b1c65d31b60",
+          "sha256": "b584426ff8897e8f22e27a068ce189d753ff45534e28d0f1305608a08bb4d9dd"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e2c724ecc0b248bd69984b1c65d31b60",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 38460,
+        "upload_time": "2022-04-11T15:34:26",
+        "upload_time_iso_8601": "2022-04-11T15:34:26.856304Z",
+        "url": "https://files.pythonhosted.org/packages/28/fa/b07b3867d7ba06328a9356adbde2748f3ad2a17204822eb5060df55982a3/dmri_rcnn-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6bd50cc8d0f567e8c811a49a2770d9c1e76901dc3fff612e8a9378137c6d5cb",
+          "md5": "1f155f31b4c8f787316e9becbec9229f",
+          "sha256": "100cc05cadf03722e859525825e836427ecb2271f4c6c104c01baf4476157609"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1f155f31b4c8f787316e9becbec9229f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 30205,
+        "upload_time": "2022-04-11T15:34:27",
+        "upload_time_iso_8601": "2022-04-11T15:34:27.975533Z",
+        "url": "https://files.pythonhosted.org/packages/d6/bd/50cc8d0f567e8c811a49a2770d9c1e76901dc3fff612e8a9378137c6d5cb/dmri-rcnn-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc66d6bf1166b6ec5f42e38008d9d756967b4de10e67eb3a00bd34e01cd2eab7",
+          "md5": "ccbf7593fbf1824ad5e63de2d405d74b",
+          "sha256": "856b983868f40c49b4bbe680431a73a646b60749628fea9e509fd86b7eb7fb26"
+        },
+        "downloads": -1,
+        "filename": "dmri_rcnn-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ccbf7593fbf1824ad5e63de2d405d74b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 41416,
+        "upload_time": "2022-05-19T15:22:59",
+        "upload_time_iso_8601": "2022-05-19T15:22:59.271713Z",
+        "url": "https://files.pythonhosted.org/packages/fc/66/d6bf1166b6ec5f42e38008d9d756967b4de10e67eb3a00bd34e01cd2eab7/dmri_rcnn-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fbbd4ab8931635fbb96bf5f188ecb38b10a14b27b4cd388f9bc07b5b79dc92a5",
+          "md5": "af23478aa1dcdbfaf5ad3b7eefd01071",
+          "sha256": "a490cd63ef52578149b3fcbc86571626cd552fd34d19ba5158b5fb181fb24a83"
+        },
+        "downloads": -1,
+        "filename": "dmri-rcnn-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af23478aa1dcdbfaf5ad3b7eefd01071",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 31465,
+        "upload_time": "2022-05-19T15:23:00",
+        "upload_time_iso_8601": "2022-05-19T15:23:00.998604Z",
+        "url": "https://files.pythonhosted.org/packages/fb/bd/4ab8931635fbb96bf5f188ecb38b10a14b27b4cd388f9bc07b5b79dc92a5/dmri-rcnn-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fc66d6bf1166b6ec5f42e38008d9d756967b4de10e67eb3a00bd34e01cd2eab7",
+        "md5": "ccbf7593fbf1824ad5e63de2d405d74b",
+        "sha256": "856b983868f40c49b4bbe680431a73a646b60749628fea9e509fd86b7eb7fb26"
+      },
+      "downloads": -1,
+      "filename": "dmri_rcnn-0.4.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ccbf7593fbf1824ad5e63de2d405d74b",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 41416,
+      "upload_time": "2022-05-19T15:22:59",
+      "upload_time_iso_8601": "2022-05-19T15:22:59.271713Z",
+      "url": "https://files.pythonhosted.org/packages/fc/66/d6bf1166b6ec5f42e38008d9d756967b4de10e67eb3a00bd34e01cd2eab7/dmri_rcnn-0.4.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fbbd4ab8931635fbb96bf5f188ecb38b10a14b27b4cd388f9bc07b5b79dc92a5",
+        "md5": "af23478aa1dcdbfaf5ad3b7eefd01071",
+        "sha256": "a490cd63ef52578149b3fcbc86571626cd552fd34d19ba5158b5fb181fb24a83"
+      },
+      "downloads": -1,
+      "filename": "dmri-rcnn-0.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "af23478aa1dcdbfaf5ad3b7eefd01071",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 31465,
+      "upload_time": "2022-05-19T15:23:00",
+      "upload_time_iso_8601": "2022-05-19T15:23:00.998604Z",
+      "url": "https://files.pythonhosted.org/packages/fb/bd/4ab8931635fbb96bf5f188ecb38b10a14b27b4cd388f9bc07b5b79dc92a5/dmri-rcnn-0.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

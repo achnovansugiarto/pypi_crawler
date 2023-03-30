@@ -1,0 +1,203 @@
+{
+  "info": {
+    "author": "Benjamin Ryon",
+    "author_email": "benjamin.ryon@aofl.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Information Technology",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "dbt-unit-test (dut)\n===\n\n_A tiny framework for testing reusable code inside of dbt models_\n\n[DBT](www.getdbt.com) (Data Buld Tool) is a great way to maintain reusable sql code. With [macros](https://docs.getdbt.com/docs/building-a-dbt-project/jinja-macros#macros), we can build parametrizable code blocks which can be used in many places while maintaining DRYness. DBT even allows us to package macros as [modules](https://docs.getdbt.com/docs/building-a-dbt-project/package-management) to be maintained independently and even shared with the world as open-source code like the [dbt-utils](https://github.com/fishtown-analytics/dbt-utils) project.\n\nWhile reusable code has big advantages, it introduces a single point of failure, which requires careful testing.\n\n`dbt-unit-test` makes it easy to write test cases for any code that might be reused in DBT models.\n\n## Installation\n```\n$ pip install dbt-unit-test\n```\nor for the very latest version:\n```\n$ pip install git+https://github.com/AgeOfLearning/dbt-unit-test.git\n```\n\n## Setup\nFrom the root of your dbt project run:\n```\n$ dut init\n```\nThis will set up a `dbt_unit_test.yml` file right next to your `dbt_project.yml`.\n\nNow, you will need to create a dbt profile called `unit_test`. This profile should use a database/schema on the system where the code to be tested is run. Ideally, at least the schema should be different than any schema that contains \"real\" DBT models.\n\n## Quick Start\n```\n$ dut run\n```\nThis runs all the tests. You can select which tests to run with `--tests`.\n\n## Anatomy of a Test\nThe init command installs an example unit test here (the one you just ran if you did the last session).:\n```\nyour_dbt_project_root/\n    dbt_project.yml\n    ...\n    dbt_unit_test.yml\n    unit_tests/\n        example_test/\n            expect.csv\n            input.csv\n            model.sql\n```\nThis `example_test` is the basic setup of a unit test: A directory with 3 files: `input.csv`,  `model.sql` and `expect.csv`. The files are always named like this. The directory distinguishes one test from another. Test directories can be organized within other directories, but must have unique names.\n\nThe `input.csv` and `expect.csv` files are both DBT [seeds](https://docs.getdbt.com/docs/building-a-dbt-project/seeds). They represent data referenced by the dbt model in `model.sql` and the data that this model is expected to produce.\n\nThe `model.sql` file is just a dbt model. It should contain code that is used elsewhere like a DBT macro or a UDF.\n\nThese files are co-located in a single directory so that each test represents a discret unit of code an all of its components are easy to find. The `dut run` command will place these files in the appropriate locations (`models/`, `data/`) so that the they can be run by DBT.\n\nAfter the unit test models are run, `dut` will validate that the DBT model produced by `model.sql` is identical to the dataset in `expect.csv`.\n\n## Inside `model.sql`\nThe `example_test/model.sql` looks like this:\n```sql\n{{\n    config(\n        materialized='view'\n    )\n}}\nwith base as (\n    select \n        grp, \n        sum(metric) as metric,\n        max(batch) as batch\n    from {{ ref('example_test_input') }} a\n    group by grp\n)\nselect * from base\n```\nAny model/seed in the test can be referenced with `{{ ref('<test_name>_<file_name>') }}`. So this test uses this rubric with `{{ ref('example_test_input') }}`.\n\n## Incremental Models\nIncremental models are often some of the trickiest to get right. This is because they rely on the state created by the previous runs to form their current run output. `dut` has a test pattern for this important use-case.\n\nThe `input.csv` file can have a column called `batch`, like this:\n```sql\nbatch,  grp,    metric\n1,      0,      10\n1,      0,      10\n1,      1,      10\n1,      1,      10\n2,      1,      10\n2,      2,      10\n2,      2,      10\n3,      3,      10\n```\n\n`dut run` will automatically create and additional model called `<test_name>_batch` that will be available within `model.sql`. `dut run` runs the test models N (default 2) times configurable with `--batches`.\n\nOn the first dbt run in our `example_test`, the model referenced by `{{ ref('example_test_batch') }}` will only have this data:\n```sql\nbatch,  grp,    metric\n1,      0,      10\n1,      0,      10\n1,      1,      10\n1,      1,      10\n```\nIt only contains rows where `batch <= 1`. Subsequent dbt runs will filter less of the data where `batch <= n`, `n` being the ordinal number of the dbt run (the batch). On the final dbt run (the 2nd by default), `{{ ref('example_test_batch') }}` will always be equivalent to `{{ ref('example_test_input') }}`.\n\n## Tutorial: Convert `example_test` into an incremental model.\n\nIf we change the model configuration to:\n```sql\n{{\n    config(\n        materialized='incremental',\n        unique_key='grp'\n    )\n}}\nwith base as (\n    select \n        grp, \n        sum(metric) as metric,\n        max(batch) as batch\n    from {{ ref('example_test_batch') }} a\n    group by grp\n)\nselect * from base\n```\nOur test passes, but the model is not really incremental because the entire table is replaced on the last dbt run of the `dut run`. We want our model to consume only the new data on each run, as well as the previous state of the model.\n\nLet's change our model to this:\n```sql\n{{\n    config(\n        materialized='incremental',\n        unique_key='grp'\n    )\n}}\nwith base as (\n    select grp, sum(metric) as metric, max(batch) as batch\n    from {{ ref('example_test_batch') }} a\n\n    {% if is_incremental() %}\n    where batch > (\n        -- only pull new data on incremental runs\n        select batch from {{ this }} order by batch desc limit 1\n    )\n    {% endif %}\n\n    group by grp\n)\n\n{% if is_incremental() %}\n\nselect \n    grp,\n    sum(metric) as metric, -- sum of sums\n    max(batch) as batch    -- update the most recent batch of the grp\nfrom (\n\n    -- find any grp sums that should be updated by data in the most recent batch\n    select grp, metric, batch\n    from {{ this }}\n    where grp in (select distinct grp from base)\n\n    union all\n\n    -- add on the new batch data\n    select grp, metric, batch\n    from base\n\n) as a\ngroup by grp\n\n{% else %}\n\n-- on a full refresh, just run the old query\nselect * from base\n\n{% endif %}\n```\n\nGreat! Now we have an incremental model that only requires the newest raw data, and the test passes.\n\n### Wait, what are we testing?\nWe have just proven that this incremental model operates the way we expect, but we need to be able to reuse this code. Let's package this as a macro:\n\n`macros/incremental_sum.sql`\n```sql\n{% macro incremental_sum(\n    reference,\n    metric_field,\n    group_field,\n    load_time_field\n) %}\n\nwith base as (\n    select \n        {{ group_field }},\n        sum({{ metric_field }}) as {{ metric_field }},\n        max({{ load_time_field }}) as {{ load_time_field }}\n    from {{ reference }} a\n\n    {% if is_incremental() %}\n    where {{ load_time_field }} > (\n        -- only pull new data on incremental runs\n        select {{ load_time_field }} from {{ this }} order by {{ load_time_field }} desc limit 1\n    )\n    {% endif %}\n\n    group by {{ group_field }}\n)\n\n{% if is_incremental() %}\n\nselect \n    {{ group_field }},\n    sum({{ metric_field }}) as {{ metric_field }}, -- sum of sums\n    max({{ load_time_field }}) as {{ load_time_field }}    -- update the most recent {{ load_time_field }} of the {{ group_field }}\nfrom (\n\n    -- find any {{ group_field }} sums that should be updated by data in the most recent {{ load_time_field }}\n    select {{ group_field }}, {{ metric_field }}, {{ load_time_field }}\n    from {{ this }}\n    where {{ group_field }} in (select distinct {{ group_field }} from base)\n\n    union all\n\n    -- add on the new {{ load_time_field }} data\n    select {{ group_field }}, {{ metric_field }}, {{ load_time_field }}\n    from base\n\n) as a\ngroup by {{ group_field }}\n\n{% else %}\n\n-- on a full refresh, just run the old query\nselect * from base\n\n{% endif %}\n\n{% endmacro %}\n```\n\nThe generic version of this code is not so easy on the eyes, but what is important is that the interface is nice and clean:\n\n`example_test/model.sql`\n```sql\n{{\n    config(\n        materialized='incremental',\n        unique_key='grp'\n    )\n}}\n{{\n    incremental_sum(\n        reference = ref('example_test_batch'),\n        metric_field = 'metric',\n        group_field = 'grp',\n        load_time_field = 'batch'\n    )\n}}\n```\nNow we can write many tests for this reusable code, and use it with confidence because we have tested it thoroughly!",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/AgeOfLearning/dbt-unit-test",
+    "keywords": "sql dbt test unittest",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "dbt-unit-test",
+    "package_url": "https://pypi.org/project/dbt-unit-test/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/dbt-unit-test/",
+    "project_urls": {
+      "Homepage": "https://github.com/AgeOfLearning/dbt-unit-test"
+    },
+    "release_url": "https://pypi.org/project/dbt-unit-test/0.0.5/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "A tiny framework for testing reusable code inside of dbt models",
+    "version": "0.0.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9680627,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ee31e56137a0c360a900b41e1d1268791834a52babcea2ecae99fd5aee67276",
+          "md5": "121a40f7efea9deed90981e160e9d387",
+          "sha256": "518a93b00645fe7e4a70745b2a69bf01ec0fec34785267a2cb19c02a14b8f21a"
+        },
+        "downloads": -1,
+        "filename": "dbt_unit_test-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "121a40f7efea9deed90981e160e9d387",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 8262,
+        "upload_time": "2021-03-05T18:49:30",
+        "upload_time_iso_8601": "2021-03-05T18:49:30.166179Z",
+        "url": "https://files.pythonhosted.org/packages/2e/e3/1e56137a0c360a900b41e1d1268791834a52babcea2ecae99fd5aee67276/dbt_unit_test-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "43ea538bd4cf3651f64af4a37bfdaacb49272b33d39fb105e7279ca606421ea4",
+          "md5": "a7d3577753ce664f5c8adac2e5b7ae71",
+          "sha256": "9622c8d1bc378a26e03d63779a260c6f92db7cb0c6ba679093beb27b3bb7dc56"
+        },
+        "downloads": -1,
+        "filename": "dbt-unit-test-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a7d3577753ce664f5c8adac2e5b7ae71",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8414,
+        "upload_time": "2021-03-05T18:49:31",
+        "upload_time_iso_8601": "2021-03-05T18:49:31.440804Z",
+        "url": "https://files.pythonhosted.org/packages/43/ea/538bd4cf3651f64af4a37bfdaacb49272b33d39fb105e7279ca606421ea4/dbt-unit-test-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "00e316169ede10f4f12a0ce18c5c1b0b8af06ec1168045f888ccf7393b0a974b",
+          "md5": "bd7f7d6d2a9317e36a8805eef85f3376",
+          "sha256": "d74818c49379c88ea58f14ff3cd49f6f267e859803d273fe1a104e0216e5227e"
+        },
+        "downloads": -1,
+        "filename": "dbt-unit-test-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bd7f7d6d2a9317e36a8805eef85f3376",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8402,
+        "upload_time": "2021-03-05T22:15:36",
+        "upload_time_iso_8601": "2021-03-05T22:15:36.688828Z",
+        "url": "https://files.pythonhosted.org/packages/00/e3/16169ede10f4f12a0ce18c5c1b0b8af06ec1168045f888ccf7393b0a974b/dbt-unit-test-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "92f97dde787f29c70e95301a556fef1de357ddbf74f85030845b71cfa24813cb",
+          "md5": "027ca0c13b20125aed31cd7a67b4d681",
+          "sha256": "913613b000f66891680f1c5a18be3ef86317850e6492f7e052c9afbd659c53a1"
+        },
+        "downloads": -1,
+        "filename": "dbt-unit-test-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "027ca0c13b20125aed31cd7a67b4d681",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8410,
+        "upload_time": "2021-03-05T22:24:13",
+        "upload_time_iso_8601": "2021-03-05T22:24:13.357430Z",
+        "url": "https://files.pythonhosted.org/packages/92/f9/7dde787f29c70e95301a556fef1de357ddbf74f85030845b71cfa24813cb/dbt-unit-test-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "685e5206a169f9b8f4350122799d2c284e4b1102a9317d13cd233bb08512edf3",
+          "md5": "d01a94a192b5c684ad2c21387973873a",
+          "sha256": "7abb3b5390414c09f13312bee9c6e6ca81290eb75621da399a75297c77717e2d"
+        },
+        "downloads": -1,
+        "filename": "dbt-unit-test-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d01a94a192b5c684ad2c21387973873a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11577,
+        "upload_time": "2021-03-05T22:38:43",
+        "upload_time_iso_8601": "2021-03-05T22:38:43.458956Z",
+        "url": "https://files.pythonhosted.org/packages/68/5e/5206a169f9b8f4350122799d2c284e4b1102a9317d13cd233bb08512edf3/dbt-unit-test-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b0d81e1fc85d0c2febae04c61d722dd1356bd6515c5a24af27fdf8ed9eefa0b8",
+          "md5": "466a954bafaf12c7fa6d11ef3ccb54db",
+          "sha256": "a1cd4b8aad448cfceff506afb6bdd24c2d18c5a861be02b4253443900ffbec4e"
+        },
+        "downloads": -1,
+        "filename": "dbt-unit-test-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "466a954bafaf12c7fa6d11ef3ccb54db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11630,
+        "upload_time": "2021-03-06T00:47:53",
+        "upload_time_iso_8601": "2021-03-06T00:47:53.250382Z",
+        "url": "https://files.pythonhosted.org/packages/b0/d8/1e1fc85d0c2febae04c61d722dd1356bd6515c5a24af27fdf8ed9eefa0b8/dbt-unit-test-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b0d81e1fc85d0c2febae04c61d722dd1356bd6515c5a24af27fdf8ed9eefa0b8",
+        "md5": "466a954bafaf12c7fa6d11ef3ccb54db",
+        "sha256": "a1cd4b8aad448cfceff506afb6bdd24c2d18c5a861be02b4253443900ffbec4e"
+      },
+      "downloads": -1,
+      "filename": "dbt-unit-test-0.0.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "466a954bafaf12c7fa6d11ef3ccb54db",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 11630,
+      "upload_time": "2021-03-06T00:47:53",
+      "upload_time_iso_8601": "2021-03-06T00:47:53.250382Z",
+      "url": "https://files.pythonhosted.org/packages/b0/d8/1e1fc85d0c2febae04c61d722dd1356bd6515c5a24af27fdf8ed9eefa0b8/dbt-unit-test-0.0.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

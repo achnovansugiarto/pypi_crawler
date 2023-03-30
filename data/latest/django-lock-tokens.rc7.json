@@ -1,0 +1,303 @@
+{
+  "info": {
+    "author": "Renaud Parent",
+    "author_email": "renaud.parent@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Framework :: Django",
+      "Framework :: Django :: 1.10",
+      "Framework :: Django :: 1.8",
+      "Framework :: Django :: 1.9",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Natural Language :: English",
+      "Programming Language :: Python :: 2",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.3",
+      "Programming Language :: Python :: 3.4",
+      "Programming Language :: Python :: 3.5",
+      "Topic :: Software Development :: Libraries :: Application Frameworks"
+    ],
+    "description": "=============================\ndjango-lock-tokens\n=============================\n\n.. image:: https://badge.fury.io/py/django-lock-tokens.svg\n    :target: https://badge.fury.io/py/django-lock-tokens\n\n.. image:: https://travis-ci.org/rparent/django-lock-tokens.svg?branch=master\n    :target: https://travis-ci.org/rparent/django-lock-tokens\n\n.. image:: https://codecov.io/gh/rparent/django-lock-tokens/branch/master/graph/badge.svg\n    :target: https://codecov.io/gh/rparent/django-lock-tokens\n\ndjango-lock-tokens is a Django application that provides a locking mechanism to prevent concurrency editing.\n\nIt is not user-based nor session-based, it is just token based. When you lock a resource, you are given a token string with an expiration date, and you will need to provide this token to unlock that resource.\n\nThe application provides some useful functions to handle this token mechanism with sessions if you want to, and a REST API (with a javascript client for it) to deal with lock tokens without sessions.\n\n\nHere is a non exhaustive list of the features coming with this token-based approach, to help you choose ``django-lock-tokens`` (or not!) over other concurrent edition preventing solutions:\n\n- No need to modify your models to use the locking mechanism : you don't \"pollute\" your datamodel with \"non-data\" fields. This also means you can use the locking mechanism on third party models that cannot be modified\n- No need to use sessions (but you can still use it if you want to)\n- Ability to check if an object is locked BEFORE trying to modify it\n- Rest API (+ javascript client to use it) out-of-the-box\n- Admin interface integration\n\n\nTable of Contents\n-----------------\n\n1. `Requirements`_\n2. `Install`_\n3. `TL;DR`_\n4. `How it works`_\n5. `LockableModel proxy`_\n6. `LockableModelAdmin for admin interface`_\n7. `Session-based usage: lock_tokens.sessions module`_\n8. `Session-based usage: lock_tokens.decorators module`_\n9. `REST API`_\n10. `REST API Javascript client`_\n11. `Settings`_\n12. `Tests`_\n\n\nRequirements\n------------\n\n* Python (2.7, 3.3, 3.4, 3.5)\n* Django (1.8, 1.9, 1.10, 1.11, 2.0, 2.1)\n\n\nInstall\n-------\n\n1. Run ``pip install django-lock-tokens``\n\n2. Add ``lock_tokens`` to your ``INSTALLED_APPS`` setting. As django-lock-tokens uses the ``contenttypes`` framework, make sure it is also available in your ``INSTALLED_APPS`` setting:\n\n.. code:: python\n\n    INSTALLED_APPS = [\n        ...\n        'django.contrib.contenttypes',\n        ...\n        'lock_tokens.apps.LockTokensConfig',\n    ]\n\n3. Run ``python manage.py migrate`` from the root of your django project to install the lock tokens model.\n\n4. If you want to use the ``LockableAdmin`` and all the session-based functionalities, make sure you have enabled a session middleware in your settings, for example:\n\n.. code:: python\n\n    MIDDLEWARE_CLASSES = (\n        ...\n        'django.contrib.sessions.middleware.SessionMiddleware',\n        ...\n    )\n\n5. If you want to use the REST API, include ``lock_tokens.urls`` with the correct namespace in your ``urls.py`` like this (it is mandatory if you want to use the ``LockableModelAdmin``):\n\n.. code:: python\n\n    urlpatterns = [\n      ...\n      url(r'^lock_tokens/', include('lock_tokens.urls', namespace='lock-tokens')),\n      ...\n    ]\n\nTL;DR\n-----\n\nAfter having completed previous steps, using the locking mechanism in your views is as simple as this:\n\n.. code:: python\n\n    from django.http import HttpResponseForbidden\n    from lock_tokens.exceptions import AlreadyLockedError, UnlockForbiddenError\n    from lock_tokens.sessions import check_for_session, lock_for_session, unlock_for_session\n\n    from my_app.models import MyModel\n\n\n    def view_with_object_edition(request):\n        \"\"\"This view locks the instance of MyModel that is to be edited.\"\"\"\n        # Get MyModel instance:\n        obj = MyModel.objects.get(...)\n        try:\n            lock_for_session(obj, request.session)\n        except AlreadyLockedError:\n            return HttpResponseForbidden(\"This resource is locked, sorry !\")\n        # ... Do stuff\n        return render(...)\n\n\n    def view_that_saves_object(request):\n        \"\"\"This view locks the instance of MyModel that is to be edited.\"\"\"\n        # Get MyModel instance:\n        obj = MyModel.objects.get(...)\n        if not check_for_session(obj, request.session):\n            return HttpResponseForbidden(\"Cannot modify the object, you don't have the lock.\")\n        # ... Do stuff\n        unlock_for_session(obj, request.session)\n        return render(...)\n\n\nOr use it directly in your Django templates to handle locking on the client side::\n\n    {% load lock_tokens_tags %}\n    {% lock_tokens_api_client %}\n    ...\n    <script type=\"text/javascript\">\n        window.addEventListener('lock_tokens.clientready', function () {\n            LockTokens.lock(...);\n            ...\n            LockTokens.unlock(...);\n        });\n    </script>\n\nHow it works\n------------\n\nTo avoid concurrency editing, ``django-lock-tokens`` provides some interfaces to lock and check lock on any model instance before changing it (including third party model instances).\nThis is handled via an internal model (``LockToken``). There can be only one ``LockToken`` instance per model instance.\n\nThe lock token lifecycle is the following:\n\n  1. When a lock is created for an object by an entity, it is valid for a certain amount of time. The entity is given a **lock token key** (a string) that it must hold to perform actions with valid lock required. A new ``LockToken`` instance is created in database, after having deleted a potential expired instance in database.\n  2. If the entity that holds the lock token key no longer needs the lock on the object, it can unlock this object by providing the lock token key. The ``LockToken`` instance is then removed from database.\n  3. The entity that holds the lock token key can also renew the lock token by providing the lock token key.\n  4. If the lock token is not renewed until the expiration time, it becomes expired, but stays in database until a new lock is created on this instance (or the entity that holds the lock token key deletes it).\n\nSo to use this mechanism correctly, you should **require** a valid lock token key and renew the lock in any method where an object is saved and you want to prevent concurrency editing. Based on the 4 previous points, we can see that there can be 3 cases for a lock token key:\n\n  1. The lock token key has a corresponding lock token in database, and it has not expired.\n  2. The lock token key has a corresponding lock token in database, but it has expired.\n  3. The lock token key has no correponding lock token in database for the object.\n\nFor case 1, it is ok to save the object and then unlock the object by deleting the lock token. The token key is still **VALID**.\n\nFor case 2, the lock has expired but no other entity has created a lock on the object in the meantime. So it is still ok to save the object as it will not overwrite any changes. The token key is still **VALID**.\n\nIn case 3, it means that the lock token created by the entity has expired, and that another entity has taken a lock on the object in the meantime and could have done some changes on it. So it is not ok to save changes. The token key is **INVALID**.\n\nHere is an example to understand the case 3:\n\n  1. Alice takes a lock on an object and opens up its editing interface. *A ``LockToken`` instance ``lt1`` is created in database, and Alice is given a lock token key*\n  2. Alice walks away from her computer, the lock expires. *``lt1`` is still in database*\n  3. Bob takes a lock on the same object. *``lt1`` is deleted from database, and a new ``LockToken`` instance ``lt2`` is created*\n  4. Bob edits the object in the interface, clicks save. The object is modified and the lock is released. *``lt2`` is deleted. The object has no longer any lock in database*\n  5. Alice returns, clicks save. The lock token key she holds has become invalid, so she gets an error.\n\nThis example shows how it is important to require a **VALID** lock token key to prevent concurrency editing.\n\n``LockableModel`` proxy\n-----------------------\n\nTo make one of your models lockable, use the ``LockableModel`` class. ``LockableModel`` is just a Django proxy model, which simply provides additional locking methods to your models.\n\nSo you can either make your models inherit from ``LockableModel``:\n\n.. code:: python\n\n    from lock_tokens.models import LockableModel\n\n    class MyModel(LockableModel):\n        ...\n\n    obj = MyModel.get(...)\n    token = obj.lock()\n\n\nor you can simply use it as a proxy on a given model instance:\n\n.. code:: python\n\n    from lock_tokens.models import LockableModel\n\n    from my_app.models import MyModel\n\n    obj = MyModel.get(...)\n    token = LockableModel.lock(obj)\n\n\nThis can be useful if you don't want to expose the locking methods for your models everywhere, or if you want to lock resources that come from a third party application.\n\nNote that as ``LockableModel`` is just a proxy model, make your models inherit from it won't change their fields so there will be no additional migrations required.\n\nAdditionally, if your model inherits from ``LockableModel``, the ``objects`` Manager has a specific method that allows you to get and lock a model like so:\n\n.. code:: python\n\n    >>>obj, token = MyModel.get_and_lock(...<usual get arguments>)\n\nIf you already overrided the default ``objects`` manager with a custom one and that you want to get this method available, make your custom manager inherit from ``lock_tokens.managers.LockableModelManager``.\n\n\n``LockableModel.lock(self, token=None)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLocks the given object, or renew existing lock if the token parameter is provided.\n\nReturns a ``dict`` containing a token a its expiration date.\n\nRaises a ``lock_tokens.exceptions.AlreadyLockedError`` if the resource is already locked, and a ``lock_tokens.exceptions.InvalidToken`` if the specified token is invalid.\n\nExample:\n\n.. code:: python\n\n    def test(myObject):\n        try:\n            token = myObject.lock()\n        except AlreadyLockedError:\n            print \"This object is already locked\"\n        return token\n\n\n    >>>token = test(obj)\n    {\"token\": \"9692ac52a27a40308b82b49b77357c97\", \"expires\": \"2016-06-23 09:48:06\"}\n    >>>test(obj)\n    \"This object is already locked\"\n    >>>test(obj, token['token'])\n    {\"token\": \"9692ac52a27a40308b82b49b77357c97\", \"expires\": \"2016-06-23 09:48:26\"}\n\n\n``LockableModel.unlock(self, token)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nUnlocks the given object if the provided token is correct.\n\nRaises a ``lock_tokens.exceptions.UnlockForbiddenError``\n\n``LockableModel.is_locked(self)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nReturns a boolean that indicates whether the given object is currently locked or not.\n\n``LockableModel.check_lock(self, token)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nReturns a boolean that indicates if the given token is valid for this object. Will also return ``True`` with a warning if the object is not locked (lock expired or no lock).\n\n\n``LockableModelAdmin`` for admin interface\n------------------------------------------\n\nIf you want to make the admin interface lock-aware, and lock objects that are edited,\nsimply make your ``ModelAdmin`` class inherit from ``LockableModelAdmin``:\n\n.. code:: python\n\n    from lock_tokens.admin import LockableModelAdmin\n    from django.contrib import admin\n\n    from my_app.models import MyModel\n\n    class MyModelAdmin(LockableModelAdmin):\n        ...\n\n    admin.site.register(MyModel, MyModelAdmin)\n\n\nWith this, when accessing a given instance of ``MyModel`` from the admin interface,\nit will check that the instance is not locked. If it is not, it will lock it. If it is,\nthen there will be a warning message displayed to inform that the object cannot be edited,\nand the saving buttons will not appear. And if despite this, the change form is sent, it will raise a ``PermissionDenied`` exception so you will get a HTTP 403 error.\n\nOverrinding `change_form_template` in `LockableModelAdmin`\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nIf you want to override the `change_form_template`, but still make sure the lock will be released when leaving the page without saving, don't forget to add the `admin_lock_handler` template tag. This template tag needs 4 arguments: the application name of the object, the model name of the object, the object id and the lock token key. So don't forget to add those (especially the lock token) into your template context if you also override the `change_view` method.\n\nExample to add the template tag to your custom template if you don't override `change_view`:\n\n.. code:: html\n\n    ...\n    {% load lock_tokens_tags %}\n    ...\n    {% if lock_token %}\n      {% admin_lock_handler opts.app_label opts.model_name original.id lock_token %}\n    {% endif %}\n\n\n\n\nSession-based usage: ``lock_tokens.sessions`` module\n----------------------------------------------------\n\nIn most cases, it will be the easiest way to deal with lock tokens, as you won't need to handle them at all.\n\n``lock_for_session(obj, session, force_new=False)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLock an object in the given session. This function will try to lock the object,\nand if it succeeds, it will hold the token value in a session variable.\n\nThere is a `force_new` optional parameter that you can set to `True` if you want to force a new lock generation without using a potentially existing token key stored in session. This is to be used with caution (i.e. exclusively in methods that only read the object, not in methods that save it) as it could lead to a potential overwriting if the session holds an invalid token.\nTo sum up: do not set this parameter to `True` unless you are sure of what you are doing!\n\nRaises a ``lock_tokens.exceptions.AlreadyLockedError`` if the resource is already locked, and a ``lock_tokens.exceptions.InvalidToken`` error if the session holds an invalid token.\n\n``unlock_for_session(obj, session)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nUnlocks an object in the given session.\n\nRaises a ``lock_tokens.exceptions.UnlockForbiddenError`` if the session does not hold the lock on the object.\n\n``check_for_session(obj, session)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nCheck if an object has a valid lock in the given session.\n\nReturns ``True`` if the session holds a valid lock (even if it has expired), and ``False`` if the session holds an invalid lock or no lock.\n\nSession-based usage: ``lock_tokens.decorators`` module\n------------------------------------------------------\n\nThis module provides view decorators for common use cases.\n\n``locks_object(model, get_object_id_callable)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLocks an object before executing view, and keep lock token in the request session. Does not unlock it when the view returns.\n\nArguments:\n\n- ``model``: the concerned django Model\n- ``get_object_id_callable``: a callable that will return the concerned object id based on the view arguments\n\nExample:\n\n.. code:: python\n\n    from lock_tokens.decorators import locks_object\n\n    @locks_object(MyModel, lambda request: request.GET.get('my_model_id'))\n    def myview(request):\n        # In this example the view will lock the MyModel instance with the id\n        # provided in the request GET parameter my_model_id\n        ...\n\n    @locks_object(MyModel, lambda request, object_id: object_id)\n    def anotherview(request, object_id):\n        # In this example the view will lock the MyModel instance with the id\n        # provided as the second view argument\n        ...\n\n\n``holds_lock_on_object(model, get_object_id_callable)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLocks an object before executing view, and keep lock token in the request session. Hold lock until the view is finished executing, then release it.\n\nArguments:\n\n- ``model``: the concerned django Model\n- ``get_object_id_callable``: a callable that will return the concerned object id based on the view arguments\n\nSee examples for ``locks_object``.\n\n\nREST API\n--------\n\nIf you want to use locking mechanism from outside your views, there is a simple HTTP API to handle tokens. It does not use sessions at all, so you need to handle the tokens yourself in this case.\n\nHere are the different entry points, where ``<app_label>`` is the name of the application of the concerned model, ``<model>`` is the name of the model, ``<object_id>`` is the id of the cmodel instance, and ``<token>`` is the lock token value.\n\n*POST* ``/lock_tokens/<app_label>/<model>/<object_id>/``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nLocks object. Returns a JSON response with \"token\" and \"expires\" keys.\n\nReturns a 404 HTTP error if the object could not be found.\n\nReturns a 403 HTTP error if the object is already locked.\n\n*GET* ``/lock_tokens/<app_label>/<model>/<object_id>/<token>/``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nReturns a JSON response with \"token\" and \"expires\" keys.\n\nReturns a 404 HTTP error if the object could not be found.\n\nReturns a 403 HTTP error if the token is incorrect.\n\n*PATCH* ``/lock_tokens/<app_label>/<model>/<object_id>/<token>/``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRenews the lock on the object. Returns a JSON response with \"token\" and \"expires\" keys.\n\nReturns a 404 HTTP error if the object could not be found.\n\nReturns a 403 HTTP error if the token is incorrect.\n\n*DELETE* ``/lock_tokens/<app_label>/<model>/<object_id>/<token>/``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nUnlocks object.\n\nReturns a 404 HTTP error if the object could not be found.\n\nReturns a 403 HTTP error if the token is incorrect.\n\n\nREST API Javascript client\n--------------------------\n\nThe application includes a javascript client to interact with the API. To enable it, simply add the following lines to your template, somewhere in the ``<body>`` section ::\n\n\n    {% load lock_tokens_tags %}\n    {% lock_tokens_api_client %}\n\nDon't forget to include the REST API urls with the correct namespace as described in section 1, otherwise it won't work.\n\nAdding those lines in your template will create a variable named ``LockTokens``, and emit a ``lock_tokens.clientready`` event when it is available in the javascript scope. This object has the following methods (parameters are self-describing):\n\n``LockTokens.lock(app_label, model, object_id, callback)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLocks the corresponding object. When the call to the API is completed, calls the ``callback`` method with a ``lock_tokens.Token`` instance as an argument, or ``null`` if the API request failed.\n\nNB: The ``LockTokens`` handles the tokens for you, so you don't need to read API responses and/or store tokens yourself.\n\n``LockTokens.register_existing_lock_token(app_label, model, object_id, token_string, callback)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nAdd an existing token to the ``LockTokens`` registry. This method is useful for example when you want to handle on client side a lock that has been set on the server side. You must provide the token string in addition to other parameters, the client will make a call to the API to ensure the token is valid and get its expiration date. Calls the ``callback`` method with a ``lock_tokens.Token`` instance as an argument, or ``null`` if the registration failed.\n\n``LockTokens.unlock(app_label, model, object_id, callback)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nLocks the corresponding object. When the call to the API is completed, calls the ``callback`` method with a boolean that indicates whether the API request has succeeded. Note that this method can be called only on an object that has been locked or registered as locked by the ``LockTokens`` object.\n\n``LockTokens.hold_lock(app_label, model, object_id)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nHolds a lock on the corresponding object. It is like the ``lock`` method, except it renews the token each time it is about to expire. A call to ``unlock`` will stop the lock holding.\n\n\n``LockTokens.clear_all_locks(callback)``\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nUnlocks all registered objects. Calls ``callback`` with no arguments when unlocking of every objects is done.\n\n\nSettings\n--------\n\nYou can override ``lock_token`` default settings by adding a ``dict`` named ``LOCK_TOKENS`` to your ``settings.py`` like so:\n\n.. code:: python\n\n    LOCK_TOKENS = {\n        'API_CSRF_EXEMPT': True,\n        'DATEFORMAT': \"%Y%m%d%H%M%S\",\n        'TIMEOUT': 60,\n    }\n\n\nTIMEOUT\n^^^^^^^\n\nThe validity duration for a lock token in seconds. Defaults to ``3600`` (one hour).\n\nDATEFORMAT\n^^^^^^^^^^\n\nThe format of the expiration date returned in the token ``dict``. Defaults to ``\"%Y-%m-%d %H:%M:%S %Z\"``\n\nAPI_CSRF_EXEMPT\n^^^^^^^^^^^^^^^\n\nA boolean that indicates whether to deactivate CSRF checks on the API views or not. Defaults to ``False``.\n\nTests\n-----\n\nTo run tests simply run from the root of the repository:\n\n::\n\n    source <YOURVIRTUALENV>/bin/activate\n    (myenv) $ pip install tox\n    (myenv) $ tox\n\n\nCredits\n-------\n\nTools used in rendering this package:\n\n*  Cookiecutter_\n*  `cookiecutter-djangopackage`_\n\n.. _Cookiecutter: https://github.com/audreyr/cookiecutter\n.. _`cookiecutter-djangopackage`: https://github.com/pydanny/cookiecutter-djangopackage\n\n\n\n\nHistory\n-------\n\n0.2.5 (2019-02-07)\n^^^^^^^^^^^^^^^^^^\n\n- Fix issue #10_\n\n.. _10: https://github.com/rparent/django-lock-tockens/issues/10\n\n0.2.4 (2018-11_30)\n^^^^^^^^^^^^^^^^^^\n- The HTTP API endpoint to get token information now returns the token information even when it has expired, because it is still valid to use (see this_)\n\n.. _this: https://github.com/rparent/django-lock-tokens#how-it-works\n\n0.2.3 (2018-10-31)\n^^^^^^^^^^^^^^^^^^\n- Fixes ``LockableModel`` for Python 2.7\n\n0.2.2 (2018-10-31)\n^^^^^^^^^^^^^^^^^^\n- Fixes ``LockableModel`` to allow to use it as a proxy\n\n0.2.1 (2018-10-04)\n^^^^^^^^^^^^^^^^^^\n- Fixes ``LockToken.save`` method to prevent potential transaction errors\n- Adds a template tag to handle lock on the client side when overriding default ``change_form_template`` in ``LockableModelAdmin``\n- Better handling of invalid lock token strings (see discussion here_) to prevent overwriting\n\n.. _here: https://github.com/rparent/django-lock-tokens/issues/6\n\n0.1.4 (2017-09-07)\n^^^^^^^^^^^^^^^^^^\n\n- Adds a ``created`` field to the ``LockToken`` model",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/rparent/django-lock-tokens",
+    "keywords": "django-lock-tokens",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-lock-tokens",
+    "package_url": "https://pypi.org/project/django-lock-tokens/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-lock-tokens/",
+    "project_urls": {
+      "Homepage": "https://github.com/rparent/django-lock-tokens"
+    },
+    "release_url": "https://pypi.org/project/django-lock-tokens/0.2.5/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "A Django application that provides a locking mechanism to prevent concurrency editing.",
+    "version": "0.2.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 4790716,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5260f2f4139c847d3f2a26860f84d83c2fedf1ccd7574bf15eb998ca0d4219da",
+          "md5": "12245a30f3a0350603d741fd98bebd4f",
+          "sha256": "dd6d9266bc51e1896dbc9b1d75a56a469dcd341b861de325f6f3292eb1876598"
+        },
+        "downloads": -1,
+        "filename": "django_lock_tokens-0.1.1-py2-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "12245a30f3a0350603d741fd98bebd4f",
+        "packagetype": "bdist_wheel",
+        "python_version": "2.7",
+        "requires_python": null,
+        "size": 21563,
+        "upload_time": "2016-10-21T14:09:54",
+        "upload_time_iso_8601": "2016-10-21T14:09:54.960260Z",
+        "url": "https://files.pythonhosted.org/packages/52/60/f2f4139c847d3f2a26860f84d83c2fedf1ccd7574bf15eb998ca0d4219da/django_lock_tokens-0.1.1-py2-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "446bdcf3fedf88a2c17654982c02556128788359bae1ad3d2b12f33a29aeb173",
+          "md5": "085ed747c7ae122962ed55ce13c95891",
+          "sha256": "01a6e0440b997077cae1eee8a18d6750e7453b1e30d7d4455cf71fcb77438510"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "085ed747c7ae122962ed55ce13c95891",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17826,
+        "upload_time": "2016-10-21T14:09:52",
+        "upload_time_iso_8601": "2016-10-21T14:09:52.555136Z",
+        "url": "https://files.pythonhosted.org/packages/44/6b/dcf3fedf88a2c17654982c02556128788359bae1ad3d2b12f33a29aeb173/django-lock-tokens-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01539cbf2676b4b400805b1b29327bde8ac7635aa8571401720a9941460fb17f",
+          "md5": "8480dcd117e1767c37c5ddd565a380b4",
+          "sha256": "74fb2a7e815162ff614e9e694a9a383bc3242bcb2aa3633611c15fed941a7157"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8480dcd117e1767c37c5ddd565a380b4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18609,
+        "upload_time": "2016-12-02T11:44:29",
+        "upload_time_iso_8601": "2016-12-02T11:44:29.410143Z",
+        "url": "https://files.pythonhosted.org/packages/01/53/9cbf2676b4b400805b1b29327bde8ac7635aa8571401720a9941460fb17f/django-lock-tokens-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47319eff391c9f1de828cc199c3386845b1df398813bdd1b254cfd814d859f1e",
+          "md5": "0645715e0275bc0fc7684e4ee3b86598",
+          "sha256": "15cb34ea63af3f896a90029f6f5a93d352428642d12b30de41cd82e3a0d53a59"
+        },
+        "downloads": -1,
+        "filename": "django_lock_tokens-0.1.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0645715e0275bc0fc7684e4ee3b86598",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 25529,
+        "upload_time": "2017-09-07T17:30:20",
+        "upload_time_iso_8601": "2017-09-07T17:30:20.556665Z",
+        "url": "https://files.pythonhosted.org/packages/47/31/9eff391c9f1de828cc199c3386845b1df398813bdd1b254cfd814d859f1e/django_lock_tokens-0.1.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad72340d452dc8c30b31d64050245647cbcb2c37d473e9a7a570acdcd8e026dd",
+          "md5": "dfac2ab42a3f88f5045d4ad56af4c8ae",
+          "sha256": "6a32f18e1d83ee59bf1e3e83081d3292e1b98c220cfdfd398254e5ca6bbed015"
+        },
+        "downloads": -1,
+        "filename": "django_lock_tokens-0.1.4-py3.5.egg",
+        "has_sig": false,
+        "md5_digest": "dfac2ab42a3f88f5045d4ad56af4c8ae",
+        "packagetype": "bdist_egg",
+        "python_version": "3.5",
+        "requires_python": null,
+        "size": 37518,
+        "upload_time": "2018-10-04T19:44:40",
+        "upload_time_iso_8601": "2018-10-04T19:44:40.275133Z",
+        "url": "https://files.pythonhosted.org/packages/ad/72/340d452dc8c30b31d64050245647cbcb2c37d473e9a7a570acdcd8e026dd/django_lock_tokens-0.1.4-py3.5.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8ba41be3ba62ed3c34f0228576c0e0e8628cb698f41badc2245d446303b352cf",
+          "md5": "0ea6e076986d5f562673762d863a4616",
+          "sha256": "49b40196d96daaa99a4c784e1c48bb5ce36ffb0ecb2718d750c956f9dc6b198a"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0ea6e076986d5f562673762d863a4616",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21237,
+        "upload_time": "2017-09-07T17:28:13",
+        "upload_time_iso_8601": "2017-09-07T17:28:13.768777Z",
+        "url": "https://files.pythonhosted.org/packages/8b/a4/1be3ba62ed3c34f0228576c0e0e8628cb698f41badc2245d446303b352cf/django-lock-tokens-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "834752e6e364463f5320d21c6177babfced33f44d5a6dc8b3c26c9eb979bce58",
+          "md5": "ab8953cefcbc10083de367b1125e9f0d",
+          "sha256": "ddb63f34f6db36b8ea07b6c29d067ef672e66b832813ca6d9fe4361c2d0add1e"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ab8953cefcbc10083de367b1125e9f0d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 30551,
+        "upload_time": "2018-10-04T19:44:42",
+        "upload_time_iso_8601": "2018-10-04T19:44:42.518124Z",
+        "url": "https://files.pythonhosted.org/packages/83/47/52e6e364463f5320d21c6177babfced33f44d5a6dc8b3c26c9eb979bce58/django-lock-tokens-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c88159be2d5b6e0a1e21e22d15c3f1cc12c2405aee6b6076db387d3a7bd42fa",
+          "md5": "f75e56877fa1ffc5e282cfab0757e5e1",
+          "sha256": "f4bc6389b3b8de67badc06c13a01124aaa95a4296600585e7b83cfbc072f565a"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f75e56877fa1ffc5e282cfab0757e5e1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 30805,
+        "upload_time": "2018-10-31T18:37:59",
+        "upload_time_iso_8601": "2018-10-31T18:37:59.268835Z",
+        "url": "https://files.pythonhosted.org/packages/1c/88/159be2d5b6e0a1e21e22d15c3f1cc12c2405aee6b6076db387d3a7bd42fa/django-lock-tokens-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "efb1e9b821c4d55b778a9b514283072c98a29cdf370c90e9b217072b5399297e",
+          "md5": "f6ca1fc5de74a0d3dfccf6405af2cd66",
+          "sha256": "a0929acd2d05b89e3cb448f0ebb2cfd855b31775e2b256e3128b459225305691"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f6ca1fc5de74a0d3dfccf6405af2cd66",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32234,
+        "upload_time": "2018-11-29T21:13:29",
+        "upload_time_iso_8601": "2018-11-29T21:13:29.495086Z",
+        "url": "https://files.pythonhosted.org/packages/ef/b1/e9b821c4d55b778a9b514283072c98a29cdf370c90e9b217072b5399297e/django-lock-tokens-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e0b21de529ddc7ecf5752773fe81cc52d0901aba9833e5d657726fd2d347977",
+          "md5": "02c3a36d6dfec2b027c90fd873fab9ea",
+          "sha256": "cc7d513fabe2b93f00caced63dfce8c682bf09d42690a7f1349946345b3fdef4"
+        },
+        "downloads": -1,
+        "filename": "django-lock-tokens-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02c3a36d6dfec2b027c90fd873fab9ea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32425,
+        "upload_time": "2019-02-07T12:07:39",
+        "upload_time_iso_8601": "2019-02-07T12:07:39.840954Z",
+        "url": "https://files.pythonhosted.org/packages/2e/0b/21de529ddc7ecf5752773fe81cc52d0901aba9833e5d657726fd2d347977/django-lock-tokens-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2e0b21de529ddc7ecf5752773fe81cc52d0901aba9833e5d657726fd2d347977",
+        "md5": "02c3a36d6dfec2b027c90fd873fab9ea",
+        "sha256": "cc7d513fabe2b93f00caced63dfce8c682bf09d42690a7f1349946345b3fdef4"
+      },
+      "downloads": -1,
+      "filename": "django-lock-tokens-0.2.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "02c3a36d6dfec2b027c90fd873fab9ea",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 32425,
+      "upload_time": "2019-02-07T12:07:39",
+      "upload_time_iso_8601": "2019-02-07T12:07:39.840954Z",
+      "url": "https://files.pythonhosted.org/packages/2e/0b/21de529ddc7ecf5752773fe81cc52d0901aba9833e5d657726fd2d347977/django-lock-tokens-0.2.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

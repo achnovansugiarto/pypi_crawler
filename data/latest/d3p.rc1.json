@@ -1,0 +1,143 @@
+{
+  "info": {
+    "author": "FCAI R4 @ Helsinki University and Aalto University",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "Intended Audience :: Education",
+      "Intended Audience :: Science/Research",
+      "Operating System :: MacOS :: MacOS X",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# d3p - Differentially Private Probabilistic Programming\n\nd3p is an implementation of the differentially private variational inference (DP-VI) algorithm [2] for [NumPyro](https://github.com/pyro-ppl/numpyro), using [JAX](https://github.com/google/jax/) for auto-differentiation and fast execution on CPU and GPU.\n\nIt is designed to provide differential privacy guarantees for tabular data, where each individual contributed a single sensitive record (/ data point / example).\n\n## Current Status\n\nThe software is under ongoing development and specific interfaces may change suddenly.\n\nSince both NumPyro and JAX are evolving rapdily, some convenience features implemented in d3p are made obsolete by being introduced in these upstream packages. In that case, they will be gradually replaced but there might be some lag time.\n\n## Usage\n\nThe main component of `d3p` is the implementation of DP-VI in the `d3p.svi.DPSVI` class.\nIt is intended to work as a drop-in replacement of NumPyro's `numpyro.svi.SVI` and works\nwith models specified using NumPyro distributions and modelling features.\n\nFor a general introduction on writing models for NumPyro, please refer to the [NumPyro documentation](https://num.pyro.ai/en/stable/getting_started.html).\n\nThen instead of `numpyro.svi.SVI`, you can simply use `d3p.svi.DPSVI`.\n\n### Main Differences in `DPSVI`\nSince it provides differential privacy, there are additional parameters to the `DPSVI` class compared to `numpyro.svi.SVI`:\n\n#### `clipping_threshold`\nDifferential privacy requires gradients of individual data points (examples) in your data set\nto be clipped to a maximum norm, to limit the contribution any single example can have. The parameter `clipping_threshold`\nsets the threshold over which these gradient norms are clipped.\n\n#### `dp_scale`\nThis is the scale of the noise σ for the Gaussian mechanism that is used to perturb gradients in DP-VI update steps\nto turn it into a differentially-private inference algorithm. The larger `dp_scale` is, the greater the privacy\nguarantees (expressed by parameters (ε,δ)) are.\n\nNote: The final scale of the noise applied by the Gaussian mechanism is `dp_scale`·`clipping_threshold`, to properly\naccount for the maximum size of the gradient norm.\n\n_How to select_: `d3p` offers the `d3p.dputil.approximate_sigma` function to find the `dp_scale` parameter for\na choice of ε and δ (and the minibatch size) using the Fourier accountant. Unfortunately, research on appropriate values for ε and δ is still ongoing, but common practice is to select δ to be much smaller than 1/N, where N is the size of your data set, and ε not larger than one.\n\n#### `rng_suite`\nJAX's default pseudo-random number generator is not known to be cryptographically secure, which is required for meaningful\nprivacy in practice. `d3p` therefore relies on our `jax-chacha-prng` cryptographically secure PRNG package through `d3p.random` as the default PRNG for `DPSVI` to sample noise related to privacy.\n\nHowever, you if you want to use JAX's default PRNG, which is a bit faster, during debugging, you can use\nthe `rng_suite` parameter to pass the `d3p.random.debug` module, which is a slim wrapper around JAX's PRNG.\n\nNote: The choice for `rng_suite` does not affect definition of the model (or variational guide)\nor any purely modelling and sampling related functionality of NumPyro/JAX. These still all use JAX's default PRNG.\n\n### Minibatch sampling\nDP-VI relies on uniform sampling of random minibatches for each update step to guarantee privacy. This is different\nfrom simply shuffling the data set and taking consecutive batches from it, as is often done in machine learning.\n\n`d3p` implements a high-performant GPU-optimised minibatch sampling routine in `d3p.minibatch.subsample_batchify_data`.\nIt accepts the data set and a minibatch size (or, equivalently, a subsampling ratio) and returns functions\n`batchify_init` and `batchify_sample` which initialise a batchifier state from a `rng_key` and sample a random minibatch given the batchifier state respectively.\n\n### Requirements for Model Implementation\n`d3p.svi.DPSVI` only requires the `model` function to be properly setup for minibatches of independent data. This\nmeans users must use the `plate` primitive of NumPyro in their model implementation to properly annotate individual\ndata points as stochastically independent. If this is not properly done, the relative contribution of the prior\ndistributions for parameters will be overemphasized during the inference.\n\n### Short Example\n\nAs a very brief example, we consider logistic regression and define the model as:\n```python\nimport jax.numpy as jnp\nimport jax\n\nfrom numpyro.infer import Trace_ELBO\nfrom numpyro.optim import Adam\nfrom numpyro.primitives import sample, plate\nfrom numpyro.distributions import Normal, Bernoulli\nfrom numpyro.infer.autoguide import AutoDiagonalNormal\n\nfrom d3p.minibatch import subsample_batchify_data\nfrom d3p.svi import DPSVI\nfrom d3p.dputil import approximate_sigma\nimport d3p.random\n\ndef sigmoid(x):\n    return 1./(1+jnp.exp(-x))\n\n# specifies the model p(ys, w | xs) using NumPyro features\ndef model(xs, ys, N):\n    # obtain data dimensions\n    batch_size, d = xs.shape\n    # the prior for w\n    w = sample('w', Normal(0, 4),sample_shape=(d,))\n    # distribution of label y for each record x\n    with plate('batch', N, batch_size):\n        theta = sigmoid(xs.dot(w))\n        sample('ys', Bernoulli(theta), obs=ys)\n\nguide = AutoDiagonalNormal(model) # variational guide approximates posterior of theta and w with independent Gaussians\n\ndef infer(data, labels, batch_size, num_iter, epsilon, delta, seed):\n    rng_key = d3p.random.PRNGKey(seed)\n    # set up minibatch sampling\n    batchifier_init, get_batch = subsample_batchify_data((data, labels), batch_size)\n    _, batchifier_state = batchifier_init(rng_key)\n\n    # set up DP-VI algorithm\n    q = batch_size / len(data)\n    dp_scale, _, _ = approximate_sigma(epsilon, delta, q, num_iter)\n    loss = Trace_ELBO()\n    optimiser = Adam(1e-3)\n    clipping_threshold = 10.\n    dpsvi = DPSVI(model, guide, optimiser, loss, clipping_threshold, dp_scale, N=len(data))\n    svi_state = dpsvi.init(rng_key, *get_batch(0, batchifier_state))\n\n    # run inference\n    def step_function(i, svi_state):\n        data_batch, label_batch = get_batch(i, batchifier_state)\n        svi_state, loss = dpsvi.update(svi_state, data_batch, label_batch)\n        return svi_state\n\n    svi_state = jax.lax.fori_loop(0, num_iter, step_function, svi_state)\n    return dpsvi.get_params(svi_state)\n```\n\nSee the `examples/` for more examples.\n\n## Installing\n\nd3p is pure Python software. You can install it via the pip command line tool\n```\npip install d3p\n```\n\nThis will install d3p with all required dependencies (NumPyro, JAX, ..) for CPU usage.\n\n\nYou can also install the latest development version\nvia pip with the following command:\n```\npip install git+https://github.com/DPBayes/d3p.git@master#egg=d3p\n```\n\nAlternatively, you can clone this git repository and install with pip locally:\n```\ngit clone https://github.com/DPBayes/d3p\ncd d3p\npip install .\n```\n\nIf you want to run the included examples, use the `examples` installation target:\n```\npip install .[examples]\n```\n\n### Note about dependency versions\n\nNumPyro and JAX are still under ongoing development and its developers currently give no\nguarantee that the API remains stable between releases. In order to allow for users\nof d3p to benefit from latest features of NumPyro, we did not put a strict upper bound\non the NumPyro dependency version. This may lead to problems if newer NumPyro versions\nintroduce breaking API changes.\n\nIf you encounter such issues at some point,\nyou can use the `compatible-dependencies` installation target of d3p to force usage of the latest\nknown set of dependency versions known to be compatible with d3p:\n```\npip install git+https://github.com/DPBayes/d3p.git@master#egg=d3p[compatible-dependencies]\n```\n\n### GPU installation\nd3p supports hardware acceleration on CUDA devices. You will need to make sure that\nyou have the CUDA libraries set up on your system as well as a working compiler for C++.\n\nYou can then install d3p using\n```\npip install d3p[cuda] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html\n```\n\nUnfortunately, the `jax-chacha-prng` package which provides the secure randomness\ngenerator d3p relies on does not provide prebuilt packages for CUDA, so will need to\nreinstall it from sources. To do so, issue the following command after the previous one:\n```\npip install --force-reinstall --no-binary jax-chacha-prng \"jax-chacha-prng<2\"\n```\n\n### TPU installation\nTPUs are currently not supported.\n\n## Versioning Policy\n\nThe `master` branch contains the latest development version of d3p which may introduce breaking changes.\n\nVersion numbers adhere to [Semantic Versioning](https://semver.org/). Changes between releases are tracked in `ChangeLog.txt`.\n\n## License\n\nd3p is licensed under the Apache 2.0 License. The full license text is available\nin `LICENSES/Apache-2.0.txt`. Copyright holder of each contribution are the respective\ncontributing developer or his or her assignee (i.e., universities or companies\nowning the copyright of software contributed by their employees).\n\n## Acknowledgements\n\nWe thank the NVIDIA AI Technology Center Finland for their contribution of GPU performance benchmarking and optimisation.\n\n## References and Citing\n\nWhen using d3p, please cite the following papers:\n\n1. L. Prediger, N. Loppi, S. Kaski, A. Honkela.\nd3p - A Python Package for Differentially-Private Probabilistic Programming\nIn *Proceedings on Privacy Enhancing Technologies, 2022(2)*.\nLink: [https://doi.org/10.2478/popets-2022-0052](https://doi.org/10.2478/popets-2022-0052)\n\n1. J. Jälkö, O. Dikmen, A. Honkela. Differentially Private Variational Inference for Non-conjugate Models\nIn *Uncertainty in Artificial Intelligence 2017 Proceedings of the 33rd Conference, UAI 2017*.\nLink: [http://auai.org/uai2017/proceedings/papers/152.pdf](http://auai.org/uai2017/proceedings/papers/152.pdf)\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "probabilistic machine learning bayesian statistics differential-privacy",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "d3p",
+    "package_url": "https://pypi.org/project/d3p/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/d3p/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/d3p/0.2.0/",
+    "requires_dist": [
+      "numpyro[cpu] (<2.0.0,>=0.8.0)",
+      "jax (>=0.2.20)",
+      "fourier-accountant (<1.0.0,>=0.12.0)",
+      "jax-chacha-prng (<2,>=1)",
+      "numpyro (==0.10.1) ; extra == 'compatible-dependencies'",
+      "jax[cpu] (==0.3.23) ; extra == 'compatible-dependencies'",
+      "numpyro[cuda] ; extra == 'cuda'",
+      "matplotlib ; extra == 'examples'",
+      "numpyro[tpu] ; extra == 'tpu'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Differentially-Private Probabilistic Programming using NumPyro and the differentially-private variational inference algorithm",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15954101,
+  "releases": {
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f00f7ca229962e428e3ab71e1b93347b30334b77300eeebe7bdfd06cadfcd40",
+          "md5": "debb114f81047cc3fed4a5b0b86eb6cb",
+          "sha256": "5a88095045d8a5459884cacef0fb9b2693be18110b58839ccfdfca62f860168c"
+        },
+        "downloads": -1,
+        "filename": "d3p-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "debb114f81047cc3fed4a5b0b86eb6cb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 31825,
+        "upload_time": "2022-12-01T11:31:07",
+        "upload_time_iso_8601": "2022-12-01T11:31:07.285193Z",
+        "url": "https://files.pythonhosted.org/packages/6f/00/f7ca229962e428e3ab71e1b93347b30334b77300eeebe7bdfd06cadfcd40/d3p-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c40b32cb1dbef1318bda1b9a4dd0043abf52c4725aada11c8aedb0471f43ca1b",
+          "md5": "2c39a5251161e9f5c3cd6ad52e87746b",
+          "sha256": "51b6d64b8b2d0ea3e5c64d333423b47e07908c88ffe1e4c5a226b1486aaa8aeb"
+        },
+        "downloads": -1,
+        "filename": "d3p-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c39a5251161e9f5c3cd6ad52e87746b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 29194,
+        "upload_time": "2022-12-01T11:31:08",
+        "upload_time_iso_8601": "2022-12-01T11:31:08.868246Z",
+        "url": "https://files.pythonhosted.org/packages/c4/0b/32cb1dbef1318bda1b9a4dd0043abf52c4725aada11c8aedb0471f43ca1b/d3p-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6f00f7ca229962e428e3ab71e1b93347b30334b77300eeebe7bdfd06cadfcd40",
+        "md5": "debb114f81047cc3fed4a5b0b86eb6cb",
+        "sha256": "5a88095045d8a5459884cacef0fb9b2693be18110b58839ccfdfca62f860168c"
+      },
+      "downloads": -1,
+      "filename": "d3p-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "debb114f81047cc3fed4a5b0b86eb6cb",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 31825,
+      "upload_time": "2022-12-01T11:31:07",
+      "upload_time_iso_8601": "2022-12-01T11:31:07.285193Z",
+      "url": "https://files.pythonhosted.org/packages/6f/00/f7ca229962e428e3ab71e1b93347b30334b77300eeebe7bdfd06cadfcd40/d3p-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c40b32cb1dbef1318bda1b9a4dd0043abf52c4725aada11c8aedb0471f43ca1b",
+        "md5": "2c39a5251161e9f5c3cd6ad52e87746b",
+        "sha256": "51b6d64b8b2d0ea3e5c64d333423b47e07908c88ffe1e4c5a226b1486aaa8aeb"
+      },
+      "downloads": -1,
+      "filename": "d3p-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "2c39a5251161e9f5c3cd6ad52e87746b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 29194,
+      "upload_time": "2022-12-01T11:31:08",
+      "upload_time_iso_8601": "2022-12-01T11:31:08.868246Z",
+      "url": "https://files.pythonhosted.org/packages/c4/0b/32cb1dbef1318bda1b9a4dd0043abf52c4725aada11c8aedb0471f43ca1b/d3p-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

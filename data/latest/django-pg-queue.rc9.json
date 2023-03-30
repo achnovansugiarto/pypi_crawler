@@ -1,0 +1,503 @@
+{
+  "info": {
+    "author": "SweetProcess",
+    "author_email": "support@sweetprocess.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "django-pg-queue\n=====================\n\ndjango-pg-queue is a task queue system for Django backed by postgres.\n\nIt was forked from the wonderful and simpler django-pg-queue (https://github.com/gavinwahl/django-postgres-queue/)\nWritten by Gavin Wahl.\n\n\nWhy postgres?\n-------------\n\nI thought you were never supposed to use an RDBMS as a queue? Well, postgres\nhas some features that make it not as bad as you might think, it has some\ncompelling advantages.\n\n- Transactional behavior and reliability.\n\n  Adding tasks is atomic with respect to other database work. There is no need\n  to use ``transaction.on_commit`` hooks and there is no risk of a transaction\n  being committed but the tasks it queued being lost.\n\n  Processing tasks is atomic with respect to other database work. Database work\n  done by a task will either be committed, or the task will not be marked as\n  processed, no exceptions. If the task only does database work, you achieve\n  true exactly-once message processing.\n\n- Operational simplicity\n\n  By reusing the durable, transactional storage that we're already using\n  anyway, there's no need to configure, monitor, and backup another stateful\n  service. For small teams and light workloads, this is the right trade-off.\n\n- Easy introspection\n\n  Since tasks are stored in a database table, it's easy to query and monitor\n  the state of the queue.\n\n- Safety\n\n  By using postgres transactions, there is no possibility of jobs being left in\n  a locked or ambiguous state if a worker dies. Tasks immediately become\n  available for another worker to pick up. You can even ``kill -9`` a worker\n  and be sure your database and queue will be left in a consistent state.\n\n- Priority queues\n\n  Since ordering is specified explicitly when selecting the next task to work\n  on, it's easy to ensure high-priority tasks are processed first.\n\n\n- Queues\n\n  Simply implemented by allowing filtering by a queue name in the query.\n\n\n\nDisadvantages\n-------------\n\n- Lower throughput than a dedicated queue server.\n- Harder to scale a relational database than a dedicated queue server.\n- Thundering herd. Postgres will notify all workers who LISTEN for the same name.\n- With at-least-once delivery, a postgres transaction has to be held open for\n  the duration of the task. For long running tasks, this can cause table bloat\n  and performance problems.\n- When a task crashes or raises an exception under at-least-once delivery, it\n  immediately becomes eligible to be retried. If you want to implement a retry\n  delay, you must catch exceptions and requeue the task with a delay. If your\n  task crashes without throwing an exception (eg SIGKILL), you could end up in\n  an endless retry loop that prevents other tasks from being processed.\n\n\nHow it works\n------------\n\ndjango-pg-queue is able to claim, process, and remove a task in a single (simplified)\nquery.\n\n.. code:: sql\n\n    DELETE FROM pgq_job\n    WHERE id = (\n        SELECT id\n        FROM pgq_job\n        WHERE execute_at <= now()\n        ORDER BY priority DESC, created_at\n        FOR UPDATE SKIP LOCKED\n        LIMIT 1\n    )\n    RETURNING *;\n\nAs soon as this query runs, the task is unable to be claimed by other workers.\nWhen the transaction commits, the task will be deleted. If the transaction\nrolls back or the worker crashes, the task will immediately become available\nfor another worker.\n\nTo achieve at-least-once delivery, we begin a transaction, process the task,\nthen commit the transaction. For at-most-once, we claim the task and\nimmediately commit the transaction, then process the task. For tasks that don't\nhave any external effects and only do database work, the at-least-once behavior\nis actually exactly-once (because both the claiming of the job and the database\nwork will commit or rollback together).\n\n\nComparison to Celery\n--------------------\n\ndjango-pg-queue fills the same role as Celery. You must use postgres as the backend\nand the library is small enough that you can read and understand all the code.\n\n\nA note on the use of ``AtLeastOnceQueue`` and Django's ``transaction.on_commit()``\n----------------------------------------------------------------------------------\n\nA failure in an ``on_commit()`` callback will not cause that job to be retried\nwhen using an ``AtLeastOnceQueue`` (usually a job in an ``AtLeastOnceQueue``\nqueue will remain in the queue if the job fails).  This is because\n``on_commit()`` callbacks are executed after the transaction has been committed\nand, for django-pg-queue, the job is removed from the queue when the transaction\ncommits.\n\nIf you require more certainty that the code in an ``on_commit()`` callback is\nexecuted successfully, you may need to ensure it is idempotent and call it from\nwithin the job rather than using ``on_commit()``.\n\nUsage\n=====\n\nRequirements\n------------\n\ndjango-pg-queue requires Python 3, at least postgres 9.5 and at least\nDjango 2.1.\n\n\nInstallation\n------------\n\nInstall with pip::\n\n  pip install django-pg-queue\n\nThen add ``'pgq'`` to your ``INSTALLED_APPS``. Run ``manage.py migrate`` to\ncreate the jobs table.\n\nInstantiate a queue object. This can go wherever you like and be named whatever\nyou like. For example, ``someapp/queue.py``:\n\n.. code:: python\n\n    from pgq.queue import AtLeastOnceQueue\n\n    queue = AtLeastOnceQueue(\n        tasks={\n            # ...\n        },\n        queue='my-queue',\n        notify_channel='my-queue',\n    )\n\n\nYou will need to import this queue instance to queue or process tasks. Use\n``AtLeastOnceQueue`` for at-least-once delivery, or ``AtMostOnceQueue`` for\nat-most-once delivery.\n\ndjango-pg-queue comes with a management command base class that you can\nuse to consume your tasks. It can be called whatever you like, for example in a\n``someapp/managment/commands/worker.py``:\n\n.. code:: python\n\n    from pgq.commands import Worker\n\n    from someapp.queue import queue\n\n    class Command(Worker):\n        queue = queue\n\nThen you can run ``manage.py worker`` to start your worker.\n\nA task function takes two arguments -- the queue instance in use, and the Job\ninstance for this task. The function can be defined anywhere and called\nwhatever you like. Here's an example:\n\n.. code:: python\n\n    from pgq.decorators import task\n\n    from .queues import queue\n\n    @task(queue)\n    def debug_task(queue, job):\n        print(job.args)\n\nInstead of using the task decorator, you can manually register it as a task.\nAdd it to your queue instance when it is being created:\n\n.. code:: python\n\n    queue = AtLeastOnceQueue(tasks={\n        'debug_task': debug_task,\n    }, queue='my-queue')\n\nThe key is the task name, used to queue the task. It doesn't have to match the\nfunction name.\n\nTo queue the task, if you used the task decorator you may:\n\n.. code:: python\n\n    debug_task.enqueue({'some_args': 0})\n\n\nTo manually queue the task, use the ``enqueue`` method on your queue instance:\n\n.. code:: python\n\n    queue.enqueue('debug_task', {'some_args': 0})\n\nAssuming you have a worker running for this queue, the task will be run\nimmediately. The second argument must be a single json-serializeable value and\nwill be available to the task as ``job.args``.\n\nTasks registered using the ``@task`` decorator will only be available on the\nqueue if the file in which the task is defined has been imported. If your\nworker doesn't import the file containing the ``@task`` decorators somewhere,\nthe tasks will not be available for dispatch. Importing files in the\n``apps.py`` ``AppConfig.ready()`` method will ensure that the tasks are always\navailable on the queue without having to import them in your worker just for\nthe import side effects.\n\n.. code:: python\n\n   # Contents of someapp/apps.py\n   from django.apps import AppConfig\n\n   class SomeAppAppConfig(AppConfig):\n       def ready(self):\n           # Tasks registered with @task are defined in this import\n           import someapp.tasks\n\nMultiple Queues\n---------------\n\nYou may run multiple queues and workers may each listen to a queue. You can have multiple workers\nlistening to the same queue too. A queue is implemented as a CharField in the database.\nThe queue would simply filter for jobs matching its queue name.\n\nBulk Enqueue\n------------\n\nMany jobs can be efficiently created using ``bulk_enqueue()`` which accepts one\ntask name for all the jobs being created and a list of dictionaries containing\n``args`` for the task to execute with and, optionally, ``priority`` and\n``execute_at`` for that particular job.\n\n.. code:: python\n\n    queue.bulk_enqueue(\n        'debug_task',\n        [\n            {'args': {'some_args': 0}},\n            {\n                'args': {'some_args': 10}\n                'priority': 10,\n                'execute_at': timezone.now() + timedelta(days=1),\n            },\n        ]\n    )\n\n\nMonitoring\n----------\n\nTasks are just database rows stored in the ``pgq_job`` table, so you can\nmonitor the system with SQL.\n\nTo get a count of current tasks:\n\n.. code:: sql\n\n    SELECT queue, count(*) FROM pgq_job WHERE execute_at <= now() GROUP BY queue\n\n\nThis will include both tasks ready to process and tasks currently being\nprocessed. To see tasks currently being processed, we need visibility into\npostgres row locks. This can be provided by the `pgrowlocks extension\n<https://www.postgresql.org/docs/9.6/static/pgrowlocks.html>`_.  Once\ninstalled, this query will count currently-running tasks:\n\n.. code:: sql\n\n    SELECT queue, count(*)\n    FROM pgrowlocks('pgq_job')\n    WHERE 'For Update' = ANY(modes)\n    GROUP BY queue;\n\nYou could join the results of ``pgrowlocks`` with ``pgq_job`` to get the full\nlist of tasks in progress if you want.\n\nLogging\n-------\n\ndjango-pg-queue logs through Python's logging framework, so can be\nconfigured with the ``LOGGING`` dict in your Django settings. It will not log\nanything under the default config, so be sure to configure some form of\nlogging. Everything is logged under the ``pgq`` namespace. Here is an example\nconfiguration that will log INFO level messages to stdout:\n\n.. code:: python\n\n    LOGGING = {\n        'version': 1,\n        'root': {\n            'level': 'DEBUG',\n            'handlers': ['console'],\n        },\n        'formatters': {\n            'verbose': {\n                'format': '%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s',\n            },\n        },\n        'handlers': {\n            'console': {\n                'level': 'INFO',\n                'class': 'logging.StreamHandler',\n                'formatter': 'verbose',\n            },\n        },\n        'loggers': {\n            'pgq': {\n                'handlers': ['console'],\n                'level': 'INFO',\n                'propagate': False,\n            },\n        }\n    }\n\nIt would also be sensible to log WARNING and higher messages to something like\nSentry:\n\n.. code:: python\n\n    LOGGING = {\n        'version': 1,\n        'root': {\n            'level': 'INFO',\n            'handlers': ['sentry', 'console'],\n        },\n        'formatters': {\n            'verbose': {\n                'format': '%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s',\n            },\n        },\n        'handlers': {\n            'console': {\n                'level': 'INFO',\n                'class': 'logging.StreamHandler',\n                'formatter': 'verbose',\n            },\n            'sentry': {\n                'level': 'WARNING',\n                'class': 'raven.contrib.django.handlers.SentryHandler',\n            },\n        },\n        'loggers': {\n            'pgq': {\n                'level': 'INFO',\n                'handlers': ['console', 'sentry'],\n                'propagate': False,\n            },\n        },\n    }\n\nYou could also log to a file by using the built-in ``logging.FileHandler``.\n\nUseful Recipes\n==============\nThese recipes aren't officially supported features of `django-pg-queue`. We provide them so that you can mimick some of the common features in other task queues.\n\n`CELERY_ALWAYS_EAGER`\n---------------------\nCelery uses the `CELERY_ALWAYS_EAGER` setting to run a task immediately, without queueing it for a worker. It could be used during tests, and while debugging in a development environment with any workers turned off.\n\n.. code:: python\n\n    class EagerAtLeastOnceQueue(AtLeastOnceQueue):\n        def enqueue(self, *args, **kwargs):\n            job = super().enqueue(*args, **kwargs)\n            if settings.QUEUE_ALWAYS_EAGER:\n                self.run_job(job)\n            return job\n\n\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/SweetProcess/django-pg-queue",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-pg-queue",
+    "package_url": "https://pypi.org/project/django-pg-queue/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-pg-queue/",
+    "project_urls": {
+      "Homepage": "https://github.com/SweetProcess/django-pg-queue"
+    },
+    "release_url": "https://pypi.org/project/django-pg-queue/0.8.1/",
+    "requires_dist": [
+      "Django (>=2.1)"
+    ],
+    "requires_python": "",
+    "summary": "",
+    "version": "0.8.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10942207,
+  "releases": {
+    "0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7fbd542815b6a65a4255b45eace93c3d71df76ab3ab90336036fb8abbaf80519",
+          "md5": "60b6bd1ed825078e72111f31e07ec51a",
+          "sha256": "a7f0b81f979de3bc83e55a38c2dec0c2f782077117054686225d4eb53780bb9c"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "60b6bd1ed825078e72111f31e07ec51a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27467,
+        "upload_time": "2020-02-28T06:14:49",
+        "upload_time_iso_8601": "2020-02-28T06:14:49.321142Z",
+        "url": "https://files.pythonhosted.org/packages/7f/bd/542815b6a65a4255b45eace93c3d71df76ab3ab90336036fb8abbaf80519/django_pg_queue-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b50ddb5af0fb797e7b74c1151319e7fc5b4ad39eafee6de8825605e3a14d2fe",
+          "md5": "b5e1aee97851baca354c0ac73b6e5c3f",
+          "sha256": "34439c2ca237846524e2272492dbb29ed4251758681dfed8d79e27c0847deff0"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b5e1aee97851baca354c0ac73b6e5c3f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 18580,
+        "upload_time": "2020-02-28T05:58:39",
+        "upload_time_iso_8601": "2020-02-28T05:58:39.226799Z",
+        "url": "https://files.pythonhosted.org/packages/7b/50/ddb5af0fb797e7b74c1151319e7fc5b4ad39eafee6de8825605e3a14d2fe/django_pg_queue-0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e56ec24013c80870d9eb43de9ac670825a5b7360d939583aa01b602d8a7f013",
+          "md5": "1af2e3d0d07ec52a82fa0245902fe3da",
+          "sha256": "fd094e30755ff8d65ab4440f43aebae79ca35be2bb96dae8beb88aa5494f34cf"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1af2e3d0d07ec52a82fa0245902fe3da",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13978,
+        "upload_time": "2020-02-28T05:58:42",
+        "upload_time_iso_8601": "2020-02-28T05:58:42.390883Z",
+        "url": "https://files.pythonhosted.org/packages/1e/56/ec24013c80870d9eb43de9ac670825a5b7360d939583aa01b602d8a7f013/django-pg-queue-0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41ecab0037657ac217b2bdb9b3c248efcad18b9796ccef1ee238db04b40dfb12",
+          "md5": "32780ade1f64dee1eac817c13315cd7c",
+          "sha256": "20a4207bb599c866ef01e84c997207203ba16eb831228c3534637420c5bce74f"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "32780ade1f64dee1eac817c13315cd7c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27464,
+        "upload_time": "2020-02-28T06:16:55",
+        "upload_time_iso_8601": "2020-02-28T06:16:55.344425Z",
+        "url": "https://files.pythonhosted.org/packages/41/ec/ab0037657ac217b2bdb9b3c248efcad18b9796ccef1ee238db04b40dfb12/django_pg_queue-0.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6cfe7540f74d94d6971ac64317831709e31c26d5221edad7afa4b1d24d53e3be",
+          "md5": "72e616cf4cb831304bb21b0bed5cb392",
+          "sha256": "c9ec4838dfc1d6ade5734ad903a60044e2e8dd78b7a69e7cf06a70d73d6d2e58"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72e616cf4cb831304bb21b0bed5cb392",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13893,
+        "upload_time": "2020-02-28T06:16:57",
+        "upload_time_iso_8601": "2020-02-28T06:16:57.595114Z",
+        "url": "https://files.pythonhosted.org/packages/6c/fe/7540f74d94d6971ac64317831709e31c26d5221edad7afa4b1d24d53e3be/django-pg-queue-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fa33450dd85590cee3c546dab25e3e7e5746235a297d311f2dfe69b6a790b0ad",
+          "md5": "dc03ab4f975412c030224a97c85a5c2f",
+          "sha256": "0a88c41722a831196efcc99309da9425182eb65f67c363c0dc59993b33d5ad95"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dc03ab4f975412c030224a97c85a5c2f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 13930,
+        "upload_time": "2020-02-28T06:32:39",
+        "upload_time_iso_8601": "2020-02-28T06:32:39.646886Z",
+        "url": "https://files.pythonhosted.org/packages/fa/33/450dd85590cee3c546dab25e3e7e5746235a297d311f2dfe69b6a790b0ad/django_pg_queue-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9d9f80465c3459e975f85b2a07270454c861e807a7391650bfb44c019e7f0b72",
+          "md5": "cabfcf24ba76f162388a6f71d90eb207",
+          "sha256": "d5c7269756aaed995e30dc8352c485b7b5b6a2bd0d302413f30fdb97e092773b"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cabfcf24ba76f162388a6f71d90eb207",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11541,
+        "upload_time": "2020-02-28T06:32:41",
+        "upload_time_iso_8601": "2020-02-28T06:32:41.507681Z",
+        "url": "https://files.pythonhosted.org/packages/9d/9f/80465c3459e975f85b2a07270454c861e807a7391650bfb44c019e7f0b72/django-pg-queue-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ffe121f592e0defade41de22f5e0b1504df43d6ebfef6e36a6d3826862e685d7",
+          "md5": "c7fb70e577a03ee5bf72212da07f730c",
+          "sha256": "6c36a3e1e097016283c23c6fa9dd4a01a21c7fb5d86be157f301b30b2180ab37"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.6.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c7fb70e577a03ee5bf72212da07f730c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14223,
+        "upload_time": "2020-04-29T12:47:57",
+        "upload_time_iso_8601": "2020-04-29T12:47:57.976206Z",
+        "url": "https://files.pythonhosted.org/packages/ff/e1/21f592e0defade41de22f5e0b1504df43d6ebfef6e36a6d3826862e685d7/django_pg_queue-0.6.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5830cdcd3390a83bec701d7336767327fda230a470c890dc81c941039e748b6",
+          "md5": "ec87c4551ff5359cc5ebd0fc2dcebb6d",
+          "sha256": "e7740a7c51fd3689855ccd17f983a397bf5f20d785ba629ca75f5c7f6b56c536"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ec87c4551ff5359cc5ebd0fc2dcebb6d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11683,
+        "upload_time": "2020-04-29T12:47:59",
+        "upload_time_iso_8601": "2020-04-29T12:47:59.897089Z",
+        "url": "https://files.pythonhosted.org/packages/e5/83/0cdcd3390a83bec701d7336767327fda230a470c890dc81c941039e748b6/django-pg-queue-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "864a5bbd917ef29e717e216449430d404e591ec9354002024ba847f274739232",
+          "md5": "61e3b157fa24716ca946c471b59da13d",
+          "sha256": "2d80c0e0c02639fcedba5df97c56f1f37a43bb88ea800b37a3e251fe0add6f4f"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.6.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "61e3b157fa24716ca946c471b59da13d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14503,
+        "upload_time": "2020-04-30T07:42:06",
+        "upload_time_iso_8601": "2020-04-30T07:42:06.786263Z",
+        "url": "https://files.pythonhosted.org/packages/86/4a/5bbd917ef29e717e216449430d404e591ec9354002024ba847f274739232/django_pg_queue-0.6.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68be403e2345de870bd2364a083aa543aa114b2d5fcd867a33cd6723b1578145",
+          "md5": "12e2d94ae9115121971d36f9b362f620",
+          "sha256": "d4e96a5ba76ad2d24fcd463cde2a62af90d6bf863c22712777c67cec47ed35ea"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "12e2d94ae9115121971d36f9b362f620",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11942,
+        "upload_time": "2020-04-30T07:42:08",
+        "upload_time_iso_8601": "2020-04-30T07:42:08.567961Z",
+        "url": "https://files.pythonhosted.org/packages/68/be/403e2345de870bd2364a083aa543aa114b2d5fcd867a33cd6723b1578145/django-pg-queue-0.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0933b3e55b9b2cadb2f223a34b7fa71d851556a6e8ceae9ad33e7e88586a57c7",
+          "md5": "aae567bd010f8abade24dd00d21bc216",
+          "sha256": "87390e8b93061c607c25636a4693d64c255dbd9b8f3b6addd1e2a166e49145a3"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.6.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aae567bd010f8abade24dd00d21bc216",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14675,
+        "upload_time": "2021-06-18T05:41:42",
+        "upload_time_iso_8601": "2021-06-18T05:41:42.837686Z",
+        "url": "https://files.pythonhosted.org/packages/09/33/b3e55b9b2cadb2f223a34b7fa71d851556a6e8ceae9ad33e7e88586a57c7/django_pg_queue-0.6.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db8af3286e313e97cd28e2c82bd22646712b4f84926a8fadb402c0afa9a64fec",
+          "md5": "2c00410d83dc5c0c5676a9d617068bc2",
+          "sha256": "f4703a1df713a866c0187ff695f7029d7b018fe928b870370ce0c821d3e6d658"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.6.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c00410d83dc5c0c5676a9d617068bc2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12853,
+        "upload_time": "2021-06-18T05:41:44",
+        "upload_time_iso_8601": "2021-06-18T05:41:44.859988Z",
+        "url": "https://files.pythonhosted.org/packages/db/8a/f3286e313e97cd28e2c82bd22646712b4f84926a8fadb402c0afa9a64fec/django-pg-queue-0.6.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df177508737e1c766f32e30d7b43392dfb0c4dcca562d90f7c9474ed06eac25d",
+          "md5": "a984c202bec546288e33db65093a1ba3",
+          "sha256": "ed06eb62cfba56435e6df5d0228c3c541717f26f5a7102c26fdd40e352e02fcd"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.7.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a984c202bec546288e33db65093a1ba3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15611,
+        "upload_time": "2020-05-03T10:41:24",
+        "upload_time_iso_8601": "2020-05-03T10:41:24.237108Z",
+        "url": "https://files.pythonhosted.org/packages/df/17/7508737e1c766f32e30d7b43392dfb0c4dcca562d90f7c9474ed06eac25d/django_pg_queue-0.7.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f40a76a172505966b2d248249e1b7a59eb0e479dd20d0d84ccf8d935fc8a7786",
+          "md5": "f2c0d719a201cf0b87304540a99687aa",
+          "sha256": "3de594a504c937c288d03d9622d6f0ba17f9a979687631175fe9cf65b3b39d62"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f2c0d719a201cf0b87304540a99687aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13037,
+        "upload_time": "2020-05-03T10:41:25",
+        "upload_time_iso_8601": "2020-05-03T10:41:25.974980Z",
+        "url": "https://files.pythonhosted.org/packages/f4/0a/76a172505966b2d248249e1b7a59eb0e479dd20d0d84ccf8d935fc8a7786/django-pg-queue-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb2006eac8824c7e928d033dd0befc1de6756d8ad46d96130d25c33905759f57",
+          "md5": "1ce272af68deb46a6c2957d9cbb2f0bb",
+          "sha256": "a0a84fc5331420878df2b0b19039caf601672279438722b9fb0303d71a0c9a48"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.8.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ce272af68deb46a6c2957d9cbb2f0bb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14676,
+        "upload_time": "2021-06-21T04:39:15",
+        "upload_time_iso_8601": "2021-06-21T04:39:15.122600Z",
+        "url": "https://files.pythonhosted.org/packages/cb/20/06eac8824c7e928d033dd0befc1de6756d8ad46d96130d25c33905759f57/django_pg_queue-0.8.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c89230c2baaf7896c7d33110caa539bdd561309725cc369a11fdbfcff1025f08",
+          "md5": "122bb66aac9e8826dc5afe8a6dc99983",
+          "sha256": "61e288f721dbaa2cfebc71b61bcabb72c14003852043feb0531a17157d46ae54"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "122bb66aac9e8826dc5afe8a6dc99983",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12856,
+        "upload_time": "2021-06-21T04:39:17",
+        "upload_time_iso_8601": "2021-06-21T04:39:17.785350Z",
+        "url": "https://files.pythonhosted.org/packages/c8/92/30c2baaf7896c7d33110caa539bdd561309725cc369a11fdbfcff1025f08/django-pg-queue-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5cefee7c0b42fd947f4b5fab1580abe39540bb638917314a99c936057844e1b1",
+          "md5": "54466d946c580ab60ee7e70a9f6888a8",
+          "sha256": "6c9bf5e58a277cdef3c8e340fbd06e08db096b2e442bb78e6be68d061fee8124"
+        },
+        "downloads": -1,
+        "filename": "django_pg_queue-0.8.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "54466d946c580ab60ee7e70a9f6888a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14977,
+        "upload_time": "2021-07-19T01:02:49",
+        "upload_time_iso_8601": "2021-07-19T01:02:49.525221Z",
+        "url": "https://files.pythonhosted.org/packages/5c/ef/ee7c0b42fd947f4b5fab1580abe39540bb638917314a99c936057844e1b1/django_pg_queue-0.8.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e6f20d7489d8f7c1c044a8a445f6ee83dff3571c335d3e203ba8e944d9562f36",
+          "md5": "3a3d4c02de488ecc15920e707047fef7",
+          "sha256": "63b2952892b6acfa64ae6d352d69cf17fb2c996536d4ace98c688624a4a6ba92"
+        },
+        "downloads": -1,
+        "filename": "django-pg-queue-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3a3d4c02de488ecc15920e707047fef7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14780,
+        "upload_time": "2021-07-19T01:02:51",
+        "upload_time_iso_8601": "2021-07-19T01:02:51.976454Z",
+        "url": "https://files.pythonhosted.org/packages/e6/f2/0d7489d8f7c1c044a8a445f6ee83dff3571c335d3e203ba8e944d9562f36/django-pg-queue-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5cefee7c0b42fd947f4b5fab1580abe39540bb638917314a99c936057844e1b1",
+        "md5": "54466d946c580ab60ee7e70a9f6888a8",
+        "sha256": "6c9bf5e58a277cdef3c8e340fbd06e08db096b2e442bb78e6be68d061fee8124"
+      },
+      "downloads": -1,
+      "filename": "django_pg_queue-0.8.1-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "54466d946c580ab60ee7e70a9f6888a8",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 14977,
+      "upload_time": "2021-07-19T01:02:49",
+      "upload_time_iso_8601": "2021-07-19T01:02:49.525221Z",
+      "url": "https://files.pythonhosted.org/packages/5c/ef/ee7c0b42fd947f4b5fab1580abe39540bb638917314a99c936057844e1b1/django_pg_queue-0.8.1-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e6f20d7489d8f7c1c044a8a445f6ee83dff3571c335d3e203ba8e944d9562f36",
+        "md5": "3a3d4c02de488ecc15920e707047fef7",
+        "sha256": "63b2952892b6acfa64ae6d352d69cf17fb2c996536d4ace98c688624a4a6ba92"
+      },
+      "downloads": -1,
+      "filename": "django-pg-queue-0.8.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3a3d4c02de488ecc15920e707047fef7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 14780,
+      "upload_time": "2021-07-19T01:02:51",
+      "upload_time_iso_8601": "2021-07-19T01:02:51.976454Z",
+      "url": "https://files.pythonhosted.org/packages/e6/f2/0d7489d8f7c1c044a8a445f6ee83dff3571c335d3e203ba8e944d9562f36/django-pg-queue-0.8.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,715 @@
+{
+  "info": {
+    "author": "Jiri Helebrant",
+    "author_email": "jiri.helebrant@nic.cz",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# `dns-crawler`\n\n> A crawler for getting info about *(possibly a huge number of)* DNS domains\n\n[<img alt=\"CZ.NIC\" src=\"https://adam.nic.cz/media/filer_public/5f/27/5f274de4-7c39-40b2-9942-ef5e7cb66d12/logo-cznic.svg\" height=\"35\">](https://www.nic.cz/)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\n[<img alt=\"ADAM\" src=\"https://adam.nic.cz/static/img/logo-adam.svg\" height=\"50\">](https://adam.nic.cz/)\n\n[![PyPI version shields.io](https://img.shields.io/pypi/v/dns-crawler.svg)](https://pypi.python.org/pypi/dns-crawler/)\n[![PyPI pyversions](https://img.shields.io/pypi/pyversions/dns-crawler.svg)](https://pypi.python.org/pypi/dns-crawler/)\n[![PyPI license](https://img.shields.io/pypi/l/dns-crawler.svg)](https://pypi.python.org/pypi/dns-crawler/)\n[![PyPI downloads per week](https://img.shields.io/pypi/dm/dns-crawler.svg)](https://pypi.python.org/pypi/dns-crawler/)\n\n# What does it do?\n\nDespite the name, the crawler gets info for more services than just DNS:\n\n- DNS:\n  - all A/AAAA records (for the 2nd level domain and `www.` subdomain), optionally annotated with GeoIP\n  - TXT records (with SPF and DMARC parsed for easier filtering)\n  - TLSA (for the 2nd level domain and `www.` subdomain)\n  - MX\n  - DNSSEC validation\n  - nameservers:\n    - each server IP optionally annotated with GeoIP\n    - HOSTNAME.BIND, VERSION.BIND, AUTHORS.BIND and fortune (also for all IPs)\n  - users can add custom additional RRs in the config file\n- E-mail (for every server from MX):\n  - SMTP server banners (optional, ports are configurable)\n  - TLSA records\n- Web:\n  - HTTP status & headers (inc. parsed cookies) for ports 80 & 443 on each IP from A/AAAA records\n  - certificate info for HTTPS (optionally with an entire cert chain)\n  - webpage content (optional)\n  - everything of the above is saved for each _step_ in the redirect history – the crawler follows redirects until it gets a non-redirecting status or hits a configurable limit\n\nAnswers from name and mail servers are cached, so the crawler shouldn't flood hosting providers with repeating queries.\n \nIf you need to configure a firewall, the crawler connects to ports `53` (both UDP and TCP), `25` (TCP), `80` (TCP), and `443` (TCP for now, but we might add UDP with HTTP3…).\n\nSee [`result-example.json`](https://gitlab.nic.cz/adam/dns-crawler/-/blob/master/result-example.json) to get an idea what the resulting JSON looks like.\n\n## How fast is it anyway?\n\nA single fairly modern laptop on ~50Mbps connection can crawl the entire *.cz* zone (~1.3M second level domains) overnight, give or take, using 8 workers per CPU thread.\n\nSince the crawler is designed to be parallel, the actual speed depends almost entirely on the worker count. And it can scale accross multiple machines almost infinitely, so should you need a million domains crawled in an hour, you can always just throw more hardware at it (see below).\n\nCZ.NIC uses 4 machines in production (8-core Xeon Bronze 3106, 16 GB RAM, gigabit line) and crawling the entire *.cz* zone takes under 3 hours.\n\n## Installation\n\nCreate and activate a virtual environment:\n\n```bash\nmkdir dns-crawler\ncd dns-crawler\npython3 -m venv .venv\nsource .venv/bin/activate\n```\n\nInstall `dns-crawler`:\n\n```bash\npip install dns-crawler\n```\n\nDepending on your OS/distro, you might need to install some system packages. On Debian/Ubuntu, `apt install libicu-dev pkg-config build-essential` should do the trick (assumung you already have python3 installed of course).\n\n## Basic usage\n\nTo run a single-threaded crawler (suitable for small domain counts), just pass a domain list:\n\n```\n$ echo -e \"nic.cz\\nnetmetr.cz\\nroot.cz\" > domain-list.txt\n$ dns-crawler domain-list.txt > results.json\n[2019-12-03 11:03:54] Reading domains from domain-list.txt.\n[2019-12-03 11:03:54] Read 3 domains.\n[2019-12-03 11:03:55] 1/3\n[2019-12-03 11:03:55] 2/3\n[2019-12-03 11:03:56] 3/3\n[2019-12-03 11:03:56] Finished.\n```\n\nResults are printed to stdout – JSON for every domain, separated by `\\n`:\n\n```\n$ cat results.json\n{\"domain\": \"nic.cz\", \"timestamp\": \"2019-12-03 10:03:55\", \"results\": {…}}\n{\"domain\": \"netmetr.cz\", \"timestamp\": \"2019-12-03 10:03:55\", \"results\": {…}}\n{\"domain\": \"root.cz\", \"timestamp\": \"2019-12-03 10:03:56\", \"results\": {…}}\n```\n\nIf you want formatted JSONs, just pipe the output through [jq](https://stedolan.github.io/jq/) or your tool of choice: `dns-crawler domain-list.txt | jq`.\n\n## Multithreaded crawling\n\nFirst, you need a Redis server running & listening.\n\nThe crawler can run with multiple threads to speed things up when you have a lot of domains to go through. Communication betweeen the controller and workers is done through Redis (this makes it easy to run workers on multiple machines if needed, see below).\n\nStart Redis. The exact command depends on your system. If you want to use a different machine for Redis & the crawler controller, see [CLI parameters for dns-crawler-controller](#dns-crawler-controller).\n\nFeed domains into queue and wait for results:\n\n```\n$ dns-crawler-controller domain-list.txt > result.json\n```\n\n(in another shell) Start workers which process the domains and return results to the controller:\n\n```\n$ dns-crawler-workers\n```\n\nUsing the controller also gives you caching of repeating queries (mailserver banners and hostname.bind/version.bind for nameservers) for free.\n\n### Redis configuration\n\nNo special config needed, but increase the memory limit if you have a lot of domains to process (eg. `maxmemory 2G`). You can also disable disk snapshots to save some I/O time (comment out the `save …` lines). If you're not already using Redis for other things, read its log – there are often some recommendations for performance improvements.\n\n## Results\n\nResults are printed to the main process' (`dns-crawler` or `dns-crawler-controller`) stdout – JSON for every domain, separated by `\\n`:\n\n```\n…\n[2019-05-03 07:38:17] 2/3\n{\"domain\": \"nic.cz\", \"timestamp\": \"2019-09-24T05:28:06.536991\", \"results\": {…}}\n…\n```\n\nThe progress info with timestamp is printed to stderr, so you can save just the output easily – `dns-crawler list.txt > results`.\n\nA JSON schema for the output JSON is included in the repository: [`result-schema.json`](https://gitlab.nic.cz/adam/dns-crawler/-/blob/master/result-schema.json), and also an example for nic.cz: [`result-example.json`](https://gitlab.nic.cz/adam/dns-crawler/-/blob/master/result-example.json).\n\nThere are several tools for schema validation, viewing, and even code generation.\n\nTo validate a result against schema (CI is set up to do it automatically):\n\n```bash\n$ pip install jsonschema\n$ jsonschema -i result-example.json result-schema.json # if it prints nothing, it's valid\n```\n\nOr, if you don't loathe JS, `ajv` has a much better output:\n\n```bash\n$ npm i -g ajv-cli\n$ ajv validate -s result-schema.json -d result-example.json\n```\n\n### Storing crawler results\n\nIn production, CZ.NIC uses Hadoop cluster to store the results file after the crawler run is over – see a script in `utils/crawler-hadoop.sh` (pushes the results file to Hadoop and notifies a Mattermost channel).\n\nYou can even pipe the output right to hadoop without even storing it on your disk:\n\n```\ndns-crawler-controller domain-list.txt | ssh user@hadoop-node \"HADOOP_USER_NAME=… hadoop fs -put - /path/to/results.json;\"\n```\n\n### Working with the results\n\n- [R package for dns-crawler output processing](https://gitlab.nic.cz/adam/dnscrawler.parser)\n\n## Usage in Python code\n\nJust import and use the `process_domain` function like so:\n\n```\n$ python\n>>> from dns_crawler.crawl import process_domain\n>>> result = process_domain(\"nic.cz\")\n>>> result\n{'domain': 'nic.cz', 'timestamp': '2019-09-13T09:21:10.136303', 'results': { … \n>>>\n>>> result[\"results\"][\"DNS_LOCAL\"][\"DNS_AUTH\"]\n[{'value': 'a.ns.nic.cz.'}, {'value': 'b.ns.nic.cz.'}, {'value': 'd.ns.nic.cz.'}]\n```\n\nThe `process_domain` function returns Python `dict`s. If you want json, use `from dns_crawler.crawl import get_json_result` instead:\n\n```\n$ python\n>>> from dns_crawler.crawl import get_json_result\n>>> result = get_json_result(\"nic.cz\")\n>>> result\n# same as above, just converted to JSON\n```\n\nThis function just calls `crawl_domain` and converts the `dict` to JSON string. It's used by the workers, so the conversion is done by them to take some pressure off the controller process.\n\n\n## Config file\n\nGeoIP DB paths, DNS resolver IP(s), timeouts, and bunch of other things are read from `config.yml` in the working directory, if present.\n\nThe default values are listed in [`config.yml`](https://gitlab.nic.cz/adam/dns-crawler/-/blob/master/config.yml) with explanatory comments.\n\nIf you're using the multi-threaded crawler (`dns-crawler-controller` & `dns-crawler-workers`), the config is loaded by the controlled and shared with the workers via Redis.\n\nYou can override it on the worker machines if needed – just create a `config.yml` in their working dir (eg. to set different resolver IP(s) or GeoIP paths on each machine). The config is then merged – directives not defined in the worker config are loaded from the controller one (and defaults are used if the're not defined there either). But – depending on values you change – you might then get a different results from each worker machine of course.\n\n\n### GeoIP annotation\n\nFor this to work, you need to get GeoIP databases for the crawler to use. It supports both paid and free ones ([can be downloaded here after registration](https://dev.maxmind.com/geoip/geoip2/geolite2/)).\n\nThe crawler expects them in `/usr/share/GeoIP` (Maxmind's [geoipupdate](https://github.com/maxmind/geoipupdate) places them there by default), but that can be easily changed in a config file:\n\n```yaml\ngeoip:\n  enabled: True\n  country: /path/to/GeoLite2-Country.mmdb\n  asn: /path/to/GeoLite2-ASN.mmdb\n```\n\nUsing commercial (GeoIP2 Country and ISP) DBs instead of free (GeoLite2 Country and ASN) ones:\n\n```yaml\ngeoip:\n  enabled: True\n  country: /usr/share/GeoIP/GeoLite2-Country.mmdb\n  #  asn: /usr/share/GeoIP/GeoLite2-ASN.mmdb  # 'asn' is the free DB\n  isp: /usr/share/GeoIP/GeoIP2-ISP.mmdb  # 'isp' is the commercial one\n```\n\n(use either absolute paths or relative to the working directory)\n\n`ISP` (paid) database is preferred over `ASN` (free), if both are defined. The difference is described on Maxmind's website: https://dev.maxmind.com/faq/what-is-the-difference-between-the-geoip-isp-and-organization-databases/.\n\nThe free `GeoLite2-Country` seems to be a bit inaccurate, especially for IPv6 (it places some CZ.NIC nameservers in Ukraine etc.).\n\n### Getting additional DNS resource records:\n\nYou can easily get some additional RRs (for the 2nd level domain) which aren't included in the crawler by default:\n\n```yaml\ndns:\n  additional:\n    - SPF\n    - CAA\n    - CERT\n    - LOC\n    - SSHFP\n```\n\nSee the [List of DNS record types](https://en.wikipedia.org/wiki/List_of_DNS_record_types) for some ideas. Things like OPENPGPKEY won't work though, because they are intented to be used on a subdomain (generated as a hash of part of e-mail address in this case).\n\nYou can plug a parser for the record by adding a function to the `additional_parsers` enum in `dns_utils.py`. The only one included by default is SPF (since the deprecated SPF record has the same format as SPF from TXT which the crawler is getting by default).\n\n## Command line parameters\n\n### dns-crawler\n\n```\ndns-crawler - a single-threaded crawler to process a small number of domains without a need for Redis\n\nUsage: dns-crawler <file>\n       file - plaintext domain list, one domain per line, empty lines are ignored\n```\n\n### dns-crawler-controller\n\n```\ndns-crawler-controller - the main process controlling the job queue and printing results.\n\nUsage: dns-crawler-controller <file> [redis]\n       file - plaintext domain list, one domain per line, empty lines are ignored\n       redis - redis host:port:db, localhost:6379:0 by default\n\nExamples: dns-crawler-controller domains.txt\n          dns-crawler-controller domains.txt 192.168.0.22:4444:0\n          dns-crawler-controller domains.txt redis.foo.bar:7777:2\n          dns-crawler-controller domains.txt redis.foo.bar # port 6379 and DB 0 will be used if not specified\n```\n\nThe controller process uses threads (4 for each CPU core) to create the jobs faster when you give it a lot of domains (>1000× CPU core count).\n\nIt's *much* faster on (more) modern machines – eg. i7-7600U (with HT) in a laptop does about 19k jobs/s, while server with Xeon X3430 (without HT) does just about ~7k (both using 16 threads, as they both appear as 4 core to the system).\n\nTo cancel the process, just send a kill signal or hit `Ctrl-C` any time. The process will perform cleanup and exit.\n\n### dns-crawler-workers\n\n```\ndns-crawler-workers - a process that spawns crawler workers.\n\nUsage: dns-crawler-workers [count] [redis]\n       count - worker count, 8 workers per CPU core by default\n       redis - redis host:port:db, localhost:6379:0 by default\n\nExamples: dns-crawler-workers 8\n          dns-crawler-workers 24 192.168.0.22:4444:0\n          dns-crawler-workers 16 redis.foo.bar:7777:2\n          dns-crawler-workers 16 redis.foo.bar # port 6379 and DB 0 will be used if not specified\n```\n\nTrying to use more than 24 workers per CPU core will result in a warning (and countdown before it actually starts the workers):\n\n```\n$ dns-crawler-workers 999\nWhoa. You are trying to run 999 workers on 4 CPU cores. It's easy toscale\nacross multiple machines, if you need to. See README.md for details.\n\nCancel now (Ctrl-C) or have a fire extinguisher ready.\n5 - 4 - 3 -\n```\n\nStopping works the same way as with the controller process – `Ctrl-C` (or kill signal) will finish the current job(s) and exit.\n\n## Resuming work\n\nStopping the workers won't delete the jobs from Redis. So, if you stop the `dns-crawler-workers` process and then start a new one (perhaps to use different worker count…), it will pick up the unfinished jobs and continue.\n\nThis can also be used change the worker count if it turns out to be too low or high for your machine or network:\n\n- to reduce the worker count, just stop the `dns-crawler-workers` process and start a new one with a new count\n- to increase the worker count, either use the same approach, or just start a second `dns-crawler-workers` process in another shell, the worker count will just add up\n- scaling to multiple machines works the same way, see below\n\n## Running on multiple machines\n\nSince all communication between the controller and workers is done through Redis, it's easy to scale the crawler to any number of machines:\n\n```\nmachine-1                     machine-1\n┬───────────────────────────┐         ┬─────────────────────┐\n│    dns-crawler-controller │ ------- │ dns-crawler-workers │\n│             +             │         └─────────────────────┘\n│           redis           │\n│             +             │\n│        DNS resolver       │\n└───────────────────────────┘\n                                      machine-2\n                                      ┬─────────────────────┐\n                              ------- │ dns-crawler-workers │\n                                      └─────────────────────┘\n                                      …\n                                      …\n\n                                      machine-n\n                                      ┬─────────────────────┐\n                              _______ │ dns-crawler-workers │\n                                      └─────────────────────┘\n```\n\nJust tell the workers to connect to the shared Redis on the main server, eg.:\n\n```\n$ dns-crawler-workers 24 192.168.0.2:6379\n                    ^            ^\n                    24 threads   redis host\n```\n\nMake sure to run the workers with ~same Python version on these machines, otherwise you'll get `unsupported pickle protocol` errors. See the [pickle protocol versions in Python docs](https://docs.python.org/3.8/library/pickle.html#data-stream-format).\n\nThe DNS resolver doesn't have to be on a same machine as the `dns-crawler-controller`, of course – just set it's IP in `config.yml`. The crawler is tested primarily with CZ.NIC's [Knot Resolver](https://www.knot-resolver.cz/), but should work with any sane resolver supporting DNSSEC. Systemd's `systemd-resolved` seems to be really slow though.\n\nSame goes for Redis, you can point both controller and workers to a separate machine running Redis (don't forget to point them to an empty DB if you're using Redis for other things than the dns-crawler, it uses `0` by default).\n\n## Updating dependencies\n\nMaxMind updates GeoIP DBs on Tuesdays, so it may be a good idea to set a cron job to keep them fresh. More about that on [maxmind.com: Automatic Updates for GeoIP2](https://dev.maxmind.com/geoip/geoipupdate/).\n\nIf you use multiple machines to run the workers, don't forget to update GeoIP on all of them (or set up a shared location, eg. via sshfs or nfs).\n\n## Monitoring\n\n### Command line\n\n```\n$ rq info\ndefault      |████████████████████ 219458\n1 queues, 219458 jobs total\n\n0 workers, 1 queues\n```\n\n### Web interface\n\n```\n$ pip install rq-dashboard\n$ rq-dashboard\nRQ Dashboard version 0.4.0                                                 \n * Serving Flask app \"rq_dashboard.cli\" (lazy loading)                            \n * Environment: production                                                \n   WARNING: Do not use the development server in a production environment. \n   Use a production WSGI server instead.                                          \n * Debug mode: off                            \n * Running on http://0.0.0.0:9181/ (Press CTRL+C to quit)\n ```\n\n<a href=\"https://i.vgy.me/sk7zWa.png\">\n<img alt=\"RQ Dashboard screenshot\" src=\"https://i.vgy.me/sk7zWa.png\" width=\"40%\">\n</a>\n<a href=\"https://i.vgy.me/4y5Zee.png\">\n<img alt=\"RQ Dashboard screenshot\" src=\"https://i.vgy.me/4y5Zee.png\" width=\"40%\">\n</a>\n\n## Tests\n\nSome basic tests are in the `tests` directory in this repo. If you want to run them manually, take a look at the `test` stage jobs in `.gitlab-ci.yml`. Basically it just downloads free GeoIP DBs, tells the crawler to use them, and crawles some domains, checking values in JSON output. It runs the tests twice – first with the default DNS resolvers (ODVR) and then with system one(s).\n\nIf you're looking into writing some additional tests, be aware that some Docker containers used in GitLab CI don't have IPv6 configured (even if it's working on the host machine), so checking for eg. `WEB6_80_www_VENDOR` will fail without additional setup.\n\n\n## OS support\n\nThe crawler is developed primarily for Linux, but it should work on any OS supported by Python – at least the worker part (but the controller should work too, if you manage to get a Redis server running on your OS).\n\nOne exception is Windows, because it [doesn't support `fork()`](https://github.com/rq/rq/issues/859), but it's possible to get it working under WSL (Windows Subsystem for Linux):\n\n![win10 screenshot](https://i.vgy.me/emJjGN.png)\n\n…so you can turn a gaming machine into an internet crawler quite easily.\n\n\n## Bug reporting\n\nPlease create [issues in this Gitlab repo](https://gitlab.nic.cz/adam/dns-crawler/issues).",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.nic.cz/adam/dns-crawler",
+    "keywords": "crawler,dns,http,https",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "dns-crawler",
+    "package_url": "https://pypi.org/project/dns-crawler/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/dns-crawler/",
+    "project_urls": {
+      "Homepage": "https://gitlab.nic.cz/adam/dns-crawler",
+      "Operation in .CZ": "https://www.csirt.cz/en/dns-crawler/",
+      "Project ADAM": "https://adam.nic.cz/"
+    },
+    "release_url": "https://pypi.org/project/dns-crawler/1.5.8/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "A crawler for getting info about DNS domains and services attached to them.",
+    "version": "1.5.8",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9855130,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee514ac0af16db198913690cc06250275cefed8fa30f2479b9af63b11e7a78f6",
+          "md5": "c254c78a004ed8267b46ad27134e0680",
+          "sha256": "06306388d9e0c3f6935fb07a6e708c1528ef82919e2e0ab9929ed1f0b4dd53b2"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c254c78a004ed8267b46ad27134e0680",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 40213,
+        "upload_time": "2019-11-26T10:29:58",
+        "upload_time_iso_8601": "2019-11-26T10:29:58.226785Z",
+        "url": "https://files.pythonhosted.org/packages/ee/51/4ac0af16db198913690cc06250275cefed8fa30f2479b9af63b11e7a78f6/dns-crawler-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bd843506e2a74e67506687cd2e3dd9c288a8a8446554657db36c71f7db0dfc9",
+          "md5": "2a2d0a0899f39ad2943d96c810ab4a31",
+          "sha256": "2f17f259e3facd62cf0297ff2cb4dbcef5cde65ccb6585f155659f064e134d36"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2a2d0a0899f39ad2943d96c810ab4a31",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 40399,
+        "upload_time": "2019-11-29T09:32:04",
+        "upload_time_iso_8601": "2019-11-29T09:32:04.062500Z",
+        "url": "https://files.pythonhosted.org/packages/5b/d8/43506e2a74e67506687cd2e3dd9c288a8a8446554657db36c71f7db0dfc9/dns-crawler-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "66ecba089d7af5e11954dbeb6c4b04617ca46dad3744cbf1040fefd0dc5cbb06",
+          "md5": "7cb09797f35f0e07ae0ed34dc21be59b",
+          "sha256": "606fd6d298ee443ceb8bf6ad97bc9481111fa86d3662d8f818a8d8e845ad32af"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7cb09797f35f0e07ae0ed34dc21be59b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 40440,
+        "upload_time": "2019-11-29T09:40:32",
+        "upload_time_iso_8601": "2019-11-29T09:40:32.409971Z",
+        "url": "https://files.pythonhosted.org/packages/66/ec/ba089d7af5e11954dbeb6c4b04617ca46dad3744cbf1040fefd0dc5cbb06/dns-crawler-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88a8648bebaf26a564c7873af57ac3a8743726542741e19a59d4e343d6f763c3",
+          "md5": "8a3def7139f56c6bfd5a7a6eaa84be2f",
+          "sha256": "57ef7a3815308b7cb3ff657a9f8aee3bf80b4045af484604c5bd61edc24bafe8"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8a3def7139f56c6bfd5a7a6eaa84be2f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 41392,
+        "upload_time": "2019-11-29T17:43:37",
+        "upload_time_iso_8601": "2019-11-29T17:43:37.916718Z",
+        "url": "https://files.pythonhosted.org/packages/88/a8/648bebaf26a564c7873af57ac3a8743726542741e19a59d4e343d6f763c3/dns-crawler-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0ab9f8cc59ffcbd2932dccc98c826ce2bf72320e8d0d9f9a2654403afd54d352",
+          "md5": "20eb6ab2b6ab11ab705541ac99a60d2c",
+          "sha256": "60ea8c0fa037ab2a8533e6c630da31c1e5820b589aa1a640a76b8fe2e2fb9e99"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20eb6ab2b6ab11ab705541ac99a60d2c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 41487,
+        "upload_time": "2019-12-06T16:03:09",
+        "upload_time_iso_8601": "2019-12-06T16:03:09.284419Z",
+        "url": "https://files.pythonhosted.org/packages/0a/b9/f8cc59ffcbd2932dccc98c826ce2bf72320e8d0d9f9a2654403afd54d352/dns-crawler-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca855ebe16d398edcad7f5d62d0fa432c2a4870e677fc8d514b1496da64a69de",
+          "md5": "f196e5e0a1495bbfaf393b1f522aac24",
+          "sha256": "0ac390198c8e06e24c6325f0cff038e9fe791bdc2284a3311f0fbe3bd4d8658e"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f196e5e0a1495bbfaf393b1f522aac24",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 42698,
+        "upload_time": "2019-12-10T13:21:37",
+        "upload_time_iso_8601": "2019-12-10T13:21:37.264149Z",
+        "url": "https://files.pythonhosted.org/packages/ca/85/5ebe16d398edcad7f5d62d0fa432c2a4870e677fc8d514b1496da64a69de/dns-crawler-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eae28a925a6a6198c346280b2fb8eae418f7507fd8681c63a708db0ff1f77256",
+          "md5": "61eaa1a1b6687a9b2f12833b04745cf3",
+          "sha256": "47c68e1c863ab1fc2fa05d5cb0d58896e8f9af3000a3db12e0eaa4828e61791f"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "61eaa1a1b6687a9b2f12833b04745cf3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 41249,
+        "upload_time": "2019-12-11T09:21:13",
+        "upload_time_iso_8601": "2019-12-11T09:21:13.525032Z",
+        "url": "https://files.pythonhosted.org/packages/ea/e2/8a925a6a6198c346280b2fb8eae418f7507fd8681c63a708db0ff1f77256/dns-crawler-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8196035b4d88dcafd19978627d2d63548692c28120868bc1fba3b6532ba1887b",
+          "md5": "e189f648ca54930796406989190440b1",
+          "sha256": "dd0cfb4e2acf731b2316f66322885b15ec44ccbbd2804c98bc9666caf57c71ac"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e189f648ca54930796406989190440b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 43359,
+        "upload_time": "2019-12-14T11:30:10",
+        "upload_time_iso_8601": "2019-12-14T11:30:10.443163Z",
+        "url": "https://files.pythonhosted.org/packages/81/96/035b4d88dcafd19978627d2d63548692c28120868bc1fba3b6532ba1887b/dns-crawler-1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c821c3c41870d98ef0c301706d4c37fc8280a2553c3e0b3026f88964fe877c93",
+          "md5": "162e6c6c9920ccccb6b51cf0e4065a21",
+          "sha256": "6d8722dc3c7bd8253fe9476802429c5be4c2b746e886c817fb2759d6503a56ea"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "162e6c6c9920ccccb6b51cf0e4065a21",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 44526,
+        "upload_time": "2020-01-20T12:56:26",
+        "upload_time_iso_8601": "2020-01-20T12:56:26.558620Z",
+        "url": "https://files.pythonhosted.org/packages/c8/21/c3c41870d98ef0c301706d4c37fc8280a2553c3e0b3026f88964fe877c93/dns-crawler-1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1edbb842edecf069bcbe46c2120d7ad4840b2537227fee2c4e2277dc2d593b9e",
+          "md5": "053cfae472512f5c6d6e3d668e4afc4c",
+          "sha256": "fc41dc9b5d9242b6b2f1436c37464eca31c494d92a74b09d9ba730468d44dacd"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "053cfae472512f5c6d6e3d668e4afc4c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 67979,
+        "upload_time": "2020-03-12T11:53:22",
+        "upload_time_iso_8601": "2020-03-12T11:53:22.668799Z",
+        "url": "https://files.pythonhosted.org/packages/1e/db/b842edecf069bcbe46c2120d7ad4840b2537227fee2c4e2277dc2d593b9e/dns-crawler-1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99cd1530e692cc543b50db015b06927e5a205301d77461ea8aaa0bc1456d8313",
+          "md5": "617882741a57383bc6917566e2671fe5",
+          "sha256": "b53ca6f75ef9aaa1e53f3b3e5cf573be4120ce4a11d03aa975bf56ccae57edc0"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "617882741a57383bc6917566e2671fe5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 63278,
+        "upload_time": "2020-03-19T18:42:35",
+        "upload_time_iso_8601": "2020-03-19T18:42:35.586265Z",
+        "url": "https://files.pythonhosted.org/packages/99/cd/1530e692cc543b50db015b06927e5a205301d77461ea8aaa0bc1456d8313/dns-crawler-1.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c9d01a01ed358453a852a6fffc54f2a16bfe48585f8f10f3eb908e2d2680f4c",
+          "md5": "4615ad51f056b8cde71528c60e870bc9",
+          "sha256": "6f811a3a5364ff8236a0f052980ff4a976a46e7a16c958942d1f2a222ea931db"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4615ad51f056b8cde71528c60e870bc9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 64622,
+        "upload_time": "2020-03-24T09:54:54",
+        "upload_time_iso_8601": "2020-03-24T09:54:54.495222Z",
+        "url": "https://files.pythonhosted.org/packages/5c/9d/01a01ed358453a852a6fffc54f2a16bfe48585f8f10f3eb908e2d2680f4c/dns-crawler-1.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ac3c04dff7c38e7e60a7e7f72877e277cc2305d338698cd93853056d910ab3a",
+          "md5": "6ddb0edef42bf354f36802e81e826ed0",
+          "sha256": "3dac9029f055a3d87c19db5ba9711501254aefa9e45cf6f55856efc335f1c34e"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ddb0edef42bf354f36802e81e826ed0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 59008,
+        "upload_time": "2020-04-06T10:44:18",
+        "upload_time_iso_8601": "2020-04-06T10:44:18.475846Z",
+        "url": "https://files.pythonhosted.org/packages/1a/c3/c04dff7c38e7e60a7e7f72877e277cc2305d338698cd93853056d910ab3a/dns-crawler-1.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60776df71f82d2ba5d77d1b4328a6866f110f3cddcd8a81fbcfb26621dbaa53e",
+          "md5": "1ac8904339045c441befdaef42ce5d99",
+          "sha256": "fbf3c0301c09c190a32260759f3952725ad0e92d52c56c50d3503e710e071de1"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ac8904339045c441befdaef42ce5d99",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 68339,
+        "upload_time": "2020-04-23T10:47:13",
+        "upload_time_iso_8601": "2020-04-23T10:47:13.910851Z",
+        "url": "https://files.pythonhosted.org/packages/60/77/6df71f82d2ba5d77d1b4328a6866f110f3cddcd8a81fbcfb26621dbaa53e/dns-crawler-1.4.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ceba4fdad1b5b16649c479eadcb92d5d1067729e888ef5e0aec92ae4540674f5",
+          "md5": "2645b7f34aa985e024e84adbf3ecc820",
+          "sha256": "ef5d04923344713878d129926629ac3092152f37ce0f13732696d3f995677580"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2645b7f34aa985e024e84adbf3ecc820",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 68536,
+        "upload_time": "2020-05-20T08:01:08",
+        "upload_time_iso_8601": "2020-05-20T08:01:08.582135Z",
+        "url": "https://files.pythonhosted.org/packages/ce/ba/4fdad1b5b16649c479eadcb92d5d1067729e888ef5e0aec92ae4540674f5/dns-crawler-1.4.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b379718cd5338d85bc39428585c4c7beb1029a6edc855d492a230a9ab3dfb799",
+          "md5": "7bbb88419ccaf459fa6cdb3ea1a9cd84",
+          "sha256": "2d8eced12e4ad081d10a5dc453bffd34f76f5cda755758db49136966b099bf2c"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7bbb88419ccaf459fa6cdb3ea1a9cd84",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 68015,
+        "upload_time": "2020-07-02T12:03:04",
+        "upload_time_iso_8601": "2020-07-02T12:03:04.956447Z",
+        "url": "https://files.pythonhosted.org/packages/b3/79/718cd5338d85bc39428585c4c7beb1029a6edc855d492a230a9ab3dfb799/dns-crawler-1.4.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c8809ece891f390f6f50d1ee7e54ec3ff7c72d383a4c6c06b4badc891c421a1b",
+          "md5": "f529e8cf3619d5bf3b4533816df596f5",
+          "sha256": "a52f2d9fc381ebdb54dedebd16fd1a2a79761462f914d62cfa81f101100a55c6"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f529e8cf3619d5bf3b4533816df596f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 73140,
+        "upload_time": "2020-07-02T15:22:02",
+        "upload_time_iso_8601": "2020-07-02T15:22:02.718083Z",
+        "url": "https://files.pythonhosted.org/packages/c8/80/9ece891f390f6f50d1ee7e54ec3ff7c72d383a4c6c06b4badc891c421a1b/dns-crawler-1.4.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56c6bc4b04fbe995dc67d5acbd96294d0c64514f7cd53c901ec5297ef83587a1",
+          "md5": "822b153bb5179b3ccfb7d4765b54ed92",
+          "sha256": "6b17aecf8953ac1ba6f3efaa520d09d6990a980f95c582e7bdebe6a8ad080c30"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "822b153bb5179b3ccfb7d4765b54ed92",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 73170,
+        "upload_time": "2020-07-10T06:32:10",
+        "upload_time_iso_8601": "2020-07-10T06:32:10.032236Z",
+        "url": "https://files.pythonhosted.org/packages/56/c6/bc4b04fbe995dc67d5acbd96294d0c64514f7cd53c901ec5297ef83587a1/dns-crawler-1.4.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "061bac75b5bbba27d01e997556fd11228e0bcad99f2869e565b69b98e6328c48",
+          "md5": "0024211b490e26428dc274330d520c76",
+          "sha256": "f59340c4ef1769a04a4f9ebc07f27114fae289b91d287433a42c326958afb71d"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.4.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0024211b490e26428dc274330d520c76",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 66705,
+        "upload_time": "2020-07-28T16:47:28",
+        "upload_time_iso_8601": "2020-07-28T16:47:28.770784Z",
+        "url": "https://files.pythonhosted.org/packages/06/1b/ac75b5bbba27d01e997556fd11228e0bcad99f2869e565b69b98e6328c48/dns-crawler-1.4.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "110863be01ae5892c14429eb6591269ac4d3491f6c6ccb05cda9d9d40a1f10f4",
+          "md5": "4cca4cf2bdee171ff107be183bd5f026",
+          "sha256": "4511352271ab305227b7795d644365e7ec9760a699264b92ee4fbbe1c8ed60ea"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4cca4cf2bdee171ff107be183bd5f026",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 67802,
+        "upload_time": "2020-10-12T08:34:29",
+        "upload_time_iso_8601": "2020-10-12T08:34:29.791978Z",
+        "url": "https://files.pythonhosted.org/packages/11/08/63be01ae5892c14429eb6591269ac4d3491f6c6ccb05cda9d9d40a1f10f4/dns-crawler-1.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f8945d2c94a2d3e3beffe6849f741a7d349e1347538863cf234852306a55142",
+          "md5": "fffe0f520e91a6c4bbb347dd0b43fe5b",
+          "sha256": "777856f42f0fce3d16c5847f0e935dfbf171c51e92d85748c7d4933190c21ca2"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fffe0f520e91a6c4bbb347dd0b43fe5b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 67292,
+        "upload_time": "2020-10-13T13:53:46",
+        "upload_time_iso_8601": "2020-10-13T13:53:46.803006Z",
+        "url": "https://files.pythonhosted.org/packages/2f/89/45d2c94a2d3e3beffe6849f741a7d349e1347538863cf234852306a55142/dns-crawler-1.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "578198981b30ca84dcbc6fe183c7b19ba3fa05b58e6a638663cb04948519bab6",
+          "md5": "6a742c9b333dc5b1310e59e653cb6004",
+          "sha256": "bb99ed259d5d205c9859e1f700d6134281821984671970d3b917a21735f03279"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6a742c9b333dc5b1310e59e653cb6004",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 67919,
+        "upload_time": "2020-10-13T15:38:25",
+        "upload_time_iso_8601": "2020-10-13T15:38:25.240179Z",
+        "url": "https://files.pythonhosted.org/packages/57/81/98981b30ca84dcbc6fe183c7b19ba3fa05b58e6a638663cb04948519bab6/dns-crawler-1.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f02ca745b8eb32f8c2f98c93d3646d8ef18fe9e4095142c58d29723b7fba8bff",
+          "md5": "24a2b900f1ba0446dad8adf85540c0bf",
+          "sha256": "c6293d835f97de906ec931b98a0c08cb3a2ff778b1506db4a4c820ce6c530eed"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24a2b900f1ba0446dad8adf85540c0bf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 68090,
+        "upload_time": "2020-10-19T11:17:42",
+        "upload_time_iso_8601": "2020-10-19T11:17:42.921841Z",
+        "url": "https://files.pythonhosted.org/packages/f0/2c/a745b8eb32f8c2f98c93d3646d8ef18fe9e4095142c58d29723b7fba8bff/dns-crawler-1.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fbb07074b16da8810fcb1cfc07aba3f5b2af0a76ca907df6d7e458d06060c980",
+          "md5": "b90c19e895b226a870bb16f34dcea3aa",
+          "sha256": "a07d945cbd09fd512fdccd9397324f0b5985f8e33570086b6ce3ea839e78759b"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b90c19e895b226a870bb16f34dcea3aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 66293,
+        "upload_time": "2021-01-19T13:44:53",
+        "upload_time_iso_8601": "2021-01-19T13:44:53.960363Z",
+        "url": "https://files.pythonhosted.org/packages/fb/b0/7074b16da8810fcb1cfc07aba3f5b2af0a76ca907df6d7e458d06060c980/dns-crawler-1.5.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb426d6db884f28984208f9155d4ad61c1447d6263b35d60befb1fc2eda5a764",
+          "md5": "205ca374f65195ecf1b819ef1f235ed5",
+          "sha256": "56b35d3b1a1f9a2bcf12dd30edd18a48d25909ed2df61ff1850a893b063dcd77"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "205ca374f65195ecf1b819ef1f235ed5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 66392,
+        "upload_time": "2021-01-21T10:24:15",
+        "upload_time_iso_8601": "2021-01-21T10:24:15.728709Z",
+        "url": "https://files.pythonhosted.org/packages/fb/42/6d6db884f28984208f9155d4ad61c1447d6263b35d60befb1fc2eda5a764/dns-crawler-1.5.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5c8817f73a6b4c82dfa7497d9fec57ad9f0f5be22f38e79ffb3b64c48372bd3",
+          "md5": "af835c018bb210e0bd6c436932189d8a",
+          "sha256": "4a47af05d3c5706f262ce97cc5fcba3279070dea98439d327acec244e450f6d8"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af835c018bb210e0bd6c436932189d8a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 66817,
+        "upload_time": "2021-02-04T11:55:50",
+        "upload_time_iso_8601": "2021-02-04T11:55:50.081245Z",
+        "url": "https://files.pythonhosted.org/packages/b5/c8/817f73a6b4c82dfa7497d9fec57ad9f0f5be22f38e79ffb3b64c48372bd3/dns-crawler-1.5.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc6d4a14cb0b5529286b959f31bda8a980a24f58d29241c48b5daafd87c0f9ce",
+          "md5": "cd40b6d97f772fa7b81caabbea6a89e2",
+          "sha256": "87de22316f9f85ba706425b0edc571c5de24e2a183c02df866b8fe2556b4bcd2"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cd40b6d97f772fa7b81caabbea6a89e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 66966,
+        "upload_time": "2021-02-25T09:16:58",
+        "upload_time_iso_8601": "2021-02-25T09:16:58.855787Z",
+        "url": "https://files.pythonhosted.org/packages/bc/6d/4a14cb0b5529286b959f31bda8a980a24f58d29241c48b5daafd87c0f9ce/dns-crawler-1.5.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0fac8cb56da0e83c6c9dd2bd3078c9943a677dfe6dffc2feb06cd210641ba508",
+          "md5": "568ca3e3047b7445cb99bb340c22f606",
+          "sha256": "7f66d5538f1ecf4d1622fda0029259d0e335b8e01286a93775143f36546afb39"
+        },
+        "downloads": -1,
+        "filename": "dns-crawler-1.5.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "568ca3e3047b7445cb99bb340c22f606",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 67025,
+        "upload_time": "2021-03-23T14:00:28",
+        "upload_time_iso_8601": "2021-03-23T14:00:28.207558Z",
+        "url": "https://files.pythonhosted.org/packages/0f/ac/8cb56da0e83c6c9dd2bd3078c9943a677dfe6dffc2feb06cd210641ba508/dns-crawler-1.5.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0fac8cb56da0e83c6c9dd2bd3078c9943a677dfe6dffc2feb06cd210641ba508",
+        "md5": "568ca3e3047b7445cb99bb340c22f606",
+        "sha256": "7f66d5538f1ecf4d1622fda0029259d0e335b8e01286a93775143f36546afb39"
+      },
+      "downloads": -1,
+      "filename": "dns-crawler-1.5.8.tar.gz",
+      "has_sig": false,
+      "md5_digest": "568ca3e3047b7445cb99bb340c22f606",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 67025,
+      "upload_time": "2021-03-23T14:00:28",
+      "upload_time_iso_8601": "2021-03-23T14:00:28.207558Z",
+      "url": "https://files.pythonhosted.org/packages/0f/ac/8cb56da0e83c6c9dd2bd3078c9943a677dfe6dffc2feb06cd210641ba508/dns-crawler-1.5.8.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
