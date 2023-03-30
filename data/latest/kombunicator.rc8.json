@@ -1,0 +1,445 @@
+{
+  "info": {
+    "author": "Stefan Lasse",
+    "author_email": "stefanlasse87+kombunicator@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# kombunicator\n\nA threaded RabbitMQ message producer/consumer and RPC server/client.\n\n## Run tests locally\nJust execute  \n`$ docker-compose up --build`  \nA RabbitMQ mangement console is exposed to localhost on port 25672.\n\n\n## Installation\nInstall directly from the GitLab repository  \n`$ pip install --user git+https://gitlab.com/mbio/kombunicator.git`\n\n## Usage\nMessage consumers are threaded. For graceful shutdown of the threads, SIGINT and SIGTERM are captured. The signal handling routine calls the `stop()` method of the threads, which causes the `kombu.ConsumerMixin` to stop consuming and return. Then, all created threads are joined.\n\n### Message consumers\nkombunicator provides a thread-wrapped `kombu.ConsumerMixin` where you can register your own message-handler routine.  \n\n```python\nimport kombunicator\n\n# define connection parameters to your RabbitMQ instance\nrabbit_mq_conn_param = {\n    'hostname': 'localhost',\n    'port': 5672,\n    'userid': 'my_username',\n    'password': 'my_password'\n}\n\n# define a message consumer class, which inherits from\n# kombunicator.ConsumerConfigurator\n# One must overwrite the configure method and the\n# message_handler method with the latter being a static method.\nclass ExampleConsumer(kombunicator.ConsumerConfigurator):\n    def configure(self):\n        self.connection_parameter = rabbit_mq_conn_param\n        self.consumer_type='topic',\n        self.exchange_name = \"example_exchange\"\n        self.binding_keys = ['binding.key.*']\n        self.q_unique = \"unique_string\"\n        self.accept = ['json']\n\n    @classmethod\n    def message_handler(cls, payload, headers, properties):\n        print(payload)\n\n\n# finally register the message consumer\nkombunicator.register_message_consumer(ExampleConsumer)\n```\n\n### Message producer\nTo publish messages to a RabbitMQ instance, kombunicator provides\na MessageProducer class. It is configured with the connection\nparameters for RabbitMQ. Then, it can publish messages (either dict or str)\nto the RabbitMQ instance.\n\n```python\nfrom kombunicator import MessageProducer\n\n\n# define connection parameters to your RabbitMQ instance\nrabbit_mq_conn_param = {\n    'hostname': 'localhost',\n    'port': 5672,\n    'userid': 'my_username',\n    'password': 'my_password'\n}\n\n\nmessage = {\n    \"success\": True\n}\n\n\nproducer = MessageProducer(rabbit_mq_conn_param)\nproducer.publish(\n    message=message,\n    routing_key='backend_q'\n)\n```\n\n### Remote Procedure Call Server\nTo set up a Remote Procedure Call (RPC) Server a celery application is required.  \nThe celery application needs to be configured with a `broker` and a `backend`.  \nThe following example sets up a celery application with a RabbitMQ message broker  \nand a Redis result backend. So let's set up `rpc_server.py`:\n```python\nimport celery\nimport time\nfrom threading import Event\nfrom kombunicator import RPCServer\n\n# message broker configuration \nbroker_connection_parameter = {\n    'hostname': 'localhost',\n    'port': 5672,\n    'userid': 'alice',\n    'password': 'wonderland'\n}\ncp = broker_connection_parameter\nbroker_url = f\"amqp://{cp['userid']}:{cp['password']}@{cp['hostname']}:{cp['port']}\"\n\n\n# result backend configuration\nbackend_connection_parameter = {\n    'hostname': 'localhost',\n    'port': 6379,\n    'password': 'redispass'\n}\nbp = backend_connection_parameter\nbackend_url = f\"redis://:{bp['password']}@{bp['hostname']}:{bp['port']}/0\"\n\n# create the celery application\ncelery_app = celery.Celery('tasks', broker=broker_url, backend=backend_url)\n\n# note, that we need to include 'kombunicator.tasks' into the celery app\n# to add the kombunicator shared tasks to the celery applicaion.\ncelery_app.conf.update(\n    CELERY_BROKER=broker_url,\n    CELERY_RESULT_BACKEND=backend_url,\n    CELERY_IMPORTS=('rpc_server', 'kombunicator.tasks')\n)\n\n### now use celery app to configure RPCServer\n\n# first, we need a celery task to be executed on a received message.\n# This task processes the incoming data.\ndata_processor_name = 'request_processor'\n@celery_app.task(name=data_processor_name)\ndef process_request(data):\n    data['processed'] = True\n    return data\n\n# then, we setup the server with direct listening_key and \n# the just created message processing task name\nis_ready = Event()\nserver = RPCServer(\n    connection_parameter=broker_connection_parameter,\n    listening_key='rpc_server_key',\n    celery_app=celery_app,\n    processing_task_name=data_processor_name,\n    ready=is_ready\n)\nserver.start()\nis_ready.wait()\n\nwhile True:\n    time.sleep(1)\n\n```\n\n### Remote Procedure Call Clients\nTo request data from a remote server via RPC, a RPCClient can be used.\nA RPCClient will send over a request to a specific listening key of the\nserver and then spin up a thread, which waits for the answer. This answer\nis then processed by the processing routine attached to the RPCClient.\n\nFor the client's answer processor there are two options:\n  - define a default processor which is called on request return.\n  - define a variable processor which can be customized on every request.\n```python\nfrom kombunicator import RPCClient\n\n# connection credentials for celery message broker\nbroker_connection_parameter = {\n    'hostname': 'localhost',\n    'port': 5672,\n    'userid': 'alice',\n    'password': 'wonderland'\n}\n\n# define processing call function to be executed on the\n# data sent by the RPCServer \ndef default_answer_processor(data):\n    print(data)\n\n### setup a client with a default processor\nclient = RPCClient(\n    connection_parameter=broker_connection_parameter,\n    request_key='rpc_server_key',\n    default_callback=default_answer_processor\n)\n\nrequest_data = dict(id='abc123')\n\n# now request only the data. When the result returns, the default processor\n# is called with received data.\nclient.request(request_data)\n\n\n### setup a client with a custom processor\nclient = RPCClient(\n    connection_parameter=broker_connection_parameter,\n    request_key='rpc_server_key',\n    default_callback=default_answer_processor\n)\n\ndef custom_answer_processor(data):\n    print(data)\n\nrequest_data = dict(id='abc123')\n\n# Now call the request method with specified callback. Now, the\n# custom callback is executed with received data. \nclient.request(request_data, callback=custom_answer_processor)\n```\n\n### Shutdown consumers\nEvery consumer thread runs as daemon. Additionally, kombunicator provides the\n`kombunicator.shutdown_consumers()` routine. It is recommended to call this\nroutine on system exit.\n\nkombunicator catches the two system events SIGINT and SIGTERM. On either of\nthese, `kombunicator.shutdown_consumers()` is called.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://gitlab.com/mbio/kombunicator/-/archive/master/kombunicator-master.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.com/mbio/kombunicator",
+    "keywords": "AMQP,RPC,kombu,celery",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "kombunicator",
+    "package_url": "https://pypi.org/project/kombunicator/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/kombunicator/",
+    "project_urls": {
+      "Download": "https://gitlab.com/mbio/kombunicator/-/archive/master/kombunicator-master.tar.gz",
+      "Homepage": "https://gitlab.com/mbio/kombunicator"
+    },
+    "release_url": "https://pypi.org/project/kombunicator/0.9.2/",
+    "requires_dist": [
+      "celery (>=4.4.2)",
+      "kombu (>=4.6.8)",
+      "strongtyping (>=1.1.17)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A threaded RabbitMQ message producer/consumer and RPC client/server.",
+    "version": "0.9.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8035619,
+  "releases": {
+    "0.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e712949896b5b9833919e7e1170984165597185cc88bb35cfe0caaf292af6c2",
+          "md5": "218f57d24a921093a5526b11ee99a508",
+          "sha256": "72b8d71371775fd5c0488499aa1212bc747160b3fc564ff99feafab2e005a169"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "218f57d24a921093a5526b11ee99a508",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21496,
+        "upload_time": "2020-06-22T13:14:25",
+        "upload_time_iso_8601": "2020-06-22T13:14:25.524376Z",
+        "url": "https://files.pythonhosted.org/packages/0e/71/2949896b5b9833919e7e1170984165597185cc88bb35cfe0caaf292af6c2/kombunicator-0.4.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62a527ac7373a45ad0026c8539bdcd2060601c086b2e1b4c54f9b5ef98f2d7a6",
+          "md5": "e9e4a738ac30b62ea13fc1462c53828b",
+          "sha256": "41007ee22d9aeba37b09b2116a340da6f9b7149dec21745c4ab88376401d4264"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e9e4a738ac30b62ea13fc1462c53828b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 15897,
+        "upload_time": "2020-06-22T13:14:27",
+        "upload_time_iso_8601": "2020-06-22T13:14:27.714619Z",
+        "url": "https://files.pythonhosted.org/packages/62/a5/27ac7373a45ad0026c8539bdcd2060601c086b2e1b4c54f9b5ef98f2d7a6/kombunicator-0.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fd2730b501a8cab1690424947d352d4bb876cb6ba8ef829af84a2bc2fe92d3f",
+          "md5": "fe985776f983f295cc949c26e3033154",
+          "sha256": "84b13cb8c9f83e716b8b73df4551c15c7e89eba9dc51c17cd780dc76e4260129"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fe985776f983f295cc949c26e3033154",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22022,
+        "upload_time": "2020-06-23T10:45:39",
+        "upload_time_iso_8601": "2020-06-23T10:45:39.139764Z",
+        "url": "https://files.pythonhosted.org/packages/8f/d2/730b501a8cab1690424947d352d4bb876cb6ba8ef829af84a2bc2fe92d3f/kombunicator-0.4.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "499d1564592b26f450e92d98acef95ce5dbf91d26fa417c75af8fd27468fc02f",
+          "md5": "9a1bd0a605a27ec618052d73ec081c18",
+          "sha256": "e1cadb857ff9f68eb3adce6cea267349e6049b2e079d7be7ecb4be3c763a1bea"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9a1bd0a605a27ec618052d73ec081c18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16386,
+        "upload_time": "2020-06-23T10:45:40",
+        "upload_time_iso_8601": "2020-06-23T10:45:40.538862Z",
+        "url": "https://files.pythonhosted.org/packages/49/9d/1564592b26f450e92d98acef95ce5dbf91d26fa417c75af8fd27468fc02f/kombunicator-0.4.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "890a2a683fd838918914066d514ca627252d746ba3bcb17cfbb5d3a24af5dc09",
+          "md5": "7d8c4cb951d63a63d9e9b23b38f18757",
+          "sha256": "9f1086c827252d96aefeef04ddda5ebacb5a8785045488a9bf33279b4f4522dc"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7d8c4cb951d63a63d9e9b23b38f18757",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14095,
+        "upload_time": "2020-06-23T11:40:12",
+        "upload_time_iso_8601": "2020-06-23T11:40:12.311166Z",
+        "url": "https://files.pythonhosted.org/packages/89/0a/2a683fd838918914066d514ca627252d746ba3bcb17cfbb5d3a24af5dc09/kombunicator-0.4.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4ce3914980c58db549431da8fceed162907db9d2c5e7070aa1f35c0e2df26d7",
+          "md5": "e0cc127d99c9479fa9e28422b0491857",
+          "sha256": "e9fd24a499bcb1202628f31025c8f7a6045fa492ee84d4928348923163f93f63"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.4.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e0cc127d99c9479fa9e28422b0491857",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 15399,
+        "upload_time": "2020-06-23T11:40:13",
+        "upload_time_iso_8601": "2020-06-23T11:40:13.637866Z",
+        "url": "https://files.pythonhosted.org/packages/c4/ce/3914980c58db549431da8fceed162907db9d2c5e7070aa1f35c0e2df26d7/kombunicator-0.4.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "135097165886873f7ee3fddbe5681454fd068f395398902b6de2ee4b03d7b842",
+          "md5": "36a00e5cd11f14c76b02e28999bf4d5f",
+          "sha256": "1437550607b66c602c44b2d299458ed91134bb9d1638ac8e8a54d3fb4b0aaf4e"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "36a00e5cd11f14c76b02e28999bf4d5f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14113,
+        "upload_time": "2020-06-24T13:29:52",
+        "upload_time_iso_8601": "2020-06-24T13:29:52.586652Z",
+        "url": "https://files.pythonhosted.org/packages/13/50/97165886873f7ee3fddbe5681454fd068f395398902b6de2ee4b03d7b842/kombunicator-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc5a2fff097859db852f86cc8a0c23a8e0f17164885e495750f62db5c64ce55b",
+          "md5": "594f306b0145d4e50a81540398c648ae",
+          "sha256": "96686fc83fbd70d0f9cac47b87f0fe4fe6577455e3a49d70dffdb3d0753a7f11"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "594f306b0145d4e50a81540398c648ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 15492,
+        "upload_time": "2020-06-24T13:29:54",
+        "upload_time_iso_8601": "2020-06-24T13:29:54.268601Z",
+        "url": "https://files.pythonhosted.org/packages/cc/5a/2fff097859db852f86cc8a0c23a8e0f17164885e495750f62db5c64ce55b/kombunicator-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5611cf6891a226148a9172fc5f0ed06b0ab70c10a2d0fc5d3a90e0fac92d22e6",
+          "md5": "933a0c2730f452e515903307e0673577",
+          "sha256": "fb054ef05197ae192efe33933a1d810c132564f3e28e24d63373e6ed8e14d2de"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "933a0c2730f452e515903307e0673577",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 15871,
+        "upload_time": "2020-06-26T13:15:23",
+        "upload_time_iso_8601": "2020-06-26T13:15:23.142109Z",
+        "url": "https://files.pythonhosted.org/packages/56/11/cf6891a226148a9172fc5f0ed06b0ab70c10a2d0fc5d3a90e0fac92d22e6/kombunicator-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0c4d56d1a32e78c392c65f7f8975bf19527749f965df85e7fd12b99c681debf",
+          "md5": "3f403e37cddf472e60f1f4670fd7e2f4",
+          "sha256": "07a32da6a6a95e03f78acc2ca0e565a16968d0ce0eea61346d7405b071daee65"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3f403e37cddf472e60f1f4670fd7e2f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 18012,
+        "upload_time": "2020-06-26T13:15:24",
+        "upload_time_iso_8601": "2020-06-26T13:15:24.383310Z",
+        "url": "https://files.pythonhosted.org/packages/c0/c4/d56d1a32e78c392c65f7f8975bf19527749f965df85e7fd12b99c681debf/kombunicator-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c119dd027370c7c1167b4d21c50e31b747ff9ea504f1552e838c853ea126fcc4",
+          "md5": "5a2579b4cc508cccec88f8710f50dc6f",
+          "sha256": "fb33d78ec30ce8e7211690aba6be3bb94888007e78697d5ad4ed717b3e5f24b4"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5a2579b4cc508cccec88f8710f50dc6f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 16482,
+        "upload_time": "2020-06-30T13:29:21",
+        "upload_time_iso_8601": "2020-06-30T13:29:21.247823Z",
+        "url": "https://files.pythonhosted.org/packages/c1/19/dd027370c7c1167b4d21c50e31b747ff9ea504f1552e838c853ea126fcc4/kombunicator-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37093f51298fcfae361f247ba2f5231e08ca56ce868cbc3fb6ad44df7530b987",
+          "md5": "1736ecaad7a45025dbd38ec095e9cc2f",
+          "sha256": "932863fdf1aa86664dc1bb04164c70abc8e4a3ddc5c1a387f7a0401e718e3861"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1736ecaad7a45025dbd38ec095e9cc2f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 18310,
+        "upload_time": "2020-06-30T13:29:22",
+        "upload_time_iso_8601": "2020-06-30T13:29:22.428103Z",
+        "url": "https://files.pythonhosted.org/packages/37/09/3f51298fcfae361f247ba2f5231e08ca56ce868cbc3fb6ad44df7530b987/kombunicator-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "648506ed58ea20c1f6eea56e761d0f791dd4e06687c82a1d6dae2af82ae59e1e",
+          "md5": "851bb8bae20acc83252e5f1d15228cd5",
+          "sha256": "75dfddf577294785c064e1ecd942473b4205047989ac664d1a1ff972a447fe80"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.9.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "851bb8bae20acc83252e5f1d15228cd5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 17028,
+        "upload_time": "2020-08-07T16:08:20",
+        "upload_time_iso_8601": "2020-08-07T16:08:20.588916Z",
+        "url": "https://files.pythonhosted.org/packages/64/85/06ed58ea20c1f6eea56e761d0f791dd4e06687c82a1d6dae2af82ae59e1e/kombunicator-0.9.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "17ff71462ebc33dbec874e8f7f3fad715dcaeb17b2ef464b3ec91abf65a5a559",
+          "md5": "9f676b20b079fd6c7bab564d40f08321",
+          "sha256": "58512fdb6d33517a412d439ed5e71de5ba5c01a9108960145499546a86761886"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9f676b20b079fd6c7bab564d40f08321",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19543,
+        "upload_time": "2020-08-07T16:08:21",
+        "upload_time_iso_8601": "2020-08-07T16:08:21.993451Z",
+        "url": "https://files.pythonhosted.org/packages/17/ff/71462ebc33dbec874e8f7f3fad715dcaeb17b2ef464b3ec91abf65a5a559/kombunicator-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c6ad7f311771b811106576cd14321dbb1247b8cc4bb9391d10f0d966452ef04",
+          "md5": "e0f69627d5ebe8d2ae3efeee68ecd12e",
+          "sha256": "4740fe965620fac692a153f0b7bdbae4bd1c6e8a0b8ab98a55d27c524aed5a86"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.9.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0f69627d5ebe8d2ae3efeee68ecd12e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 17056,
+        "upload_time": "2020-08-25T13:50:12",
+        "upload_time_iso_8601": "2020-08-25T13:50:12.892028Z",
+        "url": "https://files.pythonhosted.org/packages/0c/6a/d7f311771b811106576cd14321dbb1247b8cc4bb9391d10f0d966452ef04/kombunicator-0.9.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d3ea86a44463fe1c442007dcedf251aed04ba0d2ee55cac70ff5aa1676f24d72",
+          "md5": "f88cedac6c17607e24dd90544dd91b75",
+          "sha256": "ae9f63217ad675eeed3bde672f346006739e0fe0e5ca558f6df9d123145a1197"
+        },
+        "downloads": -1,
+        "filename": "kombunicator-0.9.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f88cedac6c17607e24dd90544dd91b75",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19457,
+        "upload_time": "2020-08-25T13:50:14",
+        "upload_time_iso_8601": "2020-08-25T13:50:14.317716Z",
+        "url": "https://files.pythonhosted.org/packages/d3/ea/86a44463fe1c442007dcedf251aed04ba0d2ee55cac70ff5aa1676f24d72/kombunicator-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0c6ad7f311771b811106576cd14321dbb1247b8cc4bb9391d10f0d966452ef04",
+        "md5": "e0f69627d5ebe8d2ae3efeee68ecd12e",
+        "sha256": "4740fe965620fac692a153f0b7bdbae4bd1c6e8a0b8ab98a55d27c524aed5a86"
+      },
+      "downloads": -1,
+      "filename": "kombunicator-0.9.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e0f69627d5ebe8d2ae3efeee68ecd12e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 17056,
+      "upload_time": "2020-08-25T13:50:12",
+      "upload_time_iso_8601": "2020-08-25T13:50:12.892028Z",
+      "url": "https://files.pythonhosted.org/packages/0c/6a/d7f311771b811106576cd14321dbb1247b8cc4bb9391d10f0d966452ef04/kombunicator-0.9.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d3ea86a44463fe1c442007dcedf251aed04ba0d2ee55cac70ff5aa1676f24d72",
+        "md5": "f88cedac6c17607e24dd90544dd91b75",
+        "sha256": "ae9f63217ad675eeed3bde672f346006739e0fe0e5ca558f6df9d123145a1197"
+      },
+      "downloads": -1,
+      "filename": "kombunicator-0.9.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f88cedac6c17607e24dd90544dd91b75",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 19457,
+      "upload_time": "2020-08-25T13:50:14",
+      "upload_time_iso_8601": "2020-08-25T13:50:14.317716Z",
+      "url": "https://files.pythonhosted.org/packages/d3/ea/86a44463fe1c442007dcedf251aed04ba0d2ee55cac70ff5aa1676f24d72/kombunicator-0.9.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,401 @@
+{
+  "info": {
+    "author": "Rangel Reale",
+    "author_email": "rangelreale@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# KubraGen2: programmatic Kubernetes YAML generator\n\n[![PyPI version](https://img.shields.io/pypi/v/kubragen2.svg)](https://pypi.python.org/pypi/kubragen2/)\n[![Supported Python versions](https://img.shields.io/pypi/pyversions/kubragen2.svg)](https://pypi.python.org/pypi/kubragen2/)\n\nKubraGen2 is a Kubernetes YAML generator library that makes it possible to generate\nconfigurations using the full power of the Python programming language.\n\nCombined with [Helmion](https://github.com/RangelReale/helmion), it is possible to use [Helm](https://helm.sh/)\nas a Kubernetes Yaml source, customize them, and generate a script for applying it directly without using\nthe Helm release process. \n\nSee [Kubragen2 Samples](https://github.com/RangelReale/kubragen2_samples) for real-life examples.\n\n## Overview\n\nSee source code for examples\n\n* Website: https://github.com/RangelReale/kubragen2\n* Repository: https://github.com/RangelReale/kubragen2.git\n* Documentation: https://kubragen2.readthedocs.org/\n* PyPI: https://pypi.python.org/pypi/kubragen2\n\n## Example\n\n```python\nimport argparse\nimport datetime\nimport os\n\nfrom helmion.chart import ProcessorChain, Chart\nfrom helmion.helmchart import HelmRequest\nfrom helmion.processor import DefaultProcessor, FilterRemoveHelmData, ListSplitter\nfrom helmion.resource import is_any_resource\nfrom kubragen2.build import BuildData\nfrom kubragen2.data import ValueData\nfrom kubragen2.kdata import KData_PersistentVolume_HostPath, KData_PersistentVolumeClaim, \\\n    KData_PersistentVolumeClaim_NoSelector, KData_PersistentVolume_Request, KData_PersistentVolume_CSI, \\\n    KData_PersistentVolumeClaim_Request\nfrom kubragen2.output import OutputProject, OutputFile_ShellScript, OutputFile_Kubernetes, OD_FileTemplate, \\\n    OutputDriver_Directory\nfrom kubragen2.provider.aws import KData_PersistentVolume_CSI_AWSEBS\nfrom kubragen2.provider.digitalocean import KData_PersistentVolume_CSI_DOBS\nfrom kubragen2.provider.gcloud import KData_PersistentVolume_GCEPersistentDisk\n\n\ndef main():\n    parser = argparse.ArgumentParser(description='Kube Creator')\n    parser.add_argument('-p', '--provider', help='provider', required=True, choices=[\n        'google-gke',\n        'amazon-eks',\n        'digitalocean-kubernetes',\n        'k3d',\n    ])\n    parser.add_argument('--no-resource-limit', help='don''t limit resources', action='store_true')\n    parser.add_argument('-o', '--output-path', help='output path', default='output')\n    args = parser.parse_args()\n\n    #\n    # Persistent Volumes\n    #\n    pv_volumes = None\n    pvc_volumes = None\n\n    if args.provider == 'k3d':\n        pv_volumes = KData_PersistentVolume_HostPath()\n        pvc_volumes = KData_PersistentVolumeClaim_NoSelector()\n    elif args.provider == 'google-gke':\n        pv_volumes = KData_PersistentVolume_GCEPersistentDisk()\n    elif args.provider == 'digitalocean-kubernetes':\n        pv_volumes = KData_PersistentVolume_CSI_DOBS()\n    elif args.provider == 'amazon-eks':\n        pv_volumes = KData_PersistentVolume_CSI_AWSEBS()\n    else:\n        raise Exception('Unknown target')\n\n    if pvc_volumes is None:\n        pvc_volumes = KData_PersistentVolumeClaim()\n\n    #\n    # Volumes\n    #\n    pv_prometheus_files = KData_PersistentVolume_Request(\n        name='prometheus-storage',\n        selector_labels={\n            'pv.role': 'prometheus',\n        },\n        storageclassname='',\n        storage='50Gi',\n        access_modes=['ReadWriteOnce'],\n        configs=[\n            KData_PersistentVolume_HostPath.Config(hostpath={'path': '/var/storage/prometheus'}),\n            KData_PersistentVolume_CSI.Config(csi={'fsType': 'ext4'}),\n        ]\n    )\n\n    pvc_prometheus_files = KData_PersistentVolumeClaim_Request(\n        name='prometheus-claim', namespace='monitoring',\n        pvreq=pv_prometheus_files,\n    )\n\n    # Add namespace to items, and filter Helm data from labels and annotations\n    helm_default_processor = ProcessorChain(DefaultProcessor(add_namespace=True), FilterRemoveHelmData())\n\n    def helm_splitter_crd(cat, chart, data):\n            return is_any_resource(\n                data, {'apiVersionNS': 'apiextensions.k8s.io', 'kind': 'CustomResourceDefinition'})\n\n    def helm_splitter_config(cat, chart, data):\n        return is_any_resource(\n            data, {'apiVersionNS': 'rbac.authorization.k8s.io'},\n            {'apiVersionNS': 'policy'},\n            {'apiVersionNS': '', 'kind': 'ServiceAccount'},\n            {'apiVersionNS': '', 'kind': 'Secret'},\n            {'apiVersionNS': '', 'kind': 'ConfigMap'},\n            {'apiVersionNS': 'monitoring.coreos.com'},\n            {'apiVersionNS': 'admissionregistration.k8s.io'},\n        )\n\n    def helm_splitter_job(cat, chart, data):\n        return is_any_resource(\n            data, {'apiVersionNS': 'batch'})\n\n    def helm_splitter_service(cat, chart, data):\n        return is_any_resource(\n            data, {'apiVersionNS': '', 'kind': 'Service'},\n            {'apiVersionNS': '', 'kind': 'Pod'},\n            {'apiVersionNS': '', 'kind': 'List'},\n            {'apiVersionNS': 'apps', 'kind': 'Deployment'},\n            {'apiVersionNS': 'apps', 'kind': 'DaemonSet'},\n            {'apiVersionNS': 'apps', 'kind': 'StatefulSet'})\n\n    # Start output\n    out = OutputProject()\n\n    shell_script = OutputFile_ShellScript('create_{}.sh'.format(args.provider))\n    out.append(shell_script)\n\n    shell_script.append('set -e')\n\n    #\n    # Provider setup\n    #\n    if args.provider == 'k3d':\n        storage_directory = os.path.join(os.getcwd(), 'output', 'storage')\n        if not os.path.exists(storage_directory):\n            os.makedirs(storage_directory)\n        if not os.path.exists(os.path.join(storage_directory, 'prometheus')):\n            os.makedirs(os.path.join(storage_directory, 'prometheus'))\n        shell_script.append(f'# k3d cluster create kg2sample-prometheus-stack --port 5051:80@loadbalancer --port 5052:443@loadbalancer -v {storage_directory}:/var/storage')\n\n    #\n    # OUTPUTFILE: namespace.yaml\n    #\n    file = OutputFile_Kubernetes('namespace.yaml')\n    file.append([{\n        'apiVersion': 'v1',\n        'kind': 'Namespace',\n        'metadata': {\n            'name': 'monitoring',\n        },\n    }])\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: storage.yaml\n    #\n    file = OutputFile_Kubernetes('storage.yaml')\n\n    file.append(pv_volumes.build(pv_prometheus_files))\n    # file.append(pv_volumes.build_claim(pvc_volumes, pvc_prometheus_files)) # this will be used only as spec in Helm\n\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # HELM: traefik2\n    #\n    helmreq = HelmRequest(repository='https://helm.traefik.io/traefik', chart='traefik', version='9.11.0',\n                          releasename='traefik-router', # rename to avoid conflict with k3d\n                          namespace='monitoring', values=BuildData({\n            'ingressRoute': {\n                'dashboard': {\n                    'enabled': False,\n                }\n            },\n            'providers': {\n                'kubernetesCRD': {\n                    'enabled': True,\n                    'namespaces': [\n                        'default',\n                        'monitoring',\n                    ]\n                },\n                'kubernetesIngress': {\n                    'enabled': False,\n                }\n            },\n            'logs': {\n                'access': {\n                    'enabled': True,\n                }\n            },\n            'globalArguments': [\n                '--global.checkNewVersion=false',\n                '--global.sendAnonymousUsage=false',\n            ],\n            'additionalArguments': [\n                '--api.debug=true',\n                '--api.dashboard=true',\n                '--api.insecure=false',\n                '--metrics.prometheus=true',\n                '--metrics.prometheus.entryPoint=metrics',\n                '--metrics.prometheus.addEntryPointsLabels=true',\n            ],\n            'ports': {\n                'web': {\n                    'expose': True,\n                    'exposedPort': 80,\n                },\n                'websecure': {\n                    'expose': False,\n                },\n                'api': {\n                    'port': 8080,\n                    'expose': True,\n                },\n                'metrics': {\n                    'expose': True,\n                    'port': 9090,\n                },\n            },\n            'service': {\n                'type': 'NodePort' if args.provider != 'k3d' else 'ClusterIP',\n            },\n            'resources': ValueData(value={\n                'requests': {\n                    'cpu': '100m',\n                    'memory': '200Mi',\n                },\n                'limits': {\n                    'cpu': '200m',\n                    'memory': '300Mi',\n                },\n            }, enabled=not args.no_resource_limit),\n        }))\n\n    traefik_helmchart = helmreq.generate().process(helm_default_processor).split(\n        ListSplitter({\n            'crd': helm_splitter_crd,\n            'config': helm_splitter_config,\n            'service': helm_splitter_service,\n        }, exactly_one_category=True))\n\n    #\n    # OUTPUTFILE: traefik-config-crd.yaml\n    #\n    file = OutputFile_Kubernetes('traefik-config-crd.yaml')\n\n    file.append(traefik_helmchart['crd'].data)\n\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: traefik-config.yaml\n    #\n    file = OutputFile_Kubernetes('traefik-config.yaml')\n\n    file.append(traefik_helmchart['config'].data)\n\n    file.append([{\n        'apiVersion': 'traefik.containo.us/v1alpha1',\n        'kind': 'IngressRoute',\n        'metadata': {\n            'name': 'traefik-api',\n            'namespace': 'monitoring',\n        },\n        'spec': {\n            'entryPoints': ['api'],\n            'routes': [{\n                'match': 'Method(`GET`)',\n                'kind': 'Rule',\n                'services': [{\n                    'name': 'api@internal',\n                    'kind': 'TraefikService'\n                }]\n            }]\n        }\n    }])\n\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n\n\n    #\n    # HELM: prometheus\n    #\n    helmreq = HelmRequest(repository='https://prometheus-community.github.io/helm-charts',\n                          chart='kube-prometheus-stack',\n                          version='12.2.3', releasename='kube-prometheus-stack',\n                          namespace='monitoring', values=BuildData({\n            'alertmanager': {\n                'resources': ValueData(value={\n                    'requests': {\n                        'cpu': '50m',\n                        'memory': '100Mi'\n                    },\n                    'limits': {\n                        'cpu': '100m',\n                        'memory': '150Mi',\n                    },\n                }, enabled=not args.no_resource_limit),\n            },\n            'grafana': {\n                'enabled': True,\n                'adminPassword': 'grafana123',\n                'resources': ValueData(value={\n                    'requests': {\n                        'cpu': '50m',\n                        'memory': '100Mi'\n                    },\n                    'limits': {\n                        'cpu': '100m',\n                        'memory': '128Mi',\n                    },\n                }, enabled=not args.no_resource_limit),\n            },\n            'prometheusOperator': {\n                'enabled': True,\n                'resources': ValueData(value={\n                    'requests': {\n                        'cpu': '50m',\n                        'memory': '50Mi'\n                    },\n                    'limits': {\n                        'cpu': '120m',\n                        'memory': '120Mi'\n                    },\n                }, enabled=not args.no_resource_limit),\n            },\n            'kube-state-metrics': {\n                'resources': ValueData(value={\n                    'requests': {\n                        'cpu': '10m',\n                        'memory': '32Mi',\n                    },\n                    'limits': {\n                        'cpu': '100m',\n                        'memory': '64Mi',\n                    }\n                }, enabled=not args.no_resource_limit),\n            },\n            'prometheus-node-exporter': {\n                'resources': ValueData(value={\n                    'requests': {\n                        'cpu': '150m',\n                        'memory': '150Mi',\n                    },\n                    'limits': {\n                        'cpu': '200m',\n                        'memory': '200Mi'\n                    },\n                }, enabled=not args.no_resource_limit),\n            },\n            'prometheus': {\n                'service': {\n                    'port': 80,\n                },\n                'prometheusSpec': {\n                    'containers': [{\n                        'name': 'prometheus',\n                        'readinessProbe': {\n                            'initialDelaySeconds': 30,\n                            'periodSeconds': 30,\n                            'timeoutSeconds': 8,\n                        },\n                    }],\n                    'resources': ValueData(value={\n                        'requests': {\n                            'cpu': '150m',\n                            'memory': '350Mi'\n                        },\n                        'limits': {\n                            'cpu': '300m',\n                            'memory': '800Mi'\n                        },\n                    }, enabled=not args.no_resource_limit),\n                    'storageSpec': {\n                        'volumeClaimTemplate': {\n                            'spec': pv_volumes.build_claim(pvc_volumes, pvc_prometheus_files)['spec'],\n                        },\n                    }\n                }\n            },\n            'coreDns': {\n                'enabled': args.provider != 'google-gke',\n            },\n            'kubeDns': {\n                'enabled': args.provider == 'google-gke',\n            },\n        }))\n\n    prometheus_helmchart = helmreq.generate().process(helm_default_processor).split(\n        ListSplitter({\n            'crd': helm_splitter_crd,\n            'config': helm_splitter_config,\n            'job': helm_splitter_job,\n            'service': helm_splitter_service,\n        }, exactly_one_category=True))\n\n    #\n    # OUTPUTFILE: prometheus-crd.yaml\n    #\n    file = OutputFile_Kubernetes('prometheus-crd.yaml')\n    out.append(file)\n\n    file.append(prometheus_helmchart['crd'].data)\n\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: prometheus-config.yaml\n    #\n    file = OutputFile_Kubernetes('prometheus-config.yaml')\n    out.append(file)\n\n    file.append(prometheus_helmchart['config'].data)\n\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: prometheus-job.yaml\n    #\n    file = OutputFile_Kubernetes('prometheus-job.yaml')\n    out.append(file)\n\n    file.append(prometheus_helmchart['job'].data)\n\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: prometheus.yaml\n    #\n    file = OutputFile_Kubernetes('prometheus.yaml')\n    out.append(file)\n\n    file.append(prometheus_helmchart['service'].data)\n\n    file.append([{\n        'apiVersion': 'traefik.containo.us/v1alpha1',\n        'kind': 'IngressRoute',\n        'metadata': {\n            'name': 'admin-prometheus',\n            'namespace': 'monitoring',\n        },\n        'spec': {\n            'entryPoints': ['web'],\n            'routes': [{\n                'match': f'Host(`admin-prometheus.localdomain`)',\n                'kind': 'Rule',\n                'services': [{\n                    'name': 'kube-prometheus-stack-prometheus',\n                    'namespace': 'monitoring',\n                    'port': 80,\n                }],\n            }]\n        }\n    }, {\n        'apiVersion': 'traefik.containo.us/v1alpha1',\n        'kind': 'IngressRoute',\n        'metadata': {\n            'name': 'admin-grafana',\n            'namespace': 'monitoring',\n        },\n        'spec': {\n            'entryPoints': ['web'],\n            'routes': [{\n                'match': f'Host(`admin-grafana.localdomain`)',\n                'kind': 'Rule',\n                'services': [{\n                    'name': 'kube-prometheus-stack-grafana',\n                    'namespace': 'monitoring',\n                    'port': 80,\n                }],\n            }]\n        }\n    }])\n\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: http-echo.yaml\n    #\n    file = OutputFile_Kubernetes('http-echo.yaml')\n    out.append(file)\n\n    file.append([{\n        'apiVersion': 'apps/v1',\n        'kind': 'Deployment',\n        'metadata': {\n            'name': 'echo-deployment',\n            'namespace': 'default',\n            'labels': {\n                'app': 'echo'\n            }\n        },\n        'spec': {\n            'replicas': 1,\n            'selector': {\n                'matchLabels': {\n                    'app': 'echo'\n                }\n            },\n            'template': {\n                'metadata': {\n                    'labels': {\n                        'app': 'echo'\n                    }\n                },\n                'spec': {\n                    'containers': [{\n                        'name': 'echo',\n                        'image': 'mendhak/http-https-echo',\n                        'ports': [{\n                            'containerPort': 80\n                        },\n                        {\n                            'containerPort': 443\n                        }],\n                    }]\n                }\n            }\n        }\n    },\n    {\n        'apiVersion': 'v1',\n        'kind': 'Service',\n        'metadata': {\n            'name': 'echo-service',\n            'namespace': 'default',\n        },\n        'spec': {\n            'selector': {\n                'app': 'echo'\n            },\n            'ports': [{\n                'name': 'http',\n                'port': 80,\n                'targetPort': 80,\n                'protocol': 'TCP'\n            }]\n        }\n    }, {\n        'apiVersion': 'traefik.containo.us/v1alpha1',\n        'kind': 'IngressRoute',\n        'metadata': {\n            'name': 'http-echo',\n            'namespace': 'default',\n        },\n        'spec': {\n            'entryPoints': ['web'],\n            'routes': [{\n                # 'match': f'Host(`http-echo.localdomain`)',\n                'match': f'PathPrefix(`/`)',\n                'kind': 'Rule',\n                'services': [{\n                    'name': 'echo-service',\n                    'port': 80,\n                }],\n            }]\n        }\n    }])\n\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: traefik.yaml\n    #\n    file = OutputFile_Kubernetes('traefik.yaml')\n\n    file.append(traefik_helmchart['service'].data)\n\n    file.append({\n        'apiVersion': 'traefik.containo.us/v1alpha1',\n        'kind': 'IngressRoute',\n        'metadata': {\n            'name': 'admin-traefik',\n            'namespace': 'monitoring',\n        },\n        'spec': {\n            'entryPoints': ['web'],\n            'routes': [{\n                'match': f'Host(`admin-traefik.localdomain`)',\n                'kind': 'Rule',\n                'services': [{\n                    'name': 'traefik-router',\n                    'port': 8080,\n                }],\n            }]\n        }\n    })\n\n    file.append({\n        'apiVersion': 'monitoring.coreos.com/v1',\n        'kind': 'ServiceMonitor',\n        'metadata': {\n            'name': 'traefik',\n            'namespace': 'monitoring',\n            'labels': {\n                'release': 'kube-prometheus-stack',\n            },\n        },\n        'spec': {\n            'selector': {\n                'matchLabels': {\n                    'app.kubernetes.io/name': 'traefik',\n                    'app.kubernetes.io/instance': 'traefik-router',\n                },\n            },\n            'namespaceSelector': {\n                'matchNames': ['monitoring']\n            },\n            'endpoints': [{\n                'port': 'metrics',\n                'path': '/metrics',\n            }],\n        },\n    })\n\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUTFILE: ingress.yaml\n    #\n    file = OutputFile_Kubernetes('ingress.yaml')\n    http_path = '/'\n    if args.provider != 'k3d':\n        http_path = '/*'\n\n    ingress_chart = Chart(data=[\n        {\n            'apiVersion': 'extensions/v1beta1',\n            'kind': 'Ingress',\n            'metadata': {\n                'name': 'ingress',\n                'namespace': 'monitoring',\n            },\n            'spec': {\n                'rules': [{\n                    'http': {\n                        'paths': [{\n                            'path': http_path,\n                            'backend': {\n                                'serviceName': 'traefik-router',\n                                'servicePort': 80,\n                            }\n                        }]\n                    }\n                }]\n            }\n        },\n    ])\n\n    if args.provider == 'amazon-eks':\n        ingress_chart = ingress_chart.process(DefaultProcessor(jsonpatches=[{\n            'condition': [\n                {'op': 'check', 'path': '/kind', 'cmp': 'equals', 'value': 'Ingress'},\n            ],\n            'patch': [\n                {'op': 'merge', 'path': '/metadata', 'value': {'annotations': {\n                    'kubernetes.io/ingress.class': 'alb',\n                    'alb.ingress.kubernetes.io/scheme': 'internet-facing',\n                    'alb.ingress.kubernetes.io/listen-ports': '[{\"HTTP\": 80}]',\n                }}}\n            ]\n        }]))\n\n    file.append(ingress_chart.data)\n\n    out.append(file)\n    shell_script.append(OD_FileTemplate(f'kubectl apply -f ${{FILE_{file.fileid}}}'))\n\n    #\n    # OUTPUT\n    #\n    output_path = os.path.join(args.output_path, '{}-{}'.format(\n        args.provider, datetime.datetime.today().strftime(\"%Y%m%d-%H%M%S\")))\n    print('Saving files to {}'.format(output_path))\n    if not os.path.exists(output_path):\n        os.makedirs(output_path)\n\n    out.output(OutputDriver_Directory(output_path))\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\nOutput:\n\n```text\n****** BEGIN FILE: 001-namespace.yaml ********\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: monitoring\n\n****** END FILE: 001-namespace.yaml ********\n****** BEGIN FILE: 002-storage.yaml ********\napiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: prometheus-storage\n  labels:\n    pv.role: prometheus\nspec:\n  hostPath:\n    path: /var/storage/prometheus\n  persistentVolumeReclaimPolicy: Retain\n  capacity:\n    storage: 50Gi\n  accessModes:\n  - ReadWriteOnce\n\n****** END FILE: 002-storage.yaml ********\n****** BEGIN FILE: 003-traefik-config-crd.yaml ********\napiVersion: apiextensions.k8s.io/v1beta1\nkind: CustomResourceDefinition\nmetadata:\n  name: ingressroutes.traefik.containo.us\nspec:\n  group: traefik.containo.us\n  version: v1alpha1\n  names:\n    kind: IngressRoute\n    plural: ingressroutes\n    singular: ingressroute\n  scope: Namespaced\n---\napiVersion: apiextensions.k8s.io/v1beta1\nkind: CustomResourceDefinition\nmetadata:\n<...more...>\n\n****** END FILE: 003-traefik-config-crd.yaml ********\n****** BEGIN FILE: 004-traefik-config.yaml ********\nkind: ServiceAccount\napiVersion: v1\nmetadata:\n  name: traefik-router\n  labels:\n    app.kubernetes.io/name: traefik\n    app.kubernetes.io/instance: traefik-router\n  namespace: monitoring\n---\nkind: ClusterRole\napiVersion: rbac.authorization.k8s.io/v1\nmetadata:\n  name: traefik-router\n<...more...>\n****** END FILE: 004-traefik-config.yaml ********\n****** BEGIN FILE: 005-prometheus-crd.yaml ********\napiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  annotations:\n    controller-gen.kubebuilder.io/version: v0.2.4\n  creationTimestamp: null\n  name: alertmanagerconfigs.monitoring.coreos.com\nspec:\n  group: monitoring.coreos.com\n  names:\n    kind: AlertmanagerConfig\n    listKind: AlertmanagerConfigList\n    plural: alertmanagerconfigs\n    singular: alertmanagerconfig\n  scope: Namespaced\n<...more...>\n****** END FILE: 005-prometheus-crd.yaml ********\n****** BEGIN FILE: 006-prometheus-config.yaml ********\napiVersion: policy/v1beta1\nkind: PodSecurityPolicy\nmetadata:\n  name: kube-prometheus-stack-grafana\n  namespace: monitoring\n  labels:\n    app.kubernetes.io/name: grafana\n    app.kubernetes.io/instance: kube-prometheus-stack\n    app.kubernetes.io/version: 7.2.1\n  annotations:\n    seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default,runtime/default\n    seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default\n    apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default\n    apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default\nspec:\n  privileged: false\n  allowPrivilegeEscalation: false\n  requiredDropCapabilities:\n  - FOWNER\n  - FSETID\n  - KILL\n  - SETGID\n  - SETUID\n  - SETPCAP\n  - NET_BIND_SERVICE\n  - NET_RAW\n  - SYS_CHROOT\n  - MKNOD\n  - AUDIT_WRITE\n  - SETFCAP\n<...more...>\n\n****** END FILE: 006-prometheus-config.yaml ********\n****** BEGIN FILE: 007-prometheus-job.yaml ********\napiVersion: batch/v1\nkind: Job\nmetadata:\n  name: kube-prometheus-stack-admission-create\n  namespace: monitoring\n  annotations:\n    helm.sh/hook: pre-install,pre-upgrade\n    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded\n  labels:\n    app: kube-prometheus-stack-admission-create\n    chart: kube-prometheus-stack-12.2.3\n    release: kube-prometheus-stack\nspec:\n  template:\n    metadata:\n      name: kube-prometheus-stack-admission-create\n      labels:\n        app: kube-prometheus-stack-admission-create\n        chart: kube-prometheus-stack-12.2.3\n        release: kube-prometheus-stack\n        heritage: Helm\n    spec:\n      containers:\n      - name: create\n        image: jettech/kube-webhook-certgen:v1.5.0\n        imagePullPolicy: IfNotPresent\n        args:\n        - create\n        - --host=kube-prometheus-stack-operator,kube-prometheus-stack-operator.monitoring.svc\n        - --namespace=monitoring\n        - --secret-name=kube-prometheus-stack-admission\n        resources: {}\n      restartPolicy: OnFailure\n      serviceAccountName: kube-prometheus-stack-admission\n      securityContext:\n        runAsGroup: 2000\n        runAsNonRoot: true\n        runAsUser: 2000\n---\napiVersion: batch/v1\nkind: Job\nmetadata:\n  name: kube-prometheus-stack-admission-patch\n  namespace: monitoring\n  annotations:\n    helm.sh/hook: post-install,post-upgrade\n    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded\n  labels:\n    app: kube-prometheus-stack-admission-patch\n    chart: kube-prometheus-stack-12.2.3\n    release: kube-prometheus-stack\nspec:\n  template:\n    metadata:\n      name: kube-prometheus-stack-admission-patch\n      labels:\n        app: kube-prometheus-stack-admission-patch\n        chart: kube-prometheus-stack-12.2.3\n        release: kube-prometheus-stack\n        heritage: Helm\n    spec:\n      containers:\n      - name: patch\n        image: jettech/kube-webhook-certgen:v1.5.0\n        imagePullPolicy: IfNotPresent\n        args:\n        - patch\n        - --webhook-name=kube-prometheus-stack-admission\n        - --namespace=monitoring\n        - --secret-name=kube-prometheus-stack-admission\n        - --patch-failure-policy=Fail\n        resources: {}\n      restartPolicy: OnFailure\n      serviceAccountName: kube-prometheus-stack-admission\n      securityContext:\n        runAsGroup: 2000\n        runAsNonRoot: true\n        runAsUser: 2000\n\n****** END FILE: 007-prometheus-job.yaml ********\n****** BEGIN FILE: 008-prometheus.yaml ********\napiVersion: v1\nkind: Service\nmetadata:\n  name: kube-prometheus-stack-grafana\n  namespace: monitoring\n  labels:\n    app.kubernetes.io/name: grafana\n    app.kubernetes.io/instance: kube-prometheus-stack\n    app.kubernetes.io/version: 7.2.1\nspec:\n  type: ClusterIP\n  ports:\n  - name: service\n    port: 80\n    protocol: TCP\n    targetPort: 3000\n  selector:\n    app.kubernetes.io/name: grafana\n    app.kubernetes.io/instance: kube-prometheus-stack\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: kube-prometheus-stack-kube-state-metrics\n  namespace: monitoring\n  labels:\n    app.kubernetes.io/name: kube-state-metrics\n    app.kubernetes.io/instance: kube-prometheus-stack\n  annotations:\n    prometheus.io/scrape: 'true'\nspec:\n  type: ClusterIP\n  ports:\n  - name: http\n    protocol: TCP\n    port: 8080\n    targetPort: 8080\n<...more...>\n****** END FILE: 008-prometheus.yaml ********\n****** BEGIN FILE: 009-http-echo.yaml ********\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: echo-deployment\n  namespace: default\n  labels:\n    app: echo\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: echo\n  template:\n    metadata:\n      labels:\n        app: echo\n    spec:\n      containers:\n      - name: echo\n        image: mendhak/http-https-echo\n        ports:\n        - containerPort: 80\n        - containerPort: 443\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: echo-service\n  namespace: default\nspec:\n  selector:\n    app: echo\n  ports:\n  - name: http\n    port: 80\n    targetPort: 80\n    protocol: TCP\n---\napiVersion: traefik.containo.us/v1alpha1\nkind: IngressRoute\nmetadata:\n  name: http-echo\n  namespace: default\nspec:\n  entryPoints:\n  - web\n  routes:\n  - match: PathPrefix(`/`)\n    kind: Rule\n    services:\n    - name: echo-service\n      port: 80\n\n****** END FILE: 009-http-echo.yaml ********\n****** BEGIN FILE: 010-traefik.yaml ********\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: traefik-router\n  labels:\n    app.kubernetes.io/name: traefik\n    app.kubernetes.io/instance: traefik-router\n  namespace: monitoring\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app.kubernetes.io/name: traefik\n      app.kubernetes.io/instance: traefik-router\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1\n<...more...>\n\n****** END FILE: 010-traefik.yaml ********\n****** BEGIN FILE: 011-ingress.yaml ********\napiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: ingress\n  namespace: monitoring\nspec:\n  rules:\n  - http:\n      paths:\n      - path: /\n        backend:\n          serviceName: traefik-router\n          servicePort: 80\n\n****** END FILE: 011-ingress.yaml ********\n****** BEGIN FILE: create_k3d.sh ********\n#!/bin/bash\n\nset -e\n# k3d cluster create kg2sample-prometheus-stack --port 5051:80@loadbalancer --port 5052:443@loadbalancer -v /tmp/kubragen2_samples/prometheus_stack/output/storage:/var/storage\nkubectl apply -f 001-namespace.yaml\nkubectl apply -f 002-storage.yaml\nkubectl apply -f 003-traefik-config-crd.yaml\nkubectl apply -f 004-traefik-config.yaml\nkubectl apply -f 005-prometheus-crd.yaml\nkubectl apply -f 006-prometheus-config.yaml\nkubectl apply -f 007-prometheus-job.yaml\nkubectl apply -f 008-prometheus.yaml\nkubectl apply -f 009-http-echo.yaml\nkubectl apply -f 010-traefik.yaml\nkubectl apply -f 011-ingress.yaml\n\n****** END FILE: create_k3d.sh ********\n```\n\n## Author\n\nRangel Reale (rangelreale@gmail.com)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/RangelReale/kubragen2",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "kubragen2",
+    "package_url": "https://pypi.org/project/kubragen2/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/kubragen2/",
+    "project_urls": {
+      "Homepage": "https://github.com/RangelReale/kubragen2"
+    },
+    "release_url": "https://pypi.org/project/kubragen2/0.8.7/",
+    "requires_dist": [
+      "PyYAML (>=5.3.1)",
+      "requests (>=2.24.0)",
+      "jsonpatchext (>=1.37)",
+      "deepmerge (>=0.1)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "KubraGen2: programmatic Kubernetes YAML generator",
+    "version": "0.8.7",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8793191,
+  "releases": {
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8571fb2107dd5db6caff58ccc396fad4cc69627d1e727f4903f4fe7e66c566c0",
+          "md5": "15c2382162763f430447f2928cefe67a",
+          "sha256": "57c5479fe530eca34629470fed5a3dea4dabe83640b12f9f8d6f79189e8cf822"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "15c2382162763f430447f2928cefe67a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18668,
+        "upload_time": "2020-11-26T14:18:38",
+        "upload_time_iso_8601": "2020-11-26T14:18:38.675508Z",
+        "url": "https://files.pythonhosted.org/packages/85/71/fb2107dd5db6caff58ccc396fad4cc69627d1e727f4903f4fe7e66c566c0/kubragen2-0.8.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48750ead589322164251d1e7266add4873a72d913d65d2e4c38eb7aa9b8d4ac0",
+          "md5": "3233caf0a99d9208102d74ecd589b70b",
+          "sha256": "f274255ad223c5792434e9b5dddfd0881697c6de575a43ea69db2dfe435ba03a"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3233caf0a99d9208102d74ecd589b70b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 13341,
+        "upload_time": "2020-11-26T14:18:39",
+        "upload_time_iso_8601": "2020-11-26T14:18:39.825770Z",
+        "url": "https://files.pythonhosted.org/packages/48/75/0ead589322164251d1e7266add4873a72d913d65d2e4c38eb7aa9b8d4ac0/kubragen2-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bdaef067e8d18b29bc7c3a61cdacf86cc5805f6901a2b2d9d91d5240ad7c967",
+          "md5": "06618a7af09c59ff46626925d072c11a",
+          "sha256": "d6c6a64acfcff7772c29ad3e2619e2f3cb368b36a3579ae92e1217420fa983e5"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06618a7af09c59ff46626925d072c11a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18670,
+        "upload_time": "2020-11-26T14:31:38",
+        "upload_time_iso_8601": "2020-11-26T14:31:38.801350Z",
+        "url": "https://files.pythonhosted.org/packages/5b/da/ef067e8d18b29bc7c3a61cdacf86cc5805f6901a2b2d9d91d5240ad7c967/kubragen2-0.8.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f26868ed84779006eb01cea91d0cf68c77e962acf6a441aff2617d23aad27d65",
+          "md5": "c7fc31e6a110b73a66edd41f1b0e74ff",
+          "sha256": "1b2e7fd7c008d86e82583e3a92454de36ee9d99ac170430874ac294f3155d14a"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c7fc31e6a110b73a66edd41f1b0e74ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 13347,
+        "upload_time": "2020-11-26T14:31:40",
+        "upload_time_iso_8601": "2020-11-26T14:31:40.208158Z",
+        "url": "https://files.pythonhosted.org/packages/f2/68/68ed84779006eb01cea91d0cf68c77e962acf6a441aff2617d23aad27d65/kubragen2-0.8.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d08983cb1ceb4d31253a88a24b301523c891e031373e33b4eb7826c8bed80bc",
+          "md5": "9be243c17c0a3eead26079c2fd7d9a44",
+          "sha256": "f346cfdab4563e30e422126e8d28401e3d495f8d2762492312ad3b9dd1e35a5e"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9be243c17c0a3eead26079c2fd7d9a44",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19286,
+        "upload_time": "2020-11-27T14:49:05",
+        "upload_time_iso_8601": "2020-11-27T14:49:05.464178Z",
+        "url": "https://files.pythonhosted.org/packages/8d/08/983cb1ceb4d31253a88a24b301523c891e031373e33b4eb7826c8bed80bc/kubragen2-0.8.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "279ae350fe7e8cce2f46e37801d9f3ecc72362bc7da831a52ce3ec810d26c7c5",
+          "md5": "0f5145aa181d646258841a7f87a20068",
+          "sha256": "fcc2b2ab945a7ed800a3c867f2edd0d0e53cdaa383694750d9ef7c3de56d6c9e"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f5145aa181d646258841a7f87a20068",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 14182,
+        "upload_time": "2020-11-27T14:49:06",
+        "upload_time_iso_8601": "2020-11-27T14:49:06.679373Z",
+        "url": "https://files.pythonhosted.org/packages/27/9a/e350fe7e8cce2f46e37801d9f3ecc72362bc7da831a52ce3ec810d26c7c5/kubragen2-0.8.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a1d8b04a04e753f8766a62685c3556dd039fbde4840303a7fa5fd27630e7847c",
+          "md5": "d20636a3bbe63bbc4135b2fb0462888a",
+          "sha256": "d5610288313982115441321cb40e2ef9aeb9e6020c3e5d6245e9a4172ee201ed"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d20636a3bbe63bbc4135b2fb0462888a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22211,
+        "upload_time": "2020-11-27T14:57:23",
+        "upload_time_iso_8601": "2020-11-27T14:57:23.194812Z",
+        "url": "https://files.pythonhosted.org/packages/a1/d8/b04a04e753f8766a62685c3556dd039fbde4840303a7fa5fd27630e7847c/kubragen2-0.8.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "25555f61865a89caa7545454e16203edf995bd60ef8cdd6d1de860ed403c32fa",
+          "md5": "681c3497dfd62215ab954fa96e024e3a",
+          "sha256": "c58bc2fccd44249ef7fd7ed5d09f4690e5c324ad54bd2f4f5436b0ef71087029"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "681c3497dfd62215ab954fa96e024e3a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 15519,
+        "upload_time": "2020-11-27T14:57:24",
+        "upload_time_iso_8601": "2020-11-27T14:57:24.507417Z",
+        "url": "https://files.pythonhosted.org/packages/25/55/5f61865a89caa7545454e16203edf995bd60ef8cdd6d1de860ed403c32fa/kubragen2-0.8.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8632d59a68495edd52106afe4e02896cafbf76dcfe751427f107478d84a4238",
+          "md5": "2af31f732b0653dcad7ff7c95ee69577",
+          "sha256": "feff69271fe8e95930c76a9c93fc3bd87dead444d32506d76d4cd659d97f5246"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2af31f732b0653dcad7ff7c95ee69577",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 30310,
+        "upload_time": "2020-11-30T20:36:27",
+        "upload_time_iso_8601": "2020-11-30T20:36:27.581306Z",
+        "url": "https://files.pythonhosted.org/packages/a8/63/2d59a68495edd52106afe4e02896cafbf76dcfe751427f107478d84a4238/kubragen2-0.8.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc582e44edee6abdd90803e09faadb54f0e468d3ac0df8da5ca718b020f782df",
+          "md5": "550c5678b8bfe1ae8d00aa0cf51e73c2",
+          "sha256": "f21427d3cec30fda2f646ce2133c4731ce8814773d2e393420219e06c0593e8b"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "550c5678b8bfe1ae8d00aa0cf51e73c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 33789,
+        "upload_time": "2020-11-30T20:36:29",
+        "upload_time_iso_8601": "2020-11-30T20:36:29.176874Z",
+        "url": "https://files.pythonhosted.org/packages/fc/58/2e44edee6abdd90803e09faadb54f0e468d3ac0df8da5ca718b020f782df/kubragen2-0.8.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a391b143f5e4682fe029a555c393868a6943834d3ac5784987c4f5fa2533780",
+          "md5": "7fdd00e38509c35810d7de8b6fc4c5a2",
+          "sha256": "ba8ad17c8021d8e8cdbc847a30b90948ca61ddce7935183bd842a722d9e84a6a"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7fdd00e38509c35810d7de8b6fc4c5a2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29742,
+        "upload_time": "2020-12-01T14:47:15",
+        "upload_time_iso_8601": "2020-12-01T14:47:15.399595Z",
+        "url": "https://files.pythonhosted.org/packages/2a/39/1b143f5e4682fe029a555c393868a6943834d3ac5784987c4f5fa2533780/kubragen2-0.8.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6711f68fa26dfadae26eca62681bd6113d4232af3bc04cc5693510711ab3877",
+          "md5": "955132d6b78c2f3e4f11b1cccf2be7b1",
+          "sha256": "40990940ceaa310d13b0ee51d9b9a2efbc331cf088caf03bf0ea0817ae2f0f7b"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "955132d6b78c2f3e4f11b1cccf2be7b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 33642,
+        "upload_time": "2020-12-01T14:47:17",
+        "upload_time_iso_8601": "2020-12-01T14:47:17.112612Z",
+        "url": "https://files.pythonhosted.org/packages/a6/71/1f68fa26dfadae26eca62681bd6113d4232af3bc04cc5693510711ab3877/kubragen2-0.8.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4a2c295d058bbd134ec568c4df0e44d1675949f1c36f83e247ddfe94dcab967",
+          "md5": "9ed968a67e43408010541b868cb08f67",
+          "sha256": "23b1a30978d5dc26528dc2bbff6592f48b9fde5ac11aa257b24fb3435b047111"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9ed968a67e43408010541b868cb08f67",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29952,
+        "upload_time": "2020-12-01T19:55:10",
+        "upload_time_iso_8601": "2020-12-01T19:55:10.680556Z",
+        "url": "https://files.pythonhosted.org/packages/c4/a2/c295d058bbd134ec568c4df0e44d1675949f1c36f83e247ddfe94dcab967/kubragen2-0.8.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba7f9bf2c38e47282280268828004db3b1fe2a89e603febb8a8228820aee8432",
+          "md5": "a6655c459776ace3850c0f57e749a3ac",
+          "sha256": "c237857a2d6935dd2189dc84812bd59d01896ba6a5f023c9510479b1fb10a4a5"
+        },
+        "downloads": -1,
+        "filename": "kubragen2-0.8.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a6655c459776ace3850c0f57e749a3ac",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 33814,
+        "upload_time": "2020-12-01T19:55:12",
+        "upload_time_iso_8601": "2020-12-01T19:55:12.413249Z",
+        "url": "https://files.pythonhosted.org/packages/ba/7f/9bf2c38e47282280268828004db3b1fe2a89e603febb8a8228820aee8432/kubragen2-0.8.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c4a2c295d058bbd134ec568c4df0e44d1675949f1c36f83e247ddfe94dcab967",
+        "md5": "9ed968a67e43408010541b868cb08f67",
+        "sha256": "23b1a30978d5dc26528dc2bbff6592f48b9fde5ac11aa257b24fb3435b047111"
+      },
+      "downloads": -1,
+      "filename": "kubragen2-0.8.7-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "9ed968a67e43408010541b868cb08f67",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 29952,
+      "upload_time": "2020-12-01T19:55:10",
+      "upload_time_iso_8601": "2020-12-01T19:55:10.680556Z",
+      "url": "https://files.pythonhosted.org/packages/c4/a2/c295d058bbd134ec568c4df0e44d1675949f1c36f83e247ddfe94dcab967/kubragen2-0.8.7-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ba7f9bf2c38e47282280268828004db3b1fe2a89e603febb8a8228820aee8432",
+        "md5": "a6655c459776ace3850c0f57e749a3ac",
+        "sha256": "c237857a2d6935dd2189dc84812bd59d01896ba6a5f023c9510479b1fb10a4a5"
+      },
+      "downloads": -1,
+      "filename": "kubragen2-0.8.7.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a6655c459776ace3850c0f57e749a3ac",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 33814,
+      "upload_time": "2020-12-01T19:55:12",
+      "upload_time_iso_8601": "2020-12-01T19:55:12.413249Z",
+      "url": "https://files.pythonhosted.org/packages/ba/7f/9bf2c38e47282280268828004db3b1fe2a89e603febb8a8228820aee8432/kubragen2-0.8.7.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

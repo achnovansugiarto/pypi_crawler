@@ -1,0 +1,249 @@
+{
+  "info": {
+    "author": "DeepMind",
+    "author_email": "kfac-jax-dev@google.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Education",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Mathematics",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# KFAC-JAX - Second Order Optimization with Approximate Curvature in JAX\n\n[**Installation**](#installation)\n| [**Quickstart**](#quickstart)\n| [**Documentation**](https://kfac-jax.readthedocs.io/)\n| [**Examples**](https://github.com/deepmind/kfac-jax/tree/main/examples/)\n| [**Citing KFAC-JAX**](#citing-kfac-jax)\n\n![CI status](https://github.com/deepmind/kfac-jax/workflows/ci/badge.svg)\n![docs](https://readthedocs.org/projects/kfac-jax/badge/?version=latest)\n![pypi](https://img.shields.io/pypi/v/kfac-jax)\n\nKFAC-JAX is a library built on top of [JAX] for second-order optimization of \nneural networks and for computing scalable curvature approximations.\nThe main goal of the library is to provide researchers with an easy-to-use \nimplementation of the [K-FAC] optimizer and curvature estimator.\n\n## Installation<a id=\"installation\"></a>\n\nKFAC-JAX is written in pure Python, but depends on C++ code via JAX.\n\nFirst, follow [these instructions](https://github.com/google/jax#installation)\nto install JAX with the relevant accelerator support.\n\nThen, install KFAC-JAX using pip:\n\n```bash\n$ pip install git+https://github.com/deepmind/kfac-jax\n```\n\nAlternatively, you can install via PyPI:\n\n```bash\n$ pip install -U kfac-jax\n```\n\nOur examples rely on additional libraries, all of which you can install using:\n\n```bash\n$ pip install -r requirements_examples.txt\n```\n\n## Quickstart<a id=\"quickstart\"></a>\n\nLet's take a look at a simple example of training a neural network, defined \nusing [Haiku], with the K-FAC optimizer:\n\n```python\nimport haiku as hk\nimport jax\nimport jax.numpy as jnp\nimport kfac_jax\n\n# Hyper parameters\nNUM_CLASSES = 10\nL2_REG = 1e-3\nNUM_BATCHES = 100\n\n\ndef make_dataset_iterator(batch_size):\n  # Dummy dataset, in practice this should be your dataset pipeline\n  for _ in range(NUM_BATCHES):\n    yield jnp.zeros([batch_size, 100]), jnp.ones([batch_size], dtype=\"int32\") \n\n\ndef softmax_cross_entropy(logits: jnp.ndarray, targets: jnp.ndarray):\n  \"\"\"Softmax cross entropy loss.\"\"\"\n  # We assume integer labels\n  assert logits.ndim == targets.ndim + 1\n  \n  # Tell KFAC-JAX this model represents a classifier\n  # See https://kfac-jax.readthedocs.io/en/latest/overview.html#supported-losses\n  kfac_jax.register_softmax_cross_entropy_loss(logits, targets)\n  log_p = jax.nn.log_softmax(logits, axis=-1)\n  return - jax.vmap(lambda x, y: x[y])(log_p, targets)\n\n\ndef model_fn(x):\n  \"\"\"A Haiku MLP model function - three hidden layer network with tanh.\"\"\"\n  return hk.nets.MLP(\n    output_sizes=(50, 50, 50, NUM_CLASSES),\n    with_bias=True,\n    activation=jax.nn.tanh,\n  )(x)\n\n\n# The Haiku transformed model\nhk_model = hk.without_apply_rng(hk.transform(model_fn))\n\n\ndef loss_fn(model_params, model_batch):\n  \"\"\"The loss function to optimize.\"\"\"\n  x, y = model_batch\n  logits = hk_model.apply(model_params, x)\n  loss = jnp.mean(softmax_cross_entropy(logits, y))\n  \n  # The optimizer assumes that the function you provide has already added\n  # the L2 regularizer to its gradients.\n  return loss + L2_REG * kfac_jax.utils.inner_product(params, params) / 2.0\n\n\n# Create the optimizer\noptimizer = kfac_jax.Optimizer(\n  value_and_grad_func=jax.value_and_grad(loss_fn),\n  l2_reg=L2_REG,\n  value_func_has_aux=False,\n  value_func_has_state=False,\n  value_func_has_rng=False,\n  use_adaptive_learning_rate=True,\n  use_adaptive_momentum=True,\n  use_adaptive_damping=True,\n  initial_damping=1.0,\n  multi_device=False,\n)\n\ninput_dataset = make_dataset_iterator(128)\nrng = jax.random.PRNGKey(42)\ndummy_images, dummy_labels = next(input_dataset)\nrng, key = jax.random.split(rng)\nparams = hk_model.init(key, dummy_images)\nrng, key = jax.random.split(rng)\nopt_state = optimizer.init(params, key, (dummy_images, dummy_labels))\n\n# Training loop\nfor i, batch in enumerate(input_dataset):\n  rng, key = jax.random.split(rng)\n  params, opt_state, stats = optimizer.step(\n      params, opt_state, key, batch=batch, global_step_int=i)\n  print(i, stats)\n```\n\n### Do not stage (``jit`` or ``pmap``) the optimizer\n\nYou should not apply `jax.jit` or `jax.pmap` to the call to `Optimizer.step`.\nThis is already done for you automatically by the optimizer class.\nTo control the staging behaviour of the optimizer set the flag ``multi_device``\nto ``True`` for ``pmap`` and to ``False`` for ``jit``.\n \n### Do not stage (``jit`` or ``pmap``) the loss function\n\nThe ``value_and_grad_func`` argument provided to the optimizer should compute \nthe loss function value and its gradients. Since the optimizer already stages \nits step function internally, applying ``jax.jit`` to ``value_and_grad_func`` is\n**NOT** recommended.\nImportantly, applying ``jax.pmap`` is **WRONG** and most likely will lead to\nerrors.\n\n### Registering the model loss function\n\nIn order for KFAC-JAX to be able to correctly approximate the curvature matrix\nof the model it needs to know the precise loss function that you want to\noptimize. \nThis is done via registration with certain functions provided by the library.\nFor instance, in the example above this is done via the call to \n``kfac_jax.register_softmax_cross_entropy_loss``, which tells the optimizer that \nthe loss is the standard softmax cross-entropy.\nIf you don't do this you will get an error when you try to call the optimizer. \nFor all supported loss functions please read the [documentation].\n\n``Important:`` The optimizer assumes that the loss is averaged over examples in \nthe minibatch. It is crucial that you follow this convention.\n\n### Other model function options\n\nOftentimes, one will want to output some auxiliary statistics or metrics in \naddition to the loss value.\nThis can already be done in the ``value_and_grad_func``, in which case we follow\nthe same conventions as JAX and expect the output to be ``(loss, aux), grads``. \nSimilarly, the loss function can take an additional function state (batch norm \nlayers usually have this) or an PRNG key (used in stochastic layers). All of\nthese, however, need to be explicitly told to the optimizer via its arguments\n``value_func_has_aux``, ``value_func_has_state`` and ``value_func_has_rng``.\n\n### Verify optimizer registrations\n\nWe strongly encourage the user to pay attention to the logging messages produced \nby the automatic registration system, in order to ensure that it has correctly \nunderstood your model. \nFor the example above this looks like this:\n\n```python\n==================================================\nGraph parameter registrations:\n{'mlp/~/linear_0': {'b': 'Auto[dense_with_bias_3]',\n                    'w': 'Auto[dense_with_bias_3]'},\n 'mlp/~/linear_1': {'b': 'Auto[dense_with_bias_2]',\n                    'w': 'Auto[dense_with_bias_2]'},\n 'mlp/~/linear_2': {'b': 'Auto[dense_with_bias_1]',\n                    'w': 'Auto[dense_with_bias_1]'},\n 'mlp/~/linear_3': {'b': 'Auto[dense_with_bias_0]',\n                    'w': 'Auto[dense_with_bias_0]'}}\n==================================================\n```\n\nAs can be seen from this message, the library has correctly detected all\nparameters of the model to be part of dense layers.\n\n### Further reading\nFor a high level overview of the optimizer, the different curvature \napproximations, and the supported layers, please see the [documentation].\n\n## Citing KFAC-JAX<a id=\"citing-kfac-jax\"></a>\n\nTo cite this repository:\n\n```\n@software{kfac-jax2022github,\n  author = {Aleksandar Botev and James Martens},\n  title = {{KFAC-JAX}},\n  url = {http://github.com/deepmind/kfac-jax},\n  version = {0.0.2},\n  year = {2022},\n}\n```\n\nIn this bibtex entry, the version number is intended to be from\n[`kfac_jax/__init__.py`](https://github.com/deepmind/kfac-jax/blob/main/kfac_jax/__init__.py),\nand the year corresponds to the project's open-source release.\n\n\n[K-FAC]: https://arxiv.org/abs/1503.05671\n[JAX]: https://github.com/google/jax\n[Haiku]: https://github.com/deepmind/dm-haiku\n[documentation]: https://kfac-jax.readthedocs.io/\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/deepmind/kfac-jax",
+    "keywords": "",
+    "license": "Apache 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "kfac-jax",
+    "package_url": "https://pypi.org/project/kfac-jax/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/kfac-jax/",
+    "project_urls": {
+      "Homepage": "https://github.com/deepmind/kfac-jax"
+    },
+    "release_url": "https://pypi.org/project/kfac-jax/0.0.3/",
+    "requires_dist": [
+      "absl-py (>=0.12.0)",
+      "immutabledict (>=2.2.1)",
+      "numpy (>=1.19.5)",
+      "distrax (>=0.1.2)",
+      "chex (>=0.1.3)",
+      "jax (>=0.3.17)",
+      "jaxlib (>=0.3.15)",
+      "dm-tree (>=0.1.7)",
+      "pytest-xdist ; extra == 'tests'",
+      "absl-py (==0.12.0) ; extra == 'tests'",
+      "immutabledict (==2.2.1) ; extra == 'tests'",
+      "numpy (==1.20) ; extra == 'tests'",
+      "distrax (==0.1.2) ; extra == 'tests'",
+      "chex (==0.1.3) ; extra == 'tests'",
+      "jax (==0.3.17) ; extra == 'tests'",
+      "jaxlib (==0.3.15) ; extra == 'tests'",
+      "dm-haiku (==0.0.7) ; extra == 'tests'",
+      "dm-tree (==0.1.7) ; extra == 'tests'"
+    ],
+    "requires_python": "",
+    "summary": "A Jax package for approximate curvature estimation and optimization using KFAC.",
+    "version": "0.0.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15194217,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f062caf84a2c9f603c032e2951460c339c2f2ccfa7bb564d2db0edd7019621f5",
+          "md5": "2cbb26aefccd1830def2d1a6eed6492e",
+          "sha256": "09739148e4c3e1b169dbcc26923da4dc121150fb9a4c610afc3db2150e430778"
+        },
+        "downloads": -1,
+        "filename": "kfac_jax-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2cbb26aefccd1830def2d1a6eed6492e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 117707,
+        "upload_time": "2022-04-01T23:04:04",
+        "upload_time_iso_8601": "2022-04-01T23:04:04.777900Z",
+        "url": "https://files.pythonhosted.org/packages/f0/62/caf84a2c9f603c032e2951460c339c2f2ccfa7bb564d2db0edd7019621f5/kfac_jax-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2739b7610563239a06e88ef8c105cc6422a9515fb7a3cb2d7d4cecb5b142151a",
+          "md5": "82694a461612dd91db936620f9d10778",
+          "sha256": "b93e1c063126c85e901571f542976c741a0d1d323b7bfc93e69d001ed3167125"
+        },
+        "downloads": -1,
+        "filename": "kfac-jax-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "82694a461612dd91db936620f9d10778",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 106759,
+        "upload_time": "2022-04-01T23:04:07",
+        "upload_time_iso_8601": "2022-04-01T23:04:07.110301Z",
+        "url": "https://files.pythonhosted.org/packages/27/39/b7610563239a06e88ef8c105cc6422a9515fb7a3cb2d7d4cecb5b142151a/kfac-jax-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4511d0a3ba266dcc4451a27c540d324b637ef040d9765f193676e820c7601fb2",
+          "md5": "0f57d39c7d66a53e54093d31adb99829",
+          "sha256": "3e62bdebc659e5297bacd05fd2f1e3a19b3b6a60652c86ea6210db932f4e8b23"
+        },
+        "downloads": -1,
+        "filename": "kfac_jax-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0f57d39c7d66a53e54093d31adb99829",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 118212,
+        "upload_time": "2022-06-07T14:35:08",
+        "upload_time_iso_8601": "2022-06-07T14:35:08.768765Z",
+        "url": "https://files.pythonhosted.org/packages/45/11/d0a3ba266dcc4451a27c540d324b637ef040d9765f193676e820c7601fb2/kfac_jax-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "80ab9bf1c8ce848b71b9d22f57d2ead556227842b392333a7517274cf526f370",
+          "md5": "91624207c6d1c3d76661d56ece7f91a9",
+          "sha256": "075d67bd1493e5925512daa8f4546b79d4ba9fdefea3749469611546a40eeb5e"
+        },
+        "downloads": -1,
+        "filename": "kfac-jax-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "91624207c6d1c3d76661d56ece7f91a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 107177,
+        "upload_time": "2022-06-07T14:35:10",
+        "upload_time_iso_8601": "2022-06-07T14:35:10.370801Z",
+        "url": "https://files.pythonhosted.org/packages/80/ab/9bf1c8ce848b71b9d22f57d2ead556227842b392333a7517274cf526f370/kfac-jax-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07b66583edffc096f15576246e615fb4e4f6117313b34c5d139bc33b4640da6a",
+          "md5": "8d6b0c14e1154777f71648d94076f3b3",
+          "sha256": "efe703c74452e569c001efb6af505302d8d3ca864d817864d5e8b425a3f2c862"
+        },
+        "downloads": -1,
+        "filename": "kfac_jax-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8d6b0c14e1154777f71648d94076f3b3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 125726,
+        "upload_time": "2022-09-23T20:12:52",
+        "upload_time_iso_8601": "2022-09-23T20:12:52.448025Z",
+        "url": "https://files.pythonhosted.org/packages/07/b6/6583edffc096f15576246e615fb4e4f6117313b34c5d139bc33b4640da6a/kfac_jax-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8266ae9cc09bc71ce9832760b33c33329849393a7617cf474003f5cd32aeec7b",
+          "md5": "6ba3323195dad1c5abd6d56761735109",
+          "sha256": "70ddcc51275933c81997e19e221963f413ba1e95aed4c6cf9dc3c93744de42af"
+        },
+        "downloads": -1,
+        "filename": "kfac-jax-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ba3323195dad1c5abd6d56761735109",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 114733,
+        "upload_time": "2022-09-23T20:12:54",
+        "upload_time_iso_8601": "2022-09-23T20:12:54.301575Z",
+        "url": "https://files.pythonhosted.org/packages/82/66/ae9cc09bc71ce9832760b33c33329849393a7617cf474003f5cd32aeec7b/kfac-jax-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "07b66583edffc096f15576246e615fb4e4f6117313b34c5d139bc33b4640da6a",
+        "md5": "8d6b0c14e1154777f71648d94076f3b3",
+        "sha256": "efe703c74452e569c001efb6af505302d8d3ca864d817864d5e8b425a3f2c862"
+      },
+      "downloads": -1,
+      "filename": "kfac_jax-0.0.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8d6b0c14e1154777f71648d94076f3b3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 125726,
+      "upload_time": "2022-09-23T20:12:52",
+      "upload_time_iso_8601": "2022-09-23T20:12:52.448025Z",
+      "url": "https://files.pythonhosted.org/packages/07/b6/6583edffc096f15576246e615fb4e4f6117313b34c5d139bc33b4640da6a/kfac_jax-0.0.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8266ae9cc09bc71ce9832760b33c33329849393a7617cf474003f5cd32aeec7b",
+        "md5": "6ba3323195dad1c5abd6d56761735109",
+        "sha256": "70ddcc51275933c81997e19e221963f413ba1e95aed4c6cf9dc3c93744de42af"
+      },
+      "downloads": -1,
+      "filename": "kfac-jax-0.0.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6ba3323195dad1c5abd6d56761735109",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 114733,
+      "upload_time": "2022-09-23T20:12:54",
+      "upload_time_iso_8601": "2022-09-23T20:12:54.301575Z",
+      "url": "https://files.pythonhosted.org/packages/82/66/ae9cc09bc71ce9832760b33c33329849393a7617cf474003f5cd32aeec7b/kfac-jax-0.0.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

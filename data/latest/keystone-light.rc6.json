@@ -1,0 +1,208 @@
+{
+  "info": {
+    "author": "Walter Doekes, OSSO B.V.",
+    "author_email": "wjdoekes+keystone-light@osso.nl",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3",
+      "Topic :: Software Development :: Libraries"
+    ],
+    "description": "keystone-light :: A limited Identity API v3 python client\n=========================================================\n\nkeystone-light implements a Python interface to a very limited subset of\nthe `OpenStack Identity API v3`_.\n\nInitial goal: *access to OpenStack Swift, using the Identity API v3, but\nwith a lot fewer dependencies.*\n\nAs of this writing, the ``python-keystoneclient`` requires\n``keystoneauth1`` and ``oslo.*``, which in turn require some more. We\nonly require the *ubiquitous* ``requests`` (and ``PyYAML``), which you\ngenerally already have installed anyway.\n\n\nExample usage\n-------------\n\n.. code-block:: python\n\n    #!/usr/bin/env python3\n    from urllib.parse import urljoin\n\n    import requests\n    from keystone_light import Cloud, CloudsYamlConfig, PermissionDenied\n\n\n    def get_projects(cloud):\n        \"Yields projects, sorted by domain and project name\"\n        domains = cloud.get_domains()\n        for domain in sorted(domains, key=(lambda x: x.name)):\n            if domain.name == 'Default':\n                # print('WARN: skipping domain Default (fixme?)')\n                continue\n\n            projects = domain.get_projects()\n            for project in sorted(projects, key=(lambda x: x.name)):\n                project.domain = domain\n                yield project\n\n    def _give_us_project_perms_through_admin_group(project):\n        \"\"\"\n        Make sure we are in the *-admin group. Make sure the *-admin\n        group has permissions on the project.\n        \"\"\"\n        cloud = project.cloud\n        dom_admin_group = project.domain.get_admin_group()\n\n        # First check if we're member of the group at all.\n        token = cloud.get_system_token()\n        auth_headers = {'X-Auth-Token': str(token)}\n        try:\n            # FIXME: Undocumented access to system_token!\n            user_id = token.data['user']['id']\n            assert user_id and isinstance(user_id, str), user_id\n        except KeyError:\n            raise ValueError('missing user.id?', token.data)\n\n        # Are we in the *-admin group?\n        url = urljoin(\n            cloud.base_url,\n            '/v3/groups/{group_id}/users/{user_id}'.format(\n                group_id=dom_admin_group.id, user_id=user_id))\n        out = requests.head(url, headers=auth_headers)\n        if out.status_code == 404:\n            # Add us to the group.\n            out = requests.put(url, headers=auth_headers)\n            assert out.status_code == 204, (\n                'PUT', url, out.status_code, out.text)\n            # Double check.\n            out = requests.head(url, headers=auth_headers)\n        assert out.status_code == 204, (\n            'HEAD', url, out.status_code, out.text)\n\n        # Grant *-admin power to the project.\n        admin_role = cloud.get_role(name='admin')  # or 'reader'\n        url = urljoin(\n            cloud.base_url,\n            '/v3/projects/{project_id}/groups/{group_id}/roles/{role_id}'.format(\n                project_id=project.id, group_id=dom_admin_group.id,\n                role_id=admin_role.id))\n        out = requests.put(url, headers=auth_headers)\n        assert out.status_code in (201, 204), (\n            'PUT', url, out.status_code, out.text)\n\n    def get_swift_stat_ensuring_permissions(project):\n        \"Get Swift v1 stat on a project (previously: tenant)\"\n        try:\n            stat = project.get_swift().get_stat()\n        except PermissionDenied:\n            # We don't have permission to access the project? Upgrade the\n            # permissions and try again.\n            _give_us_project_perms_through_admin_group(project)\n        else:\n            return stat\n\n        # Try again. Should succeed now, with the added permissions.\n        try:\n            stat = project.get_swift().get_stat()\n        except PermissionDenied as e:\n            raise MyPermissionDenied(\n                'EPERM on {domain}.{project}: {exc} {exc_args}'.format(\n                    domain=project.domain.name, project=project.name,\n                    exc=e.__class__.__name__, exc_args=e.args)) from e\n        else:\n            return stat\n\n\n    # Take config from ~/.config/openstack/clouds.yaml and select\n    # 'my-cloud-admin', like the openstack(1) --os-cloud option.\n    config = CloudsYamlConfig('my-cloud-admin')\n    cloud = Cloud(config)\n    for project in get_projects(cloud):\n        swift_stat = get_swift_stat_ensuring_permissions(project)\n        print('{:15s} {:23s} {:21d} B ({} objects, {} containers)'.format(\n            project.domain.name[0:15], project.name,\n            int(swift_stat['X-Account-Bytes-Used']),\n            swift_stat['X-Account-Object-Count'],\n            swift_stat['X-Account-Container-Count']))\n\n\nExample output\n--------------\n\n.. code-block:: console\n\n    $ python3 example.py\n    domainx         project                  3489 B (2 objects, 1 containers)\n    domainx         otherproject       1455042022 B (267 objects, 1 containers)\n    ...\n\n\nSwift Example usage\n-------------------\n\n.. code-block:: python\n\n    from keystone_light import Cloud, DirectConfig\n\n    KEYSTONE_URL = 'https://<DOMAIN>:<USER>:<PASS>@KEYSTONE'\n    SWIFT_PROJECT = '<DOMAIN>:<PROJECT>'\n    SWIFT_CONTAINER = 'some-container'\n\n    config = DirectConfig(KEYSTONE_URI)\n    project = Cloud(config).get_current_project()\n    assert project.get_fullname() == SWIFT_PROJECT, project.get_fullname()\n\n    swift = project.get_swift()\n    container = swift.get_container(SWIFT_CONTAINER)\n\n    # (Re-)upload file:\n    filename = ('bloblet.bin' if False else 'blobzilla.bin')\n    with open(filename, 'rb') as fp:\n        try:\n            container.delete(filename)\n        except FileNotFoundError:\n            pass\n        # TIP: Use ChunkIteratorIOBaseWrapper(fp) if the input file\n        # is a pipe/stream.\n        container.put(filename, fp)\n\n    # Download file:\n    filename2 = '{}.retrieved'.format(filename)\n    with container.get(filename) as response, \\\n            open(filename2, 'wb') as fp:\n        for chunk in response.iter_content(chunk_size=8192):\n            fp.write(chunk)\n\n    # Check and compare:\n    with open(filename, 'rb') as fp, \\\n            open(filename2, 'rb') as fp2:\n        buf = buf2 = True\n        while buf and buf2:\n            buf = fp.read(8192)\n            buf2 = fp2.read(8192)\n            assert buf == buf2\n        assert buf == buf2\n\nAnd an example with timing:\n\n.. code-block:: python\n\n    from timeit import timeit\n\n    # ...\n\n    # Download file:\n    filename2 = '{}.retrieved'.format(filename)\n    def _get():\n        with container.get(filename) as response, \\\n                open(filename2, 'wb') as fp:\n            for chunk in response.iter_content(chunk_size=8192):\n                fp.write(chunk)\n    print('{:7.3f} GET'.format(timeit(number=1, stmt=_get)))\n\n\n.. _`OpenStack Identity API v3`: https://docs.openstack.org/api-ref/identity/v3/",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ossobv/keystone-light",
+    "keywords": "",
+    "license": "LGPLv3+",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "keystone-light",
+    "package_url": "https://pypi.org/project/keystone-light/",
+    "platform": "linux",
+    "project_url": "https://pypi.org/project/keystone-light/",
+    "project_urls": {
+      "Homepage": "https://github.com/ossobv/keystone-light"
+    },
+    "release_url": "https://pypi.org/project/keystone-light/1.3/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "A limited OpenStack Identity API v3 client in Python (with fewer dependencies)",
+    "version": "1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9593572,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d68fd317670699bbdf598459f193c498cc966a955fc1d819182966d333417dac",
+          "md5": "64a01e65c03d8deec6c22826f9d80b6b",
+          "sha256": "2d9cc5845e391063e7f7d2b89c6f95167dacf1a1772bcec023ca845caaf71ca9"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "64a01e65c03d8deec6c22826f9d80b6b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8209,
+        "upload_time": "2019-12-16T11:09:05",
+        "upload_time_iso_8601": "2019-12-16T11:09:05.386802Z",
+        "url": "https://files.pythonhosted.org/packages/d6/8f/d317670699bbdf598459f193c498cc966a955fc1d819182966d333417dac/keystone-light-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de2ceacf8341fde766f3a9fc5819ec7d3466802275c0a23030d55f26e2f051c3",
+          "md5": "882a16b335d92ed34fcea58a770bc572",
+          "sha256": "39d1dfabbc3e1da9baa5bfb458571cba5bd200ce4c229df82ce30abcbd8b4c99"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "882a16b335d92ed34fcea58a770bc572",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8319,
+        "upload_time": "2020-01-20T12:37:46",
+        "upload_time_iso_8601": "2020-01-20T12:37:46.651857Z",
+        "url": "https://files.pythonhosted.org/packages/de/2c/eacf8341fde766f3a9fc5819ec7d3466802275c0a23030d55f26e2f051c3/keystone-light-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "417a4238deef579f831d4b2ad5c59ab75274b41f2818b9fd723d61f7a9b414db",
+          "md5": "9ae4f14867a798bdcec4a5a10da9a406",
+          "sha256": "b505b920439189da0b7d244527b71d48adae8962954bae0ca554c45ebc30cf79"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9ae4f14867a798bdcec4a5a10da9a406",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16191,
+        "upload_time": "2021-01-28T13:39:32",
+        "upload_time_iso_8601": "2021-01-28T13:39:32.090090Z",
+        "url": "https://files.pythonhosted.org/packages/41/7a/4238deef579f831d4b2ad5c59ab75274b41f2818b9fd723d61f7a9b414db/keystone-light-1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8c809732a002a03e391415bbe2d6bd1f04588efdac1ec8c1da9e17a04149148",
+          "md5": "cb58b54fc80f64cc6b41a3bef7420245",
+          "sha256": "a4f0cdfa2f0fb064f8919778007c725908923b85c037b853b238c6a997ff46ec"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb58b54fc80f64cc6b41a3bef7420245",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15254,
+        "upload_time": "2021-02-24T15:08:29",
+        "upload_time_iso_8601": "2021-02-24T15:08:29.594253Z",
+        "url": "https://files.pythonhosted.org/packages/a8/c8/09732a002a03e391415bbe2d6bd1f04588efdac1ec8c1da9e17a04149148/keystone-light-1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ead2ccc65a40e940900ecc01c0c5485a06869eb314b5da59c5f64e5f457f8327",
+          "md5": "c773f5a8edb39b9329f9f57cef2a0038",
+          "sha256": "32fffc834d9024e871159021718be38b4dd24376ee79615a7154592b5969137b"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c773f5a8edb39b9329f9f57cef2a0038",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15242,
+        "upload_time": "2021-02-24T15:36:17",
+        "upload_time_iso_8601": "2021-02-24T15:36:17.080474Z",
+        "url": "https://files.pythonhosted.org/packages/ea/d2/ccc65a40e940900ecc01c0c5485a06869eb314b5da59c5f64e5f457f8327/keystone-light-1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4482e6131abd8e5054f4bd37e800a143242dc89339c431362ed2b066ee1f06c4",
+          "md5": "0d801a295db2024ae97bc3f2be7e1d09",
+          "sha256": "0b3939eb8f26482809fdf9fe82312f2382af2c0697b9b32bb7cfaefb7ba14daf"
+        },
+        "downloads": -1,
+        "filename": "keystone-light-1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0d801a295db2024ae97bc3f2be7e1d09",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15548,
+        "upload_time": "2021-03-02T15:08:34",
+        "upload_time_iso_8601": "2021-03-02T15:08:34.900747Z",
+        "url": "https://files.pythonhosted.org/packages/44/82/e6131abd8e5054f4bd37e800a143242dc89339c431362ed2b066ee1f06c4/keystone-light-1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4482e6131abd8e5054f4bd37e800a143242dc89339c431362ed2b066ee1f06c4",
+        "md5": "0d801a295db2024ae97bc3f2be7e1d09",
+        "sha256": "0b3939eb8f26482809fdf9fe82312f2382af2c0697b9b32bb7cfaefb7ba14daf"
+      },
+      "downloads": -1,
+      "filename": "keystone-light-1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0d801a295db2024ae97bc3f2be7e1d09",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 15548,
+      "upload_time": "2021-03-02T15:08:34",
+      "upload_time_iso_8601": "2021-03-02T15:08:34.900747Z",
+      "url": "https://files.pythonhosted.org/packages/44/82/e6131abd8e5054f4bd37e800a143242dc89339c431362ed2b066ee1f06c4/keystone-light-1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
