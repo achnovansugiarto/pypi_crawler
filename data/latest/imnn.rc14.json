@@ -1,0 +1,734 @@
+{
+  "info": {
+    "author": "Tom Charnock",
+    "author_email": "charnock@iap.fr",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "IMNN: Information maximising neural networks\n============================================\n\n|doc| |pypi| |bit| |git| |doi| |zen|\n\nThe IMNN is a statistical method for transformation and compression of data from complex, high-dimensional distributions down to the number of physical parameters in the model which generates that data. It is asymptotically lossless in terms of information about the physical parameters. The method uses neural networks as a backbone for the transformation although any parameterised transformation with enough flexibility to map the data could be used.\n\nUsing simulations generated from the model the Fisher information (for a Gaussian distribution with parameter independent covariance) is calculated from the output of the transformation and its log determinant is maximised under the condition that the covariance of the outputted transformed simulations are approximately constant and approach the identity matrix.\n\nSince the Fisher information only needs to be evaluated at a single fiducial parameter value it is exceptionally cheap to fit in comparison to other types of neural networks at the expense that the information is extracted from the data optimally about that fiducial parameter value and that the gradients of the simulations are needed (although this can be done numerically).\n\nThe ideal situation for performing inference is to fit an IMNN at a fiducial choice of parameters, evaluate the quasi-maximum-likelihood estimate of the parameters for the target data of choice and retrain a new IMNN at this estimate (still very cheap). This can be repeated iteratively until the IMNN is being trained at the maximum likelihood values of the parameters which will be most sensitive to the features in the data at that point and allow for the most precise constraints.\n\nNote that the parameter estimates from the IMNN are not intended to be indicative of unbiased parameter estimates if the fiducial parameter choice is far from the maximum likelihood parameter values from some target. Instead they are meant to be used in a likelihood-free (simulation-based) inference scenario.\n\n\n\nUsing the IMNN\n--------------\n\nImplemented in `JAX <https://jax.readthedocs.io/en/latest/>`_, the IMNN module provides a way to setup the fitting algorithm and fit an IMNN and then use it to make parameter estimates. There are several scenarios for the types of inputs that can be used.\n\nSimulatorIMNN\n_____________\n\nUsing a simulator (written in JAX or at least XLA compilable) for the generation of data provides the best results since generation of data is done on-the-fly. Since the focus of the IMNN is to maximise the information about the parameters from the data from the model, having a limited dataset means that spurious accidental correlations will almost certainly be learned about, overestimating the amount of information that can be extracted. For this reason, if using a limited sized training set like with `GradientIMNN`_ or `NumericalGradientIMNN`_, then it is important to use a validation set and use early stopping based on the information extracted from this validation set. All these problems are side-stepped if simulations are generated on the fly since the same data is never seen multiple times. Of course, if the simulator is expensive then this may not be feasible.\n\nThe simulator needs to be of the form\n\n.. code-block:: python\n\n    def simulator(rng, parameters):\n        \"\"\" Simulate a realisation of the data\n\n        Parameters\n        ----------\n        rng : int(2,)\n            A jax stateless random number generator\n        parameters : float(n_params,)\n            parameter values at which to generate the simulations at\n\n        Returns\n        -------\n        float(input_shape):\n            a simulation generated at parameter values `parameters`\n        \"\"\"\n        # Do stuff\n        return simulation\n\nGradientIMNN\n____________\n\nIf simulations are expensive but a set of simulations with their gradients can be precalculated then it is possible to use these instead to train the IMNN. In this case the simulations are passed through the network and the Jacobian of the network outputs are calculated with respect to their inputs which using the chain rule can be combined with the gradient of the simulation with respect to the model parameters to get the Jacobian of the network outputs with respect to the physical model parameters, used for calculating the Fisher information. Although possible to not use a validation set when fitting it is highly recommended to use early stopping with a validation set to avoid overestimation of the amount of information extracted.\n\nThe simulations and their gradients should be of the form\n\n.. code-block:: python\n\n    import jax\n    from imnn.utils import value_and_jacrev\n\n    rng = jax.random.PRNGKey(0)\n\n\n    fiducial_parameters = # fiducial parameter values as a float(n_params,)\n    n_s = # number of simulations used to estimate covariance of network outputs\n\n    rng, *keys = jax.random.split(rng, num=n_s + 1)\n    fiducial, derivative = jax.vmap(\n        lambda key: value_and_jacrev(\n            simulator,\n            argnums=1)(key, fiducial_parameters))(\n        np.array(keys))\n\n    fiducial.shape\n    >>> (n_s, input_shape)\n\n    derivative.shape\n    >>> (n_s, input_shape, n_params)\n\nNote that ``n_s`` derivatives are necessarily needed since only the mean of the derivatives is calculated which is more stable than the covariance. Therefore only ``n_d`` < ``n_s`` are required, although most stable optimisation is achieved using ``n_d = n_s``.\n\nNumericalGradientIMNN\n_____________________\n\nIf the gradient of the simulations with respect to the physical model parameters is not possible then numerical derivatives can be done. In this case simulations are made at the fiducial parameter value and then varied slightly with respect to each parameter independently with each of these simulations made at the same seed. Theses varied simulations are passed through the network and the outputs are used to make a numerical estimate via finite differences. There is quite a lot of fitting optimisation sensitivity to the choice of the finite difference size. Note that, again, it is VERY highly recommended to use a validation set for early stopping to prevent overestimation of the amount of information that can be extracted and the extraction of information from spurious features only existing in the limited dataset.\n\nThe simulations and their numerical derivatives should be made something like:\n\n.. code-block:: python\n\n    import jax\n    import jax.numpy as np\n\n    rng = jax.random.PRNGKey(0)\n\n\n    fiducial_parameters = # fiducial parameter values as a float(n_params,)\n    parameter_differences = # differences between varied parameter values for\n                            # finite differences as a float(n_params,)\n    n_s = # number of simulations used to estimate covariance of network outputs\n    n_d = # number of simulations used to estimate the numerical derivative of\n          # the mean of the network outputs\n\n    rng, *keys = jax.random.split(rng, num=n_s + 1)\n\n    fiducial = jax.vmap(\n        lambda key: simulator(key, fiducial_parameters))(\n        np.array(keys))\n\n    varied_below = (fiducial_parameters - np.diag(parameter_differences) / 2)\n    varied_above = (fiducial_parameters + np.diag(parameter_differences) / 2)\n\n    below_fiducial = jax.vmap(\n      lambda key: jax.vmap(\n          lambda param: simulator(key, param))(varied_below))(\n      np.array(keys)[:n_d])\n    above_fiducial = jax.vmap(\n      lambda key: jax.vmap(\n          lambda param: simulator(key, param))(varied_above))(\n      np.array(keys)[:n_d])\n\n    derivative = np.stack([below_fiducial, above_fiducial], 1)\n\n    fiducial.shape\n    >>> (n_s, input_shape)\n\n    derivative.shape\n    >>> (n_s, 2, n_params, input_shape)\n\nMatching seeds across pairs of varied parameters is fairly important for efficient training - stateless simulating like above makes this much easier.\n\nAggregation\n___________\n\nIf simulations or networks are very large then it can be difficult to fit an IMNN since the Fisher information requires the covariance to be well approximated to be able to maximise it. This means that all of the simulations must be passed through the network before doing a backpropagation step. To help with this, aggregation of computation and accumulated gradients are implemented. In this framework a list of XLA devices is passed to the IMNN class and data is passed to each device (via TensorFlow dataset iteration) to calculate the network outputs (and their derivatives using any of the `SimulatorIMNN`_, `GradientIMNN`_ or `NumericalGradientIMNN`_). These outputs are relatively small in size and so the gradient of the loss function (covariance regularised log determinant of the Fisher information) can be calculated easily. All of the data is then passed through the network again (a small number [``n_per_device``] at a time) and the Jacobian of the network outputs with respect to the neural network parameters is calculated. The chain rule is then used to combine these with the gradient of the loss function with respect to the network outputs to get the gradient of the loss function with respect to the network parameters. These gradients are summed together ``n_per_device`` at a time until a single gradient pytree for each parameter in the network is obtained which is then passed to the optimiser to implement the backpropagation. This requires two passes of the data through the network per iteration which is expensive, but is currently the only way to implement this for large data inputs which do not fit into memory. If the whole computation does fit in memory then there will be orders of magnitudes speed up compared to aggregation. However, aggregation can be done over as many XLA devices are available which should help things a bit. It is recommended to process as many simulations as possible at once by setting ``n_per_device`` to as large a value as can be handled. All central operations are computed on a host device which should be easily accessible (in terms of I/O) from all the other devices.\n\n.. code-block:: python\n\n    import jax\n\n    host = jax.devices(\"cpu\")[0]\n    devices = jax.devices(\"gpu\")\n    n_per_device = # number as high as makes sense for the size of data\n\nTensorFlow Datasets\n___________________\n\nIf memory is really tight and data needs to be loaded from disk then it is possible to use TensorFlow Datasets to do this, but the datasets must be EXTREMELY specifically made. There are examples in the ``examples`` directly, but shortly there are two different variants, the ``DatasetGradientIMNN`` and the ``DatasetNumericalGradientIMNN``. For the ``DatasetNumericalGradientIMNN`` the datasets must be of the form\n\n.. code-block:: python\n\n    import tensorflow as tf\n\n    fiducial = [\n            tf.data.TFRecordDataset(\n                    sorted(glob.glob(\"fiducial_*.tfrecords\")),\n                    num_parallel_reads=1\n                ).map(writer.parser\n                ).skip(i * n_s // n_devices\n                ).take(n_s // n_devices\n                ).batch(n_per_device\n                ).repeat(\n                ).as_numpy_iterator()\n            for i in range(n_devices)]\n\n    derivative = [\n        tf.data.TFRecordDataset(\n                sorted(glob.glob(\"derivative_*.tfrecords\")),\n                num_parallel_reads=1\n            ).map(writer.parser\n            ).skip(i * 2 * n_params * n_d // n_devices\n            ).take(2 * n_params * n_d // n_devices\n            ).batch(n_per_device\n            ).repeat(\n            ).as_numpy_iterator()\n        for i in range(n_devices)]\n\nHere the ``tfrecords`` contains the simulations which are parsed by the ``writer.parser`` (there is a demonstration in ``imnn.TFRecords``). The simulations are split into ``n_devices`` different datasets each which contain ``n_s // n_devices`` simulations which are passed to the network ``n_per_device`` at a time and repeated and not shuffled. For derivative, because there are multiple simulations at each seed for the finite differences then ``2 * n_params * n_d // n_devices`` need to be available to each device before passing ``n_per_device`` to the network on each device.\n\nFor the ``DatasetGradientIMNN`` the loops are made quicker by separating the derivative and simulation calculation from the simulation only calculations (the difference between ``n_s`` and ``n_d``). In this case the datasets must be constructed like:\n\n.. code-block:: python\n\n    fiducial = [\n        tf.data.TFRecordDataset(\n                sorted(glob.glob(\"fiducial_*.tfrecords\")),\n                num_parallel_reads=1\n            ).map(writer.parser\n            ).skip(i * n_s // n_devices\n            ).take(n_s // n_devices)\n        for i in range(n_devices)]\n\n    main = [\n        tf.data.Dataset.zip((\n            fiducial[i],\n            tf.data.TFRecordDataset(\n                sorted(glob.glob(\"derivative_*.tfrecords\")),\n                num_parallel_reads=1).map(\n                    lambda example: writer.derivative_parser(\n                        example, n_params=n_params)))\n            ).take(n_d // n_devices\n            ).batch(n_per_device\n            ).repeat(\n            ).as_numpy_iterator()\n        for i in range(n_devices)]\n\n    remaining = [\n        fiducial[i].skip(n_d // n_devices\n            ).take((n_s - n_d) // n_devices\n            ).batch(n_per_device\n            ).repeat(\n            ).as_numpy_iterator()\n        for i in range(n_devices)]\n\nNote that using datasets can be pretty tricky, aggregated versions of `GradientIMNN`_ and `NumericalGradientIMNN`_ does all the hard work as long as the data can be fit in memory.\n\nNeural models\n_____________\n\nThe IMNN is designed with `stax <https://github.com/google/jax/blob/master/jax/experimental/README.md#neural-net-building-with-stax>`_-like models and `jax optimisers <https://github.com/google/jax/blob/master/jax/experimental/README.md#First-order-optimization>`_ which are very flexible and designed to be quickly developed. Note that these modules don't need to be used exactly, but they should look like them. Models should contain\n\n.. code-block:: python\n\n    def initialiser(rng, input_shape):\n        \"\"\" Initialise the parameters of the model\n\n        Parameters\n        ----------\n        rng : int(2,)\n            A jax stateless random number generator\n        input_shape : tuple\n            The shape of the input to the network\n\n        Returns\n        -------\n        tuple:\n            The shape of the output of the network\n        pytree (list or tuple):\n            The values of the initialised parameters of the network\n        \"\"\"\n        # Do stuff\n        return output_shape, initialised_parameters\n\n    def apply_model(parameters, inputs):\n        \"\"\" Passes inputs through the network\n\n        Parameters\n        ----------\n        parameters : pytree (list or tuple)\n            The values of the parameters of the network\n        inputs : float(input_shape)\n            The data to put through the network\n\n        Returns\n        -------\n        float(output_shape):\n            The output of the network\n        \"\"\"\n        # Do neural networky stuff\n        return output\n\n    model = (initialiser, apply_model)\n\nThe optimiser also doesn't specifically need to be a ``jax.experimental.optimizer``, but it must contain\n\n.. code-block:: python\n\n    def initialiser(initial_parameters):\n        \"\"\" Initialise the state of the optimiser\n\n        Parameters\n        ----------\n        parameters : pytree (list or tuple)\n            The initial values of the parameters of the network\n\n        Returns\n        -------\n        pytree (list or tuple) or object:\n            The initial state of the optimiser containing everything needed to\n            update the state, i.e. current state, the running mean of the\n            weights for momentum-like optimisers, any decay rates, etc.\n        \"\"\"\n        # Do stuff\n        return state\n\n    def updater(it, gradient, state):\n        \"\"\" Updates state based on current iteration and calculated gradient\n\n        Parameters\n        ----------\n        it : int\n            A counter for the number of iterations\n        gradient : pytree (list or tuple)\n            The gradients of the parameters to update\n        state : pytree (list or tuple) or object\n            The state of the optimiser containing everything needed to update\n            the state, i.e. current state, the running mean of the weights for\n            momentum-like optimisers, any decay rates, etc.\n\n        Returns\n        -------\n        pytree (list or tuple) or object:\n            The updated state of the optimiser containing everything needed to\n            update the state, i.e. current state, the running mean of the\n            weights for momentum-like optimisers, any decay rates, etc.\n        \"\"\"\n        # Do updating stuff\n        return updated_state\n\n    def get_parameters(state):\n        \"\"\" Returns the values of the parameters at the current state\n\n        Parameters\n        ----------\n        state : pytree (list or tuple) or object\n            The current state of the optimiser containing everything needed to\n            update the state, i.e. current state, the running mean of the\n            weights for momentum-like optimisers, any decay rates, etc.\n\n        Returns\n        -------\n        pytree (list or tuple):\n            The current values of the parameters of the network\n        \"\"\"\n        # Get parameters\n        return current_parameters\n\n    optimiser = (initialiser, updater, get_parameters)\n\nIMNN\n____\n\nBecause there are many different cases where we might want to use different types of IMNN subclasses. i.e. with a simulator, aggregated over GPUs, using numerical derivatives, etc. then there is a handy single function will try and return the intended subclass. This is\n\n.. code-block:: python\n\n    import imnn\n\n    IMNN = imnn.IMNN(\n      n_s,                        # number of simulations for covariance\n      n_d,                        # number of simulations for derivative mean\n      n_params,                   # number of parameters in physical model\n      n_summaries,                # number of outputs from the network\n      input_shape,                # the shape a single input simulation\n      θ_fid,                      # the fiducial parameter values for the sims\n      model,                      # the stax-like model\n      optimiser,                  # the jax optimizers-like optimiser\n      key_or_state,               # either a random number generator or a state\n      simulator=None,             # SimulatorIMNN simulations on-the-fly\n      fiducial=None,              # GradientIMNN or NumericalGradientIMNN sims\n      derivative=None,            # GradientIMNN or NumericalGradientIMNN ders\n      main=None,                  # DatasetGradientIMNN sims and derivatives\n      remaining=None,             # DatasetGradientIMNN simulations\n      δθ=None,                    # NumericalGradientIMNN finite differences\n      validation_fiducial=None,   # GradientIMNN or NumericalGradientIMNN sims\n      validation_derivative=None, # GradientIMNN or NumericalGradientIMNN ders\n      validation_main=None,       # DatasetGradientIMNN sims and derivatives\n      validation_remaining=None,  # DatasetGradientIMNN simulations\n      host=None,                  # Aggregated.. host computational device\n      devices=None,               # Aggregated.. devices for running network\n      n_per_device=None,          # Aggregated.. amount of data to pass at once\n      cache=None,                 # Aggregated.. whether to cache simulations\n      prefetch=None,)             # Aggregated.. whether to prefetch sims\n\nSo for example to initialise an ``AggregatedSimulatorIMNN`` and train it we can do\n\n.. code-block:: python\n\n    rng, key = jax.random.split(rng)\n    IMNN = imnn.IMNN(n_s, n_d, n_params, n_summaries, input_shape,\n                     fiducial_parameters, model, optimiser, key,\n                     simulator=simulator, host=host, devices=devices,\n                     n_per_device=n_per_device)\n\n    rng, key = jax.random.split(rng)\n    IMNN.fit(λ=10., ϵ=0.1, rng=key)\n    IMNN.plot(expected_detF=50.)\n\n.. image:: https://bitbucket.org/tomcharnock/imnn/raw/master/docs/_images/history_plot.png\n\nOr for a`` NumericalGradientIMNN``\n\n.. code-block:: python\n\n    rng, key = jax.random.split(rng)\n    IMNN = imnn.IMNN(n_s, n_d, n_params, n_summaries, input_shape,\n                     fiducial_parameters, model, optimiser, key,\n                     fiducial=fiducial, derivative=derivative,\n                     δθ=parameter_differences,\n                     validation_fiducial=validation_fiducial,\n                     validation_derivative=validation_derivative)\n\n    IMNN.fit(λ=10., ϵ=0.1)\n    IMNN.plot(expected_detF=50.)\n\n``λ`` and ``ϵ`` control the strength of regularisation and should help with speed of convergence but not really impact the final results.\n\nDoing likelihood-free inference\n-------------------------------\n\nWith a trained IMNN it is possible to get an estimate of some data using\n\n.. code-block:: python\n\n    estimate = IMNN.get_estimate(target_data)\n\nAlong with the Fisher information from the network, we can use this to make a Gaussian approximation of the posterior under the assumption that the fiducial parameter values used to calculate the Fisher information coincide with the parameter estimate. This posterior can be calculated using the ``imnn.lfi`` module. For all of the available functions in the lfi module a `TensorFlow Probability <https://www.tensorflow.org/probability/>`_-like distribution is used for the prior, e.g. for a uniform distribution for two parameters between 0 and 10 each we could write\n\n.. code-block:: python\n\n    import tensorflow_probability\n    tfp = tensorflow_probability.substrates.jax\n\n    prior = tfp.distributions.Blockwise(\n    [tfp.distributions.Uniform(low=low, high=high)\n     for low, high in zip([0., 0.], [10., 10.])])\n\n     prior.low = np.array([0., 0.])\n     prior.high = np.array([10., 10.])\n\nWe set the values of ``prior.low`` and ``prior.high`` since they are used to define the plotting ranges. Note that ``prior.event_shape`` should be equal to ``n_params``, i.e. the number of parameters in the physical model.\n\nGaussianApproximation\n_____________________\n\nThe ``GaussianApproximation`` simply evaluates a multivariate Gaussian with mean at ``estimate`` and covariance given by ``np.linalg.inv(IMNN.F)`` on a grid defined by the prior ranges.\n\n.. code-block:: python\n\n    GA = imnn.lfi.GaussianApproximation(\n      parameter_estimates=estimate,\n      invF=np.linalg.inv(IMNN.F),\n      prior=prior,\n      gridsize=100)\n\nAnd corner plots of the Gaussian approximation can be made using\n\n.. code-block:: python\n\n    GA.marginal_plot(\n      ax=None,                   # Axes object to plot (constructs new if None)\n      ranges=None,               # Ranges for each parameter (None=preset)\n      marginals=None,            # Marginal distributions to plot (None=preset)\n      known=None,                # Plots known parameter values if not None\n      label=None,                # Adds legend element if not None\n      axis_labels=None,          # Adds labels to the axes if not None\n      levels=None,               # Plot specified approx significance contours\n      linestyle=\"solid\",         # Linestyle for the contours\n      colours=None,              # Colour for the contours\n      target=None,               # If multiple target data, which index to plot\n      format=False,              # Whether to set up the plot decoration\n      ncol=2,                    # Number of columns in the legend\n      bbox_to_anchor=(1.0, 1.0)) # Where to place the legend\n\nNote that this approximation shouldn't be necessarily a good estimate of the true posterior, for that actual LFI methods should be used.\n\nApproximateBayesianComputation\n______________________________\n\nTo generate simulations and accept or reject these simulations based on a distance based criterion from some target data we can use\n\n.. code-block:: python\n\n    ABC = imnn.lfi.ApproximateBayesianComputation(\n      target_data=target_data,\n      prior=prior,\n      simulator=simulator,\n      compressor=IMNN.get_estimate,\n      gridsize=100,\n      F=IMNN.F,\n      distance_measure=None)\n\nThis takes in the target data and compresses it using the provided compressor (like ``IMNN.get_estimate``). The Fisher information matrix can be provided to rescale the parameter directions to make meaningful distance measurements as long as summaries are parameter estimates. If a different distance measure is better for the specific problem this can be passed as a function. Note that if simulations have already been done for the ABC and only the plotting and the acceptance and rejection is needed then ``simulator`` can be set to ``None``. The ABC can actually be run by calling the module\n\n.. code-block:: python\n\n    parameters, summaries, distances = ABC(\n        ϵ=None,             # The size of the epsilon ball to accept summaries\n        rng=None,           # Random number generator for params and simulation\n        n_samples=None,     # The number of samples to run (at one time)\n        parameters=None,    # Values of parameters with premade compressed sims\n        summaries=None,     # Premade compressed sims to avoid running new sims\n        min_accepted=None,  # Num of required sims in epsilon ball (iterative)\n        max_iterations=10,  # Max num of iterations to try and get min_accepted\n        smoothing=None,     # Amount of smoothing on the histogrammed marginals\n        replace=False)      # Whether to remove all previous run summaries\n\nIf not run and no premade simulations have been made then ``n_samples`` and ``rng`` must be passed. Note that if ``ϵ`` is too large then the accepted samples should not be considered to be drawn from the posterior but rather some partially marginalised part of the joint distribution of summaries and parameters, and hence it can be very misleading - ``ϵ`` should be a small as possible! Like with the ``GaussianApproximation`` there is a ``ABC.marginal_plot(...)`` but the parameter samples can also be plotted as a scatter plot on the corner plot\n\n.. code-block:: python\n\n    ABC.scatter_plot(\n        ax=None,                 # Axes object to plot (constructs new if None)\n        ranges=None,             # Ranges for each parameter (None=preset)\n        points=None,             # Parameter values to scatter (None=preset)\n        label=None,              # Adds legend element if not None\n        axis_labels=None,        # Adds labels to the axes if not None\n        colours=None,            # Colour for the scatter points (and hists)\n        hist=True,               # Whether to plot 1D histograms of points\n        s=5,                     # Marker size for points\n        alpha=1.,                # Amount of transparency for the points\n        figsize=(10, 10),        # Size of the figure if not premade\n        linestyle=\"solid\",       # Linestyle for the histograms\n        target=None,             # If multiple target data, which index to plot\n        ncol=2,                  # Number of columns in the legend\n        bbox_to_anchor=(0., 1.)) # Where to place the legend\n\nAnd the summaries can also be plotted on a corner plot with exactly the same parameters as ``scatter_plot`` (apart from ``gridsize`` being added) but if ``points`` is left ``None`` then ``ABC.summaries.accepted`` is used instead and the ranges calculated from these values. If points is supplied but ``ranges`` is None then the ranges are calculated from the minimum and maximum values of the points are used as the edges.\n\n.. code-block:: python\n\n    ABC.scatter_summaries(\n        ax=None,\n        ranges=None,\n        points=None,\n        label=None,\n        axis_labels=None,\n        colours=None,\n        hist=True,\n        s=5,\n        alpha=1.,\n        figsize=(10, 10),\n        linestyle=\"solid\",\n        gridsize=100,\n        target=None,\n        format=False,\n        ncol=2,\n        bbox_to_anchor=(0.0, 1.0))\n\nPopulationMonteCarlo\n____________________\n\nTo more efficiently accept samples than using a simple ABC where samples are drawn from the prior, the `PopulationMonteCarlo`_ provides a JAX accelerated iterative acceptance and rejection scheme where each iteration the population of samples with summaries closest to the summary of the desired target defines a new proposal distribution to force a fixed population to converge towards the posterior without setting an explicit size for the epsilon ball of normal ABC. The PMC is stopped using a criterion on the number of accepted proposals compared to the number of total draws from the proposal. When this gets very small it suggests the distribution is stationary and that the proposal has been reached. It works similarly to `ApproximateBayesianComputation`_.\n\n.. code-block:: python\n\n    PMC = imnn.lfi.PopulationMonteCarlo(\n      target_data=target_data,\n      prior=prior,\n      simulator=simulator,\n      compressor=IMNN.get_estimate,\n      gridsize=100,\n      F=IMNN.F,\n      distance_measure=None)\n\nAnd it can be run using\n\n.. code-block:: python\n\n    parameters, summaries, distances = PMC(\n        rng,                     # Random number generator for params and sims\n        n_points,                # Number of points from the final distribution\n        percentile=None,         # Percentage of points making the population\n        acceptance_ratio=0.1,    # Fraction of accepted draws vs total draws\n        max_iteration=10,        # Maximum number of iterations of the PMC\n        max_acceptance=1,        # Maximum number of tries to get an accepted\n        max_samples=int(1e5),    # Maximum number of attempts to get parameter\n        n_initial_points=None,   # Number of points in the initial ABC step\n        n_parallel_simulations=None, # Number of simulations to do in parallel\n        proposed=None,           # Prerun parameter values for the initial ABC\n        summaries=None,          # Premade compressed simulations for ABC\n        distances=None,          # Precalculated distances for the initial ABC\n        smoothing=None,          # Amount of smoothing on histogrammed marginal\n        replace=False)           # Whether to remove all previous run summaries\n\nThe same plotting functions as `ApproximateBayesianComputation`_ are also available in the PMC\n\nNote\n....\n\nThere seems to be a bug in PopulationMonteCarlo and the parallel sampler is turned off\n\nInstallation\n------------\n\nThe IMNN can be install by cloning the repository and installing via python or by pip installing, i.e.\n\n.. code-block::\n\n    git clone https://bitbucket.org/tomcharnock/imnn.git\n    cd imnn\n    python setup.py install\n\nor\n\n.. code-block::\n\n    pip install IMNN\n\nNotes on installation\n_____________________\n\nThe IMNN was quite an early adopter of JAX and as such it uses some experimental features. It is known to be working with ``jax>=0.2.10,<=0.2.12`` and should be fine with newer versions for a while. One of the main limitations is with the use of TensorFlow Probability in the LFI module which also depends on JAX but is also dealing with the development nature of this language. The TensorFlow Datasets also requires TensorFlow>=2.1.0, but this requirement is not explicitly set so that python3.9 users can install a newer compatible version of TensorFlow without failing.\n\nDuring the development of this code I implemented the value_and_jac* functions in JAX, which saves a huge amount of time for the IMNN, but these had not yet been pulled into the JAX api and as such there is a copy of these functions in ``imnn.utils.jac`` but they depend on ``jax.api`` and other functions which may change with jax development. If this becomes a problem then it will be necessary to install jax and jaxlib first, i.e. via\n\n.. code-block::\n\n    pip install jax==0.2.11 jaxlib==0.1.64\n\nor whichever CUDA enabled version suits you.\n\nThe previous version of the IMNN is still available (and works well) built on a TensorFlow backend. If you want to use keras models, etc. it will probably be easier to use that. It is not as complete as this module, but is likely to be a bit more stable due to not depending on JAXs development as heavily. This can be installed via either\n\n.. code-block::\n\n    git clone https://bitbucket.org/tomcharnock/imnn-tf.git\n    cd imnn-tf\n    python setup.py install\n\nor\n\n.. code-block::\n\n    pip install imnn-tf\n\nNote that that code isn't as well documented, but there are plenty of examples still.\n\n\nReferences\n----------\n\nIf you use this code please cite\n\n.. code-block::\n\n    @article{charnock2018,\n      author={Charnock, Tom and Lavaux, Guilhem and Wandelt, Benjamin D.},\n      title={Automatic physical inference with information maximizing neural networks},\n      volume={97},\n      ISSN={2470-0029},\n      url={http://dx.doi.org/10.1103/PhysRevD.97.083004},\n      DOI={10.1103/physrevd.97.083004},\n      number={8},\n      journal={Physical Review D},\n      publisher={American Physical Society (APS)},\n      year={2018},\n      month={Apr}\n    }\n\nand maybe also\n\n.. code-block::\n\n    @software{imnn2021,\n      author = {Tom Charnock},\n      title = {{IMNN}: Information maximising neural networks},\n      url = {http://bitbucket.org/tomcharnock/imnn},\n      version = {0.3.2},\n      year = {2021},\n    }\n\n.. |doc| image:: https://bitbucket.org/tomcharnock/imnn/raw/master/docs/_images/doc.svg\n    :target: https://www.aquila-consortium.org/doc/imnn/\n\n.. |pypi| image:: https://bitbucket.org/tomcharnock/imnn/raw/master/docs/_images/pypi.svg\n    :target: https://pypi.org/project/IMNN/\n\n.. |bit| image:: https://bitbucket.org/tomcharnock/imnn/raw/master/docs/_images/bit.svg\n    :target: https://bitbucket.org/tomcharnock/imnn\n\n.. |git| image:: https://bitbucket.org/tomcharnock/imnn/raw/master/docs/_images/git.svg\n    :target: https://github.com/tomcharnock/imnn\n\n.. |doi| image:: https://zenodo.org/badge/DOI/10.1103/PhysRevD.97.083004.svg\n   :target: https://doi.org/10.1103/PhysRevD.97.083004\n\n.. |zen| image:: https://zenodo.org/badge/DOI/10.5281/zenodo.1175196.svg\n   :target: https://doi.org/10.5281/zenodo.1175196\n\n\n",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://bitbucket.org/tomcharnock/imnn.git",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "IMNN",
+    "package_url": "https://pypi.org/project/IMNN/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/IMNN/",
+    "project_urls": {
+      "Homepage": "https://bitbucket.org/tomcharnock/imnn.git"
+    },
+    "release_url": "https://pypi.org/project/IMNN/0.3.2/",
+    "requires_dist": [
+      "jax (>=0.2.24)",
+      "jaxlib (>=0.1.73)",
+      "tensorflow",
+      "tqdm (>=4.48.2)",
+      "tensorflow-probability[jax]",
+      "numpy",
+      "scipy",
+      "matplotlib"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Using neural networks to extract sufficient statistics from         data by maximising the Fisher information",
+    "version": "0.3.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13057460,
+  "releases": {
+    "0.1.dev0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d64d92e3b83a60d39127f8af8f5597448057de8060f39822d78a352001a306e8",
+          "md5": "3e1977e6bac0f3329c48ca0f15ccf10b",
+          "sha256": "2503e8aeb9bf4413fb4c8fbe7ce87c6ab86544afa1685ffcec3ae2128d63add0"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3e1977e6bac0f3329c48ca0f15ccf10b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 35250,
+        "upload_time": "2019-01-23T17:36:04",
+        "upload_time_iso_8601": "2019-01-23T17:36:04.982909Z",
+        "url": "https://files.pythonhosted.org/packages/d6/4d/92e3b83a60d39127f8af8f5597448057de8060f39822d78a352001a306e8/IMNN-0.1.dev0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0dadea5a670be10cd97bf81eb4033bdd8ca963c4656f1f06322d4a4094dd119a",
+          "md5": "be51168f81db7066ac4b0356b000ba74",
+          "sha256": "e718b51b8f67365ea0069240091040807259d42fca158a3f073572d22461c573"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "be51168f81db7066ac4b0356b000ba74",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 49339,
+        "upload_time": "2019-01-23T17:36:06",
+        "upload_time_iso_8601": "2019-01-23T17:36:06.898708Z",
+        "url": "https://files.pythonhosted.org/packages/0d/ad/ea5a670be10cd97bf81eb4033bdd8ca963c4656f1f06322d4a4094dd119a/IMNN-0.1.dev0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d427d7e51b66acf3c7b8b3a2f8077f7e012d83cd9809281f4220cd794bb66131",
+          "md5": "2fe58c400d0a3de14f7f16ed0f04f6ee",
+          "sha256": "4eeb4ed8d347b9eedf72356be589101d9e857eaa4a57030fba528e0ba022a76a"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2fe58c400d0a3de14f7f16ed0f04f6ee",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 34996,
+        "upload_time": "2019-01-28T11:07:11",
+        "upload_time_iso_8601": "2019-01-28T11:07:11.004882Z",
+        "url": "https://files.pythonhosted.org/packages/d4/27/d7e51b66acf3c7b8b3a2f8077f7e012d83cd9809281f4220cd794bb66131/IMNN-0.1.dev2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf13bf5345e3b85e425735949638c8e75c2b13c0c746cb04543008aaebf21533",
+          "md5": "2c0008b8d90d369680cb1094e126fdfd",
+          "sha256": "f962aa006ba1776a317ddae0b5fe836e5840590b5cfbce4ef89742e2b33988c0"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c0008b8d90d369680cb1094e126fdfd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 48651,
+        "upload_time": "2019-01-28T11:07:13",
+        "upload_time_iso_8601": "2019-01-28T11:07:13.194089Z",
+        "url": "https://files.pythonhosted.org/packages/bf/13/bf5345e3b85e425735949638c8e75c2b13c0c746cb04543008aaebf21533/IMNN-0.1.dev2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f97ad16b748782bb56040583ed3c4e27a12c8241c4e8c2abbecaad0c5557c38",
+          "md5": "a51c6ead7513f57e0722cdf02e268e01",
+          "sha256": "5a1dc1d06db2e7809904a3926b457cf9d7669a4e3bea40d551d4d1dadfc7d032"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a51c6ead7513f57e0722cdf02e268e01",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 35003,
+        "upload_time": "2019-01-28T11:58:49",
+        "upload_time_iso_8601": "2019-01-28T11:58:49.574781Z",
+        "url": "https://files.pythonhosted.org/packages/2f/97/ad16b748782bb56040583ed3c4e27a12c8241c4e8c2abbecaad0c5557c38/IMNN-0.1.dev3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2efe6f6e666d7a444d755250bf45c035bc6c2e2959a36feb6218ea58c013e22e",
+          "md5": "d9aae80c21d9b6902d2d5e95060ae409",
+          "sha256": "4499e43651c2585e76a9fc5eed5e1ee55b3c606eed3c59e7fb35a2d9f76795d9"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d9aae80c21d9b6902d2d5e95060ae409",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 48653,
+        "upload_time": "2019-01-28T11:58:51",
+        "upload_time_iso_8601": "2019-01-28T11:58:51.261890Z",
+        "url": "https://files.pythonhosted.org/packages/2e/fe/6f6e666d7a444d755250bf45c035bc6c2e2959a36feb6218ea58c013e22e/IMNN-0.1.dev3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab36c67ad160b987c50110e0960d48b688bad0445e76d90a8849ceb5c5d6bdcb",
+          "md5": "76ecccc76a96f13e18e47b83729c4b7a",
+          "sha256": "ff814a7096f97c3a5aa71d87492cc88c610a5707830e44a941954eba1e4f4b0d"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76ecccc76a96f13e18e47b83729c4b7a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 35002,
+        "upload_time": "2019-01-28T12:13:11",
+        "upload_time_iso_8601": "2019-01-28T12:13:11.866826Z",
+        "url": "https://files.pythonhosted.org/packages/ab/36/c67ad160b987c50110e0960d48b688bad0445e76d90a8849ceb5c5d6bdcb/IMNN-0.1.dev4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "164150978445be50fae20ccaacccbb77e3188cf6cd9f39853b45f38e098ebdb8",
+          "md5": "39f419fc52499f8ebe0e03ba1208f1e2",
+          "sha256": "4b87c285b6a7bc54283d20fe8d3cfdcd8ab8c39274163c08cf8ddc1b546304fc"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "39f419fc52499f8ebe0e03ba1208f1e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 48653,
+        "upload_time": "2019-01-28T12:13:13",
+        "upload_time_iso_8601": "2019-01-28T12:13:13.456697Z",
+        "url": "https://files.pythonhosted.org/packages/16/41/50978445be50fae20ccaacccbb77e3188cf6cd9f39853b45f38e098ebdb8/IMNN-0.1.dev4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef966bba42cac447e1623a64d3a79d6f78c298e0784a18b9a7e3e1e2693bae9a",
+          "md5": "18296fe144d015772ca5576c1a9a3e3c",
+          "sha256": "9957217601cd6d7c2818cd12d6735c957e9a892f45b8b10830baf27c129485ba"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "18296fe144d015772ca5576c1a9a3e3c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 35001,
+        "upload_time": "2019-01-28T12:17:08",
+        "upload_time_iso_8601": "2019-01-28T12:17:08.815098Z",
+        "url": "https://files.pythonhosted.org/packages/ef/96/6bba42cac447e1623a64d3a79d6f78c298e0784a18b9a7e3e1e2693bae9a/IMNN-0.1.dev5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "073892cc32817d3452f2c9a3faccb85107509e02bd3e25a197aaf09f83431998",
+          "md5": "3022e29661f800bf3312ef81ffce0cb1",
+          "sha256": "6132855954e3d0ee4599c7c41076cb02f8bc061c41226e3630f0467a1f4374d3"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3022e29661f800bf3312ef81ffce0cb1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 48648,
+        "upload_time": "2019-01-28T12:17:10",
+        "upload_time_iso_8601": "2019-01-28T12:17:10.398221Z",
+        "url": "https://files.pythonhosted.org/packages/07/38/92cc32817d3452f2c9a3faccb85107509e02bd3e25a197aaf09f83431998/IMNN-0.1.dev5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f6501c081cb92464740725b698bf884210bb29936312f87c2a9bb19a4cbc07e",
+          "md5": "5e918e9e534ae7b7be2d08a536ccc9b8",
+          "sha256": "f3b048958ac811e33de46d12317b0f2099da72670e5b50b6bc0fd5b883134444"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5e918e9e534ae7b7be2d08a536ccc9b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 34946,
+        "upload_time": "2019-01-28T18:25:49",
+        "upload_time_iso_8601": "2019-01-28T18:25:49.491243Z",
+        "url": "https://files.pythonhosted.org/packages/9f/65/01c081cb92464740725b698bf884210bb29936312f87c2a9bb19a4cbc07e/IMNN-0.1.dev6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45d197929f102dedc740ae0f985ee5cd40b4b8dc4cbe2d08040468429d01901c",
+          "md5": "d8a17a51a224a45f05ad4394eb65131c",
+          "sha256": "76c8e412a9bfa0a79d4fc55690fa98aa7762759a1e89d72d4671d51ede8ece40"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d8a17a51a224a45f05ad4394eb65131c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 48604,
+        "upload_time": "2019-01-28T18:25:53",
+        "upload_time_iso_8601": "2019-01-28T18:25:53.261825Z",
+        "url": "https://files.pythonhosted.org/packages/45/d1/97929f102dedc740ae0f985ee5cd40b4b8dc4cbe2d08040468429d01901c/IMNN-0.1.dev6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.dev8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "667a9974dd11345297ccf8848bcb0fe23b87dba1c779da41cfa44fe785663e6c",
+          "md5": "b7ce6e5aa451b9219500449934154656",
+          "sha256": "4da6851163337e0a355e399ed7482f571c3ee6b864e95113e959b4e785cad79f"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7ce6e5aa451b9219500449934154656",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 38707,
+        "upload_time": "2019-03-07T15:25:54",
+        "upload_time_iso_8601": "2019-03-07T15:25:54.283004Z",
+        "url": "https://files.pythonhosted.org/packages/66/7a/9974dd11345297ccf8848bcb0fe23b87dba1c779da41cfa44fe785663e6c/IMNN-0.1.dev8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63c46a1254c4766211f4225b7999102c835fb79813594f6e1629dee963fabfc8",
+          "md5": "e2b45deca9f2265d0ed5d54f9923fece",
+          "sha256": "ee7add025a03cdaf48308c3f5d341771d4c751729970a283034998a073b887a5"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1.dev8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e2b45deca9f2265d0ed5d54f9923fece",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 54410,
+        "upload_time": "2019-03-07T15:25:56",
+        "upload_time_iso_8601": "2019-03-07T15:25:56.074474Z",
+        "url": "https://files.pythonhosted.org/packages/63/c4/6a1254c4766211f4225b7999102c835fb79813594f6e1629dee963fabfc8/IMNN-0.1.dev8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e45fcef3827bbec6acf00af9c2e1dd77223ba03c0f6d7e673a83e7ec3162a07",
+          "md5": "6fbf225f0f3fb80b5004503f9242a754",
+          "sha256": "4c2271a2d7d7d4c563bc15a98bafd3221486ceaf50ea28b25a1093498d60315d"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1rc1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6fbf225f0f3fb80b5004503f9242a754",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 37879,
+        "upload_time": "2019-02-01T18:11:40",
+        "upload_time_iso_8601": "2019-02-01T18:11:40.230801Z",
+        "url": "https://files.pythonhosted.org/packages/6e/45/fcef3827bbec6acf00af9c2e1dd77223ba03c0f6d7e673a83e7ec3162a07/IMNN-0.1rc1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e77131bb47c26cbf7bef9d91a8a0c2a03f687ece2f422334070beeaff0eb21de",
+          "md5": "9bc2f2f3d09085b862335c9d6d388cca",
+          "sha256": "8d810c18e7f4f5104f0968ace045712253b3b1abfdfe35c3858d9b67667bde63"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.1rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9bc2f2f3d09085b862335c9d6d388cca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 54298,
+        "upload_time": "2019-02-01T18:11:43",
+        "upload_time_iso_8601": "2019-02-01T18:11:43.168104Z",
+        "url": "https://files.pythonhosted.org/packages/e7/71/31bb47c26cbf7bef9d91a8a0c2a03f687ece2f422334070beeaff0eb21de/IMNN-0.1rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d7573d270f9d2e7141552bc5d9413b0cce0a87c192fd4373604405fa4fcc7c83",
+          "md5": "940a6fd908c2bd0dfcd3112aab0dbcfd",
+          "sha256": "7593bbc6816b707074b2276af5e7e082465e70af622dc694428a5bb29e3f8c7a"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "940a6fd908c2bd0dfcd3112aab0dbcfd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 32276,
+        "upload_time": "2019-11-26T15:19:31",
+        "upload_time_iso_8601": "2019-11-26T15:19:31.286790Z",
+        "url": "https://files.pythonhosted.org/packages/d7/57/3d270f9d2e7141552bc5d9413b0cce0a87c192fd4373604405fa4fcc7c83/IMNN-0.2a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "835c6391c3042068e62730140616d1f736a7a74da67de31492a7ddb166139514",
+          "md5": "526daba1ebd6f63f60bb964dd1a52ba4",
+          "sha256": "55f1d635693df3690371c21ef563c5fa4f8819a9bd1ac26086c25facffa810d5"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "526daba1ebd6f63f60bb964dd1a52ba4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 48047,
+        "upload_time": "2019-11-26T15:19:36",
+        "upload_time_iso_8601": "2019-11-26T15:19:36.032897Z",
+        "url": "https://files.pythonhosted.org/packages/83/5c/6391c3042068e62730140616d1f736a7a74da67de31492a7ddb166139514/IMNN-0.2a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f62f47385598b4b6911b554a11259504950a8cadeac92bc890deb438a8da43be",
+          "md5": "766bfcc197ac7e41e0ca8388e8ce56bf",
+          "sha256": "e1a4a5faf42622af9d04391b596ec210a28c1ca6c1f58e797e625c8743c973f4"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "766bfcc197ac7e41e0ca8388e8ce56bf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 32261,
+        "upload_time": "2019-11-27T14:28:37",
+        "upload_time_iso_8601": "2019-11-27T14:28:37.046727Z",
+        "url": "https://files.pythonhosted.org/packages/f6/2f/47385598b4b6911b554a11259504950a8cadeac92bc890deb438a8da43be/IMNN-0.2a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "622c3e3350a7478e36546219aada011929adf66e793c61f8416ae680cf8b608b",
+          "md5": "c535b6e474bc8902dd62637227046b3f",
+          "sha256": "0ddbe7b4de6934163aaeed5d97fb319c815085e83247a945afdfc49b11f63e4b"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c535b6e474bc8902dd62637227046b3f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 48033,
+        "upload_time": "2019-11-27T14:28:39",
+        "upload_time_iso_8601": "2019-11-27T14:28:39.938806Z",
+        "url": "https://files.pythonhosted.org/packages/62/2c/3e3350a7478e36546219aada011929adf66e793c61f8416ae680cf8b608b/IMNN-0.2a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2a5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6201ecfab8f93d89ce30abddb162cf3e5f2e521ba5ca3d38813992da6254945f",
+          "md5": "22f6cf7cf811691c6435893c9acc5b46",
+          "sha256": "9b0aed0fa1b6c84143a33731cdf93396eabd36932f2b2d12d73741876a317f82"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "22f6cf7cf811691c6435893c9acc5b46",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 33683,
+        "upload_time": "2020-05-12T07:03:29",
+        "upload_time_iso_8601": "2020-05-12T07:03:29.207902Z",
+        "url": "https://files.pythonhosted.org/packages/62/01/ecfab8f93d89ce30abddb162cf3e5f2e521ba5ca3d38813992da6254945f/IMNN-0.2a5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "997c19af3c5ca0001a30f598e6fc255621a952fffa8b63b9871c0424c08a3117",
+          "md5": "7e3abca429fc7165158acf7ab87593fb",
+          "sha256": "55c36f5a97a4ea30b5d4869fd9f7030e9ec9eb5e1ecbb57cb98e821d55168785"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.2a5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7e3abca429fc7165158acf7ab87593fb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 37948,
+        "upload_time": "2020-05-12T07:03:31",
+        "upload_time_iso_8601": "2020-05-12T07:03:31.037226Z",
+        "url": "https://files.pythonhosted.org/packages/99/7c/19af3c5ca0001a30f598e6fc255621a952fffa8b63b9871c0424c08a3117/IMNN-0.2a5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3548075666877192c3602e4f16dd2ccc8381ddceb4454ea216b90fc2c9356ce2",
+          "md5": "1b5ccb6be558bfe6bdbf8ae6a7c6827d",
+          "sha256": "9eb1df876a0b8e7fda866b6a79eb8edcd224cf60901c95032904117c8f399fd5"
+        },
+        "downloads": -1,
+        "filename": "imnn-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b5ccb6be558bfe6bdbf8ae6a7c6827d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 127377,
+        "upload_time": "2021-04-30T16:02:14",
+        "upload_time_iso_8601": "2021-04-30T16:02:14.040080Z",
+        "url": "https://files.pythonhosted.org/packages/35/48/075666877192c3602e4f16dd2ccc8381ddceb4454ea216b90fc2c9356ce2/imnn-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98c7d6f913aeead7a99df51d659906e1cc4552b2aabd9ad4e824542c99fc3e03",
+          "md5": "259e42fb16ac6b258738c2df50a8c25d",
+          "sha256": "90383f38d83ea74da3ca2fc145a996fdb6234039cd4ce297ae9aeb577fa9441a"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "259e42fb16ac6b258738c2df50a8c25d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 127378,
+        "upload_time": "2021-04-30T16:04:48",
+        "upload_time_iso_8601": "2021-04-30T16:04:48.436822Z",
+        "url": "https://files.pythonhosted.org/packages/98/c7/d6f913aeead7a99df51d659906e1cc4552b2aabd9ad4e824542c99fc3e03/IMNN-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6d14031edc3bdca96793adde1d0a4cac536268c481d7959e0b401b4d35476ac",
+          "md5": "9789a4c4aa3c645ab599fd084c90a226",
+          "sha256": "58f05312c56b3a03ffc62ca2b4fbca881b46e6bd88e936938e300905c1c64ae4"
+        },
+        "downloads": -1,
+        "filename": "imnn-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9789a4c4aa3c645ab599fd084c90a226",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 2051823,
+        "upload_time": "2021-04-30T16:02:20",
+        "upload_time_iso_8601": "2021-04-30T16:02:20.118068Z",
+        "url": "https://files.pythonhosted.org/packages/a6/d1/4031edc3bdca96793adde1d0a4cac536268c481d7959e0b401b4d35476ac/imnn-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6274f71a792531b9718bc1405192b292115366acd95e8addaf80aaf74af732a9",
+          "md5": "94941da5289dac479fbfc67aa519c8c2",
+          "sha256": "5595586a7f3c0256d1d6eafa53046c13792f0d35ef5138f5638e68d21b8aa42d"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "94941da5289dac479fbfc67aa519c8c2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 127395,
+        "upload_time": "2021-09-11T08:00:20",
+        "upload_time_iso_8601": "2021-09-11T08:00:20.670688Z",
+        "url": "https://files.pythonhosted.org/packages/62/74/f71a792531b9718bc1405192b292115366acd95e8addaf80aaf74af732a9/IMNN-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe90834118a6333a8920cc6712f18ea9ce8edb0ce3b392eaf1777020f33f9be8",
+          "md5": "27d554340cc49ff782b56678bed3a158",
+          "sha256": "6c83acae772ee69463e48695b6d43177289b48c8893b71c025f7780ecf6d02bb"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "27d554340cc49ff782b56678bed3a158",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 2050996,
+        "upload_time": "2021-09-11T08:00:23",
+        "upload_time_iso_8601": "2021-09-11T08:00:23.364631Z",
+        "url": "https://files.pythonhosted.org/packages/fe/90/834118a6333a8920cc6712f18ea9ce8edb0ce3b392eaf1777020f33f9be8/IMNN-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f386e8c914d994aa50591281fddaab96a1d89bde0627e7c0799b371b410abeb1",
+          "md5": "80c4e5a6a09e334361725cd58db22971",
+          "sha256": "a35865c98264b6470b33df7861d18de1a3dc2ebf1ba23e0426c8918615b518f7"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "80c4e5a6a09e334361725cd58db22971",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 127488,
+        "upload_time": "2021-10-28T14:06:28",
+        "upload_time_iso_8601": "2021-10-28T14:06:28.570944Z",
+        "url": "https://files.pythonhosted.org/packages/f3/86/e8c914d994aa50591281fddaab96a1d89bde0627e7c0799b371b410abeb1/IMNN-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c72fec68a74f305b700245f3c6b6fb08870937a017b778fe8fa79bf2e895596f",
+          "md5": "0abf8259a86fc8d0b3d9dcfe2cc9f407",
+          "sha256": "11d4485f6785c9c107179b4e346169d8dde4265e0fedb96ba5928fc4d6ea82f6"
+        },
+        "downloads": -1,
+        "filename": "IMNN-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0abf8259a86fc8d0b3d9dcfe2cc9f407",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 2050857,
+        "upload_time": "2021-10-28T14:06:32",
+        "upload_time_iso_8601": "2021-10-28T14:06:32.471286Z",
+        "url": "https://files.pythonhosted.org/packages/c7/2f/ec68a74f305b700245f3c6b6fb08870937a017b778fe8fa79bf2e895596f/IMNN-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f386e8c914d994aa50591281fddaab96a1d89bde0627e7c0799b371b410abeb1",
+        "md5": "80c4e5a6a09e334361725cd58db22971",
+        "sha256": "a35865c98264b6470b33df7861d18de1a3dc2ebf1ba23e0426c8918615b518f7"
+      },
+      "downloads": -1,
+      "filename": "IMNN-0.3.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "80c4e5a6a09e334361725cd58db22971",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 127488,
+      "upload_time": "2021-10-28T14:06:28",
+      "upload_time_iso_8601": "2021-10-28T14:06:28.570944Z",
+      "url": "https://files.pythonhosted.org/packages/f3/86/e8c914d994aa50591281fddaab96a1d89bde0627e7c0799b371b410abeb1/IMNN-0.3.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c72fec68a74f305b700245f3c6b6fb08870937a017b778fe8fa79bf2e895596f",
+        "md5": "0abf8259a86fc8d0b3d9dcfe2cc9f407",
+        "sha256": "11d4485f6785c9c107179b4e346169d8dde4265e0fedb96ba5928fc4d6ea82f6"
+      },
+      "downloads": -1,
+      "filename": "IMNN-0.3.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0abf8259a86fc8d0b3d9dcfe2cc9f407",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 2050857,
+      "upload_time": "2021-10-28T14:06:32",
+      "upload_time_iso_8601": "2021-10-28T14:06:32.471286Z",
+      "url": "https://files.pythonhosted.org/packages/c7/2f/ec68a74f305b700245f3c6b6fb08870937a017b778fe8fa79bf2e895596f/IMNN-0.3.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

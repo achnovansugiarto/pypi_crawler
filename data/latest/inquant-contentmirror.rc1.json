@@ -1,0 +1,93 @@
+{
+  "info": {
+    "author": "Stefan Eletzhofer",
+    "author_email": "stefan.eletzhofer@inquant.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Framework :: Plone",
+      "Framework :: Zope2",
+      "Framework :: Zope3",
+      "Programming Language :: Python",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "Contentmirror\n=============\n\n:Author:    $Author: seletz $\n:Date:      $Date: 2008-01-08 16:13:40 +0100 (Di, 08 Jan 2008) $\n:Revision:  $Revision: 56670 $\n\nAbstract\n--------\n\nThis package is provides a way to have a instance of a Plone_ content\nmirrored transparently into one or more locations. To do so, we basically\nneed to:\n\n- locate content to be mirrored on traversal\n\n- insert the located oject into the traversed context's acquisition chain\n\nTo do so, we'll implement a adapter for the Zope 3 traversal mechanism, do\na lookup for content to be mirrored in this adapter, and insert the object\nin the adapted contexts acquisition chain.\n\nGotchas, Limitations\n--------------------\n\nBecause we do add the mirrored object like this, plone will eventually\nreindex the object multiple times (for example if one edits the object when\nappearing on a mirrored path). This has the following consequences:\n\nsearches -- on a search, the object is listed twice, because it's\n    in the catalog twice. IMHO that's OK, because that's what we actually\n    want, we want the object to appear in two places.\n\nedit -- KSS edit and normal edit of mirrored content works as expected. The\n    content will be reindexed on edit. Users which view the same object\n    visible on another path will see the changes on page reload. Nothing\n    unusual here.\n\nremoval, rename -- there it gets tricky. Because the object is in the\n    twice, something like the **folder_listing** will show the object on\n    mirrored paths despite it's no longer there. All we do is mirroring,\n    not copying. I'll try to handle that with an event subscriber.\n\nUID catalog -- because the object may be catalogued multiple times, the UID\n    catalog will contain the UID multiple times. Furthermore, the catalog\n    brains of the additional entries in the uid catalog will return\n    **None** for a **getObject()**. The exact implications of this are\n    unclear to me, that might well be an error in the UID catalog (why does\n    it insert a UID twice in the first place?)\n\nBasic Setup\n-----------\n\nsome needed imports for this doctest::\n\n    >>> from zope import interface\n    >>> from zope import component\n    >>> from zope.app.testing import ztapi\n    >>> from zope.publisher.browser import TestRequest\n\nLocating content\n----------------\n\nTo locate content, we provide an interface::\n\n    >>> from inquant.contentmirror.interfaces import IMirrorContentLocator\n\nWe now can define an adapter which is able to locate content from somewhere\nelse::\n\n    >>> class TestLocator(object):\n    ...     def __init__(self, context):\n    ...         self.context = context\n    ...     def locate( self, name):\n    ...         return self.source.get(name)\n\nSo basically this adapter just has to return a object for a given name.\nLet's try that. We need to setup some plone content for this::\n\n    >>> _ = self.folder.invokeFactory(\"Folder\", \"src\")\n    >>> _ = self.folder.src.invokeFactory(\"Document\", \"doc\", title=\"Muha\")\n    >>> _ = self.folder.invokeFactory(\"Folder\", \"target\")\n\nNow we can provide the adapter::\n\n    >>> from Products.ATContentTypes.content.folder import ATFolder\n    >>> ztapi.provideAdapter(ATFolder,\n    ...    IMirrorContentLocator, TestLocator)\n\nAnd look up the adapter::\n\n    >>> locator = IMirrorContentLocator(self.folder.target)\n    >>> locator.source = self.folder.src\n\nnow we can fetch the content by name::\n\n    >>> locator.locate(\"doc\")\n    <ATDocument at /plone/Members/test_user_1_/src/doc>\n\nOk, that worked.\n\nInserting (mirroring) content\n-----------------------------\n\nBasically what we do is to strip the content to be mirrored from its\nacquisition context and insert it into the target context's acquisition\nchain. Lets try that::\n\n    >>> from Acquisition import aq_inner, aq_base, aq_chain\n    >>> obj = self.folder.src.doc\n    >>> aq_chain(obj)\n    [<ATDocument at /plone/Members/test_user_1_/src/doc>, <ATFolder at /plone/Members/test_user_1_/src>, ... \n\nWe see, that **obj** has a normal acquisition chain, as one would expect.\nNext, we'll fake the acquisition chain such that obj_mirrored will\n**appear** to be below the **target** folder::\n\n    >>> obj_mirrored = aq_base(obj).__of__(self.folder.target)\n    >>> aq_chain(obj_mirrored)\n    [<ATDocument at /plone/Members/test_user_1_/target/doc>, <ATFolder at /plone/Members/test_user_1_/target>, ... \n\nYay.\n\nTraversing\n----------\n\nNow all wa have to do is to provide a way to hook into Plone's object\ntraversal mechanism, and to alter it such that we can return the mirrored\nobject. The traverser we'll provide uses the **IPublishTraverse**\ninterface, which is the Zope 3 way of doing it::\n\n    >>> from zope.publisher.interfaces import IPublishTraverse\n\nZope 2 used to use **__bobo_traverse__** to traverse objects. Nowadays,\ntraversal is done by providing a adapter to **IPublishTraverse**. The\ndefault traverser is **DefaultPublishTraverse**, which is defined in the\nZope 2 publisher::\n\n   >>> from ZPublisher.BaseRequest import DefaultPublishTraverse\n\nThis adapter does eventually call **__bobo_traverse__**. Thus, there's no\nneed to overwrite **__bobo_traverse__** anymore. Yay.\n\nOur special adapter for our mirror content woll do the following:\n\n- try to adapt the traversed context to **IMirrorContentLocator**, and\n  locate a content for the currently traversed name\n\n- strip the located content object of its acquisition chain and insert it\n  into the travesed context's acquisition chain, and return it\n\nOk, let's try it.\n\nFirst, we need to create a **IPublishTraverse** adapter. Note that this is\na multi adapter adapting a interface and a **IHTTPRequest** to\n**IPublishTraverse**::\n\n    >>> class MirrorTraverse(object):\n    ...     def __init__(self,context,request):\n    ...         self.context = context\n    ...         self.request = request\n    ...         self.locator = IMirrorContentLocator(context)\n    ...     def publishTraverse(self, request, name):\n    ...         obj = locator.locate(name)\n    ...         return aq_base(aq_inner(obj)).__of__(self.context)\n\nNow, we want to provide the adapter. We do NOT want to overwrite the\ndefault behavior, though. That's why we define a marker interface to adapt\nto **IMirrorContentProvider**. We provide the adapter::\n\n    >>> from inquant.contentmirror.interfaces import IMirrorContentProvider\n    >>> from zope.publisher.interfaces.http import IHTTPRequest\n    >>> ztapi.provideAdapter(\n    ...     (IMirrorContentProvider,IHTTPRequest),\n    ...     IPublishTraverse,\n    ...     MirrorTraverse)\n\nNow we should be able to traverse. To call up the adapter we need a test\nrequest, though::\n\n    >>> request = TestRequest()\n    >>> IHTTPRequest.providedBy(request)\n    True\n\nQuery the ZCA for the adapter::\n\n    >>> traverser = component.getMultiAdapter(\n    ...     (self.folder.target, request), IPublishTraverse )\n    Traceback (most recent call last):\n    ...\n    ComponentLookupError: ...\n\nOuch!\nAh, we need to provide the **IMirrorContentProvider** first::\n\n    >>> interface.alsoProvides(self.folder.target, IMirrorContentProvider)\n    >>> IMirrorContentProvider.providedBy(self.folder.target)\n    True\n\nTry again::\n\n    >>> traverser = component.queryMultiAdapter(\n    ...     (self.folder.target, request), IPublishTraverse )\n\nA-haaa!\n\nUnfortunately, for sake of this test, we need to patch in the source\nmanually. In reality, the locator adapter would of course determine the\nsource itself.::\n\n    >>> traverser.locator.source = self.folder.src\n\nNow try to traverse::\n\n    >>> traverser.publishTraverse(request, \"doc\")\n    <ATDocument at /plone/Members/test_user_1_/target/doc>\n\nYay! Note that the returned object seems to come from the **target**\nfolder, but it is located in the **src** folder in reality.\n\nCleanup\n-------\n\nRemove the adapter::\n\n    >>> gsm = component.getGlobalSiteManager()\n    >>> gsm.unregisterAdapter(\n    ...     MirrorTraverse,\n    ...     (IMirrorContentProvider,IHTTPRequest),\n    ...     IPublishTraverse)\n    True\n    >>> gsm.unregisterAdapter(TestLocator, (ATFolder,),\n    ...    IMirrorContentLocator)\n    True\n\nLinks\n-----\n\nPlone_ is a CMS.\n\n.. _Plone: http://plone.org\n\n\n::\n\n vim: set ft=rst tw=75 nocin nosi ai sw=4 ts=4 expandtab:",
+    "description_content_type": null,
+    "docs_url": null,
+    "download_url": "UNKNOWN",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://svn.plone.org/svn/collective/inquant.contentmirror/trunk",
+    "keywords": "",
+    "license": "GPL",
+    "maintainer": null,
+    "maintainer_email": null,
+    "name": "inquant.contentmirror",
+    "package_url": "https://pypi.org/project/inquant.contentmirror/",
+    "platform": "UNKNOWN",
+    "project_url": "https://pypi.org/project/inquant.contentmirror/",
+    "project_urls": {
+      "Download": "UNKNOWN",
+      "Homepage": "https://svn.plone.org/svn/collective/inquant.contentmirror/trunk"
+    },
+    "release_url": "https://pypi.org/project/inquant.contentmirror/0.1/",
+    "requires_dist": null,
+    "requires_python": null,
+    "summary": "mirror plone content transparently in a plone site",
+    "version": "0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 793369,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62c30cb1df3a54e569337ddad7ef8c2faa61a2880e45b10f4abca73de56ea522",
+          "md5": "bffc5c1601181f3d4e4917384fe64291",
+          "sha256": "98b3e1efd4ba3df73191a4ba29cd03fa489fe741bafd596edd46dd3015ce32b3"
+        },
+        "downloads": -1,
+        "filename": "inquant.contentmirror-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bffc5c1601181f3d4e4917384fe64291",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9451,
+        "upload_time": "2008-01-08T15:16:50",
+        "upload_time_iso_8601": "2008-01-08T15:16:50Z",
+        "url": "https://files.pythonhosted.org/packages/62/c3/0cb1df3a54e569337ddad7ef8c2faa61a2880e45b10f4abca73de56ea522/inquant.contentmirror-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "62c30cb1df3a54e569337ddad7ef8c2faa61a2880e45b10f4abca73de56ea522",
+        "md5": "bffc5c1601181f3d4e4917384fe64291",
+        "sha256": "98b3e1efd4ba3df73191a4ba29cd03fa489fe741bafd596edd46dd3015ce32b3"
+      },
+      "downloads": -1,
+      "filename": "inquant.contentmirror-0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "bffc5c1601181f3d4e4917384fe64291",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 9451,
+      "upload_time": "2008-01-08T15:16:50",
+      "upload_time_iso_8601": "2008-01-08T15:16:50Z",
+      "url": "https://files.pythonhosted.org/packages/62/c3/0cb1df3a54e569337ddad7ef8c2faa61a2880e45b10f4abca73de56ea522/inquant.contentmirror-0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

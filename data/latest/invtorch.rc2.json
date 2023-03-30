@@ -1,0 +1,189 @@
+{
+  "info": {
+    "author": "Modar M. Alfadly",
+    "author_email": "modar.alfadly@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Environment :: Console",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: Apache Software License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Image Recognition",
+      "Topic :: Scientific/Engineering :: Information Analysis"
+    ],
+    "description": "# InvTorch: Memory-Efficient Invertible Functions\n\nWhen working with extremely deep neural networks, memory becomes an immediate concern. It will be filled with [saved tensors](https://pytorch.org/docs/1.10.0/notes/autograd.html#:~:text=Saved%20tensors) that are needed for gradient computation. PyTorch provides a solution, [`checkpoint_sequential`](https://pytorch.org/docs/1.10.0/checkpoint.html#:~:text=torch.utils.checkpoint.checkpoint_sequential), that allows us to segment every few layers as a checkpoint. Such that, the forward pass is run in `no_grad` mode. Meanwhile, the inputs of every segment is saved in memory. Every other unreferenced tensor gets deallocated. In the backward pass, the forward pass of every segment, starting from the last to the first, will be run again using its saved inputs to compute its gradients. Refer to [this](https://pytorch.org/docs/1.10.0/checkpoint.html) for more details.\n\nThis module extends the functionality of `torch.utils.checkpoint.checkpoint` to work with invertible functions. So, everything now can be released from memory and recomputed later using the inverse function in the backward pass. This is useful for extremely wide networks where more compute is traded with memory. However, there are few considerations to keep in mind when working with invertible checkpoints and non-materialized tensors. Please, read the limitations section below for specifics.\n\n## Installation\n\n[InvTorch](https://github.com/xmodar/invtorch) has minimal dependencies. It only requires Python `>=3.6` and PyTorch `>=1.10.0`.\n\n```bash\npip install invtorch\n```\n\n## Usage\n\nWe are interested in `invtorch.nn.Module` which inherits from `torch.nn.Module`. Subclass it to implement your own invertible code.\n\n```python\nimport torch\nfrom torch import nn\n\nimport invtorch.nn as inn\n\n\nclass InvertibleLinear(inn.Module):\n    def __init__(self, in_features, out_features):\n        super().__init__()\n        self.weight = nn.Parameter(torch.randn(out_features, in_features))\n        self.bias = nn.Parameter(torch.randn(out_features))\n\n    def function(self, inputs):\n        return inputs @ self.weight.T + self.bias\n\n    def inverse(self, outputs):\n        return (outputs - self.bias) @ self.weight.T.pinverse()\n\n\nif __name__ == '__main__':\n    x = torch.randn(10, 3)\n    model = InvertibleLinear(3, 5)\n    print('Is invertible:', model.check(x))\n\n    y = model(x)\n    print('Input was freed:', x.storage().size() == 0)\n\n    y.backward(torch.randn_like(y))\n    print('Input was restored:', x.storage().size() != 0)\n```\n\n### forward()\n\nYou can immediately notice few differences to the regular PyTorch module here. There is no longer a need to define `forward()`. Instead, it is replaced with `function()`. Additionally, it is necessary to define its inverse function as `inverse()`. Both methods should input and output only positional arguments as a `tuple` or a single `torch.Tensor`. Furthermore, `forward()` accepts an optional keyword argument `keep` which is an iterable of input tensors that shouldn't be deallocated.\n\n### function()\n\nThe first call to `function()` is always run in `dry_mode` (check it with `invtorch.in_dry_mode()`). This is a novel mode that has gradient graph construction enabled but doesn't allow for backward propagation. The second call is during the backward pass which is when the gradients will actually be computed (check it with `invtorch.in_backward()`).\n\n### inverse()\n\nYou can verify your implementation of `inverse()` by calling `check()`. In some cases, switching to double precision is advised as invertible functions can run into some numerical instability when using single precision. For some functions, a view of an input tensor is passed in the outputs. In such case, this will be automatically detected and the input tensor will not be released from memory.\n\n### num_outputs\n\nSometimes, `inverse()` requires auxiliary outputs from `function()` that are not necessarily needed as an output for `forward()`. To specify how many outputs do we need to keep, we can modify the `num_outputs` property (`None` keeps everything). Extra outputs will be hidden using `process()` which is automatically called by `forward()`. Another property `num_inputs` is also defined which helps composing inverse calls like in `invtorch.nn.Sequential.inverse()`.\n\n### reverse()\n\n`invtorch.nn.Module` can be implemented to be reversible, i.e. `forward()` will call `inverse()` instead of `function()`. Not all invertible modules need to support reversibility. If you want to support it on your own module, then you need to override the `reversible` property to return `True`. The module can be reversed by calling `reverse()` and checked with the `reversed` property. To avoid confusion, `Module` has `call_function()` and `call_inverse()` which will call the correct function based on the value of `reversed`.\n\n### checkpoint, invertible, and seed\n\n`invtorch.nn.Module` has two flags which control the mode of operation; `checkpoint` and `invertible`. If `checkpoint` was set to `False`, or when working in `no_grad` mode, it acts exactly as a normal PyTorch module. Otherwise, the model is either `invertible` or a `checkpoint` depending on whether `invertible` is set to `True` or `False`, respectively. Those, flags can be changed at any time during operation without any repercussions. A third flag `seed` is by default `False` and if set to `True`, it ensures that the forward runs in the same random number generator's state of the devices of the input tensors.\n\n### invtorch.checkpoint()\n\nPyTorch's checkpoint cannot track the `requires_grad` attribute for its output tensors since it is running in `no_grad` mode. Instead, InvTorch's checkpoint doesn't have this issue because it runs in `dry_mode`. In addition, it supports invertible functions.\n\n## Limitations\n\nThere are few caveats to consider though. Invertible functions are hard to define without requiring more memory. Moreover, they are prone to numerical instabilities (e.g., multiplying by numbers close to zero). Even if we can get away with these fundamental problems, there are technical details to consider. There is no way of guarding against accessing the data in the input tensors after calling `function()` and before the backward pass. It is up to the user to ensure this. Otherwise, it is possible to run into illegal memory access errors. Think of residual connections as an example. In `x + f(x)`, assuming `f` is an invertible checkpoint, `x` will be freed from memory before the sum is computed. On the other hand, we can maybe use `x.clone() + f(x)` (not `f(x) + x.clone()`!) but now we have a copy of `x` in memory. It is recommended to encapsulate this inside `f` itself or use a simple checkpoint instead. Other alternatives exists and you should study your case carefully before deciding to use this. For instance, check out `torch.autograd.graph.saved_tensors_hooks()` and `torch.autograd.graph.save_on_cpu()`.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "http://github.com/xmodar/invtorch",
+    "keywords": "deep learning,pytorch,ai",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "invtorch",
+    "package_url": "https://pypi.org/project/invtorch/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/invtorch/",
+    "project_urls": {
+      "Homepage": "http://github.com/xmodar/invtorch"
+    },
+    "release_url": "https://pypi.org/project/invtorch/0.5.0/",
+    "requires_dist": [
+      "torch (>=1.10.0)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "InvTorch: Memory-Efficient Invertible Functions",
+    "version": "0.5.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12590968,
+  "releases": {
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94b9e4cf035f8fa03d0f3f7772dcf0e2a222075e85786c2aeb27ef0448f64b7b",
+          "md5": "c476071c06099a7a4824b938d0aae881",
+          "sha256": "fa0c86f0de7ba5f8e6c82389b025ae2cb6a98e799e58243907d6a72759fab67e"
+        },
+        "downloads": -1,
+        "filename": "invtorch-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c476071c06099a7a4824b938d0aae881",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 20927,
+        "upload_time": "2021-12-06T14:40:49",
+        "upload_time_iso_8601": "2021-12-06T14:40:49.712995Z",
+        "url": "https://files.pythonhosted.org/packages/94/b9/e4cf035f8fa03d0f3f7772dcf0e2a222075e85786c2aeb27ef0448f64b7b/invtorch-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33999d716854f11f30aa54f41199984170c581f4b4113db355ba27c0e129dcdd",
+          "md5": "e887d52c639f381991fba2d7f39efd3f",
+          "sha256": "787b2bda5b6f686aac46d2694388a4eb8af4d134f41ee2f22b8f7cc4f150843d"
+        },
+        "downloads": -1,
+        "filename": "invtorch-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e887d52c639f381991fba2d7f39efd3f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19722,
+        "upload_time": "2021-12-06T14:40:51",
+        "upload_time_iso_8601": "2021-12-06T14:40:51.104376Z",
+        "url": "https://files.pythonhosted.org/packages/33/99/9d716854f11f30aa54f41199984170c581f4b4113db355ba27c0e129dcdd/invtorch-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3b82165a0ba736465ae26482f37cae1ed666ddb6d13289001bdeb5e097a7b4f",
+          "md5": "76b220f2ecf2a890fedcfd19fded1c32",
+          "sha256": "384b4d4f282b4ce27cf30c1ad9288598534e93b52fca74052c141fe67dfd039c"
+        },
+        "downloads": -1,
+        "filename": "invtorch-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76b220f2ecf2a890fedcfd19fded1c32",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24396,
+        "upload_time": "2022-01-16T21:26:13",
+        "upload_time_iso_8601": "2022-01-16T21:26:13.504811Z",
+        "url": "https://files.pythonhosted.org/packages/c3/b8/2165a0ba736465ae26482f37cae1ed666ddb6d13289001bdeb5e097a7b4f/invtorch-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22276143b6e44ae775dd85ff619019b0c75f73aa7bc712b1ffb8860159d2da98",
+          "md5": "ed6969167f3a840c9e0f9fbcfe2b1ed3",
+          "sha256": "940500b3b15fe68d08ae2f7636e9986b46a8179612f022a6671869906ab427c0"
+        },
+        "downloads": -1,
+        "filename": "invtorch-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed6969167f3a840c9e0f9fbcfe2b1ed3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 21631,
+        "upload_time": "2022-01-16T21:26:15",
+        "upload_time_iso_8601": "2022-01-16T21:26:15.217502Z",
+        "url": "https://files.pythonhosted.org/packages/22/27/6143b6e44ae775dd85ff619019b0c75f73aa7bc712b1ffb8860159d2da98/invtorch-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c3b82165a0ba736465ae26482f37cae1ed666ddb6d13289001bdeb5e097a7b4f",
+        "md5": "76b220f2ecf2a890fedcfd19fded1c32",
+        "sha256": "384b4d4f282b4ce27cf30c1ad9288598534e93b52fca74052c141fe67dfd039c"
+      },
+      "downloads": -1,
+      "filename": "invtorch-0.5.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "76b220f2ecf2a890fedcfd19fded1c32",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 24396,
+      "upload_time": "2022-01-16T21:26:13",
+      "upload_time_iso_8601": "2022-01-16T21:26:13.504811Z",
+      "url": "https://files.pythonhosted.org/packages/c3/b8/2165a0ba736465ae26482f37cae1ed666ddb6d13289001bdeb5e097a7b4f/invtorch-0.5.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "22276143b6e44ae775dd85ff619019b0c75f73aa7bc712b1ffb8860159d2da98",
+        "md5": "ed6969167f3a840c9e0f9fbcfe2b1ed3",
+        "sha256": "940500b3b15fe68d08ae2f7636e9986b46a8179612f022a6671869906ab427c0"
+      },
+      "downloads": -1,
+      "filename": "invtorch-0.5.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "ed6969167f3a840c9e0f9fbcfe2b1ed3",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 21631,
+      "upload_time": "2022-01-16T21:26:15",
+      "upload_time_iso_8601": "2022-01-16T21:26:15.217502Z",
+      "url": "https://files.pythonhosted.org/packages/22/27/6143b6e44ae775dd85ff619019b0c75f73aa7bc712b1ffb8860159d2da98/invtorch-0.5.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

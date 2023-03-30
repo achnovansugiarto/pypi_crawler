@@ -1,0 +1,402 @@
+{
+  "info": {
+    "author": "Gareth Jones",
+    "author_email": "garethgithub@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Incremental trees\n![The overcomplicated tests are...](https://github.com/garethjns/IncrementalTrees/workflows/The%20overcomplicated%20tests%20are.../badge.svg)\n\nAdds partial fit method to sklearn's forest estimators (currently RandomForestClassifier/Regressor and ExtraTreesClassifier/Regressor) to allow [incremental training](https://scikit-learn.org/0.15/modules/scaling_strategies.html) without being limited to a linear model. Works with or without [Dask-ml's Incremental](http://ml.dask.org/incremental.html).\n\nThese methods don't try and implement partial fitting for decision trees, rather they remove requirement that individual decision trees within forests are trained with the same data (or equally sized bootstraps). This reduces memory burden, training time, and variance. This is at the cost of generally increasing the number of weak learners will probably be required. \n\nThe resulting forests are not \"true\" online learners, as batch size affects performance. However, they should have similar (possibly better) performance as their standard versions after seeing an equivalent number of training rows.\n\n## Installing package\n\nQuick start:\n\n1) Clone repo and build pip installable package.\n   ````bash\n    pip install incremental_trees\n   ````\n\n\n## Usage Examples\nCurrently implemented:\n - Streaming versions of RandomForestClassifier (StreamingRFC) and ExtraTreesClassifer (StreamingEXTC). They work should work for binary and multi-class classification, but not multi-output yet.\n - Streaming versions of RandomForestRegressor (StreamingRFR) and ExtraTreesRegressor (StreamingEXTR). \n\nSee:\n- Below for example of using different mechanisms to feed .partial_fit() and different parameter set ups.  \n- [notes/PerformanceComparisons.ipynb](https://github.com/garethjns/IncrementalTrees/blob/master/notes/PerformanceComparisons.ipynb) and  [notes/PerformanceComparisonsDask.ipynb](https://github.com/garethjns/IncrementalTrees/blob/master/notes/PerformanceComparisonsDask.ipynb) for more examples and performance comparisons against RandomForest. Also there are some (unfinished) performance comparisons in tests/.\n\n\n### Data feeding mechanisms\n\n#### Fitting with .fit()\nFeeds .partial_fit() with randomly samples rows.\n\n\n````python\nimport numpy as np\nfrom sklearn.datasets import make_blobs\nfrom incremental_trees.models.classification.streaming_rfc import StreamingRFC\n\n# Generate some data in memory\nx, y = make_blobs(n_samples=int(2e5), random_state=0, n_features=40, centers=2, cluster_std=100)\n\nsrfc = StreamingRFC(n_estimators_per_chunk=3,\n                    max_n_estimators=np.inf,\n                    spf_n_fits=30,  # Number of calls to .partial_fit()\n                    spf_sample_prop=0.3)  # Number of rows to sample each on .partial_fit()\n\nsrfc.fit(x, y, sample_weight=np.ones_like(y))  # Optional, gets sampled along with the data\n\n# Should be n_estimators_per_chunk * spf_n_fits\nprint(len(srfc.estimators_))\nprint(srfc.score(x, y))\n````\n\n#### Fitting with .fit() and Dask\nCall .fit() directly, let dask handle sending data to .partial_fit()\n\n````python\nimport numpy as np\nimport dask_ml.datasets\nfrom dask_ml.wrappers import Incremental\nfrom dask.distributed import Client, LocalCluster\nfrom dask import delayed\nfrom incremental_trees.models.classification.streaming_rfc import StreamingRFC\n\n# Generate some data out-of-core\nx, y = dask_ml.datasets.make_blobs(n_samples=2e5, chunks=1e4, random_state=0,\n                                   n_features=40, centers=2, cluster_std=100)\n\n# Create throwaway cluster and client to run on                                  \nwith LocalCluster(processes=False, n_workers=2, \n                  threads_per_worker=2) as cluster, Client(cluster) as client:\n\n    # Wrap model with Dask Incremental\n    srfc = Incremental(StreamingRFC(dask_feeding=True,  # Turn dask on\n                                    n_estimators_per_chunk=10,\n                                    max_n_estimators=np.inf,\n                                    n_jobs=4))\n    \n    # Call fit directly, specifying the expected classes\n    srfc.fit(x, y,\n             classes=delayed(np.unique)(y).compute())\n             \n    print(len(srfc.estimators_))\n    print(srfc.score(x, y))\n````\n\n#### Feeding .partial_fit() manually \n.partial_fit can be called directly and fed data manually.\n\nFor example, this can be used to feed .partial_fit() sequentially (although below example selects random rows, which is similar to non-dask example above).\n\n````python\nimport numpy as np\nfrom sklearn.datasets import make_blobs\nfrom incremental_trees.models.classification.streaming_rfc import StreamingRFC\n\nsrfc = StreamingRFC(n_estimators_per_chunk=20,\n                    max_n_estimators=np.inf,\n                    n_jobs=4)\n\n# Generate some data in memory\nx, y = make_blobs(n_samples=int(2e5), random_state=0, n_features=40,\n                  centers=2, cluster_std=100)\n\n# Feed .partial_fit() with random samples of the data\nn_chunks = 30\nchunk_size = int(2e3)\nfor i in range(n_chunks):\n   sample_idx = np.random.randint(0, x.shape[0], chunk_size)\n   # Call .partial_fit(), specifying expected classes, also supports other .fit args such as sample_weight\n   srfc.partial_fit(x[sample_idx, :], y[sample_idx],\n                    classes=np.unique(y))\n\n# Should be n_chunks * n_estimators_per_chunk             \nprint(len(srfc.estimators_))\nprint(srfc.score(x, y))\n````\n\n### Possible model set ups\nThere are a couple of different model setups worth considering. No idea which works best. \n\n#### \"Incremental forest\"\nFor the number of chunks/fits, sample rows from X, then fit a number of single trees (with different column subsets), eg.\n````python\nsrfc = StreamingRFC(n_estimators_per_chunk=10, max_features='sqrt')    \n````\n#### \"Incremental decision trees\"\nSingle (or few) decision trees per data subset, with all features. \n````python\nsrfc = StreamingRFC(n_estimators_per_chunk=1, max_features=x.shape[1])\n````\n\n# Version history\n## v0.6.0\n - Update to work with scikit-learn==1.2, dask==2022.12, dask-glm==0.2.0, dask-ml==2022.5.27. Support python 3.8 and 3.9.\n## v0.5.1\n - Add support for passing fit args/kwargs via `.fit` (specifically, `sample_weight`)\n## v0.5.0\n - Add support for passing fit args/kwargs via `.partial fit` (specifically, `sample_weight`)\n## v0.4.0\n - Refactor and tidy, try with new versions of Dask/sklearn\n## v0.3.1-3\n  - Update Dask versions\n## v0.3.0\n  - Updated unit tests\n  - Added performance benchmark tests for classifiers, not finished.\n  - Added regressor versions of RandomForest (StreamingRFR) and ExtaTrees (StreamingEXTR, also renamed StreamingEXT to StreamingEXTC).\n  - .fit() overload to handle feeding .partial_fit() with random row samples, without using Dask. Adds compatibility with sklearn SearchCV objects.\n## v0.2.0\n  - Add ExtraTreesClassifier (StreamingEXT)\n## v0.1.0\n  - .partial_fit() for RandomForestClassifier (StreamingRFC)\n  - .predict_proba() for RandomforestClassifier\n  \n  \n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/garethjns/IncrementalTrees",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "incremental-trees",
+    "package_url": "https://pypi.org/project/incremental-trees/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/incremental-trees/",
+    "project_urls": {
+      "Homepage": "https://github.com/garethjns/IncrementalTrees"
+    },
+    "release_url": "https://pypi.org/project/incremental-trees/0.6.0/",
+    "requires_dist": [
+      "scikit-learn (==1.2)",
+      "pandas",
+      "numpy",
+      "dask (==2022.12)",
+      "dask-glm (==0.2.0)",
+      "dask-ml (==2022.5.27)",
+      "fsspec"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Sklearn forests with partial fits",
+    "version": "0.6.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16277781,
+  "releases": {
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f590a17a3b190cf5e1868f3c434a771d4f733c201523ecc748cd8c0f8eb91ab",
+          "md5": "cf99d81fdd94f95f33a961ccc641c6ec",
+          "sha256": "836d44e2657b80ee61a6a554532d86b5e11e4fcf017b29fbc75c5e2afb9cd73d"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cf99d81fdd94f95f33a961ccc641c6ec",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 5298,
+        "upload_time": "2020-03-10T23:20:39",
+        "upload_time_iso_8601": "2020-03-10T23:20:39.843920Z",
+        "url": "https://files.pythonhosted.org/packages/2f/59/0a17a3b190cf5e1868f3c434a771d4f733c201523ecc748cd8c0f8eb91ab/incremental_trees-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf74c5d77788d2a34071f9a6e501d02daa5df48dbff2fcc31668bf6e45632da3",
+          "md5": "647fcba0a249d0c257bd8ee5a4459b8e",
+          "sha256": "b7eef67e81c5680e356ff2d84726ac6384fe633a127381ec4e8bc769abe6e4f0"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "647fcba0a249d0c257bd8ee5a4459b8e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5965,
+        "upload_time": "2020-03-10T23:20:43",
+        "upload_time_iso_8601": "2020-03-10T23:20:43.059014Z",
+        "url": "https://files.pythonhosted.org/packages/bf/74/c5d77788d2a34071f9a6e501d02daa5df48dbff2fcc31668bf6e45632da3/incremental_trees-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44275792d339bf00aee0c52f3a336d64eaf6b4a02837f4f35054733c4fc6f84b",
+          "md5": "143db1e64dcaa63ae6ac64e47bd09f82",
+          "sha256": "fdee5cca9f62448593054e6f361e2baa0da98c4ec6c225b748b39f0ff65fe5fb"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "143db1e64dcaa63ae6ac64e47bd09f82",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6303,
+        "upload_time": "2020-03-10T23:20:41",
+        "upload_time_iso_8601": "2020-03-10T23:20:41.920769Z",
+        "url": "https://files.pythonhosted.org/packages/44/27/5792d339bf00aee0c52f3a336d64eaf6b4a02837f4f35054733c4fc6f84b/incremental_trees-0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "165555ef024381b4c03b68ab6b554c984ac4d607282da835d2e82ad7f753aa55",
+          "md5": "c6cb38642246a610cd5ae790d8257271",
+          "sha256": "0f6a964152df283d3836b9a4fe06af5218e88731545b0e88804228c5fb079f3d"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c6cb38642246a610cd5ae790d8257271",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7830,
+        "upload_time": "2020-03-10T23:20:47",
+        "upload_time_iso_8601": "2020-03-10T23:20:47.468015Z",
+        "url": "https://files.pythonhosted.org/packages/16/55/55ef024381b4c03b68ab6b554c984ac4d607282da835d2e82ad7f753aa55/incremental_trees-0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dbb003bf337106c918e0d59737c10e638843f32cf4415691afa33b455cd9dc4d",
+          "md5": "1dd87be22e002796692126a134def360",
+          "sha256": "d6368c45079fc17155ce06e3483014fe81b264cab6a3da7632f06dc5ca09123a"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1dd87be22e002796692126a134def360",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10323,
+        "upload_time": "2020-03-10T23:20:44",
+        "upload_time_iso_8601": "2020-03-10T23:20:44.381089Z",
+        "url": "https://files.pythonhosted.org/packages/db/b0/03bf337106c918e0d59737c10e638843f32cf4415691afa33b455cd9dc4d/incremental_trees-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e3223496264da87ff0fb475e9c9b6a1f0a9fd6906894eb29968d4f9ac8449b1",
+          "md5": "e8dfc2286daf14204d3e52aa03db51f7",
+          "sha256": "b9fdc0a2e3fe722bb86b1b07265593d525db8777c80b58897c4c1840573e1c04"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e8dfc2286daf14204d3e52aa03db51f7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18274,
+        "upload_time": "2020-03-10T23:20:45",
+        "upload_time_iso_8601": "2020-03-10T23:20:45.886225Z",
+        "url": "https://files.pythonhosted.org/packages/5e/32/23496264da87ff0fb475e9c9b6a1f0a9fd6906894eb29968d4f9ac8449b1/incremental_trees-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6cd9f1ea25337c96a8bdee9358ce0663a5a76dfca2bd0663acdd9dea9181055b",
+          "md5": "f642fd811b1100d4103c778e2e4e37bc",
+          "sha256": "eae275542ec729c7e958877f6aa3d59f261f19ff04c47c80a07abddf2e2c45d2"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f642fd811b1100d4103c778e2e4e37bc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 26693,
+        "upload_time": "2020-05-23T22:19:37",
+        "upload_time_iso_8601": "2020-05-23T22:19:37.543546Z",
+        "url": "https://files.pythonhosted.org/packages/6c/d9/f1ea25337c96a8bdee9358ce0663a5a76dfca2bd0663acdd9dea9181055b/incremental_trees-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e2eb2e973ace88173e7cbdfed4aa419554597fd4e38a5a2406082d1519e707e",
+          "md5": "d90b7c3965a84c2fc5474ef7fda8a260",
+          "sha256": "77e61e7f428ae540c0a9bb3bf7326cc0ade1dc9b5db8e4214cd16bfabae90b83"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d90b7c3965a84c2fc5474ef7fda8a260",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19919,
+        "upload_time": "2020-05-23T22:19:38",
+        "upload_time_iso_8601": "2020-05-23T22:19:38.366313Z",
+        "url": "https://files.pythonhosted.org/packages/5e/2e/b2e973ace88173e7cbdfed4aa419554597fd4e38a5a2406082d1519e707e/incremental_trees-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a7f2929181f11cb664b00da8d0d9e411f3919fc8c57d55eb79ccafbfd8cbf59",
+          "md5": "1d76947f9d13ed3ae7a33f6b624e226a",
+          "sha256": "ee016b249a5a268ac62b50fadc7a8f42327d65914af33707aec58fba95d42d09"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1d76947f9d13ed3ae7a33f6b624e226a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27613,
+        "upload_time": "2021-08-17T13:04:42",
+        "upload_time_iso_8601": "2021-08-17T13:04:42.138211Z",
+        "url": "https://files.pythonhosted.org/packages/5a/7f/2929181f11cb664b00da8d0d9e411f3919fc8c57d55eb79ccafbfd8cbf59/incremental_trees-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22bccee5b83f919dd95202c47c4cd8d732c2ad04d06bede73b2dd458e1bbdfa6",
+          "md5": "4639eb1fd470c5f4ebf8a0f346f474d2",
+          "sha256": "173cc2d85643dd5aacfa467f4f43ee212bd9a01930fe42121aa79167b81033c2"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4639eb1fd470c5f4ebf8a0f346f474d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20786,
+        "upload_time": "2021-08-17T13:04:43",
+        "upload_time_iso_8601": "2021-08-17T13:04:43.060240Z",
+        "url": "https://files.pythonhosted.org/packages/22/bc/cee5b83f919dd95202c47c4cd8d732c2ad04d06bede73b2dd458e1bbdfa6/incremental_trees-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bab5900937f6804d8fd4e3e3431a5b2b8db2457c5fb252f7d88e72f29f00d84",
+          "md5": "ec37c21aa600c47133467957175071ee",
+          "sha256": "cab14c885fed0f10b8cf7e559f38e4db53a0571f9163ebb27880e4db4d9b076f"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ec37c21aa600c47133467957175071ee",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27771,
+        "upload_time": "2021-08-17T16:27:50",
+        "upload_time_iso_8601": "2021-08-17T16:27:50.515943Z",
+        "url": "https://files.pythonhosted.org/packages/5b/ab/5900937f6804d8fd4e3e3431a5b2b8db2457c5fb252f7d88e72f29f00d84/incremental_trees-0.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e09866b56580de08501e9de3c98c681f60a1b2b42adabc8fbe3a4da8e829f2e",
+          "md5": "30caa8b9d7cddd32b5b2daf2cd504496",
+          "sha256": "d07becb5f2134318c4f8f9fe5f1cd30d14493e592a67f482ac7a5ddd2e1b77ce"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30caa8b9d7cddd32b5b2daf2cd504496",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20986,
+        "upload_time": "2021-08-17T16:27:52",
+        "upload_time_iso_8601": "2021-08-17T16:27:52.121923Z",
+        "url": "https://files.pythonhosted.org/packages/1e/09/866b56580de08501e9de3c98c681f60a1b2b42adabc8fbe3a4da8e829f2e/incremental_trees-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0208cd83e4f7b0d80b05dea54b5772278f729d923945904499581f383820d074",
+          "md5": "5fc390c2b4b2db261408fe464c69647e",
+          "sha256": "18da88847ece429465506f2b07c3678726b8839f01c83cf8499d874a7fbc1191"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5fc390c2b4b2db261408fe464c69647e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 33991,
+        "upload_time": "2023-01-02T10:17:54",
+        "upload_time_iso_8601": "2023-01-02T10:17:54.524756Z",
+        "url": "https://files.pythonhosted.org/packages/02/08/cd83e4f7b0d80b05dea54b5772278f729d923945904499581f383820d074/incremental_trees-0.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd54f48d246b91a7354756e500699302e6750220944827989ac1a13e38cfdd24",
+          "md5": "6736a835dadff367207ade3689882474",
+          "sha256": "d44553a4554c3e3fc5b83335c09d947fc05d87b1aa659ba61c42e02c900c2a9a"
+        },
+        "downloads": -1,
+        "filename": "incremental_trees-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6736a835dadff367207ade3689882474",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 21419,
+        "upload_time": "2023-01-02T10:17:55",
+        "upload_time_iso_8601": "2023-01-02T10:17:55.862095Z",
+        "url": "https://files.pythonhosted.org/packages/bd/54/f48d246b91a7354756e500699302e6750220944827989ac1a13e38cfdd24/incremental_trees-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0208cd83e4f7b0d80b05dea54b5772278f729d923945904499581f383820d074",
+        "md5": "5fc390c2b4b2db261408fe464c69647e",
+        "sha256": "18da88847ece429465506f2b07c3678726b8839f01c83cf8499d874a7fbc1191"
+      },
+      "downloads": -1,
+      "filename": "incremental_trees-0.6.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5fc390c2b4b2db261408fe464c69647e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 33991,
+      "upload_time": "2023-01-02T10:17:54",
+      "upload_time_iso_8601": "2023-01-02T10:17:54.524756Z",
+      "url": "https://files.pythonhosted.org/packages/02/08/cd83e4f7b0d80b05dea54b5772278f729d923945904499581f383820d074/incremental_trees-0.6.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bd54f48d246b91a7354756e500699302e6750220944827989ac1a13e38cfdd24",
+        "md5": "6736a835dadff367207ade3689882474",
+        "sha256": "d44553a4554c3e3fc5b83335c09d947fc05d87b1aa659ba61c42e02c900c2a9a"
+      },
+      "downloads": -1,
+      "filename": "incremental_trees-0.6.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6736a835dadff367207ade3689882474",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 21419,
+      "upload_time": "2023-01-02T10:17:55",
+      "upload_time_iso_8601": "2023-01-02T10:17:55.862095Z",
+      "url": "https://files.pythonhosted.org/packages/bd/54/f48d246b91a7354756e500699302e6750220944827989ac1a13e38cfdd24/incremental_trees-0.6.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
