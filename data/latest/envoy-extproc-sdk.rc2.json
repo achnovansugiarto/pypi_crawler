@@ -1,0 +1,184 @@
+{
+  "info": {
+    "author": "W. Ross Morrow",
+    "author_email": "morrowwr@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# An Envoy ExternalProcessor SDK in python\n\n## Overview\n\n[`envoy`](https://www.envoyproxy.io/), one of the most powerful and widely used reverse proxies, is able to query an [ExternalProcessor](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) gRPC service in it's filter chain. This functionality opens the door to quickly and robustly implemently customized functions at the edge, instead of in targeted services. [Bond](www.bond.tech), for example, is using this functionality to implement authentication, API call logging, and write-request idempotency. While powerful, implementing these services still requires dealing with complicated `envoy` specs, managing information sharing across request phases, and an understanding of gRPC, none of which are exactly straightforward. \n\n**The purpose of this SDK is to make development of ExternalProcessors easy**. This SDK _certainly_ won't supply the most _performant_ edge functions. With the `docker-compose` setup here we see an overhead of about 20ms/req with 6 processors in the filter chain, or maybe about 4-5ms/req per filter. Without a doubt, much better performance will come from eschewing the ease-of-use functionality here, packing processor functions together in one filter, implementing your filter in a compiled language, or even more likely _not using an ExternalProcessor at all_ but instead using a [WASM plugin](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/wasm/v3/wasm.proto) or registered [custom filter binary](https://github.com/envoyproxy/envoy-filter-example). Optimal performance isn't our goal; usability, maintainability, and low time-to-functionality is, and those aspects can often be more important than minimal latency. \n\n### Usage\n\nSpecifically we supply a `BaseExtProcService` that provides much of the boilerplate required to make this type of service. Here is a brief, untyped example of how to build one (based on `examples/decorated.py`):\n```\nimport logging\nfrom envoy_extproc_sdk import BaseExtProcService, serve\n\nsvc = BaseExtProcService(name=\"DecoratedExtProcService\")\n\n@svc.process(\"request_headers\")\ndef start_digest(headers, context, request, response):\n    ... # do stuff\n\n@svc.process(\"request_body\")\ndef complete_digest(body, context, request, response):\n    ... # do stuff\n\nif __name__ == \"__main__\":\n    FORMAT = \"%(asctime)s : %(levelname)s : %(message)s\"\n    logging.basicConfig(level=logging.INFO, format=FORMAT, handlers=[logging.StreamHandler()])\n    serve(service=svc)\n```\nIn short, you can simply \"decorate\" methods (of the right signature) and form an ExternalProcessor. This \"route decoration\" is a pattern common to `python` server frameworks, and is probably the easiest way to get started. The primary pattern we use though is subclassing, as you'll see if you review `examples/*.py`. \n```\nclass SomeExtProcService(BaseExtProcService):\n\n    def process_request_headers(self, headers, context, request, response):\n        ... # do stuff\n\n    def process_request_body(self, body, context, request, response):\n        ... # do stuff\n\nif __name__ == \"__main__\":\n    FORMAT = \"%(asctime)s : %(levelname)s : %(message)s\"\n    logging.basicConfig(level=logging.INFO, format=FORMAT, handlers=[logging.StreamHandler()])\n    serve(service=SomeExtProcService())\n```\nObviously there's more to it, but that's the basic idea: focus on behaviors more than lower level implementations. \n\nThe provided `serve` interface adopts the `grpc.aio` paradigm, which we've found a bit cleaner to use here than the threading concurrency model. We also add an implementation of the [HealthService](https://github.com/grpc/grpc/blob/master/src/proto/grpc/health/v1/health.proto) for gRPC in order to run in a context (like `kubernetes`) with health probes. \n\nReally you'll still need to learn some details about how `envoy` specifies and types these services and their data, but it's much more limited here. Basically `BaseExtProcService` implements the single RPC `Process` [defined by the spec](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto), pulls out the request phase data from [ProcessingRequest](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L63), and wraps request phase specific handlers in the requisite [ProcessingResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L126). This enables a subclass (or decorated methods) to focus solely on the logic for handling the request phases. These phases are\n* `{request,response}_headers`: process request or response headers\n* `{request,response}_body`: process request or response bodies\n* `{request,response}_trailers`: process request or response trailers (note: we've found this buggy in `envoy`)\n\nSee [this PRD](https://docs.google.com/document/d/1IZqm5IUnG9gc2VqwGaN5C2TZAD9_QbsY9Vvy5vr9Zmw/edit#heading=h.3zlthggr9vvv) for some extra illustration and discussion around the ExternalProcessor flow. \n\nThe `BaseExtProcService` _also_ implements it's own \"request context\" (the `request` argument in the decorated handlers above) to enable data passing between request phases. This is a _critical_ feature for effective, powerful external processing. `envoy` sends only request header data when asking to process request headers, only body data when asking to process request body, etc. But processor behaviors or computing can easily depend on the full known scope of request data. \n\nStoring and managing that inter-phase data is what `request` is for; see `examples/*.py` for, well, examples. `BaseExtProcService` is largely unopinionated about what data should be contained in the `request`, as that is highly use-case specific. As of now it only takes two default actions: \n* In the `request_headers` phase, it pulls a set of \"standard\" headers into the `request`: the `method`, `path`, `content-type`, `content-length`, and the `x-request-id`. \n* In the `response_headers` phase, it does the same over writing `content-type` and `content-length`. \n\n### Distribution\n\nWe distribute this as `python` package (TBD)\n```\n$ pip install envoy-extproc-sdk\n```\nand as a `docker` container (TBD)\n```\n$ docker pull envoy-extprox-sdk:latest\n```\nNote we do _not_ package generated code from `envoy`'s `protobuf` specs in the `python` module. (The `grpc` libraries themselves are \"broken\" relative to newer `protobuf` because they embedd old generated code for health checks, which seem now unusable.) So if you use the `python` package you have to build and install the `protobuf` generated code from `envoy` (see `buf.yaml` here and `make codegen`) for it to work. We recommend following our approach here, as we customize handling of the health check generated code. \n\nYou can build on top of the `envoy_extproc_sdk` `docker` image and avoid this, as we _do_ package the generated code in images. This can be done in the normal way, actually as illustrated by the examples here. In fact, `examples/Dockerfile` (used in the `docker-compose.yaml`) is only\n```\n# syntax=docker/dockerfile:1.2\nARG IMAGE_TAG=latest\nFROM envoy-extproc-sdk:${IMAGE_TAG}\nCOPY ./examples ./examples\n```\n\n### Testing\n\nThere are also some testing utilities in `envoy_extproc_sdk.testing`. These mainly help create and send payloads to a processor for unit testing. \n* `envoy_headers`: return a [HttpHeaders](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L180) object from a `dict` of headers or a `list` of key-value pairs\n* `envoy_body`: return a [HttpBody](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L199) object from several types that could be bodies\n* `envoy_set_headers_to_dict`: return a `dict` of headers from a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object (useful for response modification assertions)\n* `AsEnvoyExtProc` is a class that can be initialized with phase data and sent to `BaseExtProcService.Process` to mimic processing of a request; ie\n```\nP = BaseExtProcService()\nE = AsEnvoyExtProc(request_headers=headers, request_body=body)\nasync for response in P.Process(E, None):\n    ... # parse ProcessResponse and execute assertions based on phase\n```\n\n### Envoy Configuration\n\nOf course, this service isn't useful outside an `envoy` deployment configured to use it. This SDK doesn't help you configure your `envoy`, but see `envoy.yaml` for example configurations and see [the configuration reference](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/ext_proc.proto). \n\nA simple version is something like\n```\n- name: envoy.filters.http.ext_proc\n  typed_config:\n    \"@type\": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor\n    grpc_service: \n      envoy_grpc:\n        cluster_name: my-extproc\n      timeout: 30s\n    failure_mode_allow: true\n    message_timeout: 0.2s\n    processing_mode: \n      request_header_mode: SEND\n      response_header_mode: SKIP\n      request_body_mode: BUFFERED\n      response_body_mode: BUFFERED\n      request_trailer_mode: SKIP\n      response_trailer_mode: SKIP\n```\nwhere `my-extproc` is a defined `cluster` pointing to the gRPC service. \n\nThe key features to point out are: \n* `failure_mode_allow` declares whether ExternalProcessor failures to _break_ the request flow (`false`) or should be ignored (`true`); if a processor's action is critical to request processing, this should be `false`. \n* `message_timeout` is the per-message timeout within a stream. This should be tailored to how long _any phase_ in request processing can take. \n* `grpc_service.timeout` is the _full request_ timeout of a whole stream. This should be tailored to how long _the whole request_ can take, including any upstream filters or the ultimate target. \n* the `processing_mode`s are important, describing what data an ExternalProcessor gets or doesn't. See [the specification](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/extensions/filters/http/ext_proc/v3/processing_mode.proto#L25) for details. The example service above will receive request headers but _not_ response headers, the _full_ request and response bodies in one pass (not streamed), and no trailers. \n\n## Interface\n\n### Command Line Interface\n\nYou can run the package as module and invoke a CLI: \n```\n$ python -m envoy_extproc_sdk --help\nusage: __main__.py [-h] [-s SERVICE] [-p PORT] [-g GRACE_PERIOD] [-l]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  -s SERVICE, --service SERVICE\n                        Processor to use, as an import spec\n  -p PORT, --port PORT  Port to run service on\n  -g GRACE_PERIOD, --grace-period GRACE_PERIOD\n                        Grace period to finish requests on shutdown\n  -l, --logging         Include logging setup\n```\nUse \n* `-s/--service` to tell the CLI what service to run (values should be a `python` import spec), \n* `-p/--port` is the port to run the server on (by default `50051`), \n* `-g/--grace-period` is the time (in seconds) to wait for requests to finish after interrupt (by default `5`), \n* `-l/--logging` is a flag to setup `logging` at runtime (you might not want this, preferring your own logging setup).\n\nOther or overlapping settings from `env` vars are in `settings.py`: \n* `GRPC_PORT` (default `50051`): the server listerner port\n* `SHUTDOWN_GRACE_PERIOD` (default `5` seconds): the time to wait for gracefull shutdown of the gRPC service\n* `REVEAL_EXTPROC_CHAIN` (default `True`): whether to add a response header that builds a list of all ExternalProcessors used in handling a request\n* `EXTPROCS_APPLIED_HEADER` (default `x-ext-procs-applied`): the name of that header\n\n### Utilities\n\nCurrently `BaseExtProcService` has some `@staticmethod` helpers for processing headers. Helpers for handling bodies may be introduced later. \n\n**BaseExtProcService.get_header** Get a header from the request or response headers. \n\nArguments:\n* `headers` a [HttpHeaders](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L180) object\n* `name` (`str`) the name of the header to look for\n* `lower_cased` (`bool`, default `False`) whether the name is _already_ lowercased\n\nReturns the value of the header searched for, if it exists. `None` if it doesn't. \n\n**BaseExtProcService.get_headers** Get a set of headers from the request or response headers. \n\nArguments:\n* `headers` a [HttpHeaders](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L180) object\n* `names` (`Union[Dict[str, str], List[Tuple[str, str]]]`) the names of the headers to look for, by _actual_ header names, mapped to keys to use in the returned list (e.g., `x-api-key` to `apikey`)\n* `lower_cased` (`bool`, default `False`) whether the name is _already_ lowercased\n\nReturns a `Dict` with mapped names as keys and header values (or `None`) as values.  \n\n**BaseExtProcService.add_header** Add a header to the request or response headers. \n\nArguments:\n* `response` a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object\n* `key` (`str`) the header to set\n* `value` (`str`) the header value\n\nReturns the updated response. \n\n**BaseExtProcService.add_headers** Add a set of headers to the request or response headers. \n\nArguments:\n* `response` a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object\n* `headers` (`Union[Dict[str, str], List[Tuple[str, str]]]`) the headers, as a `dict` or list of key-value pairs, to add\n\nReturns the updated response. \n\n**BaseExtProcService.remove_header** Remove a header from the request or response headers. \n\nArguments:\n* `response` a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object\n* `name` (`str`) the header to remove (if it exists)\n\nReturns the updated response. \n\n**BaseExtProcService.remove_headers** Remove a set of headers from the request or response headers.\n\nArguments:\n* `response` a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object\n* `name` (`List[str]`) the headers, by name, to remove (if they exist)\n\nReturns the updated response. \n\n**BaseExtProcService.form_immediate_response** Construct an [ImmediateResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L286) object, which tells `envoy` to stop processing the request and respond as described. \n\nArguments:\n* `status` (`EnvoyHttpStatusCode` a wrapper around `envoy`'s [StatusCode](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/type/http_status.proto#L18)) the status code for the response\n* `headers` (`Dict[str, str]`) the response headers to return to the caller\n* `body` (`str`) the body to return to the caller\n\nReturns the constructed `ImmediateResponse`. \n\n### Phase Handlers\n\nThe following documents how to implement the \"request phase handlers\". These describe what to do win each phase, how to read/write request context, and how to modify a request or response. In any phase you can `raise` a \n```\nenvoy_extproc_sdk.StopRequestProcessing\n```\n`Exception` to supply a response directly from the processor (without sending to the upstream processors or target). The constructor requires an [ImmediateResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L286) object, which you can construct with the helper method\n```\nraise StopRequestProcessing(response=form_immediate_response(...))\n```\nin `BaseExtProcService`. \n\nIn the labels below we assume \n```\nP = BaseExtProcService(name=\"SomeExtProcService\")\n```\n\n#### `@P.process(\"request_headers\")` or `def process_request_headers`\n\nArguments: \n* `headers`, an `envoy` [HttpHeaders](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L180) object describing the request headers. \n* `context`, a gRPC [ServicerContext](https://grpc.github.io/grpc/python/grpc.html#grpc.ServicerContext) from the RPC\n* `request`, a simple `Dict` for supplying/supplementing request context across phases\n* `response`, a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object for telling `envoy` how to mutate the request (if at all). \n\nReturn the (possibly modified) `response` passed in, or `raise` a `StopRequestProcessing`. \n\n#### `@P.process(\"request_body\")` or `def process_request_body`\n\nArguments: \n* `body`, an `envoy` [HttpBody](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L199) object describing the request body. \n* `context`, a gRPC [ServicerContext](https://grpc.github.io/grpc/python/grpc.html#grpc.ServicerContext) from the RPC\n* `request`, a simple `Dict` for supplying/supplementing request context across phases\n* `response`, a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object for telling `envoy` how to mutate the request (if at all). \n\nReturn the (possibly modified) `response` passed in, or `raise` a `StopRequestProcessing`. \n\n#### `@P.process(\"response_headers\")` or `def process_response_headers`\n\nArguments: \n* `headers`, an `envoy` [HttpHeaders](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L180) object describing the request headers. \n* `context`, a gRPC [ServicerContext](https://grpc.github.io/grpc/python/grpc.html#grpc.ServicerContext) from the RPC\n* `request`, a simple `Dict` for supplying/supplementing request context across phases\n* `response`, a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object for telling `envoy` how to mutate the response (if at all). \n\nReturn the (possibly modified) `response` passed in, or `raise` a `StopRequestProcessing`. \n\n#### `@P.process(\"response_body\")` or `def process_response_body`\n\nArguments: \n* `body`, an `envoy` [HttpBody](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L199) object describing the response body. \n* `context`, a gRPC [ServicerContext](https://grpc.github.io/grpc/python/grpc.html#grpc.ServicerContext) from the RPC\n* `request`, a simple `Dict` for supplying/supplementing request context across phases\n* `response`, a [CommonResponse](https://github.com/envoyproxy/envoy/blob/1cf5603dc5239c92e5bc38ef321f59ccf6eabc6e/api/envoy/service/ext_proc/v3/external_processor.proto#L230) object for telling `envoy` how to mutate the response (if at all). \n\nReturn the (possibly modified) `response` passed in, or `raise` a `StopRequestProcessing`. \n\n#### Trailers\n\nTrailers handlers are similar, but less likely to be used. See the code for details. \n\n## Examples\n\nThere are several examples in `examples/`. These can be packaged in the `docker` image built from `examples/Dockerfile` (see `make build`) and included as services in the `docker-compose.yaml`. The basic `envoy` config `envoy.yaml` (used by the `docker-compose`) sets each example up to be used. \n\n`envoy_extproc_sdk.BaseExtProcService`: The `BaseExtProcService` is an example in it's own right, but does nothing to requests. Using `LOG_LEVEL=DEBUG` will print log lines describing the processing steps taken. Run with\n```\nLOG_LEVEL=DEBUG make run\n```\nFor any other examples you can use the same command to run, specifying the `SERVICE`. For example, \n```\nmake run SERVICE=examples.TrivialExtProcService\n```\nwill run our first example, the \"trivial\" processor. \n\n* `examples.TrivialExtProcService`: This example adds an upstream header as well as a response header, both the `x-request-id` but in the name `x-extra-request-id`. \n\n* `examples.TimerExtProcService`: This example times the request, add an upstream header (which the request started), and add two response headers (when the request started and how long it took in nanoseconds). \n\n* `examples.DigestExtProcService`: This example computes a SHA256 digest of the request method, path, and body, and add that as an upstream request header and a response header `x-request-digest`. It demonstrates inter-phase data use. \n\n* `examples.DecoratedExtProcService`: This example copies `DigestExtProcService`, but implements the service using the `@process` decorator instead of as a subclass service. \n\n* `examples.EchoExtProcService`: This example demonstrates use of `StopRequestProcessing` to respond immediately from an ExternalProcessor, instead of sending a request to the upstream processors or target. \n\n* `CtxExtProcService`: This example allows for testing the request context. It reads a request header `x-context-id`, adding that to the upstream request headers. If that header is missing, the service does nothing else. If it exists, it will also analyze the request body, which it expects to be exactly the `x-context-id` supplied. The processor will fail if this doesn't match. The filter also processes the response body, which it expects to be JSON with the request path equal to `path` (as with our echo server in `tests/mocks/echo`). The service checks that value matches the `path` stored in the request context. These steps are largely to check that we can _concurrently_ make requests with different values and see consistency in the response header `x-context-id`, which we will not get if the service's processing fails. \n\n## Development\n\n### Requirements\n\n* `python3.9`\n* `poetry` for package management\n* `make` for convenience commands\n* `protoc` and `buf` for generating code from `protobuf` schemas for `envoy`\n* `docker` for testing\n\n### Quickstart\n\n#### CLI/`make`\n\nThe `Makefile` provides a lot of helpful targets to get started. The simplest quickstart is probably\n```\n$ make install format unit-test run\n```\nThis will (a) install the `python` dependencies, (b) use `buf` to generate code (and install it in the current virtual environment), (c) format the code, (d) run the unit tests, (e) and run the `BaseExtProcService`. However, running the service on it's own is only partially useful as the service is a gRPC service which isn't the easiest to just `curl` at. \n\nReview the `Makefile` for other commands, including \n* `format` (`isort`, `black`, and `flake8` linting), \n* `types` (for `mypy` static type analysis), \n* `build` (for `docker build`)\n* `package` (for building a `python` package)\n* `publish` (for distributing the `python` package)\n\n#### `docker`\n\nThe `docker-compose` is a setup with `envoy`, a naive \"echo\" HTTP server (see `tests/mocks/echo/echo.py`), and the example ExternalProcessor services from `examples/`. This way you can make plain HTTP requests and actually see outcomes from the filters. The single upstream `echo` server responds to any request with a JSON payload containing the following keys\n* `method`: the request method it saw\n* `path`: the request path \n* `headers`: a nested JSON of all the request headers it received\n* `body`: any request body it received\n* `message`: a message from the `echo` server\n\nFor example, after running \n```\n$ make up\n```\nyou can try \n```\n$ curl localhost:8080/something -D -\nHTTP/1.1 200 OK\nserver: envoy\ndate: Sat, 16 Jul 2022 22:55:19 GMT\ncontent-length: 524\ncontent-type: application/json\nx-envoy-upstream-service-time: 1\nx-request-started: 2022-07-16T22:55:19.290822Z\nx-duration-ns: 23589000\nx-ext-procs-applied: TrivialExtProcService,TimerExtProcService,EchoExtProcService,DigestExtProcService,DecoratedExtProcService,CtxExtProcService\nx-extra-request-id: 554c54e8-fac1-42e3-8ab8-1f2264f59664\n\n{\"method\": \"get\", \"path\": \"/something\", \"headers\": {\"host\": \"localhost:8080\", \"user-agent\": \"curl/7.64.1\", \"accept\": \"*/*\", \"x-forwarded-proto\": \"http\", \"x-request-id\": \"554c54e8-fac1-42e3-8ab8-1f2264f59664\", \"x-extra-request-id\": \"554c54e8-fac1-42e3-8ab8-1f2264f59664\", \"x-request-started\": \"2022-07-16T22:55:19.290822Z\", \"x-request-digest\": \"860d64d6465b9e9886050295087e8a547b3e7a3c40e79d26147b50a97b9ac2c6\", \"x-context-id\": \"\", \"x-envoy-expected-rq-timeout-ms\": \"15000\"}, \"body\": \"{\\\"hello\\\":\\\"hi\\\"}\", \"message\": \"Hello\"}\n```\nor \n```\n$ curl localhost:8080/something -X PUT -H 'Content-type: application/json' -d '{\"hello\":\"hi\"}' -D -\nHTTP/1.1 200 OK\nserver: envoy\ndate: Sat, 16 Jul 2022 22:54:49 GMT\ncontent-length: 584\ncontent-type: application/json\nx-envoy-upstream-service-time: 0\nx-request-digest: a794dbc467285567e4c2604c991938386366f6ab94b0b0e4fab5e27e0a932e60\nx-request-started: 2022-07-16T22:54:49.660908Z\nx-duration-ns: 25046000\nx-ext-procs-applied: TrivialExtProcService,TimerExtProcService,EchoExtProcService,DigestExtProcService,DecoratedExtProcService,CtxExtProcService\nx-extra-request-id: 7a983b59-d67c-44c8-a54a-2afae7069ac9\n\n{\"method\": \"put\", \"path\": \"/something\", \"headers\": {\"host\": \"localhost:8080\", \"user-agent\": \"curl/7.64.1\", \"accept\": \"*/*\", \"content-type\": \"application/json\", \"content-length\": \"14\", \"x-forwarded-proto\": \"http\", \"x-request-id\": \"7a983b59-d67c-44c8-a54a-2afae7069ac9\", \"x-extra-request-id\": \"7a983b59-d67c-44c8-a54a-2afae7069ac9\", \"x-request-started\": \"2022-07-16T22:54:49.660908Z\", \"x-request-digest\": \"a794dbc467285567e4c2604c991938386366f6ab94b0b0e4fab5e27e0a932e60\", \"x-context-id\": \"\", \"x-envoy-expected-rq-timeout-ms\": \"15000\"}, \"body\": \"{\\\"hello\\\":\\\"hi\\\"}\", \"message\": \"Hello\"}\n```\n\nFor contrast, here are these two requests _without_ filters: \n```\n$ curl localhost:8080/something -X PUT -H 'Content-type: application/json' -d '{\"hello\":\"hi\"}' -D -\nHTTP/1.1 200 OK\nserver: envoy\ndate: Sat, 16 Jul 2022 23:40:24 GMT\ncontent-length: 362\ncontent-type: application/json\nx-envoy-upstream-service-time: 1\n\n{\"method\": \"put\", \"path\": \"/something\", \"headers\": {\"host\": \"localhost:8080\", \"user-agent\": \"curl/7.64.1\", \"accept\": \"*/*\", \"content-type\": \"application/json\", \"content-length\": \"14\", \"x-forwarded-proto\": \"http\", \"x-request-id\": \"0afcd2c4-6d3d-4513-a29b-40c7954f8942\", \"x-envoy-expected-rq-timeout-ms\": \"15000\"}, \"body\": \"{\\\"hello\\\":\\\"hi\\\"\n\n$ curl localhost:8080/something -D -\nHTTP/1.1 200 OK\nserver: envoy\ndate: Sat, 16 Jul 2022 23:40:30 GMT\ncontent-length: 302\ncontent-type: application/json\nx-envoy-upstream-service-time: 1\n\n{\"method\": \"get\", \"path\": \"/something\", \"headers\": {\"host\": \"localhost:8080\", \"user-agent\": \"curl/7.64.1\", \"accept\": \"*/*\", \"x-forwarded-proto\": \"http\", \"x-request-id\": \"f8dfa254-157b-4f75-a7d0-121f3d245d6b\", \"x-envoy-expected-rq-timeout-ms\": \"15000\"}, \"body\": \"{\\\"hello\\\":\\\"hi\\\"}\", \"message\": \"Hello\"}\n```\nNote the additional response headers and the extra information about the upstream services request headers in the response body. That's the filter set working! ",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/wrossmorrow/envoy-extproc-sdk",
+    "keywords": "",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "envoy-extproc-sdk",
+    "package_url": "https://pypi.org/project/envoy-extproc-sdk/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/envoy-extproc-sdk/",
+    "project_urls": {
+      "Homepage": "https://github.com/wrossmorrow/envoy-extproc-sdk",
+      "Repository": "https://github.com/wrossmorrow/envoy-extproc-sdk"
+    },
+    "release_url": "https://pypi.org/project/envoy-extproc-sdk/0.1.1/",
+    "requires_dist": [
+      "grpcio (>=1.46.1,<2.0.0)",
+      "protoc-gen-validate (>=0.4.2,<0.5.0)",
+      "grpclib (>=0.4.2,<0.5.0)",
+      "ddtrace",
+      "datadog (>=0.44.0,<0.45.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "A python SDK for envoy External Processors",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14583786,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b362be134f4780a7448b842aec8f1040fe08b61e0d00aa395876dbdea2bef47",
+          "md5": "b7c5490526d02719255b98a809552b8b",
+          "sha256": "5e5265da842d56e884e971532f2cb98e220ea18da2b4bbdfce40a19d6f970363"
+        },
+        "downloads": -1,
+        "filename": "envoy_extproc_sdk-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7c5490526d02719255b98a809552b8b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12130,
+        "upload_time": "2022-07-29T02:34:39",
+        "upload_time_iso_8601": "2022-07-29T02:34:39.404499Z",
+        "url": "https://files.pythonhosted.org/packages/5b/36/2be134f4780a7448b842aec8f1040fe08b61e0d00aa395876dbdea2bef47/envoy_extproc_sdk-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6b5bb5a648a06e197139e2c6742c07c774812254464c5c05abb5575431a98c0a",
+          "md5": "a56e34be4706b7732495f3271d459e41",
+          "sha256": "3e87c8deaca93678ef6784b181aae67ee5bd9a97ecc6b364780cb6596d726d1e"
+        },
+        "downloads": -1,
+        "filename": "envoy_extproc_sdk-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a56e34be4706b7732495f3271d459e41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9706,
+        "upload_time": "2022-07-29T02:34:41",
+        "upload_time_iso_8601": "2022-07-29T02:34:41.172165Z",
+        "url": "https://files.pythonhosted.org/packages/6b/5b/b5a648a06e197139e2c6742c07c774812254464c5c05abb5575431a98c0a/envoy_extproc_sdk-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c659e4b06eaf0a4764b1f5349de9cfff89ce8edc5e2d78763882891665bb14fc",
+          "md5": "0e57191c0c2db7325b29b53d06862b65",
+          "sha256": "8e4b30b43ee97e43f6b47a55a91d2c469bd0dc43d629546c58c7df2beb233953"
+        },
+        "downloads": -1,
+        "filename": "envoy_extproc_sdk-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0e57191c0c2db7325b29b53d06862b65",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 20415,
+        "upload_time": "2022-07-29T02:37:52",
+        "upload_time_iso_8601": "2022-07-29T02:37:52.594851Z",
+        "url": "https://files.pythonhosted.org/packages/c6/59/e4b06eaf0a4764b1f5349de9cfff89ce8edc5e2d78763882891665bb14fc/envoy_extproc_sdk-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b36b595ca73cf632cb31a9206a428778fc558571c20b3f28b27e1857bd20f5b",
+          "md5": "7f6caf1e7da417b6ec45a86572447d22",
+          "sha256": "6cd299f686baf83cd96ae0165c7a34580116cd599f67f7ce6778b5f7957eaf71"
+        },
+        "downloads": -1,
+        "filename": "envoy_extproc_sdk-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7f6caf1e7da417b6ec45a86572447d22",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 26902,
+        "upload_time": "2022-07-29T02:37:54",
+        "upload_time_iso_8601": "2022-07-29T02:37:54.489555Z",
+        "url": "https://files.pythonhosted.org/packages/7b/36/b595ca73cf632cb31a9206a428778fc558571c20b3f28b27e1857bd20f5b/envoy_extproc_sdk-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c659e4b06eaf0a4764b1f5349de9cfff89ce8edc5e2d78763882891665bb14fc",
+        "md5": "0e57191c0c2db7325b29b53d06862b65",
+        "sha256": "8e4b30b43ee97e43f6b47a55a91d2c469bd0dc43d629546c58c7df2beb233953"
+      },
+      "downloads": -1,
+      "filename": "envoy_extproc_sdk-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "0e57191c0c2db7325b29b53d06862b65",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 20415,
+      "upload_time": "2022-07-29T02:37:52",
+      "upload_time_iso_8601": "2022-07-29T02:37:52.594851Z",
+      "url": "https://files.pythonhosted.org/packages/c6/59/e4b06eaf0a4764b1f5349de9cfff89ce8edc5e2d78763882891665bb14fc/envoy_extproc_sdk-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7b36b595ca73cf632cb31a9206a428778fc558571c20b3f28b27e1857bd20f5b",
+        "md5": "7f6caf1e7da417b6ec45a86572447d22",
+        "sha256": "6cd299f686baf83cd96ae0165c7a34580116cd599f67f7ce6778b5f7957eaf71"
+      },
+      "downloads": -1,
+      "filename": "envoy_extproc_sdk-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "7f6caf1e7da417b6ec45a86572447d22",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 26902,
+      "upload_time": "2022-07-29T02:37:54",
+      "upload_time_iso_8601": "2022-07-29T02:37:54.489555Z",
+      "url": "https://files.pythonhosted.org/packages/7b/36/b595ca73cf632cb31a9206a428778fc558571c20b3f28b27e1857bd20f5b/envoy_extproc_sdk-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

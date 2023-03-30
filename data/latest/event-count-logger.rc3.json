@@ -1,0 +1,229 @@
+{
+  "info": {
+    "author": "Václav Bartoš",
+    "author_email": "bartos@cesnet.cz",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Topic :: Software Development",
+      "Topic :: System :: Logging",
+      "Typing :: Typed"
+    ],
+    "description": "# Event Count Logger\n\nPython library (and a daemon program) allowing to count the number of various events per time interval(s) in a distributed system using shared counters in Redis.\n\n\n\nSimple example:\n```python\necl = EventCountLogger(cfg_groups)\nevent_logger = ecl.get_group('event_group_1')\n...\nevent_logger.log('event1')  # increment shared counter of 'event1' by 1\n```\n```shell\n# Read counts in the last 5-min interval\n$ ecl_reader ecl_config.yml -g event_group_1 -i 5m\nevent1:10\nevent2:2\n```\n\n**Main features**\n* Count any 'events' across multiple processes or machines\n* Multiple counters, grouped into *event groups*\n  * Pre-defined or dynamic list of event IDs in each group\n* Multiple time intervals (count number of events in 5 minute and 1 hour intervals at the same time, for example)\n* Local cache for high-rate events, synchronized with the shared counters at a lower rate\n\n## Installation\n\n```shell\npip install event_count_logger\n```\n\nPython >=3.6 is required.\n\n## Architecture\n\n```\n   System\n components                      Redis                    ecl_reader\n+-----------+                +------------+           +---------------+\n|   log()   | -------------> |   shared   | --------> |  get_counts() |\n+-----------+      +-------> |  counters  |           +---------------+\n                   |         +------------+\n+-----------+      |               ^               ecl_master\n|   log()   | -----+               |           +----------------+\n+-----------+                      +---------> |  periodically  |\n                                               | reset counters |\n                                               +----------------+\n```\nShared counters are stored in [Redis](https/redis.io) (in-memory key-value store).\nThey can be safely incremented by calls to `EventGroup.log(event_id)` from multiple processes.\n\nA single instance of `ecl_master` script must be continuously running - it resets the counters in defined time intervals (and makes values of the last complete interval available for reading).\n\nCounters can be read by `ecl_reader` script, or by using `EventCountLogger.get_*()` methods from any other program.\n\n\n## How it works\n\nMultiple types of event (identified by any string, *event ID*) can be logged. They are split into *groups*, each group is configured and handled separately.\n\nFor each group, a list of event ID is defined in a configuration file (or they can be defined dynamically, see later),\nas well as the list of time intervals, in which the counters should be 'rotated'.\n\nIn Redis, there are two keys with integer value for each event ID and interval length - one with the number of\nlogged events in the current (incomplete) interval, one with the final value of the last finished interval.\nThe keys are named as `<group>:<interval>:<cur_or_last>:<event_id>`, e.g. `requests:5m:cur:req1`.\n\nLogging an event means to increment the `cur` counters with given `<group>` and `<event_id>` and all `<intervals>`.\n\nAt the end of an interval, the `ecl_master` script renames all `cur` keys (with matching `<interval>`) to corresponding `last` ones and resets the `cur` ones to zero.\n\nThe expected usage is that `ecl_reader` is called periodically to fetch values of the `last` counters and\npasses them to some monitoring system (e.g. Munin) or shows them in real-time in some GUI, for example.\n\nThere is also a `<group>:<interval>:cur:@ts` key for each group and interval containing the start time of the current interval (as UNIX timestamp).\n\n### Local counters\n\nNormally, when an event is logged, the counter in Redis in incremented immediately.\nWhile Redis is quite fast, it is still a network communication which may be a problem with  too frequent events.\nSo, there is a possibility cache counts locally in a specific group.\nIn such case, only a local counter (i.e. a normal Python variable) is incremented when event is logged.\nThese local counters are synchronized with Redis only after some time elapses (`sync_interval` config param)\nor when one of the counters in the group counter reaches a defined value (`sync_limit`).\n\n## Usage example\n\nLog event in a program:\n```python\nfrom event_count_logger import EventCountLogger\ncfg_groups = {\n  'requests': {\n    'events': ['req1', 'req2', 'req3', 'error'],\n    'intervals': ['5s', '5m'],\n  }\n}\necl = EventCountLogger(cfg_groups)\nreq_logger = ecl.get_group('requests')\n\n...\n\ndef handle_request(..., req_type, ...):\n  try:\n    if req_type == 'req1':\n      req_logger.log('req1') # increment counter of 'req1' event by 1\n      process_req1()\n    ...\n  except Exception as e:\n    req_logger.log('error') # increment 'error' counter by 1\n    handle_error(e)\n```\n\nRead the number of events in the last finished 5-minute interval:\n```shell\n$ ecl_reader ecl_config.yml -g requests -i 5m\nreq1:54\nreq2:11\nreq3:42\nerror:3\n```\n\n## Configuration\n\nA YAML file is used to define event groups and specify Redis connection parameters.\nSee `example_config.yml` for an example with comments.\n\nEvent group specification keys:\n* `events` (mandatory) - List of predefined event IDs (strings). Only those events can be logged in the group, unless `auto_declare_events=true`.\n* `intervals` (mandatory) - List of interval lengths in which to 'rotate' the counters. Each interval length is a string in format `<number><s/m/h>` (seconds, minutes, hours), e.g. `5m` or `1h`.\n* `auto_declare_events` - Enable automatic declaration of events not listed in `events`, i.e. a new counter is automatically created when a new event ID is logged. Such events are ephemeral, the counters are removed at the end of each interval. (`true/false`, default: `false`) \n* `sync_interval` - Synchronize local counters with Redis after this number of seconds (int or float).\n* `sync_limit` - Synchronize local counters with Redis when a counter reach this number (int).\n\nIf none of `sync_interval` and `sync_limit` is specified, local counters are not used (i.e. shared counters in Redis are manipulated directly).\n\n## Munin\n\nExample [Munin](http://munin-monitoring.org/) plugins are included for easy logging and visualization\n(they must be modified for a specific case, a separate plugin should be used for each event group).\n\nExample output:\n\n![Munin graph](https://github.com/CESNET/EventCountLogger/raw/master/munin/example_graph.png)\n\n---\n\n# Notes\n\nWritten mainly for [NERD](https://github.com/CESNET/NERD) (and another internal project), but can be used in any Python system distributed to multiple processes.\n\nIf you want to use it and need more info, drop me a message (`bartos <at> cesnet.cz`).\nIf there are more users, I'll write a more complete documentation.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/CESNET/EventCountLogger",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "event-count-logger",
+    "package_url": "https://pypi.org/project/event-count-logger/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/event-count-logger/",
+    "project_urls": {
+      "Homepage": "https://github.com/CESNET/EventCountLogger"
+    },
+    "release_url": "https://pypi.org/project/event-count-logger/1.1.1/",
+    "requires_dist": [
+      "redis",
+      "apscheduler",
+      "pyyaml"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Count number of events per time interval(s) in a distributed system using shared counters in Redis.",
+    "version": "1.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10907480,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5d2ce659b5404ca9eb1688c2c6c3654ddf80663d7d8885e95974324eef0d1e5",
+          "md5": "902ce9c44e4888ca0b7187ce269bbf43",
+          "sha256": "23aaefb4ba30b62a6f4874fc1efc06968d46264b82414058526e75ad1ca1dcc1"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "902ce9c44e4888ca0b7187ce269bbf43",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14677,
+        "upload_time": "2021-02-04T13:28:22",
+        "upload_time_iso_8601": "2021-02-04T13:28:22.834235Z",
+        "url": "https://files.pythonhosted.org/packages/c5/d2/ce659b5404ca9eb1688c2c6c3654ddf80663d7d8885e95974324eef0d1e5/event_count_logger-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6dabb849d6ba7b196d2fce0a3dff6b5113e6af9331fbb847ddc942ea05a07037",
+          "md5": "6c44670e572ab9ee9bc1a1604b927e29",
+          "sha256": "9ad2f80a688c2b34303a58250973ab8d3e67c946af1c2359011f04d98e62aa79"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6c44670e572ab9ee9bc1a1604b927e29",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11611,
+        "upload_time": "2021-02-04T13:28:24",
+        "upload_time_iso_8601": "2021-02-04T13:28:24.706786Z",
+        "url": "https://files.pythonhosted.org/packages/6d/ab/b849d6ba7b196d2fce0a3dff6b5113e6af9331fbb847ddc942ea05a07037/event_count_logger-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "53adbc6cf99b1f2c495afdc60646dc3e3f67be5e99c53f9edc2acb10ee2298cb",
+          "md5": "c65affd9c05eaac3745999b71c94e127",
+          "sha256": "a7dfa69f049c101ea3643294064ed950aefc4c17ed981282f04d117ff1a5956a"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c65affd9c05eaac3745999b71c94e127",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 15301,
+        "upload_time": "2021-07-14T11:39:21",
+        "upload_time_iso_8601": "2021-07-14T11:39:21.313129Z",
+        "url": "https://files.pythonhosted.org/packages/53/ad/bc6cf99b1f2c495afdc60646dc3e3f67be5e99c53f9edc2acb10ee2298cb/event_count_logger-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "90210fe0580664cf247ef3e4a7246660c220254a0866a071a3aa141175c8d82a",
+          "md5": "17ad98bcef2dc45293fa90907571dfb2",
+          "sha256": "f56b760df602900adea80ffd98f2f0a49c39d3dd87e35085fb8923d9b9261def"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "17ad98bcef2dc45293fa90907571dfb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 13676,
+        "upload_time": "2021-07-14T11:39:22",
+        "upload_time_iso_8601": "2021-07-14T11:39:22.814783Z",
+        "url": "https://files.pythonhosted.org/packages/90/21/0fe0580664cf247ef3e4a7246660c220254a0866a071a3aa141175c8d82a/event_count_logger-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a694b217b37e3468135c9703736f0a6895fb2f96d29bb02a3adbcaf467152ed8",
+          "md5": "8a9783d29035f001c932868d86f944e8",
+          "sha256": "9a6e747c662edceb043778c78a58e00f92156d10a9163919b74b009f949ee633"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8a9783d29035f001c932868d86f944e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 15195,
+        "upload_time": "2021-07-14T12:53:20",
+        "upload_time_iso_8601": "2021-07-14T12:53:20.495265Z",
+        "url": "https://files.pythonhosted.org/packages/a6/94/b217b37e3468135c9703736f0a6895fb2f96d29bb02a3adbcaf467152ed8/event_count_logger-1.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d8bba3fe25f254e8dbf4401f2677bdb7fa0e883955ca400b09cccd3220ebfd6",
+          "md5": "ae5eca4424cfcd379c55656d2c14dd12",
+          "sha256": "f1fe7541916b992c62a9f4b20f66d8e41012bf8ad75db545585d88944aa48fed"
+        },
+        "downloads": -1,
+        "filename": "event_count_logger-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ae5eca4424cfcd379c55656d2c14dd12",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12147,
+        "upload_time": "2021-07-14T12:53:22",
+        "upload_time_iso_8601": "2021-07-14T12:53:22.485632Z",
+        "url": "https://files.pythonhosted.org/packages/4d/8b/ba3fe25f254e8dbf4401f2677bdb7fa0e883955ca400b09cccd3220ebfd6/event_count_logger-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a694b217b37e3468135c9703736f0a6895fb2f96d29bb02a3adbcaf467152ed8",
+        "md5": "8a9783d29035f001c932868d86f944e8",
+        "sha256": "9a6e747c662edceb043778c78a58e00f92156d10a9163919b74b009f949ee633"
+      },
+      "downloads": -1,
+      "filename": "event_count_logger-1.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8a9783d29035f001c932868d86f944e8",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 15195,
+      "upload_time": "2021-07-14T12:53:20",
+      "upload_time_iso_8601": "2021-07-14T12:53:20.495265Z",
+      "url": "https://files.pythonhosted.org/packages/a6/94/b217b37e3468135c9703736f0a6895fb2f96d29bb02a3adbcaf467152ed8/event_count_logger-1.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4d8bba3fe25f254e8dbf4401f2677bdb7fa0e883955ca400b09cccd3220ebfd6",
+        "md5": "ae5eca4424cfcd379c55656d2c14dd12",
+        "sha256": "f1fe7541916b992c62a9f4b20f66d8e41012bf8ad75db545585d88944aa48fed"
+      },
+      "downloads": -1,
+      "filename": "event_count_logger-1.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "ae5eca4424cfcd379c55656d2c14dd12",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 12147,
+      "upload_time": "2021-07-14T12:53:22",
+      "upload_time_iso_8601": "2021-07-14T12:53:22.485632Z",
+      "url": "https://files.pythonhosted.org/packages/4d/8b/ba3fe25f254e8dbf4401f2677bdb7fa0e883955ca400b09cccd3220ebfd6/event_count_logger-1.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

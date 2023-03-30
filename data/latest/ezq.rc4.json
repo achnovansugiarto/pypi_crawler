@@ -1,0 +1,269 @@
+{
+  "info": {
+    "author": "Metaist LLC",
+    "author_email": "metaist@metaist.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent"
+    ],
+    "description": "# ezq\n\n_Simple wrappers for python multiprocessing._\n\n[![Build Status](https://img.shields.io/github/workflow/status/metaist/ezq/CI?style=for-the-badge)](https://github.com/metaist/ezq/actions)\n[![ezq on PyPI](https://img.shields.io/pypi/v/ezq.svg?color=blue&style=for-the-badge)](https://pypi.org/project/ezq)\n\n[Changelog] - [Issues] - [Documentation]\n\n[changelog]: https://github.com/metaist/ezq/blob/main/CHANGELOG.md\n[issues]: https://github.com/metaist/ezq/issues\n[documentation]: https://metaist.github.io/ezq/\n\n## Why?\n\nEven though [`multiprocessing`][1] has `Pool` and `Queue`, it's surprisingly difficult\nto get started to do slightly more complex workflows. `ezq` makes it easy to connect subprocesses (workers) using queues.\n\n[1]: https://docs.python.org/3/library/multiprocessing.html\n\n## Install\n\n```bash\npip install ezq\n```\n\n## Example: Sum Messages\n\nHere's a simple example of a worker that reads from an input queue, sums up the\nmessages, and puts the result on an output queue.\n\n```python\nimport ezq\n\n\ndef worker(in_q, out_q):\n    \"\"\"Add up all the messges.\"\"\"\n    count = 0\n    for msg in ezq.iter_msg(in_q):\n        # you could check `msg.kind` if there's different kinds of work\n        count += msg.data\n\n    # when `in_q` is done, put the result on `out_q`\n    ezq.put_msg(out_q, data=count)\n\n\ndef main():\n    \"\"\"Run several workers.\"\"\"\n    in_q = ezq.Queue()  # to send work\n    out_q = ezq.Queue()  # to get results\n\n    workers = [ezq.run(worker, in_q, out_q) for _ in range(ezq.NUM_CPUS)]\n    # workers started\n\n    for i in range(1000):\n        ezq.put_msg(in_q, data=i)  # send work\n\n    ezq.endq_and_wait(in_q, workers)\n    # all workers are done\n\n    result = sum(msg.data for msg in ezq.iter_q(out_q))\n    assert result == sum(x for x in range(1000))\n    print(result)\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n## Typical worker lifecycle\n\n- The main process [creates workers](#create-workers) with `ezq.run`.\n\n- The main process [sends data](#send-data) with `ezq.put_msg`.\n\n- The worker [iterates over the queue](#iterate-over-messages) with `ezq.iter_msg`.\n\n- The main process [ends the queue](#end-the-queue) with `ezq.endq_and_wait`.\n\n- The worker returns when it reaches the end of the queue.\n\n## A worker is just a function\n\nIn general, there's nothing special about a worker function, but note:\n\n- All arguments are passed through `pickle` first ([see below](#beware-pickle)).\n\n- We don't currently do anything with the return value of this function. You'll\n  need an output queue to return data back to the main process.\n\n## Create workers\n\nIn the main process, create workers using `ezq.run` which takes a function and\nany additional parameters. Note that **workers cannot create additional workers**.\n\n## Send data\n\nOnce you've started the workers, you send them data by calling with `ezq.put_msg`\nwhich creates `ezq.Msg` objects and puts them in the queue. There are three\nattributes that are sent (all optional):\n\n- `kind` - a string that indicates what kind of message it is.\n  You can use this to send multiple kinds of work to the same worker.\n  Note that the special `END` kind is used to indicate the end of a queue\n  (that's what `ezq.endq` sends).\n\n- `data` - anything that can be pickled.\n  This is the data you want the worker to work on.\n\n- `order` - an integer that indicates the message order.\n  This can help you reorder results or ensure that messages from a queue are\n  read in a particular order (that's what `ezq.sortiter` uses).\n\n## Beware `pickle`\n\nAll parameters sent to workers in `ezq.run` and any values put in queues\nusing `ezq.put_msg` are first passed to `pickle` by [`multiprocessing`][1]\nso anything that cannot be pickled (e.g., database connection)\ncannot be passed to workers.\n\n## Iterate over messages\n\nInside the worker, use `ezq.iter_msg` to iterate over the messages in the queue\nuntil the queue ends ([see below](#end-the-queue)). If the messages need to be\nsorted first, wrap the call with `ezq.sortiter`.\n\nIf you need to read all the messages currently in the queue, you can use `ezq.iter_q`\nwhich will immediately end the queue and return results. You can also wrap this call\nin `ezq.sortiter` if you need the messages to be sorted first.\n\n## End the queue\n\nAfter the main process has sent all the data to the workers, it needs to indicate\nthat there's no additional work to be done. This is done by putting a special\n`ezq.END_MSG` in the queue which is processed by `ezq.iter_msg` and never seen by\nthe workers.\n\nThere are three ways a queue can be ended:\n\n- `ezq.endq` - Explicitly end a queue. You normally won't need to call this.\n\n- `ezq.iter_q` - End a queue and iterate over the current messages. This is\n  useful when processing an output queue back in the main process.\n\n- `ezq.endq_and_wait` - End a queue and wait for the workers to finish. The most\n  common way to end a queue. You'll need to call this before the end of your main\n  process in order to get results back from all the workers.\n\n## Example: Read and Write Queues\n\nIn this example, several workers read from a queue, process data, and then write to a\ndifferent queue that a single worker uses to print to the screen sorting the results as\nit goes along. When interfacing with a single I/O device (e.g., screen, file) we typically use a single worker to avoid clashes or overwriting.\n\n```python\nimport ezq\n\n\ndef printer(write_q):\n    \"\"\"Print results in increasing order.\"\"\"\n    for msg in ezq.sortiter(ezq.iter_msg(write_q)):\n        print(msg.data)\n\n\ndef collatz(read_q, write_q):\n    \"\"\"Read numbers and compute values.\"\"\"\n    for msg in ezq.iter_msg(read_q):\n        num = msg.data\n        if msg.kind == \"EVEN\":\n            ezq.put_msg(write_q, data=(num, num / 2), order=msg.order)\n        elif msg.kind == \"ODD\":\n            ezq.put_msg(write_q, data=(num, 3 * num + 1), order=msg.order)\n\n\ndef main():\n    \"\"\"Run several subprocesses.\"\"\"\n    read_q, write_q = ezq.Queue(), ezq.Queue()\n    readers = [ezq.run(collatz, read_q, write_q) for _ in range(ezq.NUM_CPUS - 1)]\n    writers = ezq.run(printer, write_q)\n\n    for i in range(40):\n        kind = \"EVEN\" if i % 2 == 0 else \"ODD\"\n        ezq.put_msg(read_q, kind=kind, data=i, order=i)\n\n    ezq.endq_and_wait(read_q, readers)\n    ezq.endq_and_wait(write_q, writers)\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n## License\n\n[MIT License](https://github.com/metaist/ezq/blob/main/LICENSE.md)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://github.com/metaist/ezq",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/metaist/ezq",
+    "keywords": "simple,multiprocessing,queue,subprocesses",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ezq",
+    "package_url": "https://pypi.org/project/ezq/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/ezq/",
+    "project_urls": {
+      "Download": "https://github.com/metaist/ezq",
+      "Homepage": "https://github.com/metaist/ezq"
+    },
+    "release_url": "https://pypi.org/project/ezq/2.0.2/",
+    "requires_dist": [
+      "setuptools"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Simple wrapper for python multiprocessing.",
+    "version": "2.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11264593,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "289a2109466a76ba234c2eba74f1da50aa72d1746efef6cd0d9003c2fcf0bd71",
+          "md5": "585ec5af7cc0cbfcd2bee4feb55d6111",
+          "sha256": "ac8f67c105aed16ed5550cbf9788d939c178648df3286de9da77f5dbc1967b1d"
+        },
+        "downloads": -1,
+        "filename": "ezq-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "585ec5af7cc0cbfcd2bee4feb55d6111",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 3862,
+        "upload_time": "2021-08-20T19:59:27",
+        "upload_time_iso_8601": "2021-08-20T19:59:27.921477Z",
+        "url": "https://files.pythonhosted.org/packages/28/9a/2109466a76ba234c2eba74f1da50aa72d1746efef6cd0d9003c2fcf0bd71/ezq-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d034d855d30a7eb079c7300cd7d2eefb0fe40dcef4bc62a05e8f0ca5b1156b9",
+          "md5": "0f7277d8dee9f5141f6028c5f90f8b20",
+          "sha256": "e1501703aa0226e97a91850573e6fdbe52398d8fe78a6fa260d33eb8010bd350"
+        },
+        "downloads": -1,
+        "filename": "ezq-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f7277d8dee9f5141f6028c5f90f8b20",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 4859,
+        "upload_time": "2021-08-20T19:59:28",
+        "upload_time_iso_8601": "2021-08-20T19:59:28.979275Z",
+        "url": "https://files.pythonhosted.org/packages/6d/03/4d855d30a7eb079c7300cd7d2eefb0fe40dcef4bc62a05e8f0ca5b1156b9/ezq-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "15396580014ac7660ea788582a9517a83ca2e329d4c74939150d257f71d81c32",
+          "md5": "b88b126fb591a33cbae6343297dbd536",
+          "sha256": "9ebbd9d43d5b9e4243f0ee5d370b564766b70aefccc48780b6ac6b07aa901560"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b88b126fb591a33cbae6343297dbd536",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 3944,
+        "upload_time": "2021-08-22T20:13:26",
+        "upload_time_iso_8601": "2021-08-22T20:13:26.137533Z",
+        "url": "https://files.pythonhosted.org/packages/15/39/6580014ac7660ea788582a9517a83ca2e329d4c74939150d257f71d81c32/ezq-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "508aaf747e3b71e44a8c55effa820acfee521e0b1f4fed09d6ef6bd06ba27d80",
+          "md5": "0cf37acca558d03f0418754d7e111480",
+          "sha256": "ab0bb1ab74c4f1bf7ad6c415062827c5c8f7ea7313f207e48f12333415819aa1"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0cf37acca558d03f0418754d7e111480",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 6667,
+        "upload_time": "2021-08-22T20:13:27",
+        "upload_time_iso_8601": "2021-08-22T20:13:27.091447Z",
+        "url": "https://files.pythonhosted.org/packages/50/8a/af747e3b71e44a8c55effa820acfee521e0b1f4fed09d6ef6bd06ba27d80/ezq-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0cfedc00e82f6330dc1b2a4e7f1613e1cb8cf6eb597710e1dbffa46b443e294d",
+          "md5": "ac0497f17b82de2472b7c36e47e2a9f9",
+          "sha256": "d2644a1c19277531fc2b96406795685b5b8995283eee0a2158c9cc3aba04721a"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ac0497f17b82de2472b7c36e47e2a9f9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 5958,
+        "upload_time": "2021-08-22T20:27:05",
+        "upload_time_iso_8601": "2021-08-22T20:27:05.463878Z",
+        "url": "https://files.pythonhosted.org/packages/0c/fe/dc00e82f6330dc1b2a4e7f1613e1cb8cf6eb597710e1dbffa46b443e294d/ezq-2.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1a680e6941238e7cdbb2ef18c170b2a814cf70df25301922069e44cc2d104795",
+          "md5": "d54106dde7dbfc787aa7c8663dcded8f",
+          "sha256": "28fb4015e6bcc63c807dadc8c6c3ca92671e617f928897e0722430502982a471"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d54106dde7dbfc787aa7c8663dcded8f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 6904,
+        "upload_time": "2021-08-22T20:27:06",
+        "upload_time_iso_8601": "2021-08-22T20:27:06.787632Z",
+        "url": "https://files.pythonhosted.org/packages/1a/68/0e6941238e7cdbb2ef18c170b2a814cf70df25301922069e44cc2d104795/ezq-2.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e8e1469b91194be170ddfbce8ee3f806d939ed7e317ee83fb6cc9fe72cd95df",
+          "md5": "cdea3e1e54c1f95c653d2bc4122f5275",
+          "sha256": "22557eaccd08cf93d80b3577e30c1f23acf5fee97e9babc44e6bd7cc1740acb5"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cdea3e1e54c1f95c653d2bc4122f5275",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 7119,
+        "upload_time": "2021-08-24T17:46:10",
+        "upload_time_iso_8601": "2021-08-24T17:46:10.548439Z",
+        "url": "https://files.pythonhosted.org/packages/1e/8e/1469b91194be170ddfbce8ee3f806d939ed7e317ee83fb6cc9fe72cd95df/ezq-2.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f28a48f9bc279e30df401287b19a70768786b04d50b981812f2825cfd10f1bec",
+          "md5": "20ff1a3fff99dbe727421133e16ea4fa",
+          "sha256": "4239dc5d77253f188d94b2ec808a751059cac4840bb6ac436e6a16cff79f0fe2"
+        },
+        "downloads": -1,
+        "filename": "ezq-2.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20ff1a3fff99dbe727421133e16ea4fa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 8118,
+        "upload_time": "2021-08-24T17:46:12",
+        "upload_time_iso_8601": "2021-08-24T17:46:12.103365Z",
+        "url": "https://files.pythonhosted.org/packages/f2/8a/48f9bc279e30df401287b19a70768786b04d50b981812f2825cfd10f1bec/ezq-2.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1e8e1469b91194be170ddfbce8ee3f806d939ed7e317ee83fb6cc9fe72cd95df",
+        "md5": "cdea3e1e54c1f95c653d2bc4122f5275",
+        "sha256": "22557eaccd08cf93d80b3577e30c1f23acf5fee97e9babc44e6bd7cc1740acb5"
+      },
+      "downloads": -1,
+      "filename": "ezq-2.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "cdea3e1e54c1f95c653d2bc4122f5275",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 7119,
+      "upload_time": "2021-08-24T17:46:10",
+      "upload_time_iso_8601": "2021-08-24T17:46:10.548439Z",
+      "url": "https://files.pythonhosted.org/packages/1e/8e/1469b91194be170ddfbce8ee3f806d939ed7e317ee83fb6cc9fe72cd95df/ezq-2.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f28a48f9bc279e30df401287b19a70768786b04d50b981812f2825cfd10f1bec",
+        "md5": "20ff1a3fff99dbe727421133e16ea4fa",
+        "sha256": "4239dc5d77253f188d94b2ec808a751059cac4840bb6ac436e6a16cff79f0fe2"
+      },
+      "downloads": -1,
+      "filename": "ezq-2.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "20ff1a3fff99dbe727421133e16ea4fa",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 8118,
+      "upload_time": "2021-08-24T17:46:12",
+      "upload_time_iso_8601": "2021-08-24T17:46:12.103365Z",
+      "url": "https://files.pythonhosted.org/packages/f2/8a/48f9bc279e30df401287b19a70768786b04d50b981812f2825cfd10f1bec/ezq-2.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

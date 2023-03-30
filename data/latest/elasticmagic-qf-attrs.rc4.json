@@ -1,0 +1,276 @@
+{
+  "info": {
+    "author": "Alexander Koval",
+    "author_email": "kovalidis@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "[![Test and build](https://github.com/anti-social/elasticmagic-qf-attrs/actions/workflows/python.yaml/badge.svg)](https://github.com/anti-social/elasticmagic-qf-attrs/actions/workflows/python.yaml)\n\nElasticmagic query filters for attributes\n=========================================\n\nLibrary to store, filter and build facets for custom attributes\n\nThe problem\n-----------\n\nEach attribute pair can be stored in the index as a nested document.\nWe can use following mapping for that:\n\n```yaml\nattrs:\n  type: nested\n  properties:\n    attr_id:\n      type: integer\n    # usually only one of the next fields should be populated\n    value_int:\n      type: integer\n    value_bool:\n      type: boolean\n    value_float:\n      type: float\n```\n\nThis makes it possible to filter documents by an attribute id and its value\n(for example we want to find all the documents with `attr_id = 1234` and `value = 5678`):\n\n```yaml\nquery:\n  bool:\n    filter:\n    - nested:\n        path: attrs\n        query:\n          bool:\n            must:\n            - term:\n                attrs.attr_id: 1234\n            - term:\n                attrs.value_int: 5678\n```\n\nIt is also possible to build a facets for all attributes at once:\n\n```yaml\naggs:\n  attrs_nested:\n    nested:\n      path: attrs\n    aggs:\n      attrs:\n        terms:\n          field: attrs.attr_id\n        aggs:\n          values:\n            field: attrs.value_int\n```\n\nor for a single attribute:\n\n```yaml\naggs:\n  attrs_nested:\n    nested:\n      path: attrs\n    aggs:\n      attr_1234:\n        filter:\n          term:\n            attrs.attr_id: 1234\n        aggs:\n          values:\n            field: attrs.value_int\n```\n\nBut nested documents have some drawbacks. Every nested document is stored\nin the index as different document. For instance, next document will be stored\nas 5 lucene documents:\n\n```yaml\nname: \"I'm a document with nested attributes\"\nattrs:\n- attr_id: 1\n  value_int: 42\n- attr_id: 2\n  value_int: 43\n- attr_id: 3\n  value_bool: true\n- attr_id: 4\n  value_float: 99.9\n```\n\nNested queries are slow by itself:\n   \n> In particular, joins should be avoided. nested can make queries several times\nslower and parent-child relations can make queries hundreds of times slower.\n> - https://www.elastic.co/guide/en/elasticsearch/reference/master/tune-for-search-speed.html#_document_modeling\n\nBut what is worse regular queries are also slower when there are nested documents\nin the index. It is because of all the fields of main documents becomes sparse.\nThis in turn degrades performance of all filters and accesses to doc_values.\n\nThe solution\n------------\n\nThe idea is to encode pair of an attribute id and a corresponding value into\na single value. If our attribute ids are 32-bit integers and all value types\nalso fit into 32 bits we can store them as a single 64-bit value.\n\nSo our mapping can be:\n\n```yaml\nattrs:\n  type: object\n  properties:\n    int:\n      type: long\n    bool:\n      type: long\n    float:\n      type: long\n```\n\nDocument with encoded attributes:\n\n```yaml\nname: \"I'm a document with packed attributes\"\nattrs:\n# (1 << 32) | 42\n- int: 0x1_0000002a\n# (2 << 32) | 43\n- int: 0x2_0000002b\n# (3 << 1) | 1\n- bool: 0x7\n# (4 << 32) | {integer representation of 99.9}\n# (4 << 32) | struct.unpack('=I', struct.pack('=f', 99.9))[0]\n- float: 0x4_42c7cccd\n```\n\nNow with a bit of bit magic we can emulate nested queries.\n\nFiltering by attribute id `1234` with value `5678`:\n\n```yaml\nquery:\n  bool:\n    filter:\n    - term:\n        attrs.int: 0x4d2_0000162e\n```\n\nBuilding facet for all attribute values:\n\n```yaml\naggs:\n  attrs_int:\n    terms:\n      field: attrs.int\n      # specify big enough aggregation size\n      # so all flat attrite values should fit\n      size: 10000\n```\n\nOne more step that client should do is to decode and group values by\nattribute id.\n\nHow to use it in python\n-----------------------\n\n```python\nfrom elasticsearch import Elasticsearch\n\nfrom elasticmagic import Cluster, Document, Field\nfrom elasticmagic.types import List, Long\nfrom elasticmagic.ext.queryfilter import QueryFilter\n\nfrom elasticmagic_qf_attrs import AttrBoolFacetFilter\nfrom elasticmagic_qf_attrs import AttrIntFacetFilter\nfrom elasticmagic_qf_attrs import AttrRangeFacetFilter\nfrom elasticmagic_qf_attrs.util import merge_attr_value_bool\nfrom elasticmagic_qf_attrs.util import merge_attr_value_float\nfrom elasticmagic_qf_attrs.util import merge_attr_value_int\n\n# Specify document\nclass AttrsDocument(Document):\n    __doc_type__ = 'attrs'\n\n    ints = Field(List(Long))\n    bools = Field(List(Long))\n    floats = Field(List(Long))\n\n# Create an index\nindex_name = 'test-attrs'\nclient = Elasticsearch()\nclient.indices.create(index=index_name)\ncluster = Cluster(client)\nindex = cluster.get_index(index_name)\nindex.put_mapping(AttrsDocument)\n\n# Index example document\nindex.add([\n    AttrsDocument(\n        ints=[\n            merge_attr_value_int(1, 42),\n            merge_attr_value_int(2, 43),\n        ],\n        bools=[merge_attr_value_bool(3, True)],\n        floats=[merge_attr_value_float(4, 99.9)],\n    ),\n], refresh=True)\n\n# Define a query filter\nclass AttrsQueryFilter(QueryFilter):\n    ints = AttrIntFacetFilter(AttrsDocument.ints, alias='a')\n    bools = AttrBoolFacetFilter(AttrsDocument.bools, alias='a')\n    ranges = AttrRangeFacetFilter(AttrsDocument.floats, alias='a')\n\n# Now we can build facets\nqf = AttrsQueryFilter()\nsq = index.search_query()\nsq = qf.apply(sq, {})\nres = sq.get_result()\nassert res.total == 1\nqf_res = qf.process_result(res)\n\n# And finally lets print results\nfor attr_id, facet in qf_res.ints.facets.items():\n    print(f'> {attr_id}:')\n    for facet_value in facet.all_values:\n        print(f'  {facet_value.value}: ({facet_value.count_text})')\n\nfor attr_id, facet in qf_res.bools.facets.items():\n    print(f'> {attr_id}:')\n    for facet_value in facet.all_values:\n        print(f'  {facet_value.value}: ({facet_value.count_text})')\n\nfor attr_id, facet in qf_res.ranges.facets.items():\n    print(f'> {attr_id}: ({facet.count})')\n\n# Also we can filter documents:\nqf = AttrsQueryFilter()\nsq = index.search_query()\nsq = qf.apply(\n    sq,\n    {\n        'a1': '42',\n        'a3': 'true',\n        'a4__lte': '100',\n    }\n)\nres = sq.get_result()\nassert res.total == 1\n\nqf = AttrsQueryFilter()\nsq = index.search_query()\nsq = qf.apply(\n    sq,\n    {\n        'a4__gte': '100',\n    }\n)\nres = sq.get_result()\nassert res.total == 0\n```\n\nThis script should print:\n\n```\n> 1:\n  42: (1)\n> 2:\n  43: (1)\n> 3:\n  True: (1)\n> 4: (1)\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/anti-social/elasticmagic-qf-attrs",
+    "keywords": "",
+    "license": "Apache-2.0",
+    "maintainer": "Alexander Koval",
+    "maintainer_email": "kovalidis@gmail.com",
+    "name": "elasticmagic-qf-attrs",
+    "package_url": "https://pypi.org/project/elasticmagic-qf-attrs/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/elasticmagic-qf-attrs/",
+    "project_urls": {
+      "Homepage": "https://github.com/anti-social/elasticmagic-qf-attrs",
+      "Repository": "https://github.com/anti-social/elasticmagic-qf-attrs"
+    },
+    "release_url": "https://pypi.org/project/elasticmagic-qf-attrs/0.1.4/",
+    "requires_dist": [
+      "elasticmagic (>=0.1.0-beta.1,<0.2.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "",
+    "version": "0.1.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12538425,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "81289d355f5f541f2d1d114bc2970ca691b80578b95abea18ffa5724723f2b8e",
+          "md5": "83f60d382eebcc1e2f9002904c8d3e52",
+          "sha256": "673a8efa8cfa788c19204a1b06f450be7bfcdbc42e72684300bfdfc084a14cf3"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic_qf_attrs-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "83f60d382eebcc1e2f9002904c8d3e52",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6906,
+        "upload_time": "2020-04-22T11:44:53",
+        "upload_time_iso_8601": "2020-04-22T11:44:53.415550Z",
+        "url": "https://files.pythonhosted.org/packages/81/28/9d355f5f541f2d1d114bc2970ca691b80578b95abea18ffa5724723f2b8e/elasticmagic_qf_attrs-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "70d48ce916f3645b4792626c5b0e824ff9b18b406f450b6762f66db638f4ac54",
+          "md5": "4e5d0df08f5510ddccbc1f8b22428d1c",
+          "sha256": "48a7b55b60f37249a09123a71822f83b3f14dabbd6c95f014313bf864f1888e4"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic-qf-attrs-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4e5d0df08f5510ddccbc1f8b22428d1c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5525,
+        "upload_time": "2020-04-22T11:44:52",
+        "upload_time_iso_8601": "2020-04-22T11:44:52.406109Z",
+        "url": "https://files.pythonhosted.org/packages/70/d4/8ce916f3645b4792626c5b0e824ff9b18b406f450b6762f66db638f4ac54/elasticmagic-qf-attrs-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "497fa1909cbdf860bed2f483185ac377561c0e6491d3a5b09b89c490eb25cba2",
+          "md5": "5b95e1f3f3640b411be8e168d35466bf",
+          "sha256": "7f9747958cee7a3697231881c8c8d1f6b593de050fea146be477ce3e7d2deea8"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic_qf_attrs-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5b95e1f3f3640b411be8e168d35466bf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9205,
+        "upload_time": "2021-07-07T10:11:01",
+        "upload_time_iso_8601": "2021-07-07T10:11:01.582468Z",
+        "url": "https://files.pythonhosted.org/packages/49/7f/a1909cbdf860bed2f483185ac377561c0e6491d3a5b09b89c490eb25cba2/elasticmagic_qf_attrs-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e43421c4440671b1ece5279432342be5a8871fc15e164bb28e2034aec6b4e9d3",
+          "md5": "1969bb23e9aa44fbcdafec7567e93485",
+          "sha256": "f6a59759f8f8d02f878468de25dd0cfe877e64e4b7fe1cf257251974c2866c1b"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic-qf-attrs-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1969bb23e9aa44fbcdafec7567e93485",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 10481,
+        "upload_time": "2021-07-07T10:11:00",
+        "upload_time_iso_8601": "2021-07-07T10:11:00.653170Z",
+        "url": "https://files.pythonhosted.org/packages/e4/34/21c4440671b1ece5279432342be5a8871fc15e164bb28e2034aec6b4e9d3/elasticmagic-qf-attrs-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6cd94d633afe2281b84ef83406b2886d5564d3a66a8e760524bbd7cfef99683",
+          "md5": "8b53fa63493fa66d26a82abcc8908b88",
+          "sha256": "98e172c50c0c4a9c4802f529f098b959841f6c063324e4b7b55bc140e6615ec3"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic_qf_attrs-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8b53fa63493fa66d26a82abcc8908b88",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9157,
+        "upload_time": "2021-08-20T10:00:30",
+        "upload_time_iso_8601": "2021-08-20T10:00:30.108734Z",
+        "url": "https://files.pythonhosted.org/packages/b6/cd/94d633afe2281b84ef83406b2886d5564d3a66a8e760524bbd7cfef99683/elasticmagic_qf_attrs-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d6c065cc914a93acb806b59cbccd8a4779b612e0c4a27f6573a10f2a102094e",
+          "md5": "846ff34716990f5e41b2703e3be3de25",
+          "sha256": "f1688badd2e0c63287033d80511baacc2132736920101efe9c5dff0a71281110"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic-qf-attrs-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "846ff34716990f5e41b2703e3be3de25",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 10610,
+        "upload_time": "2021-08-20T10:00:28",
+        "upload_time_iso_8601": "2021-08-20T10:00:28.641692Z",
+        "url": "https://files.pythonhosted.org/packages/7d/6c/065cc914a93acb806b59cbccd8a4779b612e0c4a27f6573a10f2a102094e/elasticmagic-qf-attrs-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "712408f170defff537b973b2048d1c8aa44c59508b8f132d0e98982f8a7fcba8",
+          "md5": "d3c0e9c0498b57a5fe9e2a8882ea1456",
+          "sha256": "5d80e37d0897bf1ce92247e5d79462286c347e8e1659d9eec2fc8e99ed57ab6e"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic_qf_attrs-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d3c0e9c0498b57a5fe9e2a8882ea1456",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9993,
+        "upload_time": "2022-01-11T11:29:58",
+        "upload_time_iso_8601": "2022-01-11T11:29:58.881769Z",
+        "url": "https://files.pythonhosted.org/packages/71/24/08f170defff537b973b2048d1c8aa44c59508b8f132d0e98982f8a7fcba8/elasticmagic_qf_attrs-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cca911e2a8db9f909404d9a272b6ff8f782efb9df35520f24cbb887b8fe011d9",
+          "md5": "6ea6498fbacd92c44e494e8e1f38d6ae",
+          "sha256": "251bac5abdf3f8bf42085fd66aa4dce715c995fc517772969d69ef536cdb3571"
+        },
+        "downloads": -1,
+        "filename": "elasticmagic-qf-attrs-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ea6498fbacd92c44e494e8e1f38d6ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 11429,
+        "upload_time": "2022-01-11T11:29:57",
+        "upload_time_iso_8601": "2022-01-11T11:29:57.154990Z",
+        "url": "https://files.pythonhosted.org/packages/cc/a9/11e2a8db9f909404d9a272b6ff8f782efb9df35520f24cbb887b8fe011d9/elasticmagic-qf-attrs-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "712408f170defff537b973b2048d1c8aa44c59508b8f132d0e98982f8a7fcba8",
+        "md5": "d3c0e9c0498b57a5fe9e2a8882ea1456",
+        "sha256": "5d80e37d0897bf1ce92247e5d79462286c347e8e1659d9eec2fc8e99ed57ab6e"
+      },
+      "downloads": -1,
+      "filename": "elasticmagic_qf_attrs-0.1.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d3c0e9c0498b57a5fe9e2a8882ea1456",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 9993,
+      "upload_time": "2022-01-11T11:29:58",
+      "upload_time_iso_8601": "2022-01-11T11:29:58.881769Z",
+      "url": "https://files.pythonhosted.org/packages/71/24/08f170defff537b973b2048d1c8aa44c59508b8f132d0e98982f8a7fcba8/elasticmagic_qf_attrs-0.1.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "cca911e2a8db9f909404d9a272b6ff8f782efb9df35520f24cbb887b8fe011d9",
+        "md5": "6ea6498fbacd92c44e494e8e1f38d6ae",
+        "sha256": "251bac5abdf3f8bf42085fd66aa4dce715c995fc517772969d69ef536cdb3571"
+      },
+      "downloads": -1,
+      "filename": "elasticmagic-qf-attrs-0.1.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6ea6498fbacd92c44e494e8e1f38d6ae",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 11429,
+      "upload_time": "2022-01-11T11:29:57",
+      "upload_time_iso_8601": "2022-01-11T11:29:57.154990Z",
+      "url": "https://files.pythonhosted.org/packages/cc/a9/11e2a8db9f909404d9a272b6ff8f782efb9df35520f24cbb887b8fe011d9/elasticmagic-qf-attrs-0.1.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
