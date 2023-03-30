@@ -1,0 +1,359 @@
+{
+  "info": {
+    "author": "Doist Developers",
+    "author_email": "dev@doist.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 2",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# pickle-compat\n\n![tests](https://github.com/imankulov/pickle-compat/workflows/tests/badge.svg)\n\nPython 2/3 compatibility layer for Pickle\n\n## TL;DR\n\nTo make your pickle forward- and backward-compatible between Python versions, use this:\n\n```\npip install pickle-compat\n```\n\nThen monkey-patch your pickle library with this:\n\n```python\nimport pickle_compat\n\npickle_compat.patch()\n```\n\nFrom this point, you can safely assume that what's pickled with `pickle.dumps()` in Python 2 can be converted back to the real object in Python 3 with `pickle.loads()`, and vise versa. However, note that it doesn't play well with cPickle, future.moves.pickle, or six.moves.cPickle, you need to use plain \"import pickle\" instead.\n\nIf you want to roll back the patch, use:\n\n```\npickle_compat.unpatch()\n```\n\n## Problem Statement\n\nYou were always aware of how pickle is unsafe, hard to debug, and how backward-incompatibility issues may bite you if you decide to update the version. You also heard that you should never use the pickle in a multi-language environment because it's Python-specific.\n\nYou knew it all, but you considered it \"good enough\" for your case. You worked on a monolith application, and pickle provides a serialization mechanism that works out of the box for anything you can create from your Python code.\n\nUntil came the time to migrate to Python 3. Anxious, you postponed it for your big legacy app for as long as you could, but there's no way you can delay it even further. This was when you realized that Python 2 and Python 3 are not two versions of the same language, but actually **two different languages** that happen to share some code constructs.\n\nOK, now all of a sudden, you came up with a multi-language environment, where you need to read the pickle content, serialized by Python 2, from your code in Python 3. If you're making gradual migration, the opposite is also true.\n\n## First frustrations\n\nThings work out of the box only for the most straightforward cases.\n\n```bash\n$ python2 -c 'import pickle; print pickle.dumps(\"Hello world\")' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer)))'\n'Hello world'\n```\n\nAll of a sudden, things start to get broken in the most unexpected places. For example, Python 3 fails to unpickle Python 2's datetime, spitting the scariest issue of any Python developer, a UnicodeDecodeError.\n\n```bash\n$ python2 -c 'import pickle, datetime; print pickle.dumps(datetime.datetime.utcnow())' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer)))'\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nUnicodeDecodeError: 'ascii' codec can't decode byte 0xe4 in position 1: ordinal not in range(128)\n```\n\nLet's follow the rabbit to learn a bit more about the pickle, just enough to make it work for Python 2 and Python 3. At this point, I'm not sure how to make a smooth transition from where you are to where I wanted us to be, so I start throwing random facts at you in the hope that they build a more or less consistent picture in your head.\n\n## Protocol versions\n\nPickle has several so-called \"protocols,\" or formats in which the file can be written. You can optionally define the protocol version in the `pickle.dumps()`. The default format in Python 2.7 is 0 (also known as ASCII format), but it can read and write in formats 1 and 2 as well. Formats 1 and 2 are not ASCII-safe, but they are more compact and faster.\n\n```python\n>>> pickle.dumps(\"hello\")\n\"S'hello'\\np0\\n.\"\n>>> pickle.dumps(\"hello\", protocol=1)\n'U\\x05helloq\\x00.'\n>>> pickle.dumps(\"hello\", protocol=2)\n'\\x80\\x02U\\x05helloq\\x00.'\n```\n\nIn Python 3, Guido introduced a new version of the protocol, intentionally make it backward-incompatible with Python 2.7. [See the commit](https://github.com/python/cpython/commit/f41698169198b32eecd60337a9437ea8c1714380). The comment around the `DEFAULT_PROTOCOL` constant warns, \"We intentionally write a protocol that Python 2.x cannot read; there are too many issues with that.\"\n\nThe main takeaway from us is that if we want to have a backward- and forward-compatible code, we can only use protocols that both Python 2 and Python 3 understand: from 0 to 2 inclusive.\n\n## Pickle format and pickletools\n\nModule [pickletools](https://github.com/python/cpython/blob/master/Lib/pickletools.py) calls itself an \"Executable documentation\" for the pickle module. I highly recommend we open the source code and read an extensive introduction, starting with the words \"A pickle is a program for a virtual pickle machine.\" Another useful feature of pickletools is that it provides a readable representation of the pickle stack.\n\n```python\n$ python2\n>>> import pickle, pickletools\n>>> pickletools.dis(pickle.dumps(\"hello\"))\n    0: S    STRING     'hello'\n    9: p    PUT        0\n   12: .    STOP\nhighest protocol among opcodes = 0\n```\n\nHere the main takeaway is that data in a pickle are represented in the format of the \"opcode - data,\" where opcode decides, roughly speaking, the type of the following element. The list of opcodes is quite extensive and is always growing. You can find them [here](https://github.com/python/cpython/blob/5eb45d7d4e812e89d77da84cc619e9db81561a34/Lib/pickle.py#L107-L195)\n\n## Strings and bytes\n\nLet's find out how text and bytes are represented in Python 2 and Python 3 and what the differences are between them. We'll use Pickle version 2 for comparison. There's no surprise that Python 2 encodes strings and bytes as `BINSTRING` and Unicode objects as `BINUNICODE`.\n\n```python\n$ python2\n>>> import pickle, pickletools\n>>> pickletools.dis(pickle.dumps(\"foo\", protocol=2))\n    0: \\x80 PROTO      2\n    2: U    SHORT_BINSTRING 'foo'\n    7: q    BINPUT     0\n    9: .    STOP\nhighest protocol among opcodes = 2\n>>> pickletools.dis(pickle.dumps(b\"foo\", protocol=2))\n    0: \\x80 PROTO      2\n    2: U    SHORT_BINSTRING 'foo'\n    7: q    BINPUT     0\n    9: .    STOP\nhighest protocol among opcodes = 2\n>>> pickletools.dis(pickle.dumps(u\"foo\", protocol=2))\n    0: \\x80 PROTO      2\n    2: X    BINUNICODE u'foo'\n   10: q    BINPUT     0\n   12: .    STOP\nhighest protocol among opcodes = 2\n```\n\nOn the contrary, Python 3 doesn't want to deal with \"strings\" as the name is ambiguous and prefers to deal with `BINBYTES` and `BINUNICODE`. I will show how it's encoded in protocol 3 that doesn't mean to be compatible with Python 2.\n\n```python\n$ python3\n>>> import pickle, pickletools\n>>> pickletools.dis(pickle.dumps(b\"foo\", protocol=3))\n    0: \\x80 PROTO      3\n    2: C    SHORT_BINBYTES b'foo'\n    7: q    BINPUT     0\n    9: .    STOP\nhighest protocol among opcodes = 3\n>>> pickletools.dis(pickle.dumps(u\"foo\", protocol=3))\n    0: \\x80 PROTO      3\n    2: X    BINUNICODE 'foo'\n   10: q    BINPUT     0\n   12: .    STOP\nhighest protocol among opcodes = 2\n```\n\nHere come two questions:\n\n- How Python 3 encode bytes in protocol 2? Note that the second protocol knows nothing about `BINBYTES`?\n- How Python 3 decodes the `BINSTRING` type, provided that it's a Python 2 type and it's ambiguous?\n\nAnswering the first question is easy. The pickler introduces a backward-compatible hack.\n\n```python\n$ python3\n>>> pickletools.dis(pickle.dumps(b'foo', protocol=2))\n    0: \\x80 PROTO      2\n    2: c    GLOBAL     '_codecs encode'\n   18: q    BINPUT     0\n   20: X    BINUNICODE 'foo'\n   28: q    BINPUT     1\n   30: X    BINUNICODE 'latin1'\n   41: q    BINPUT     2\n   43: \\x86 TUPLE2\n   44: q    BINPUT     3\n   46: R    REDUCE\n   47: q    BINPUT     4\n   49: .    STOP\nhighest protocol among opcodes = 2\n```\n\nConverting back to Python, it saves the byte sequence to a Unicode object, puts it to the stack, and tells the unpickler to execute the following command:\n\n```python\nimport _codecs\n_codecs.encode(u\"foo\", \"latin1\")\n```\n\nA side note. I did not know, but apparently, you can convert safely to Unicode and back any byte sequence.\n\n```python\n$ python3\n>>> import os\n>>> s = os.urandom(100000)\n>>> s == s.decode('latin1').encode('latin1')\nTrue\n```\n\nIt also works for Python 2, so we shouldn't care much about the backward compatibility.\n\nNow, how Python 3 decodes `BINSTRING` opcodes? From the first example, we can see that a string in Python 2 is now a Unicode object in Python 3. In other words, the pickler tries to convert bytes to Unicode.\n\n```bash\n$ python2 -c 'import pickle; print pickle.dumps(\"Hello world\")' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer)))'\n'Hello world'\n```\n\nAt this point, you probably ask yourself what encoding does it use? Fortunately, the answer is right there, in [the documentation](https://docs.python.org/3/library/pickle.html#pickle.Unpickler). Python 3 introduced a parameter \"encoding\" that defaults to ASCII.\n\n> The encoding and errors tell pickle how to decode 8-bit string instances pickled by Python 2; these default to ‘ASCII’ and ‘strict’, respectively. The encoding can be ‘bytes’ to read these 8-bit string instances as bytes objects. Using encoding='latin1' is required for unpickling NumPy arrays and instances of datetime, date and time pickled by Python 2.\n\nIf you wonder what's wrong with datetime, here's how its output looks like in Python 2.\n\n```python\n$ python2\n\n>>> import pickle, pickletools, datetime\n>>> pickletools.dis(pickle.dumps(datetime.datetime.utcnow(), protocol=2))\n    0: \\x80 PROTO      2\n    2: c    GLOBAL     'datetime datetime'\n   21: q    BINPUT     0\n   23: U    SHORT_BINSTRING '\\x07\\xe4\\x05\\x1a\\x0f\\x01\\x16\\x00\\x96\\x10'\n   35: q    BINPUT     1\n   37: \\x85 TUPLE1\n   38: q    BINPUT     2\n   40: R    REDUCE\n   41: q    BINPUT     3\n   43: .    STOP\nhighest protocol among opcodes = 2\n```\n\nHere comes yet another surprise for me: datetime constructor can accept a byte sequence to initialize its internal state, and pickle takes advantage of this.\n\n```python2\n>>> import datetime\n>>> datetime.datetime(b'\\x07\\xe4\\x05\\x1a\\x0f\\x01\\x16\\x00\\x96\\x10')\ndatetime.datetime(2020, 5, 26, 15, 1, 22, 38416)\n```\n\nSetting the encoding to \"latin1\" seems to work.\n\n```bash\npython2 -c 'import pickle, datetime; print pickle.dumps(datetime.datetime.utcnow())' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer, encoding=\"latin1\")))'\ndatetime.datetime(2020, 5, 26, 15, 19, 6, 275120)\n```\n\nThe main takeaway is that strings in Python 2 are converted to Unicode objects in Python 3, and you can control the encoding.\n\n## Non-latin strings in Python 2\n\nWhat if you have non-ASCII content, represented as an old string and not a Unicode object? If you pickle it in Python 2 and unpickle it back in Python 3, you are in trouble.\n\nThe byte string doesn't have any information about the encoding. In Python 2, you probably implicitly supposed that it's a UTF-8, but when you convert it back to Python 3 with Unpickle, it appears as encoded with latin1.\n\n```bash\npython2 -c 'import pickle; print pickle.dumps(\"©\")' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer, encoding=\"latin1\")))'\n'Â©'\n```\n\nTo workaround, you need to use UTF-8, which will work for this case.\n\n```bash\npython2 -c 'import pickle; print pickle.dumps(\"©\")' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer, encoding=\"utf8\")))'\n'©'\n```\n\nUnfortunately, it will not work for datetimes and other binary strings that don't represent a valid UTF-8 sequence.\n\n## Unpickling with \"bytes\" encoding\n\nWell, we were so close to the victory, and we're back to square one. What we're going to do? Fortunately, there's a documented escape hatch, the \"bytes\" encoding. This encoding looks precisely the way we need it. It doesn't try to outsmart you and convert bytes to something that looks like a string. Instead, it returns bytes as bytes objects. Even better than \"latin1\"!\n\n```bash\npython2 -c 'import pickle; print pickle.dumps(\"©\")' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer, encoding=\"bytes\")))'\nb'\\xc2\\xa9'\n```\n\nDatetime objects also work. Is this a victory? Not so fast.\n\n## Unpickling with \"bytes\" encoding. The string constants\n\nI never bothered annotating my string constants that play the role of the \"string constants\" with a `u\"\"` prefix. It's ugly and redundant, and in most cases, when my strings don't contain any non-ASCII symbols, the migration works just fine.\n\nIt's not the case, though, when pickle comes into play. For example, consider the function which takes two arguments and an operation name as a string:\n\n```python\ndef apply_operation(a, b, op):\n    if op == \"ADD\":\n        return a + b\n    elif op == \"SUB\":\n        return a - b\n    else:\n        raise ValueError(\"Unknown operation\")\n```\n\nSomewhere else, I let the `op` pass through the pickle-unpickle pipeline so that Python 2 would convert it to a binary string, and Python 3 would unpickle it exactly as is. In my case, this could be a caching library or a queue processor. Now, I pass my `op` as a binary object to the function, and because `\"ADD\" != b\"ADD\"`, it will always fail with an \"Unknown operation\" exception.\n\nThe most common bytes vs. Unicode problems look like these. Case one:\n\n```python\n>>> \"foo\" == b\"foo\"\nFalse\n```\n\nCase two:\n\n```python\n>>> {\"key\": \"value\"}[b\"key\"]\nTraceback (most recent call last):\n  File \"<stdin>\", line 1, in <module>\nKeyError: b'key'\n```\n\nOne solution is to make all string constants behave like Unicode objects. You can convert them explicitly from `\"\"` to `u\"\"` or add `from __future__ import unicode_literals`. Both solutions don't look quite elegant. Fortunately, when you finally migrate to Python 3, you can delete both of them, and you can do this automatically. I prefer the \"future\" solution because it generates a smaller diff.\n\n```bash\nfuturize --stage1 --unicode-literals --write --nobackups path/to/code\n```\n\n## Unpickling with \"bytes\" encoding. Objects with attributes\n\nIt is, by far, not the worst case. To make things even more complicated, let's try to serialize `foo.foo`.\n\n```python\n# file: foo.py\n\nclass Foo(object):\n    a = 'UNSET'\n    b = 'UNSET'\n    def __init__(self):\n        self.a = 1\n        self.b = 2\n    def __repr__(self):\n        return 'Foo(%s, %s)' % (self.a, self.b)\n\nfoo = Foo()\n```\n\nAs long as we use the default settings, we're good.\n\n```bash\n$ python2 -c 'import pickle, foo; print pickle.dumps(foo.foo)' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer)))'\n\nFoo(1, 2)\n```\n\nBut if we pass \"bytes\" as an argument, all of a sudden, something goes wrong.\n\n```bash\npython2 -c 'import pickle, foo; print pickle.dumps(foo.foo)' | python3 -c 'import pickle, sys; print(repr(pickle.load(sys.stdin.buffer, encoding=\"bytes\")))'\n\nFoo(UNSET, UNSET)\n```\n\nWe lost the attributes of `a` and `b`. Where do they go? The same `pickletool.dis()` helps us to find the answer:\n\n```python\n\n$ python2\n>>> import pickle, pickletools, foo\n>>> pickletools.dis(pickle.dumps(foo.foo, protocol=2))\n    0: \\x80 PROTO      2\n    2: c    GLOBAL     'foo Foo'\n   11: q    BINPUT     0\n   13: )    EMPTY_TUPLE\n   14: \\x81 NEWOBJ\n   15: q    BINPUT     1\n   17: }    EMPTY_DICT\n   18: q    BINPUT     2\n   20: (    MARK\n   21: U        SHORT_BINSTRING 'a'\n   24: q        BINPUT     3\n   26: K        BININT1    1\n   28: U        SHORT_BINSTRING 'b'\n   31: q        BINPUT     4\n   33: K        BININT1    2\n   35: u        SETITEMS   (MARK at 20)\n   36: b    BUILD\n   37: .    STOP\nhighest protocol among opcodes = 2\n```\n\nThe pickle loader doesn't call `__init__`. Instead, it creates a new empty \"dummy\" object of the class `Foo` and populates its state by updating the `__dict__`. If this would be Python, we could write it like this:\n\n```python\nobj = object.__new__(foo.Foo)\nobj.__dict__ = {\"a\": 1, \"b\": 2}\n```\n\nI think now you understand what went wrong. Because of the `bytes` encoding, we did not convert b\"a\" and b\"b\" to their \"python3-string\" representations. You can put anything to an object's dict, but only the keys that are strings are represented as \"proper object attributes.\"\n\nThe next command shows the contents of the `__dict__` of an object and proves that we were right?\n\n```bash\npython2 -c 'import pickle, foo; print pickle.dumps(foo.foo)' | python3 -c 'import pickle, sys; print(pickle.load(sys.stdin.buffer, encoding=\"bytes\").__dict__)'\n\n{b'a': 1, b'b': 2}\n```\n\nOK, we can't use `ASCII`, `latin1`, `utf8` as an encoding, and now we learned that we couldn't use `bytes`? It looks like a dead-end. Or you can get to your last resort, dirty and evil, monkey-patching. The previous version of the pickle-compat used this approach, but we eventually decided to get away without it in favor of \"latin1\", due to way too many corner cases.\n\n## Get back to unpickling with \"latin1\" encoding. Be careful with non-ASCII strings\n\nSo, as we learned, the only practical unpickling option is to automatically decode Python 2 str to Python 3 str using \"latin1\" as an encoding. As we discussed earlier, though, we need to be very careful with byte strings implicitly encoded with UTF-8. I will only provide some examples where you can accidentally come across them. This way or another, you need to fix everything outlined below, regardless of whether you plan to deal with Pickle cases.\n\n### Code\n\nThis returns str:\n\n```python\n# coding: utf-8\n\ncopy = \"©\"\n```\n\nUse this instead:\n\n```python\n# coding: utf-8\nfrom __future__ import unicode_literals\n\ncopy = \"©\"\n```\n\n### Files\n\nThis returns an str:\n\n```python\nopen('test.txt').read()\n```\n\nUse the variant that returns unicode and works correctly in Python 2 and Python 3:\n\n```python\nimport io\nio.open('test.txt', 'rt', encoding='utf8').read()\n```\n\n### Redis\n\nThis returns an str:\n\n```python\nredis.Redis().get(\"foo\")\n```\n\nUse `decode_responses` instead:\n\n```python\nredis.Redis(decode_responses=True).get(\"foo\")\n```\n\n### CSV reader\n\nThis returns str objects:\n\n```python\n>>> import csv\n>>> list(csv.reader(open(\"foo.csv\")))\n[['a', 'b'], ['c', 'd']]\n```\n\nInstall [backports.csv](https://pypi.org/project/backports.csv/) and open files in text modes instead:\n\n```python\n>>> from backports import csv\n>>> import io\n>>> list(csv.reader(io.open(\"foo.csv\", \"rt\", encoding=\"utf8\")))\n[[u'a', u'b'], [u'c', u'd']]\n```\n\n### Requests\n\nThis returns an str:\n\n```python\nrequests.get(\"https://example.com\").content\n```\n\nUse the variant that returns unicode:\n\n```python\nrequests.get(\"https://example.com\").text\n```\n\n## Old-style classes\n\nWe are almost there, except for one thing: old-style classes. As you know, in Python 3, everything subclasses objects, while in Python 2, unless you explicitly inherit your class from it, the top-level class will be \"type\". It is considered outdated, but it's still used in different places of the standard library, waiting to ruin your life in the most unexpected moment.\n\nThis time we talk about forward-compatibility and want to make sure that anything that is pickled in Python 3 can be successfully unpicked in Python 2.\n\nLet's take an object that is an old-style class in Python 2.\n\n```bash\npython3 -c 'import pickle, smtplib, sys; sys.stdout.buffer.write(pickle.dumps(smtplib.SMTP(), protocol=2))' | python2 -c 'import pickle, sys; print pickle.load(sys.stdin)'\n\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"2.7.15/lib/python2.7/pickle.py\", line 1384, in load\n    return Unpickler(file).load()\n  File \"2.7.15/lib/python2.7/pickle.py\", line 864, in load\n    dispatch[key](self)\n  File \"2.7.15/lib/python2.7/pickle.py\", line 1089, in load_newobj\n    obj = cls.__new__(cls, *args)\nAttributeError: class SMTP has no attribute '__new__'\n```\n\nThe approach is similar to the old one: find out how unpickler loads new objects and then patch it to see if the class is old. The Python 2 implementation lives [here](https://github.com/python/cpython/blob/8d21aa21f2cbc6d50aab3f420bb23be1d081dac4/Lib/pickle.py#L1086-L1091).\n\nNote that the protocol version 0 doesn't contain a NEWOBJ opcode and uses a set of workarounds to make it work, so this approach will only work for version 2 of the protocol.\n\n## cPickle, future, and six moves\n\nHere is a word of warning. The patcher doesn't fix cPickle of Python 2 and \\_pickle of Python 3. The latter is an undocumented module imported by Python 3's pickle, if possible.\n\nThe way we solved the problem for ourselves at Doist is by importing \"pickle\" everywhere. It works slower on Python 2, but that only serves as an extra incentive to finish the migration faster. You can use [futurize](https://python-future.org/futurize.html) from the \"future\" package to make it automatically, and it will convert all occurrences of `import cPickle` to `import pickle.`\n\nIf you chose a different migration strategy, with \"moves,\" this can become cumbersome because you can import cPickle unknowingly. More specifically, this will import cPickle implementation under the hood:\n\n```\nfrom future.moves import pickle\n```\n\nThe same goes for this:\n\n```\nfrom six.moves import cPickle\n```\n\nThe main takeaway is that this patcher will not as expected if you use cPickle, future.moves.pickle or six.moves.cPickle.\n\n## Putting it all together\n\nWhat we learned\n\n- The default version of the protocol has to be 2, both for Python 2 and Python 3.\n- We must use the \"latin1\" encoding in the pickle for Python 3.\n- We must be careful with plain strings, represented non-ASCII objects.\n- We must patch Unpickler in Python 2 to correctly unpickle instances of old-style classes.\n\nAlso, we learned some of the internals of pickle and learned how to use pickletools. Finally, we wrapped everything with a `pickle_compat` library that monkey-patches the standard pickle module.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/imankulov/pickle-compat",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pickle-compat",
+    "package_url": "https://pypi.org/project/pickle-compat/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pickle-compat/",
+    "project_urls": {
+      "Homepage": "https://github.com/imankulov/pickle-compat",
+      "Repository": "https://github.com/imankulov/pickle-compat"
+    },
+    "release_url": "https://pypi.org/project/pickle-compat/2.1.1/",
+    "requires_dist": null,
+    "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+    "summary": "Python 2/3 compatibility layer for Pickle",
+    "version": "2.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14320706,
+  "releases": {
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84397409a1701f571b0c8da3a58b6a07a28689c90e23d849d3547751ab637f87",
+          "md5": "e449e238c9715cea252d7392660c72f6",
+          "sha256": "cacfe13fce3d0712f0ba6ab63c3f64ed750ff1401b8909260e627e340347c1fc"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-1.0.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e449e238c9715cea252d7392660c72f6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 9416,
+        "upload_time": "2020-05-26T20:04:48",
+        "upload_time_iso_8601": "2020-05-26T20:04:48.793279Z",
+        "url": "https://files.pythonhosted.org/packages/84/39/7409a1701f571b0c8da3a58b6a07a28689c90e23d849d3547751ab637f87/pickle_compat-1.0.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "966e3504dda68874e06479cc0891c9e24822874ab971da1a18c70adc9e9734ca",
+          "md5": "1e5e94d7871532076b25fa1991588432",
+          "sha256": "bc1e280925c2ad44ad8e045edf585fc7a2c2524db6c2a592368ec301682ce5dc"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1e5e94d7871532076b25fa1991588432",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 15222,
+        "upload_time": "2020-05-26T20:04:47",
+        "upload_time_iso_8601": "2020-05-26T20:04:47.614330Z",
+        "url": "https://files.pythonhosted.org/packages/96/6e/3504dda68874e06479cc0891c9e24822874ab971da1a18c70adc9e9734ca/pickle-compat-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79f04d90319038d9f73e656f1142f3d7a18c31778df9a4fc612de3cab10bfead",
+          "md5": "6ab92da7b394c78b4b58f39f927d95b3",
+          "sha256": "9474fc214fa89edc8cb649b3975156c103c471768fb1e0aa1f0de70b9982df8e"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-1.0.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6ab92da7b394c78b4b58f39f927d95b3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 9500,
+        "upload_time": "2020-05-26T20:05:51",
+        "upload_time_iso_8601": "2020-05-26T20:05:51.967537Z",
+        "url": "https://files.pythonhosted.org/packages/79/f0/4d90319038d9f73e656f1142f3d7a18c31778df9a4fc612de3cab10bfead/pickle_compat-1.0.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f326a803ddb57e3d518d25232f75013d34c1af313652d069c00466babe2735a2",
+          "md5": "9f3fe8a276abfddf78e09ff5191515ba",
+          "sha256": "67e3935ab8874a3c886a927c7253bb6094c40b0289a2ca8bb266bdf7b2ddcb2a"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9f3fe8a276abfddf78e09ff5191515ba",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 15395,
+        "upload_time": "2020-05-26T20:05:50",
+        "upload_time_iso_8601": "2020-05-26T20:05:50.753782Z",
+        "url": "https://files.pythonhosted.org/packages/f3/26/a803ddb57e3d518d25232f75013d34c1af313652d069c00466babe2735a2/pickle-compat-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d400285263b68b172ec55c0dd9185423984fe9c1d42da819d4fe282496191cf2",
+          "md5": "fe1af2d8ff625ccfbfce4a9b9206d796",
+          "sha256": "a6a899d8d25c3d7280c6b0592bea47f7d2b525c2b2003991b4147b3e53601e09"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-1.0.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fe1af2d8ff625ccfbfce4a9b9206d796",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 10031,
+        "upload_time": "2020-05-28T23:38:58",
+        "upload_time_iso_8601": "2020-05-28T23:38:58.415619Z",
+        "url": "https://files.pythonhosted.org/packages/d4/00/285263b68b172ec55c0dd9185423984fe9c1d42da819d4fe282496191cf2/pickle_compat-1.0.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c17aed05fbe299782dd9852d7da1430b7d09740b5871a2db79b1acc0f968fb27",
+          "md5": "53c4c3cdd1ddfba49228ec3d7b668ebf",
+          "sha256": "db132824ba63be7891e8e202249d851c473a8458a4f972bebb5a5aec4cb3ce99"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "53c4c3cdd1ddfba49228ec3d7b668ebf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 16394,
+        "upload_time": "2020-05-28T23:38:56",
+        "upload_time_iso_8601": "2020-05-28T23:38:56.714506Z",
+        "url": "https://files.pythonhosted.org/packages/c1/7a/ed05fbe299782dd9852d7da1430b7d09740b5871a2db79b1acc0f968fb27/pickle-compat-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e588e54d029264a414a92df721475c147866bf6d33cae990444d985b5005326",
+          "md5": "eaae07e02afc4d7c2488b2871b85ae6e",
+          "sha256": "0cf5de92f74ed46e53f1eb59b7f1469ff614c886b86e6300efc26f6a70856d50"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-2.0.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eaae07e02afc4d7c2488b2871b85ae6e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 10765,
+        "upload_time": "2020-06-18T10:29:47",
+        "upload_time_iso_8601": "2020-06-18T10:29:47.699716Z",
+        "url": "https://files.pythonhosted.org/packages/9e/58/8e54d029264a414a92df721475c147866bf6d33cae990444d985b5005326/pickle_compat-2.0.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0023068fa5272dfdaf2ea51a47f98ed78973a1968e789edf37c72b4ce0388701",
+          "md5": "856103c14bc2cd31812524a4382072e6",
+          "sha256": "d36f46349291f129e6a63f7f69b975225b24a73c187ec5bab7ee00fff67ef5b9"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "856103c14bc2cd31812524a4382072e6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 18564,
+        "upload_time": "2020-06-18T10:29:46",
+        "upload_time_iso_8601": "2020-06-18T10:29:46.330789Z",
+        "url": "https://files.pythonhosted.org/packages/00/23/068fa5272dfdaf2ea51a47f98ed78973a1968e789edf37c72b4ce0388701/pickle-compat-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "890f7cfeef168a0ffe071e12a53ac498d19a86aec320cb5923baf0b096f76014",
+          "md5": "effe95911cdb5f4595c31561d46c800d",
+          "sha256": "de2a2076f7aa4445179da2e6ef7a5efa478fdeb100724387735b5ba6fc81ab56"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-2.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "effe95911cdb5f4595c31561d46c800d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 10751,
+        "upload_time": "2020-12-28T19:26:16",
+        "upload_time_iso_8601": "2020-12-28T19:26:16.863401Z",
+        "url": "https://files.pythonhosted.org/packages/89/0f/7cfeef168a0ffe071e12a53ac498d19a86aec320cb5923baf0b096f76014/pickle_compat-2.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d89a0470e253151f52647a5520216ac18295bae3d28cb77eca91d87b57f968a8",
+          "md5": "780f240a717f4c88868bd8a6198c5232",
+          "sha256": "a8638218ff1ea0f0b8648f6341ee4ec599e5b97e7f5e5ffb9da1d17437e41730"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-2.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "780f240a717f4c88868bd8a6198c5232",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 18625,
+        "upload_time": "2020-12-28T19:26:15",
+        "upload_time_iso_8601": "2020-12-28T19:26:15.189172Z",
+        "url": "https://files.pythonhosted.org/packages/d8/9a/0470e253151f52647a5520216ac18295bae3d28cb77eca91d87b57f968a8/pickle-compat-2.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8d5d5fda8425c470f0667cc024c13333cbb07ef6dbb8dad65bd32450c1b52dc",
+          "md5": "85fc5bac7cdfa47c145c928e1f6475af",
+          "sha256": "ec92e576900a43d3247ca6333895f401321d9d69a7a28a28a71a172815b8c08f"
+        },
+        "downloads": -1,
+        "filename": "pickle_compat-2.1.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "85fc5bac7cdfa47c145c928e1f6475af",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 11669,
+        "upload_time": "2022-07-03T07:10:29",
+        "upload_time_iso_8601": "2022-07-03T07:10:29.601170Z",
+        "url": "https://files.pythonhosted.org/packages/b8/d5/d5fda8425c470f0667cc024c13333cbb07ef6dbb8dad65bd32450c1b52dc/pickle_compat-2.1.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2decabca800d5484dd48328f02e76c25b6c0b7f435ebcd0c0c74d44a1c528aeb",
+          "md5": "263d2a976b7dfe65c40aa3f44ac73321",
+          "sha256": "5325149ef9b4c1eab53f5e5f8883e4115e279c268cf0fca06e9c85c52b16e86d"
+        },
+        "downloads": -1,
+        "filename": "pickle-compat-2.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "263d2a976b7dfe65c40aa3f44ac73321",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+        "size": 19468,
+        "upload_time": "2022-07-03T07:10:31",
+        "upload_time_iso_8601": "2022-07-03T07:10:31.553305Z",
+        "url": "https://files.pythonhosted.org/packages/2d/ec/abca800d5484dd48328f02e76c25b6c0b7f435ebcd0c0c74d44a1c528aeb/pickle-compat-2.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b8d5d5fda8425c470f0667cc024c13333cbb07ef6dbb8dad65bd32450c1b52dc",
+        "md5": "85fc5bac7cdfa47c145c928e1f6475af",
+        "sha256": "ec92e576900a43d3247ca6333895f401321d9d69a7a28a28a71a172815b8c08f"
+      },
+      "downloads": -1,
+      "filename": "pickle_compat-2.1.1-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "85fc5bac7cdfa47c145c928e1f6475af",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+      "size": 11669,
+      "upload_time": "2022-07-03T07:10:29",
+      "upload_time_iso_8601": "2022-07-03T07:10:29.601170Z",
+      "url": "https://files.pythonhosted.org/packages/b8/d5/d5fda8425c470f0667cc024c13333cbb07ef6dbb8dad65bd32450c1b52dc/pickle_compat-2.1.1-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2decabca800d5484dd48328f02e76c25b6c0b7f435ebcd0c0c74d44a1c528aeb",
+        "md5": "263d2a976b7dfe65c40aa3f44ac73321",
+        "sha256": "5325149ef9b4c1eab53f5e5f8883e4115e279c268cf0fca06e9c85c52b16e86d"
+      },
+      "downloads": -1,
+      "filename": "pickle-compat-2.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "263d2a976b7dfe65c40aa3f44ac73321",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*, !=3.6.*",
+      "size": 19468,
+      "upload_time": "2022-07-03T07:10:31",
+      "upload_time_iso_8601": "2022-07-03T07:10:31.553305Z",
+      "url": "https://files.pythonhosted.org/packages/2d/ec/abca800d5484dd48328f02e76c25b6c0b7f435ebcd0c0c74d44a1c528aeb/pickle-compat-2.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

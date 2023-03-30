@@ -1,0 +1,317 @@
+{
+  "info": {
+    "author": "Jonathan Drake",
+    "author_email": "jdrake@narrativescience.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# py2sfn-task-tools\n\n[![](https://img.shields.io/pypi/v/py2sfn-task-tools.svg)](https://pypi.org/pypi/py2sfn-task-tools/) [![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)\n\nTools for tasks embedded in an [AWS Step Functions](https://aws.amazon.com/step-functions/) state machine. This is a helper library for [py2sfn](https://github.com/NarrativeScience/py2sfn).\n\nFeatures:\n\n- Offload state data to DynamoDB/S3 instead of storing data in the *very* constrained state machine input data object\n- Cancel the currently executing workflow\n\nTable of Contents:\n\n- [Installation](#installation)\n- [Guide](#guide)\n  - [Stopping the execution](#stopping-the-execution)\n  - [Working with the State Data Client](#working-with-the-state-data-client)\n- [Development](#development)\n\n## Installation\n\npy2sfn-task-tools requires Python 3.6 or above. It should be installed in a [py2sfn task entry point](https://github.com/NarrativeScience/py2sfn#task-entry-points).\n\n```bash\npip install py2sfn-task-tools\n```\n\n## Guide\n\nOnce the py2sfn-task-tools library is installed, a `Context` should be created and passed to the tasks. Each py2sfn task will then have a `context` object to work with.\n\n### Stopping the execution\n\nIf you need to stop/cancel/abort the execution from within a task, you can use the  `context.stop_execution` method within your task's `run` method. A common use case is if you need to check the value of a feature flag at the beginning of the execution and abort if it's false. For example:\n\n```python\nif not some_condition:\n    return await context.stop_execution()\n```\n\nYou can provide extra detail by passing `error` and `cause` keyword arguments to the `stop_execution` method. The `error` is a short string like a code or enum value whereas `cause` is a longer description.\n\n### Working with the State Data Client\n\nOne of the stated Step Functions best practices is to avoid passing large payloads between states; the input data limit is only 32K characters. To get around this, you can choose to store data from your task code in a DynamoDB table. With DynamoDB, we have an item limit of 400KB to work with. When you put items into the table you receive a pointer to the DynamoDB item which you can return from your task so it gets includes in the input data object. From there, since the pointer is in the `data` dict, you can reload the stored data in a downstream task. This library's `StateDataClient` class provides methods for putting and getting items from this DynamoDB table. It's available in your task's `run` method as `context.state_data_client`.\n\nThe client methods are split between \"local\" and \"global\" variants. Local methods operate on items stored within the project whereas global methods can operate on items that were stored from any project. Global methods require a fully-specified partition key (primary key, contains the execution ID) and table name to locate the item whereas local methods only need a simple key because the partition key and table name can be infered from the project automatically. The `put_*` methods return a dict with metadata about the location of the item, including the `key`, `partition_key`, and `table_name`. If you return this metadata object from a task, it will get put on the `data` object and you can call a `get_*` method later in the state machine.\n\nMany methods also accept an optional `index` argument. This argument needs to be provided when getting/putting an item that was originally stored as part of a `put_items` or `put_global_items` call. Providing the `index` is usually only done within a map iteration task.\n\nBelow are a few of the more common methods:\n\n#### `put_item`/`put_items`\n\nThe `put_item` method puts an item in the state store. It takes `key`, `data`, and `index` arguments. For example:\n\n```python\ncontext.state_data_client.put_item(\"characters\", {\"name\": \"jerry\"})\ncontext.state_data_client.put_item(\"characters\", {\"name\": \"elaine\"}, index=24)\n```\n\nNote that the item at the given array index doesn't actually have to exist in the table before you call `put_item`. However, if it doesn't exist then you may have a fan-out logic bug upstream in your state machine.\n\nThe `put_items` method puts an entire list of items into the state store. Each item will be stored separately under its corresponding array index. For example:\n\n```python\ncontext.state_data_client.put_items(\"characters\", [{\"name\": \"jerry\"}, {\"name\": \"elaine\"}])\n```\n\n#### `get_item`\n\nThe `get_item` method gets the data attribute from an item in the state store. It takes `key` and `index` arguments. For example:\n\n```python\ncontext.state_data_client.get_item(\"characters\")  # -> {\"name\": \"jerry\"}\ncontext.state_data_client.get_item(\"characters\", index=24)  # -> {\"name\": \"elaine\"}\n```\n\n#### `get_item_for_map_iteration`/`get_global_item_for_map_iteration`\n\nThe `get_item_for_map_iteration` method gets the data attribute from an item in the state store using the `event` object. This method only works when called within a map iterator task. For example, if the `put_items` example above was called in a task, and its value was given to a map state to fan out, we can use the `get_item_for_map_iteration` method within our iterator task to fetch each item:\n\n```python\n# Iteration 0:\ncontext.state_data_client.get_item_for_map_iteration(event)  # -> {\"name\": \"jerry\"}\n# Iteration 1:\ncontext.state_data_client.get_item_for_map_iteration(event)  # -> {\"name\": \"elaine\"}\n```\n\nThis works because the map iterator state machine receives an input data object with the schema:\n\n```json\n{\n  \"items_result_table_name\": \"<DynamoDB table for the project>\",\n  \"items_result_partition_key\": \"<execution ID>:characters\",\n  \"items_result_key\": \"characters\",\n  \"context_index\": \"<array index>\",\n  \"context_value.$\": \"1\"\n}\n```\n\nThe `get_item_for_map_iteration` is a helper method that uses that input to locate the right item. The `get_global_item_for_map_iteration` method has the same signature. It should be called when you know that the array used to fan out could have come from another project (e.g. the map state is the first state in a state machine triggered by a subscription).\n\n## Development\n\nTo run functional tests, you need an AWS IAM account with permissions to:\n\n- Create/update/delete a DynamoDB table\n- Create/update/delete an S3 bucket\n\nSet the following environment variables:\n\n- `AWS_ACCESS_KEY_ID`\n- `AWS_SECRET_ACCESS_KEY`\n- `AWS_DEFAULT_REGION`\n\nTo run tests:\n\n```bash\ntox\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/NarrativeScience/py2sfn-task-tools",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "py2sfn-task-tools",
+    "package_url": "https://pypi.org/project/py2sfn-task-tools/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/py2sfn-task-tools/",
+    "project_urls": {
+      "Homepage": "https://github.com/NarrativeScience/py2sfn-task-tools",
+      "Repository": "https://github.com/NarrativeScience/py2sfn-task-tools"
+    },
+    "release_url": "https://pypi.org/project/py2sfn-task-tools/1.0.2/",
+    "requires_dist": [
+      "backoff (>=2.2.1,<3.0.0)",
+      "boto3 (>=1.24.59,<2.0.0)",
+      "sfn-workflow-client (>=1.1.1,<2.0.0)"
+    ],
+    "requires_python": ">=3.7,<4",
+    "summary": "Tools for tasks embedded in an AWS Step Functions state machine. This is a helper library for py2sfn.",
+    "version": "1.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15439294,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "af7da580a42dd637448e5f1590a002ca1ddae32394d91cadcdb8ac96a784c8e8",
+          "md5": "ef2e1d3d84188970384857f26a5c86d4",
+          "sha256": "8bf744c44e9b7cccfb50874d5bb1564ffc6f067c0905dab64a32990c5e89bca0"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ef2e1d3d84188970384857f26a5c86d4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4",
+        "size": 10149,
+        "upload_time": "2020-01-30T19:19:21",
+        "upload_time_iso_8601": "2020-01-30T19:19:21.541698Z",
+        "url": "https://files.pythonhosted.org/packages/af/7d/a580a42dd637448e5f1590a002ca1ddae32394d91cadcdb8ac96a784c8e8/py2sfn_task_tools-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c205792bc1e09d21bcb4c9dd87d4c7aa57a2f39116742896f365a714fca9ecf",
+          "md5": "d69f4c4463d788818b7a20cb0cdeae6b",
+          "sha256": "d7ae3e60e1740db654671c916663b3e1c75435705c0947fef8003f3182cd3d47"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d69f4c4463d788818b7a20cb0cdeae6b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4",
+        "size": 10170,
+        "upload_time": "2020-01-30T19:19:24",
+        "upload_time_iso_8601": "2020-01-30T19:19:24.227999Z",
+        "url": "https://files.pythonhosted.org/packages/5c/20/5792bc1e09d21bcb4c9dd87d4c7aa57a2f39116742896f365a714fca9ecf/py2sfn_task_tools-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "983c65c28eb99ccaed4260890bd914c464e852f2f39ae94e4f7a5d8d5d75ef06",
+          "md5": "6385ef50696653edb3064766d9a6caf3",
+          "sha256": "53138eefba35642cd8a392d16cc2303f02a912e41945c1f34dbb647685a53393"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6385ef50696653edb3064766d9a6caf3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4",
+        "size": 10199,
+        "upload_time": "2020-01-30T19:25:52",
+        "upload_time_iso_8601": "2020-01-30T19:25:52.725614Z",
+        "url": "https://files.pythonhosted.org/packages/98/3c/65c28eb99ccaed4260890bd914c464e852f2f39ae94e4f7a5d8d5d75ef06/py2sfn_task_tools-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a6327be69c30c9f03752a465ad140f2129b1b28da3cd6025aeba1d7fda5f84f",
+          "md5": "c4941c2bd89702e69c7bc7c8a7346566",
+          "sha256": "fcca5132172b0e063493081339f25dfdb10040a0b77e0c21da88eaddac0dad38"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c4941c2bd89702e69c7bc7c8a7346566",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4",
+        "size": 10248,
+        "upload_time": "2020-01-30T19:25:54",
+        "upload_time_iso_8601": "2020-01-30T19:25:54.497653Z",
+        "url": "https://files.pythonhosted.org/packages/2a/63/27be69c30c9f03752a465ad140f2129b1b28da3cd6025aeba1d7fda5f84f/py2sfn_task_tools-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd346a001a169e784944ca6739630286482c02cc9aef682d389bf2d4c54c08df",
+          "md5": "0fab0d85293493b06fdd26c93f88f0ab",
+          "sha256": "208d508f62dced792fcc11eddca9d3edae2e1bcbf445370b8fab80a887f093c6"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0fab0d85293493b06fdd26c93f88f0ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4",
+        "size": 10204,
+        "upload_time": "2020-01-30T19:55:17",
+        "upload_time_iso_8601": "2020-01-30T19:55:17.042783Z",
+        "url": "https://files.pythonhosted.org/packages/cd/34/6a001a169e784944ca6739630286482c02cc9aef682d389bf2d4c54c08df/py2sfn_task_tools-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e0d159cf597f54d80548f84fe533c3553f56c9f14b438c7f675967da2ea7278",
+          "md5": "5b7ad6cc6412a011ed559318a99dca1c",
+          "sha256": "0727347d97916ebab51710f34a4338e6f86576280c177e3aaf99d247f2d9393c"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5b7ad6cc6412a011ed559318a99dca1c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4",
+        "size": 10265,
+        "upload_time": "2020-01-30T19:55:18",
+        "upload_time_iso_8601": "2020-01-30T19:55:18.778780Z",
+        "url": "https://files.pythonhosted.org/packages/0e/0d/159cf597f54d80548f84fe533c3553f56c9f14b438c7f675967da2ea7278/py2sfn_task_tools-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3af438d9ebe20e8a63dc48dc5eaff8d2399f72d95b3587cc4932f872d3c17d1",
+          "md5": "8fdabb8a425d91420e1a2d18df119253",
+          "sha256": "bf735f09dce6ff5e6fa49767c3a4dfe721251eadf88dba91f0513611a4ab02fa"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8fdabb8a425d91420e1a2d18df119253",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4",
+        "size": 10201,
+        "upload_time": "2022-10-14T17:54:53",
+        "upload_time_iso_8601": "2022-10-14T17:54:53.932360Z",
+        "url": "https://files.pythonhosted.org/packages/f3/af/438d9ebe20e8a63dc48dc5eaff8d2399f72d95b3587cc4932f872d3c17d1/py2sfn_task_tools-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d337f2c927ad1dcef24aa1d999f48a71bacc9e54af255ec3a8e29463e5c4dae5",
+          "md5": "0ca009195ec322e08bc0888a0306a13a",
+          "sha256": "95d092456b803b63b8d96c624d3b983bca9d6fa88ebd24402b21764c4bcc6b3f"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0ca009195ec322e08bc0888a0306a13a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4",
+        "size": 11725,
+        "upload_time": "2022-10-14T17:54:55",
+        "upload_time_iso_8601": "2022-10-14T17:54:55.325751Z",
+        "url": "https://files.pythonhosted.org/packages/d3/37/f2c927ad1dcef24aa1d999f48a71bacc9e54af255ec3a8e29463e5c4dae5/py2sfn_task_tools-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6466d1df97348855fedebc3f3dc533fa6bf25465eb17d0e35c9c00aa4ece2a07",
+          "md5": "975be22d56d1d69920fabb746e1dfd39",
+          "sha256": "fae07ab90d12e009f23be5e629bb1a5acfd450401a081e4d0643ea7ba3c2bbd4"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "975be22d56d1d69920fabb746e1dfd39",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4",
+        "size": 10201,
+        "upload_time": "2022-10-17T17:20:22",
+        "upload_time_iso_8601": "2022-10-17T17:20:22.511843Z",
+        "url": "https://files.pythonhosted.org/packages/64/66/d1df97348855fedebc3f3dc533fa6bf25465eb17d0e35c9c00aa4ece2a07/py2sfn_task_tools-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "246c7fbadbbdf1e865306f0ff992d31f44b0d4ad011bfc6068adb360430bae84",
+          "md5": "274525cda62c3808607d4a20d7087878",
+          "sha256": "4c3f92171d9a7faa6c47670e5d5226c1c4f7aa861efed853a03f1ff7f9d666c6"
+        },
+        "downloads": -1,
+        "filename": "py2sfn_task_tools-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "274525cda62c3808607d4a20d7087878",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4",
+        "size": 11733,
+        "upload_time": "2022-10-17T17:20:24",
+        "upload_time_iso_8601": "2022-10-17T17:20:24.023079Z",
+        "url": "https://files.pythonhosted.org/packages/24/6c/7fbadbbdf1e865306f0ff992d31f44b0d4ad011bfc6068adb360430bae84/py2sfn_task_tools-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6466d1df97348855fedebc3f3dc533fa6bf25465eb17d0e35c9c00aa4ece2a07",
+        "md5": "975be22d56d1d69920fabb746e1dfd39",
+        "sha256": "fae07ab90d12e009f23be5e629bb1a5acfd450401a081e4d0643ea7ba3c2bbd4"
+      },
+      "downloads": -1,
+      "filename": "py2sfn_task_tools-1.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "975be22d56d1d69920fabb746e1dfd39",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4",
+      "size": 10201,
+      "upload_time": "2022-10-17T17:20:22",
+      "upload_time_iso_8601": "2022-10-17T17:20:22.511843Z",
+      "url": "https://files.pythonhosted.org/packages/64/66/d1df97348855fedebc3f3dc533fa6bf25465eb17d0e35c9c00aa4ece2a07/py2sfn_task_tools-1.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "246c7fbadbbdf1e865306f0ff992d31f44b0d4ad011bfc6068adb360430bae84",
+        "md5": "274525cda62c3808607d4a20d7087878",
+        "sha256": "4c3f92171d9a7faa6c47670e5d5226c1c4f7aa861efed853a03f1ff7f9d666c6"
+      },
+      "downloads": -1,
+      "filename": "py2sfn_task_tools-1.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "274525cda62c3808607d4a20d7087878",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4",
+      "size": 11733,
+      "upload_time": "2022-10-17T17:20:24",
+      "upload_time_iso_8601": "2022-10-17T17:20:24.023079Z",
+      "url": "https://files.pythonhosted.org/packages/24/6c/7fbadbbdf1e865306f0ff992d31f44b0d4ad011bfc6068adb360430bae84/py2sfn_task_tools-1.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,611 @@
+{
+  "info": {
+    "author": "Pablo Woolvett",
+    "author_email": "pablowoolvett@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# pythia\n\nPythonic Deepstream.\n\n---\n[![PyPI - Version](https://img.shields.io/pypi/v/pythiags)](https://pypi.org/project/pythiags/)\n[![PyPI - Wheels](https://img.shields.io/pypi/wheel/pythiags)](https://pypi.org/project/pythiags/)\n[![Docs](https://img.shields.io/badge/docs-github_pages-blue)](https://rmclabs-io.github.io/pythia-docs/)\n\n---\n\n[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow.svg)](https://conventionalcommits.org)\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n[![security: bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://github.com/PyCQA/bandit)\n\n---\n\n\n[NVidia Deepstream](https://developer.nvidia.com/deepstream-sdk) is an excellent gstreamer\nframework which allows to build ai-powered, performant applications running on nvidia\nhardware. Its python API and bindings, however, have a bunch of painpoints which we've\nhere collected and addressed with pythia:\n\n* **Metadata Extraction**: Deepstream metadata extraction requires using buffer probes:\n  pythia provides an easy to use interface which splits metadata extraction and\n  processing.\n* **Metadata Iteration**: pyds api iterators are not pythonic: pythia provides intuitive \n  deepstream metadata iterators to use, like `for frame in frames_per_batch(buffer)`\n  wrapping pybind c++ casting and iteration.\n* **Python boilerplate**: Python gstreamer apps get very large very fast. Pythia abstracts\n  away common stuff and lets you focus on your application.\n* **Quick prototyping**: Sometimes you just want to check the performance of a new model\n  (eg after exporting from [Nvidia TAO](https://developer.nvidia.com/tao)), or verify\n  the environment. Pythia comes with ready-to-run demo applications, and a\n  `gst-launch`-like cli.\n\npythia offers:\n\n* Common metadata extraction and parsing utilities.\n* Workers and queues management in the background, to offload processing outside of the \n  buffer probe.\n* Ready to use Docker images for both aarch64 (jetson) and x86_64 (nvidia gpu).\n\n## Examples\n\n### Running pythia from the cli\n\n<details><summary> gst-pylaunch</summary>\n\nYou can run familiar pipelines and attach buffer probes from simple python modules.\n\n#### Create Files\n\n<!-- gst-pylaunch probe -->\n* Create a file `probe.py` with:\n\n```python\n\nfrom pythia import objects_per_batch\n\ndef gen_detections(batch_meta):\n    for frame, detection in objects_per_batch(batch_meta):\n        box = detection.rect_params\n        yield {\n            \"frame_num\": frame.frame_num,\n            \"label\": detection.obj_label,\n            \"left\": box.left,\n            \"top\": box.top,\n            \"width\": box.width,\n            \"height\": box.height,\n            \"confidence\": detection.confidence,\n        }\n\n```\n\n<!-- gst-pylaunch pipeline -->\n* Create a file `pipeline.txt` with:\n\n```\nuridecodebin\n  uri=file://{input}\n! identity\n  eos-after=30\n! nvvideoconvert\n! muxer.sink_0\nnvstreammux\n  name=muxer width=1280 height=720 batch-size=1\n! nvinfer\n  name=pgie\n  config-file-path={pgie-conf}\n! nvvideoconvert\n! nvdsosd\n! nvvideoconvert\n! queue\n! x264enc\n! mp4mux\n! filesink location={output}\n```\n\n#### Running pythia\n\n<!-- gst-pylaunch console -->\n* run the application with:\n\n```console\n$ gst-pylaunch \\\n  -p ./pipeline.txt \\\n  --pgie-conf=/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_infer_primary.txt \\\n  --input=/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4 \\\n  --output=/tmp/overlayed.mp4 \\\n  --probe=probe.py:gen_detections@pgie.src\n```\n\nNote the `--pgie-conf`, `--input`, and `--output` cli args were dynamically parsed and\nadded from the pipeline file. \n\nThis command instructed pythia to do the following:\n  1. Load a pipeline from a file located at `./pipeline.txt`, which contains\n    `gst-launch`-like syntax with some parameters to be inserted (`input`, `pgie-conf`,\n    `output`).\n  2. Format the pipelie with `input`, `pgie-conf` and `output` from received parameters.\n    (For a more complex syntax, you can install `pythia[jinja]` to use jinja as a\n    template backend. See the documentation for more details.)\n  4. Setup a buffer probe which internally calls the `gen_detections` method defined in the\n    `probe.py` file.\n  5. Attach said buffer probe in the `source pad` of the `pgie`-named element of the\n    pipeline.\n  6. Send incoming metadata to a logger which prints jsonified metadata to console.\n\n#### Check your output\n\n* Check your console to see the incoming detections.\n* Want to do something else with the detections? You can choose between several\n  backends: logging (stdout <default>, stderr, file available), in-memory (deque),\n  kafka, redis, or implement your own streaming connector with the `PYTHIA_STREAM_URI`\n  env var. Check the documentation for more details.\n  \n</details>\n\n\n### Develop applications based on pythia\n<details><summary>python API</summary>\n\n\nIf you want more granular control over the behavior of the application, its signals,\nevents, and messages, you can instead program an aplication using pythia's API.\n\n\n#### Create Files\n\nContinuing with the same pipeline as in the previous example,\n\n<!-- api application -->\n* Create a file `myscript.py` with:\n\n```python\nimport json\nfrom kafka import KafkaProducer\nfrom kafka.admin import KafkaAdminClient, NewTopic\nfrom pythia import Application, Gst, objects_per_batch\n\nclass App(Application):\n\n    def __init__(self, *a, **kw):\n        super().__init__(*a, **kw)\n        self.manual_kafka = KafkaProducer(\n            bootstrap_servers=\"kafka:9092\"\n        )\n\n    def on_message_error(self, *a, **kw):\n        err, debug = super().on_message_error(*a, **kw)\n        self.manual_kafka.send(\n            \"app_events\",\n            json.dumps({ \"CONDITION\":\"ERROR\", \"ERR\": err, \"DEBUG\": debug}).encode()\n        )\n        raise RuntimeError(\"Unhandled pipeline error\")\n\n    def on_message_eos(self, bus, message):\n        self.manual_kafka.send(\n            \"app_events\",\n            json.dumps({ \"CONDITION\":\"EOS\", \"SENT_BY\": str(message.src)}).encode()\n        )\n        super().on_message_eos(bus, message)\n\napp = App.from_pipeline_file(\n    \"pipeline.txt\",\n    params={\n      \"pgie-conf\": \"/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_infer_primary.txt\",\n      \"input\": \"/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4\",\n      \"output\": \"/tmp/overlayed.mp4\",\n    }\n)\n\n@app.probe(\n    \"pgie\",\n    pad_direction=\"src\",\n    backend_uri=\"kafka://kafka:9092?stream=raw_detections\"\n)\ndef pgie_srcprobe(batch_meta):\n    for frame, detection in objects_per_batch(batch_meta):\n        frame_num = frame.frame_num\n        box = detection.rect_params\n        yield {\n            \"frame_num\": frame_num,\n            \"label\": detection.obj_label,\n            \"left\": box.left,\n            \"top\": box.top,\n            \"width\": box.width,\n            \"height\": box.height,\n            \"confidence\": detection.confidence,\n        }\n\n@app.probe(\n    \"muxer\",\n    pad_direction=\"src\",\n)\ndef source_probe(pad, info):\n    app.manual_kafka.send(\n        \"app_events\",\n        json.dumps({\n            \"CONDITION\":\"STARTED\",\n            \"PAD_CAPS\": pad.props.caps.to_string(),\n            \"PAD_DIRECTION\": pad.props.direction,\n            \"PAD_OFFSET\": pad.props.offset,\n        }).encode()\n    )\n    return Gst.PadProbeReturn.REMOVE\n\nif __name__ == \"__main__\":\n    admin = KafkaAdminClient(bootstrap_servers=\"kafka:9092\")\n    if \"app_events\" not in admin.list_topics():\n        admin.create_topics(\n            new_topics=[\n                NewTopic(name=\"app_events\", num_partitions=1,replication_factor=1)\n            ],\n            validate_only=False,\n        )\n    app()\n\n```\n\n#### Running pythia\n\n<!-- api console -->\n* run the application with:\n\n```console\n$ python myscript.py\n```\n\nIn this mode, you have more control over the application behavior:\n\n1. Subclass application\n2. instantiate a custom message handler (a kafka producer in this example)\n3. forward error and EOS messages to a custom kafka topic\n4. interpolate the pipeline template file with python variables to construct the app\n5. use the `@app.probe` decorator as a generator, letting pythia handle the messages\n  internally\n6. use the `@app.probe` decorator as a probe, handling manually the buffer flow and\n  messaging.\n\n\nWant to do something else while the application is running? you can run the application\nwith `app(background=True)` instead. See the documentation for details and more\nexamples.\n\n#### Check your output\n\n* Check the kafka topics to see the incoming detections.\n\n</details>\n\n## Setup\n\n### Prerequisites\n\n* nvidia hardware (either jetson or gpu)\n* One of\n  - recent docker (with support `--gpus=all`)\n  - `nvidia-docker` installed,\n  - environment with deepstream 6.1.1 and [these bindings](https://github.com/rmclabs.io/deepstream_python_apps)\n\n\n### Install\n\n#### non-docker\n\n* `pip install pythiags`\n\n#### docker\n\n* `docker login ghcr.io` (See instructions [here](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry))\n* `docker pull ghcr.io/rmclabs-io/pythia` or `ghcr.io/rmclabs-io/pythia-l4t`\n* Build your image using `FROM ghcr.io/rmclabs-io/pythia` or\n  `FROM ghcr.io/rmclabs-io/pythia-l4t`\n\nNOTE: `latest` tag is deliberately not published.\n\n* run docker with the following flags at least:\n\n  ```console\n  $ docker run \\\n    --gpus=all \\\n    -v /tmp/.X11-unix:/tmp/.X11-unix \\\n    -e DISPLAY \\\n    ghcr.io/rmclabs-io/pythia-dev:1.2.1\n  ```\n\nAlternatively, you could use `ghcr.io/rmclabs-io/pythia-dev` or\n`FROM ghcr.io/rmclabs-io/pythia-l4t-dev`.\n\n## Usage\n\nNote: If running from docker, make sure you've properly configured the container and its\nenvironment, see the\n[reference upstream](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_docker_containers.html#)\n\nFor more examples and tutorials, visit the\n[examples section](https://dev.rmclabs.io/pythia/docs/examples.html)\nof the documentation.\n\n## FAQ\n\nCheck out ongoing and future development [here](https://github.com/rmclabs-io/pythiags/projects)\n\n### FAQ / Common Issues\n\n* Q: Package installation fails:\n\n  * A1: upgrade your pip: `pip install --upgrade pip` (Required \"pip>=10\").\n  * A2: Make sure you've installed the build prerequisites, as listed in `reqs/apt.build.list`.\n\n* Q: My application is running slow on Jetson\n\n  * A: Ensure to enable jetson-clocks and maxn (See\n    [reference](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Performance.html#jetson))\n    :\n\n     ```console\n     sudo nvpmodel -m 0\n     sudo jetson_clocks\n     ```\n\n* Q: Program exits with error `Unable to get a Window, abort.`\n\n  * A: Make sure x11 is properly configured. This is common when running through ssh\n     sessions. In most of the cases, this just means you need to have the `DISPLAY`\n     environment variable correctly set. To list available displays, run the `w`\n     command:\n\n     ```bash\n     $ w\n     09:53:38 up 2 days, 17:26,  1 user,  load average: 0,36, 0,33, 0,23\n     USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n     rmclabs  :0       :0               lun16   ?xdm?   3:06m  0.02s /usr/lib/gdm3/gdm-x-session --run-script /usr/lib/gnome-session/run-systemd-session unity-session.     target\n     rmclabs  pts/11   10.100.10.79     09:57    1.00s  0.10s  0.00s w\n     ```\n\n     From here, choose a display corresponding to a local connection (`:0` in this case,\n     including the colon). Then, export the environment variable and run again your program:\n\n     ```bash\n     export DISPLAY=:0\n     # run your program here\n     ```\n\n* Q: Program exits with error (from docker):\n\n     ```console\n     X Error of failed request:  BadShmSeg (invalidshared segment parameter)\n       Major opcode of failed request:  150 (XVideo)\n       Minor opcode of failed request:  19 ()\n       Segment id in failed request:  0x121\n       Serial number of failed request:  57\n       Current serial number in output stream:  58\n     python: ../../src/hb-object-private.hh:154: Type* hb_object_reference(Type*) [with Type = hb_unicode_funcs_t]: Assertion `hb_object_is_valid (obj)' failed.\n     ```\n\n  * A: Add `--ipc=host` flag to docker run.\n\n* Q: Python segfaults when several applications are run subsequently:\n\n  * A: It seems to be a race condition produced by the `uridecodebin` element using\n    `nvjpegenc` (maybe others?). You can either add a timeout between runs (1 sec seems\n    to do it), or change `nvjpegenc` - see `pythia.utils.gst:demote_plugin`.\n\n* Q: Python segfaults when several applications are run subsequently:\n\n  * A: It seems to be a race condition produced by the `uridecodebin` element using\n    `nvjpegenc` (maybe others?). You can either add a timeout between runs (1 sec seems\n    to do it), or change `nvjpegenc` - see `pythia.utils.gst:demote_plugin`.\n\n* Q: I am unable to build the devcontainer:\n\n  * A: Make sure to update the `devcontainer.json` with a proper `BASE_IMAGE` and\n    `DOCKER_GROUP_ID`.\n\n## Contribute\n\n1. fork\n2. clone\n3. Pull Request from new branch\n4. [Optional, recommended]: use provided devcontainer.\n5. [Optional, recommended]: run `pre-commit install` to validate commits.\n6. add tests, docs, code, scripts, etc\n7. [Optional] check code manually, with `./scripts/format`, `./scripts/lint`,\n  `./scripts/docs`, `./scripts/test`, etc.\n8. Commit using\n  [Conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#summary).\n9. push, wait for ci and/or maintainers feedback\n10. repeat 6-8 until success!\n\nFor more instructions, visit the\n[Developers section](https://rmclabs-io.github.io/pythia-docs/development)\nof the documentation.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://dev.rmclabs.io/pythia",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pythiags",
+    "package_url": "https://pypi.org/project/pythiags/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pythiags/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/rmclabs-io/pythia/issues",
+      "Documentation": "https://rmclabs-io.github.io/pythia-docs/",
+      "Homepage": "https://dev.rmclabs.io/pythia",
+      "Repository": "https://github.com/rmclabs-io/pythia"
+    },
+    "release_url": "https://pypi.org/project/pythiags/1.3.0/",
+    "requires_dist": [
+      "Jinja2 (>=3.1.2,<4.0.0); extra == \"jinja\"",
+      "fire (==0.4.0); extra == \"cli\"",
+      "kafka-python (==2.0.2); extra == \"kafka\"",
+      "numpy (>=1.23.2,<2.0.0)",
+      "opencv-python (>=4.6.0.66); extra == \"opencv\"",
+      "pycairo (==1.21.0)",
+      "pyds_ext (>=2,<3)",
+      "pygobject (==3.36.0)",
+      "redis (==4.3.4); extra == \"redis\"",
+      "typer; extra == \"cli\""
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "pythonic Deepstream.",
+    "version": "1.3.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15339229,
+  "releases": {
+    "0.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71f34e2ad483f021dbd8ea901450d6f30a77ec34ee9949fef46a0c11fa2041e1",
+          "md5": "8c351a5fec1d941b1abe30a0251ba222",
+          "sha256": "647a6b5ab8e8380c1edb6d3cc907f4fed326aa3857b3a0e1e729b519d8b5f788"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.10.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8c351a5fec1d941b1abe30a0251ba222",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 32317,
+        "upload_time": "2021-04-22T21:03:31",
+        "upload_time_iso_8601": "2021-04-22T21:03:31.459744Z",
+        "url": "https://files.pythonhosted.org/packages/71/f3/4e2ad483f021dbd8ea901450d6f30a77ec34ee9949fef46a0c11fa2041e1/pythiags-0.10.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38a768b8acb2b14bed9f42d945e334e8e2b4de3bcba704839b12035704a4d175",
+          "md5": "9c49c14324334807e041c5cd01375f24",
+          "sha256": "6248b87c5561d104c1c498042534ba6c67c4a83599f6e84c76a6c94900dbb850"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.11.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9c49c14324334807e041c5cd01375f24",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 53498,
+        "upload_time": "2021-09-24T21:33:01",
+        "upload_time_iso_8601": "2021-09-24T21:33:01.509831Z",
+        "url": "https://files.pythonhosted.org/packages/38/a7/68b8acb2b14bed9f42d945e334e8e2b4de3bcba704839b12035704a4d175/pythiags-0.11.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eee8d93901051033b7849018916ddb2263ac66f214f4a6efc0a0d3460e7761ef",
+          "md5": "24d551500f8464f25e7d2bc0eabb2568",
+          "sha256": "7f4744690385f5e8a4125844b8e3a836082e18feaf7c56a78d8aaec0735a7cd5"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.11.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "24d551500f8464f25e7d2bc0eabb2568",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 49376,
+        "upload_time": "2021-10-06T14:11:13",
+        "upload_time_iso_8601": "2021-10-06T14:11:13.276748Z",
+        "url": "https://files.pythonhosted.org/packages/ee/e8/d93901051033b7849018916ddb2263ac66f214f4a6efc0a0d3460e7761ef/pythiags-0.11.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "28513d46aa2892d2802e376071fab2824cadcaf1caf71def502a6ba8b6d526f3",
+          "md5": "b605577f51884ecca60e73cf74f32c3a",
+          "sha256": "22e5f0ec376524f8983e64a9e7ca799bacd9bc2eaf3c6d89bdc95d673dd024ee"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.11.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b605577f51884ecca60e73cf74f32c3a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 49632,
+        "upload_time": "2021-11-05T03:28:51",
+        "upload_time_iso_8601": "2021-11-05T03:28:51.023631Z",
+        "url": "https://files.pythonhosted.org/packages/28/51/3d46aa2892d2802e376071fab2824cadcaf1caf71def502a6ba8b6d526f3/pythiags-0.11.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1af24a1ab78bd55d967f9329056cfc5f79c9c021bdfabb9d9375524f1fffdcea",
+          "md5": "6d40ab5e239cd8834e19d88876128668",
+          "sha256": "6ed4137813ae9d63616b6942dc6e217f646f4a3c7c6a8334233880417586f7ae"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.12.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6d40ab5e239cd8834e19d88876128668",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 49610,
+        "upload_time": "2021-11-05T13:21:10",
+        "upload_time_iso_8601": "2021-11-05T13:21:10.184512Z",
+        "url": "https://files.pythonhosted.org/packages/1a/f2/4a1ab78bd55d967f9329056cfc5f79c9c021bdfabb9d9375524f1fffdcea/pythiags-0.12.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "36171e083e4bcc38f4704afd92828769c8e4aa496f83a76e19d757f9234ef224",
+          "md5": "1d086581029cf1c8e84b48db3bb0982d",
+          "sha256": "837cde0f521faf9e1aef7d8c5355096132a299f0b87841440adb19e3951ecb75"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.12.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1d086581029cf1c8e84b48db3bb0982d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 49604,
+        "upload_time": "2022-02-15T14:36:11",
+        "upload_time_iso_8601": "2022-02-15T14:36:11.365668Z",
+        "url": "https://files.pythonhosted.org/packages/36/17/1e083e4bcc38f4704afd92828769c8e4aa496f83a76e19d757f9234ef224/pythiags-0.12.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "627e1c23a1b58c39d4a6853cf920322b85b91fd3e66f9c270b4d1c84a68f1aec",
+          "md5": "53ddb5be4327344751101488ff500ef0",
+          "sha256": "41f42cf11ed93b9ebe12d9cef9b3b3422301e720ab71558ac46ba66d9791c559"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.5.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "53ddb5be4327344751101488ff500ef0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 29413,
+        "upload_time": "2021-02-17T17:32:53",
+        "upload_time_iso_8601": "2021-02-17T17:32:53.253931Z",
+        "url": "https://files.pythonhosted.org/packages/62/7e/1c23a1b58c39d4a6853cf920322b85b91fd3e66f9c270b4d1c84a68f1aec/pythiags-0.5.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f2f398c482197d6bed349a96af5735aa162034476b36b8057062ecdfe5652b3",
+          "md5": "6abefafd941b16690631fef843d73d01",
+          "sha256": "0a5a970528e3359ccb31acf42e39064c87c3dcc3960342d248ce97e24ca75f76"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.5.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6abefafd941b16690631fef843d73d01",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 29427,
+        "upload_time": "2021-02-17T20:27:51",
+        "upload_time_iso_8601": "2021-02-17T20:27:51.847585Z",
+        "url": "https://files.pythonhosted.org/packages/0f/2f/398c482197d6bed349a96af5735aa162034476b36b8057062ecdfe5652b3/pythiags-0.5.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9be54f2baeedf9b8c77ac15336a4779fe022a37a5fd720baea51a7b1847e217",
+          "md5": "4e18acfdad6fbec31909ce31cb293e6f",
+          "sha256": "dc7ca10f8061d9f4ea52941daba5f4fcaf5b863f4bfe004d509f949fa66f049e"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.5.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4e18acfdad6fbec31909ce31cb293e6f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 30812,
+        "upload_time": "2021-02-22T18:39:28",
+        "upload_time_iso_8601": "2021-02-22T18:39:28.646851Z",
+        "url": "https://files.pythonhosted.org/packages/e9/be/54f2baeedf9b8c77ac15336a4779fe022a37a5fd720baea51a7b1847e217/pythiags-0.5.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "31846e9225382abffdbdbdb27334bb049bfb5e10e829b594e3e38b3bb2742c21",
+          "md5": "d75c4e4d6f4079c107794ddb049cc9ce",
+          "sha256": "31987e757da4064db82e9d22294d1cc137d8312fd7a2dc87a685694097106068"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.5.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d75c4e4d6f4079c107794ddb049cc9ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 31051,
+        "upload_time": "2021-02-23T13:22:53",
+        "upload_time_iso_8601": "2021-02-23T13:22:53.338866Z",
+        "url": "https://files.pythonhosted.org/packages/31/84/6e9225382abffdbdbdb27334bb049bfb5e10e829b594e3e38b3bb2742c21/pythiags-0.5.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d5be06ab5dff3e6bb3ae485adb6241e90b60574a2c183ca797dc74f516a76eb6",
+          "md5": "9defec502955127ff348b7e9fa252ee9",
+          "sha256": "ade95ce4c692524c6b81a4b81e5236e27b9d568b869790bce083ed06a66aa4ec"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9defec502955127ff348b7e9fa252ee9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 31193,
+        "upload_time": "2021-02-23T20:49:13",
+        "upload_time_iso_8601": "2021-02-23T20:49:13.481754Z",
+        "url": "https://files.pythonhosted.org/packages/d5/be/06ab5dff3e6bb3ae485adb6241e90b60574a2c183ca797dc74f516a76eb6/pythiags-0.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1cff01869eecdea48275329f38ef4b6768f0452a836179ccedae458b336d2aec",
+          "md5": "59d3c46fd4d75eb24312a857601afa98",
+          "sha256": "331ab6a9cf80aab5277a3a60326a74746ed516b45229715224d02deabdb41847"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "59d3c46fd4d75eb24312a857601afa98",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 31667,
+        "upload_time": "2021-02-25T18:26:21",
+        "upload_time_iso_8601": "2021-02-25T18:26:21.602793Z",
+        "url": "https://files.pythonhosted.org/packages/1c/ff/01869eecdea48275329f38ef4b6768f0452a836179ccedae458b336d2aec/pythiags-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "885096b85c3c7db022e80a0fc17445264d2855fadac563643c9dab40da92481c",
+          "md5": "aebbd522be2aa49c5522faf847629257",
+          "sha256": "1b6713f267ae217254298cee352870eee3c4d7ebc411d9997fc635e460604849"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.7.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aebbd522be2aa49c5522faf847629257",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 31661,
+        "upload_time": "2021-02-25T18:55:49",
+        "upload_time_iso_8601": "2021-02-25T18:55:49.001081Z",
+        "url": "https://files.pythonhosted.org/packages/88/50/96b85c3c7db022e80a0fc17445264d2855fadac563643c9dab40da92481c/pythiags-0.7.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e2d5d945c32ee961ada9e2817aaa5981e887846304fcc228c80f0d6158648d2",
+          "md5": "b7ae8c40d6902bab3c49ba0ab086275a",
+          "sha256": "c4a1667e68dc6fc482f114873813786d84afccb46ef9ed19a99cd295bc123c12"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7ae8c40d6902bab3c49ba0ab086275a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 31933,
+        "upload_time": "2021-02-26T21:08:25",
+        "upload_time_iso_8601": "2021-02-26T21:08:25.594680Z",
+        "url": "https://files.pythonhosted.org/packages/6e/2d/5d945c32ee961ada9e2817aaa5981e887846304fcc228c80f0d6158648d2/pythiags-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16a9b00f57ca41df60d528a2767acb137d1625cb6c2ef79a89fc188f93bda948",
+          "md5": "d6cbd9febf867bfb1b495d863483691a",
+          "sha256": "84c140444c3aff321d17b5aa71bcb7bdfea8c7661b7cd136dcfe37d819e9efe1"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.8.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d6cbd9febf867bfb1b495d863483691a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 32041,
+        "upload_time": "2021-03-11T20:45:12",
+        "upload_time_iso_8601": "2021-03-11T20:45:12.071110Z",
+        "url": "https://files.pythonhosted.org/packages/16/a9/b00f57ca41df60d528a2767acb137d1625cb6c2ef79a89fc188f93bda948/pythiags-0.8.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1be14636c69318fef28b335c43978695ecaa61f243d97b9a9824e4ab63b1eb43",
+          "md5": "629a618a3167aeddac8f5b5b47e030aa",
+          "sha256": "a6d165414a0d27fe1df6b2b515ce7b24329fb37a09a0bd5e919cc5bbe80002a8"
+        },
+        "downloads": -1,
+        "filename": "pythiags-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "629a618a3167aeddac8f5b5b47e030aa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.9,<4.0.0",
+        "size": 32244,
+        "upload_time": "2021-04-13T16:10:02",
+        "upload_time_iso_8601": "2021-04-13T16:10:02.732338Z",
+        "url": "https://files.pythonhosted.org/packages/1b/e1/4636c69318fef28b335c43978695ecaa61f243d97b9a9824e4ab63b1eb43/pythiags-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8192c0f2bbab5b83f5dd76fb3fdc97b7fbd5aae5d1445bacc623763d883e5bd0",
+          "md5": "a411ff1055527fec6b707f10318797b7",
+          "sha256": "6cbf4bc2e2a5ca71f050b2a79a53f6d6e5a260cadff2453e59de2a31ccf8e521"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a411ff1055527fec6b707f10318797b7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 47740,
+        "upload_time": "2022-09-15T12:33:25",
+        "upload_time_iso_8601": "2022-09-15T12:33:25.827454Z",
+        "url": "https://files.pythonhosted.org/packages/81/92/c0f2bbab5b83f5dd76fb3fdc97b7fbd5aae5d1445bacc623763d883e5bd0/pythiags-1.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "808a96aaf4e84716f2722912904f278de0f940aa01de747b10d8f28839071cb3",
+          "md5": "deff472e795520a68a325469321e6f63",
+          "sha256": "29a3fea0d812412b14ec214c2a82dd698b6b022a10b3994f2db5e3e0c9a253d0"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "deff472e795520a68a325469321e6f63",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 48614,
+        "upload_time": "2022-09-23T13:18:51",
+        "upload_time_iso_8601": "2022-09-23T13:18:51.972634Z",
+        "url": "https://files.pythonhosted.org/packages/80/8a/96aaf4e84716f2722912904f278de0f940aa01de747b10d8f28839071cb3/pythiags-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76ddcc68b48a534c469a44a693ea3dd9d6a3bce0968101b0e5c08358916a42fe",
+          "md5": "21c54cdeefb458f409fb9a3d50d775d7",
+          "sha256": "ddb4eff3c8ac61ea0e7f5572317cbee3eda7266e66e9399fadf0a14a2dbc836a"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "21c54cdeefb458f409fb9a3d50d775d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 48612,
+        "upload_time": "2022-09-23T15:45:42",
+        "upload_time_iso_8601": "2022-09-23T15:45:42.003464Z",
+        "url": "https://files.pythonhosted.org/packages/76/dd/cc68b48a534c469a44a693ea3dd9d6a3bce0968101b0e5c08358916a42fe/pythiags-1.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b861c3213ef8207bc98b6735c542e46b006b22c42cc1be1171b8be385a47636b",
+          "md5": "a3bed94eb5cdf55c494b94c1e9332275",
+          "sha256": "6654dc1861fd71ce859f90fd95ad0b113c396c422e5cad296142fb4c36bdfdcd"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a3bed94eb5cdf55c494b94c1e9332275",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 48817,
+        "upload_time": "2022-09-23T16:54:35",
+        "upload_time_iso_8601": "2022-09-23T16:54:35.208385Z",
+        "url": "https://files.pythonhosted.org/packages/b8/61/c3213ef8207bc98b6735c542e46b006b22c42cc1be1171b8be385a47636b/pythiags-1.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce840023b9739401fff309b27f88387a8ea4e7170e9fadea7b2bca1f29e04f74",
+          "md5": "0fba0e0262e517e6d8eefb5f5d53e964",
+          "sha256": "0e91d6572793518b9e8c32378e85660541c14a5d0a0efd3d42dc9ab129581d83"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0fba0e0262e517e6d8eefb5f5d53e964",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 48818,
+        "upload_time": "2022-09-23T20:18:47",
+        "upload_time_iso_8601": "2022-09-23T20:18:47.975457Z",
+        "url": "https://files.pythonhosted.org/packages/ce/84/0023b9739401fff309b27f88387a8ea4e7170e9fadea7b2bca1f29e04f74/pythiags-1.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f8e55a315ada1cc4db925376197c3305ff5c763340461f334c6cafcb30d854e",
+          "md5": "4f55afa6bcae0633f8a175c71a845c3f",
+          "sha256": "a9dc948941a69883d8cc6c5e15438815a3380b9987304ff0034c05f7f1a01488"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4f55afa6bcae0633f8a175c71a845c3f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 48818,
+        "upload_time": "2022-09-28T14:59:14",
+        "upload_time_iso_8601": "2022-09-28T14:59:14.550443Z",
+        "url": "https://files.pythonhosted.org/packages/9f/8e/55a315ada1cc4db925376197c3305ff5c763340461f334c6cafcb30d854e/pythiags-1.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c338ed050b7a049cd101a25d798577daf4bf389e15394fea6f1926e5bd19d994",
+          "md5": "a4da60d7a599c32c073c365f4cd5cf1f",
+          "sha256": "14a8a20bb668d58873d5d98116a2601006e4e2b67cad95d06d88e2344e6857c2"
+        },
+        "downloads": -1,
+        "filename": "pythiags-1.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a4da60d7a599c32c073c365f4cd5cf1f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 49493,
+        "upload_time": "2022-10-07T19:28:55",
+        "upload_time_iso_8601": "2022-10-07T19:28:55.275611Z",
+        "url": "https://files.pythonhosted.org/packages/c3/38/ed050b7a049cd101a25d798577daf4bf389e15394fea6f1926e5bd19d994/pythiags-1.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c338ed050b7a049cd101a25d798577daf4bf389e15394fea6f1926e5bd19d994",
+        "md5": "a4da60d7a599c32c073c365f4cd5cf1f",
+        "sha256": "14a8a20bb668d58873d5d98116a2601006e4e2b67cad95d06d88e2344e6857c2"
+      },
+      "downloads": -1,
+      "filename": "pythiags-1.3.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a4da60d7a599c32c073c365f4cd5cf1f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 49493,
+      "upload_time": "2022-10-07T19:28:55",
+      "upload_time_iso_8601": "2022-10-07T19:28:55.275611Z",
+      "url": "https://files.pythonhosted.org/packages/c3/38/ed050b7a049cd101a25d798577daf4bf389e15394fea6f1926e5bd19d994/pythiags-1.3.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,206 @@
+{
+  "info": {
+    "author": "Adaptant Labs",
+    "author_email": "labs@adaptant.io",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "Intended Audience :: System Administrators",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: System :: Hardware",
+      "Topic :: System :: Monitoring"
+    ],
+    "description": "# Intel NCS2 Prometheus Exporter\n\n[![PyPI](https://img.shields.io/pypi/v/prometheus-ncs2-exporter.svg)](https://pypi.python.org/pypi/prometheus-ncs2-exporter)\n[![PyPI](https://img.shields.io/pypi/pyversions/prometheus-ncs2-exporter.svg)](https://pypi.python.org/pypi/prometheus-ncs2-exporter)\n[![Docker Pulls](https://img.shields.io/docker/pulls/adaptant/prometheus-ncs2-exporter.svg)](https://hub.docker.com/repository/docker/adaptant/prometheus-ncs2-exporter)\n\nA Prometheus exporter for the Intel Neural Compute Stick 2 (NCS2) / Intel Movidius MyriadX\n\n## Quick Start\n\nTo directly install `prometheus_ncs2_exporter` as a `DaemonSet` into the Kubernetes cluster:\n\n```\n$ kubectl apply -f https://raw.githubusercontent.com/adaptant-labs/prometheus_ncs2_exporter/prometheus-ncs2-exporter.yaml\n```\n\nPods will be scheduled on any node with a `feature.node.kubernetes.io/usb-ff_03e7_2485.present` (provided by [NFD]) or\n`accelerators/ncs2` (provided by [k8s-auto-labeller], in combination with NFD-based discovery) label set. These labels\ncan also be set manually on NCS2-capable nodes for simple deployments in order to enqueue the Pod.\n\n[NFD]: https://github.com/kubernetes-sigs/node-feature-discovery\n[k8s-auto-labeller]: https://github.com/adaptant-labs/k8s-auto-labeller\n\n## Usage\n\n`prometheus_ncs2_exporter` can be run as-is without any additional configuration. A number of configuration and\nvalidation options are provided, but should not need to be used in normal cases. These are explained below:\n\n```\n$ prometheus_ncs2_exporter --help\nusage: prometheus_ncs2_exporter [-h] [--ip IP] [--port PORT]\n                                [--polling-interval SEC] [--model MODEL]\n                                [--instantiate-devices]\n\nPrometheus Exporter for Intel NCS2 Metrics\n\noptional arguments:\n  -h, --help              show this help message and exit\n  --ip IP                 IP address to bind to (default: 0.0.0.0)\n  --port PORT             Port to expose metrics on (default: 8084)\n  --polling-interval SEC  Polling interval in seconds (default: 1)\n  --model MODEL           XML (IR) model to load (only for validation)\n  --instantiate-devices   Instantiate available devices (only for validation)\n```\n\n## Metrics\n\nThe following metrics are exported:\n\n| Metric | Description |\n|--------|-------------|\n| ncs2_num_devices | The total number of NCS2 devices |\n| ncs2_num_available_devices | The total number of *available* NCS2 devices |\n| ncs2_temperature_celsius | NCS2 device temperature in Celsius (per device) |\n\nViewed from the exporter:\n\n```\n# TYPE ncs2_num_devices gauge\nncs2_num_devices 1.0\n# HELP ncs2_num_available_devices Number of available NCS2 devices\n# TYPE ncs2_num_available_devices gauge\nncs2_num_available_devices 1.0\n# HELP ncs2_temperature_celsius NCS2 device temperature in Celsius\n# TYPE ncs2_temperature_celsius gauge\nncs2_temperature_celsius{name=\"MYRIAD\"} 40.917320251464844\n```\n\n**Note:** Unfortunately, as the current OpenVINO API does not presently permit querying the `DEVICE_THERMAL` metric\ndirectly without a model loaded onto the device, the `ncs2_temperature_celsius` metric will, therefore, return 0°C for\ndevices that don't presently have a model loaded. Furthermore, applications that are using the NCS2 device directly\nmay result in the device being flagged as *unavailable* by the OpenVINO runtime, preventing the main exporter from\nbeing able to enumerate the device or obtain metrics from it. In order to mitigate these issues, the exporter has been\nsplit into two parts:\n\n- The main exporter that provides an overview of NCS2 devices on the system (discoverable/available)\n- A device metric exporter to be instantiated within each NCS2-enabled inference application independently\n\nA high-level overview of the expected interactions, metric sources, and integration points is as follows:\n\n![NCS2 Exporter Overview](https://github.com/adaptant-labs/prometheus_ncs2_exporter/blob/master/overview.png?raw=true)\n\n### Device Metric Exporter Instantiation in Inference Applications\n\n`prometheus_ncs2_exporter` exposes a python API that can be used directly by inference applications, and which is\ncomplementary to the [OpenVINO Inference Engine Python API][inference_api]. A minimal example is provided below:\n\n```python\nfrom prometheus_ncs2_exporter import NCS2DeviceExporter\nfrom openvino.inference_engine import IECore\nfrom time import sleep\n\ninference_engine = IECore()\nnet = inference_engine.read_network('model.xml', 'model.bin')\nexec_net = inference_engine.load_network(net, 'MYRIAD')\n\nexporter = NCS2DeviceExporter(inference_engine=inference_engine)\nexporter.start_http_server()\n\nwhile True:\n    sleep(1)\n```\n\nNote that while `start_http_server()` will kick off a separate thread from which to serve the device metrics from\n(exposed on port 8085 by default), it is *non-blocking* by default. This is by design, as it permits the inference\napplication to continue on with its main thread of execution. The thread is run in `daemon` mode, and will terminate\ntogether with the main thread.\n\nFor applications that wish to terminate gracefully, a `shutdown()` method is provided which can be used by exception\nand signal handlers. A more complete example demonstrating this use is provided in [inference_example.py][inference_example]\nfor reference.\n\n#### Automated Metric Scraping / Kubernetes Pod Annotation\n\nAs each application instantiating the device metric exporter will be exposing metrics, Kubernetes Pods should be\nannotated with the `prometheus.io/scrape: \"true\"` annotation in order to be automatically scraped alongside the main\nexporter.\n\n### Device Validation with Model Loading\n\nThe option to load a model onto each available device is provided for\nvalidating the functionality of the exporter, but as this generates work on the device-under-monitoring and, worse,\npotentially makes a device unavailable to a service that actually needs it, should never be used in production.\n\n## Alerting Rules\n\nThe stated nominal operating range for the NCS2 is between 0°C and 40°C. While it can still operate at higher\ntemperatures, there is an increased risk of inference failures being produced. Thermal throttling is applied\nautomatically once the internal device temperature reaches 70°C, at which point the USB device will automatically\ndisconnect itself and it will no longer be possible to obtain thermal readings until it cools off and re-attaches.\n\nWith these points in mind, sample alerting rules for Prometheus (provided in [alerting_rules.yml][alerting_rules]\nfor convenience) are as follows:\n\n```yaml\ngroups:\n  - name: ncs2_temp_monitoring\n    rules:\n      - alert: ncs2_temp_warning\n        expr: ncs2_temperature_celsius > 45.0\n        labels:\n          severity: warning\n        annotations:\n          summary: \"High NCS2 device temperature\"\n      - alert: ncs2_temp_critical\n        expr: ncs2_temperature_celsius > 65.0\n        labels:\n          severity: critical\n        annotations:\n          summary: \"Critical NCS2 device temperature\"\n```\n\nDepending on the deployment, it may be necessary to increase the warning threshold to avoid spurious warnings. It is\nrecommended to monitor the expected upper bounds of the inference workload in real-world deployments and to adjust this\naccordingly.\n\n## Features and bugs\n\nPlease file feature requests and bugs in the [issue tracker][tracker].\n\n## Acknowledgements\n\nThis project has received funding from the European Union’s Horizon 2020 research and innovation programme under grant\nagreement No 825480 ([SODALITE]).\n\n## License\n\n`prometheus_ncs2_exporter` is licensed under the terms of the Apache 2.0 license, the full\nversion of which can be found in the LICENSE file included in the distribution.\n\n[tracker]: https://github.com/adaptant-labs/prometheus_ncs2_exporter/issues\n[SODALITE]: https://sodalite.eu\n[alerting_rules]: https://raw.githubusercontent.com/adaptant-labs/prometheus_ncs2_exporter/master/alerting_rules.yml\n[inference_api]: https://docs.openvinotoolkit.org/2021.1/ie_python_api/annotated.html\n[inference_example]: https://raw.githubusercontent.com/adaptant-labs/prometheus_ncs2_exporter/master/inference_example.py\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/adaptant-labs/prometheus_ncs2_exporter",
+    "keywords": "prometheus,movidius,ncs2,myriad,myriadx,monitoring,exporter",
+    "license": "Apache 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "prometheus-ncs2-exporter",
+    "package_url": "https://pypi.org/project/prometheus-ncs2-exporter/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/prometheus-ncs2-exporter/",
+    "project_urls": {
+      "Homepage": "https://github.com/adaptant-labs/prometheus_ncs2_exporter"
+    },
+    "release_url": "https://pypi.org/project/prometheus-ncs2-exporter/0.1.0/",
+    "requires_dist": [
+      "prometheus-client",
+      "pyusb"
+    ],
+    "requires_python": "",
+    "summary": "Prometheus Exporter for Intel NCS2 Metrics",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8675919,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f988a6c50b910a34b1cb9d2081d6913806121d6c4eda91f5233b5bff386f2fed",
+          "md5": "28cf1b24ed74118cb22a0e3ad6175ec4",
+          "sha256": "f3f6481623fac48b060657214f0a22b98a3bb2926385c24ad8ecc899d1a15aca"
+        },
+        "downloads": -1,
+        "filename": "prometheus_ncs2_exporter-0.0.1-py3.7.egg",
+        "has_sig": false,
+        "md5_digest": "28cf1b24ed74118cb22a0e3ad6175ec4",
+        "packagetype": "bdist_egg",
+        "python_version": "3.7",
+        "requires_python": null,
+        "size": 9454,
+        "upload_time": "2020-11-15T00:06:54",
+        "upload_time_iso_8601": "2020-11-15T00:06:54.964197Z",
+        "url": "https://files.pythonhosted.org/packages/f9/88/a6c50b910a34b1cb9d2081d6913806121d6c4eda91f5233b5bff386f2fed/prometheus_ncs2_exporter-0.0.1-py3.7.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "870cd85d328a95995cadb1547d5e3d526436003b2f563b3eab347308f8ffbef5",
+          "md5": "da368b4cf5af8bb5c038eb78a7566b58",
+          "sha256": "066f992993c61390be0379111cfd465ca24979a0ad293d6c4e8143dc3594ba9f"
+        },
+        "downloads": -1,
+        "filename": "prometheus_ncs2_exporter-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "da368b4cf5af8bb5c038eb78a7566b58",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11185,
+        "upload_time": "2020-11-15T00:06:53",
+        "upload_time_iso_8601": "2020-11-15T00:06:53.531655Z",
+        "url": "https://files.pythonhosted.org/packages/87/0c/d85d328a95995cadb1547d5e3d526436003b2f563b3eab347308f8ffbef5/prometheus_ncs2_exporter-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e8eedad1ce62a0725ef76d709c6c38853123332542cf0478428301291cfdc430",
+          "md5": "eb4e4353e1c5790f45aedceccf62eb41",
+          "sha256": "8f3abefaee8793e780a18ebfc4083772a77a936fd973f2a7b363453a03ded218"
+        },
+        "downloads": -1,
+        "filename": "prometheus_ncs2_exporter-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eb4e4353e1c5790f45aedceccf62eb41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6374,
+        "upload_time": "2020-11-15T00:06:56",
+        "upload_time_iso_8601": "2020-11-15T00:06:56.006855Z",
+        "url": "https://files.pythonhosted.org/packages/e8/ee/dad1ce62a0725ef76d709c6c38853123332542cf0478428301291cfdc430/prometheus_ncs2_exporter-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c10ed2c668251e2c018099468eb8bbb00cbe7252f6059863a47c295587ee23b0",
+          "md5": "1102599773f228e23874148ce9cc4133",
+          "sha256": "56570535c7b0af383dfe71be6357ce9bf603565a8f308d1c0c85a6778733ee5b"
+        },
+        "downloads": -1,
+        "filename": "prometheus_ncs2_exporter-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1102599773f228e23874148ce9cc4133",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11597,
+        "upload_time": "2020-11-17T02:27:12",
+        "upload_time_iso_8601": "2020-11-17T02:27:12.669723Z",
+        "url": "https://files.pythonhosted.org/packages/c1/0e/d2c668251e2c018099468eb8bbb00cbe7252f6059863a47c295587ee23b0/prometheus_ncs2_exporter-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4c0d3b02a60a32267d6a30d0254bc640d0ea8430ec8bb6aca28470abcbf4579",
+          "md5": "43562eacf4809711f68290030756dce3",
+          "sha256": "74a27b404863af21c83b05abf3c02e444fc69b412f327f11ac58afbd1cd18853"
+        },
+        "downloads": -1,
+        "filename": "prometheus_ncs2_exporter-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "43562eacf4809711f68290030756dce3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7997,
+        "upload_time": "2020-11-17T02:27:13",
+        "upload_time_iso_8601": "2020-11-17T02:27:13.857998Z",
+        "url": "https://files.pythonhosted.org/packages/a4/c0/d3b02a60a32267d6a30d0254bc640d0ea8430ec8bb6aca28470abcbf4579/prometheus_ncs2_exporter-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c10ed2c668251e2c018099468eb8bbb00cbe7252f6059863a47c295587ee23b0",
+        "md5": "1102599773f228e23874148ce9cc4133",
+        "sha256": "56570535c7b0af383dfe71be6357ce9bf603565a8f308d1c0c85a6778733ee5b"
+      },
+      "downloads": -1,
+      "filename": "prometheus_ncs2_exporter-0.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "1102599773f228e23874148ce9cc4133",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 11597,
+      "upload_time": "2020-11-17T02:27:12",
+      "upload_time_iso_8601": "2020-11-17T02:27:12.669723Z",
+      "url": "https://files.pythonhosted.org/packages/c1/0e/d2c668251e2c018099468eb8bbb00cbe7252f6059863a47c295587ee23b0/prometheus_ncs2_exporter-0.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a4c0d3b02a60a32267d6a30d0254bc640d0ea8430ec8bb6aca28470abcbf4579",
+        "md5": "43562eacf4809711f68290030756dce3",
+        "sha256": "74a27b404863af21c83b05abf3c02e444fc69b412f327f11ac58afbd1cd18853"
+      },
+      "downloads": -1,
+      "filename": "prometheus_ncs2_exporter-0.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "43562eacf4809711f68290030756dce3",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 7997,
+      "upload_time": "2020-11-17T02:27:13",
+      "upload_time_iso_8601": "2020-11-17T02:27:13.857998Z",
+      "url": "https://files.pythonhosted.org/packages/a4/c0/d3b02a60a32267d6a30d0254bc640d0ea8430ec8bb6aca28470abcbf4579/prometheus_ncs2_exporter-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

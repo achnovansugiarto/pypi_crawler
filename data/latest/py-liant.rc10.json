@@ -1,0 +1,539 @@
+{
+  "info": {
+    "author": "George Barbăroșie",
+    "author_email": "george.barbarosie@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.4",
+      "Programming Language :: Python :: Implementation :: CPython",
+      "Programming Language :: Python :: Implementation :: PyPy"
+    ],
+    "description": "\n# py-liant\n\n## Table of Contents\n\n- [py-liant](#py-liant)\n  - [Table of Contents](#table-of-contents)\n  - [Introduction](#introduction)\n    - [RESTful API](#restful-api)\n    - [Opinionated](#opinionated)\n    - [Modified JSON](#modified-json)\n  - [How to use](#how-to-use)\n  - [Reference](#reference)\n    - [JsonObject](#jsonobject)\n    - [JSONEncoder](#jsonencoder)\n    - [JSONDecoder](#jsondecoder)\n    - [pyramid_json_renderer_factory](#pyramid_json_renderer_factory)\n    - [pyramid_json_decoder](#pyramid_json_decoder)\n    - [patch_sqlalchemy_base_class](#patch_sqlalchemy_base_class)\n    - [monkeypatch: obj.apply_changes](#monkeypatch-objapply_changes)\n    - [CRUDView](#crudview)\n    - [ConvertMatchdictPredicate](#convertmatchdictpredicate)\n    - [CatchallPredicate](#catchallpredicate)\n    - [CatchallView](#catchallview)\n      - [Hints syntax](#hints-syntax)\n      - [Drilldown support](#drilldown-support)\n      - [Single element from collection](#single-element-from-collection)\n      - [Filtering, sorting, pagination](#filtering-sorting-pagination)\n      - [Polymorphic casting](#polymorphic-casting)\n      - [Polymorphic loading hints](#polymorphic-loading-hints)\n      - [Polymorphic identity](#polymorphic-identity)\n      - [Implicit filters](#implicit-filters)\n      - [Hint profiles](#hint-profiles)\n    - [JsonGuardProvider](#jsonguardprovider)\n    - [SearchPathSetter](#searchpathsetter)\n    - [EnumAttrs and PythonEnum](#enumattrs-and-pythonenum)\n\n## Introduction\n\nPy-liant is a library of helpers for rapid creation of opinionated RESTful APIs\nusing pyramid and SQLAlchemy. It provides a read-write set of operations using\na slightly modified object-graph aware JSON structure which is tightly coupled\nwith the data models being exposed.\n\nIt was created by Trip Solutions for internal projects but we feel it may prove\nuseful for general consumption.\n\n### RESTful API\n\nThe [CRUDView](#crudview) base class assumes the API follows REST conventions\nand provides CRUD ([C]reate, [R]ead, [U]pdate, [D]elete) functionality, or a\nsubset of that. It does not make any assumptions about the endpoints, which are\nstill defined in user code. There are assumptions being made about the format of\nthe payloads, see [Modified JSON](#modified-json) and [CrudView](#crudview)\n\n### Opinionated\n\nThe [CatchallView](#catchallview) base class however provides a custom parser\nfor the URL string and is heavily opinionated about the structure of the API.\nThis allows it to be effortlessly deployed on top of existing SQLAlchemy data\nstructures but has the disadvantage of being less customizable.\n\n### Modified JSON\n\nORM data models are not always trees. Any real-world application beyond a\ncertain complexity level is bound to get to a point where mapping deep data\nmodels directly to JSON is [not\nfeasible](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Cyclic_object_value).\nIn our first iterations we've worked around this issue by manually decoupling\nthe JSON from the structure, but any manual process quickly turns into a time\nsink; it adds a lot of complexity for both client and server code.\n\nPy-liant solves the graph awareness issue by reserving two keywords for internal\nuse in the JSON graph. Any object that needs to be referenced from within the\nJSON structure will get a special key `_id` with a generated value. References\nto an object are codified using an object with a sigle key `_ref` matching the\n`_id` of the referenced object. Please note, this is only true for SQLAlchemy\nmodel objects.\n\nFor example, given the model declaration below:\n\n```python\nfrom sqlalchemy.orm import relationship, backref\nfrom sqlalchemy import Column, Integer, Text, ForeignKey\nfrom sqlalchemy.ext.declarative import declarative_base\nBase = declarative_base()\n\n\nclass Parent(Base):\n    __tablename__ = 'parent'\n    id = Column(Integer, primary_key=True)\n    data = Column(Text)\n\n\nclass Child(Base):\n    __tablename__ = 'child'\n    id = Column(Integer, primary_key=True)\n    parent_id = Column(ForeignKey(Parent.id))\n    data = Column(Text)\n\n    parent = relationship(Parent, backref=backref('children'))\n```\n\nthe following code snippent\n\n```python\nfrom py_liant.json_encoder import JSONEncoder\nencoder = JSONEncoder(base_type=Base, check_circular=False, indent=4*' ')\nparent = Parent(id=1, data=\"parent object\")\nparent.children.extend([\n    Child(id=1, data=\"child 1\"),\n    Child(id=2, data=\"child 2\")\n])\nprint(encoder.encode(parent))\n```\n\nwill output\n\n```json\n{\n    \"id\": 1,\n    \"data\": \"parent object\",\n    \"children\": [\n        {\n            \"id\": 1,\n            \"data\": \"child 1\",\n            \"parent\": {\n                \"_ref\": 1\n            },\n            \"_id\": 2\n        },\n        {\n            \"id\": 2,\n            \"data\": \"child 2\",\n            \"parent\": {\n                \"_ref\": 1\n            },\n            \"_id\": 3\n        }\n    ],\n    \"_id\": 1\n}\n```\n\nThe encoder will also extract metadata information from SQLAlchemy models to\nsupport serialization. It will serialize only column and relationship\nproperties, which means it will not display any non-SQLAlchemy properties. It\nalso expects all relationships to be eagerly loaded and will avoid triggering\nany lazy-loaded properties. Deferred columns are also avoided.\n\nConversely, the [JSONDecoder](#jsondecoder) will turn a simlarly codified JSON\nstructure and return a completed graph, with potentially cyclic or multiple\nreferences, for use in the application.\n\nThe decoder will generate a structure of [JsonObject](#jsonobject)s. If the base\nclass is patched using [patch_sqlalchemy_base_class](#patchsqlalchemybaseclass),\nthe decoded object can be used to patch an existing or new SQLAlchemy model\ninstance.\n\nWe also provide a pair of encoder / decoder functions for use in javascript\nin [pyliant.js](./pyliant.js).\n\n## How to use\n\nIn pyramid's config block you can override the default JSON renderer using the\nfollowing:\n\n```python\nfrom py_liant.pyramid import pyramid_json_renderer_factory\nconfig.add_renderer('json', pyramid_json_renderer_factory(Base))\n```\n\nThen use `renderer='json'` in any `@view_config()` or `add_view()`.\n\nYou can use py-liant's JSON decoder by adding the following in pyramid's config:\n\n```python\nfrom py_liant.pyramid import pyramid_json_decoder\nconfig.add_request_method(pyramid_json_decoder, 'json', reify=True)\n```\n\nThus, for any request with a JSON payload in body you can access the decoded\nJsonObject structure using `request.json`.\n\nPatching the SQLAlchemy model's base class:\n\n```python\npatch_sqlalchemy_base_class(Base)\n```\n\nAdding the view predicates:\n\n```python\nconfig.add_view_predicate('convert_matchdict', ConvertMatchdictPredicate)\nconfig.add_view_predicate('catchall', CatchallPredicate)\n```\n\nPy-liant also provides a callable factory to do all of the above:\n\n```python\nfrom py_liant.pyramid import includeme_factory\nconfig.include(includeme_factory(base_class=Base))\n# identical to includeme_factory(base_class=Base)(config)\n```\n\nConcrete usage examples of [CRUDView](#crudview) and\n[CatchallView](#catchallview) can be found in the reference documentation\n\n## Reference\n\n### JsonObject\n\nThis class is a `dict` implementation that exposes all string keys as\nproperties. It eliminates the need to access dictionary values using index\nnotation (`request.json['prop']` becomes `request.json.prop`). The\n[JSONDecoder](#jsondecoder) returns instances of this class.\n\n### JSONEncoder\n\nA `simplejson.JSONEncoder` implementation that adds the following:\n\n- converts `date`, `time` and `datetime` objects to ISO8859 strings\n- converts `byte` values to Base64\n- strigifies python `Enum` values to their name, `uuid.UUID` values\n- tracks SQLAlchemy models (if provided a base class) as discussed in [Modified JSON](#modified-json)\n\nConstructor arguments:\n\n```python\nJSONEncoder(request=None, base_type=None, **kwargs)\n```\n\n`request` should be a pyramid request object. If provided it's used to apply\n[JsonGuardProvider](#jsonguardprovider) fencing for serialization.\n\n`base_type` is the SQLAlchemy models base class. If not provided the\nfunctionality related to SQLAlchemy is disabled.\n\n`kwargs` is passed to `simplejson.JSONEncoder`'s constructor\n\n### JSONDecoder\n\nA `simplejson.JSONDecoder` implementation that returns a\n[JsonObject](#jsonobject) as a result and handles `_id`/`_ref` logic as\ndescribed in [Modified JSON](#modified-json).\n\nConstructor argumets:\n\n```python\nJSONDecoder(**kwargs)\n```\n\n`**kwargs` is passed to `simplejson.JSONDecoder`'s constructor.\n\n### pyramid_json_renderer_factory\n\nFactory for a pyramid renderer that provides JSON serialization using\n[JSONEncoder](#jsonencoder). See [How to use](#how-to-use) for usage.\n\nArguments:\n\n```python\npyramid_json_renderer_factory(base_type=None, wsgi_iter=False,\n                              separators=(',',':'))\n```\n\n`base_type` and `separators` are passed to [JSONEncoder](#jsonencoder)'s\nconstructor. The default value for `separators` is meant to minimize payload\nsize by skipping any unnecessary spaces.\n\n`wsgi_iter` can be used to optimize rendering of JSON by passing an iterable\ndirectly to the WSGI layer. By default the renderer writes directly in the\npyramid `response` object. When activated, pyramid can no longer handle error\nredirects for execptions thrown during serialization.\n\n### pyramid_json_decoder\n\nThis is a fucnction that can be added to pyramid using\n`config.add_request_method`. See [How to use](#how-to-use) for usage.\n\n### patch_sqlalchemy_base_class\n\nThis is the function that adds the method\n[apply_changes](#monkeypatch-objapplychanges) to SQLAlchemy's base class.\n\n### monkeypatch: obj.apply_changes\n\n```python\nobj.apply_changes(data, object_dict=None, context=None, for_update=True)\n```\n\nOnce SQLAlchemy's base class is patched using\n[patch_sqlalchemy_base_class](#patchsqlalchemybaseclass), all model instances get\na method that can be used to apply patches. This can be used directly but most\nof the time, if you use [CRUDView](#crudview) and/or\n[CatchallView](#catchallview), you won't have to.\n\nThe method will apply changes in any depth required. It converts the data types\nbased on metadata extracted from SQLAlchemy. It handles relationships, both\ncollections and instances, by tracking and comparing the primary keys provided in JSON. \nWhere needed it will add new instances.\n\nFor an object without relationships it applies the values from `data` to their\ncorresponding column properties in `obj`. No property values are overwritten\nunless specified in the `data` object.\n\nIf an object has relationships, the `data` object can drill down into them. For\ncollection relationships the `apply_changes` method expects all objects to be\nprovided in the corresponding array, at a minimum with their primary key\npresent. If a member of the array does not provide a primary key it is presumed\nto be a new instance. If a member of the object's collection cannot be tracked\nback to a member of the array in data, it will be removed from the collection.\n\nIf the primary key of the descendants is a composite that includes any of the\ncolumns in the foreign key, the caller can provide the partial primary key and\npy-liant will reconstruct the remaining columns based on the relatonship to the\nparent.\n\nIf a pyramid `context` is provided that implements\n[JsonGuardProvider](#jsonguardprovider), it will be used for security fencing\nthe patching.\n\n### CRUDView\n\nThis class provides CRUD functionality for a given model class. You can\nconfigure the routes and views as needed for your application but the\nrecommended way is shown below:\n\n```python\nconfig.add_route('parent_pk', 'parent/{id}')\nconfig.add_route('parent_list', 'parent')\n\n@view_config(route_name='parent_pk', request_method='GET', attr='get')\n@view_config(route_name='parent_pk', request_method='POST', attr='update')\n@view_config(route_name='parent_pk', request_method='DELETE', attr='delete')\n@view_config(route_name='parent_list', request_method='GET', attr='list')\n@view_config(route_name='parent_list', request_method='POST', attr='insert')\nclass ParentView(CRUDView):\n    target_type = Parent\n    target_name = 'parent'\n\n    def __init__(self, request):\n        super().__init__(request)\n        self.filters = self.auto_filters()\n        self.accept_order = self.auto_order()\n\n    def identity_filter(self):\n        return Parent.id == int(self.request.matchdict('id'))\n```\n\nThis is enough to provide a complete read-write endpoint for objects of type\n`Parent`.\n\nUse `GET /parent/1 HTTP/1.1` to retrieve parent with id=1. It should return\nsomething along the lines of:\n\n```json\n{\n  \"parent\": {\n    \"id\": 1,\n    \"data\": \"parent object\",\n    \"_id\": 1\n  }\n}\n```\n\nUse\n\n```http\nPOST /parent/1 HTTP/1.1\n\n{\n  \"parent\": {\n    \"data\": \"parent object changed\"\n  }\n}\n```\n\nto update the data in instance of parent with id=1.\n\nPosting to `/parent` instead of `/parent/1` will create a new instance instead\nof updating an existing one.\n\n`DELETE /parent/2 HTTP/1.1` will delete the parent with id=2.\n\nFinally, `GET /parent HTTP/1.1` will provide a list of all parent instances in\nthe database.\n\nFor the listing endpoint the following response will be returned:\n\n```json\n{\n  \"items\": [\n    {\n      \"id\": 1,\n      \"data\": \"parent object\",\n      \"_id\": 1\n    }\n  ],\n  \"total\": 1\n}\n```\n\nThe `CRUDView` class also offers pagination support, implicit and explicit\nfiltering, implicit and explicity sorting.\n\nPagination is supported via GET parameters `page` and `pageSize` (i.e., `GET\n/parent?page=3&pageSize=20`).\n\nImplicit filters and sorting are provided for all column properties. Assuming\ncolumn properties `id` and `data` for class `User`, the following filters will be\nadded to `self.filters` (in the example usage above, during construction, see\nthe `auto_filters()` call): `id`, `id_lt`, `id_le`, `id_gt`, `id_ge`, `id_isnull`,\n`id_in`, `data`, `data_lt`, `data_le`, `data_gt`, `data_ge`, `data_like`,\n`data_isnull`, `data_in`. The filters `[field_name]_[operator]`\nprovide filtering using the `less-than`, `less-or-equal`, `greater-than`,\n`greater-or-equal`, `contains`, `is-null` and `in` operators. The `contains`\noperator is automatically generated for string column properties only. The\n`is-null` operator accepts a boolean-like value and has the effect of applying\nthe SQL `IS NULL` operator if given a truthy value and `IS NOT NULL` operator\nif given a falsey value. The `in` operator accepts a comma-delimited list of\nvalues and checks if the field contains one of the listed values.\n\nAutomatic sorting keys are also added (in the example usage above see the call to\n`auto_order()`) for both fields.\n\nFiltering in a listing endpoint is done as such: `GET /parent?data_like=object`.\nMultiple filters can be applied, i.e. `GET /parent?id_lt=10&id_gt=5`.\n\nSorting is done by using the GET parameter `order`, i.e. `GET\n/parent?order=data`. Multipe sorting expressions can be applied, i.e.\n`order=data,id`. In other words the value passed in `order` is a comma-separated\nlist of sorting keys. Each sorting key also accepts the descending modifier,\ni.e. `order=data+desc,id`.\n\nSorting and filtering keys can also be manually defined. \nIn the usage example above we could have defined some filters and orderings by hand as such:\n\n```python\nclass ParentView(CRUDView):\n    filters = {\n        'id': lambda _: Parent.id == int(_),\n        'id_lt': lambda _: Parent.id < int(_),\n        'data': lambda _: Parent.data == _,\n        'data_like': lambda _: Parent.data.contains(_)\n    }\n    accept_order = {\n        'data': Parent.data,\n        'data_lowercase': func.lower(Parent.data)\n    }\n```\n\nDoing this is obviously more laborious but allows you to define custom filters or soring expressions.\n\nThe implementation assumes `request.dbsession` is a request method that returns\na SQLAlchemy database session valid for the model.\n\n### ConvertMatchdictPredicate\n\nIf pyramid has been configured to use this predicate as indicated in [How to\nuse](#how-to-use), you can get around the need to convert matchdict parameters.\n\nPyramid's [URL\nDispatch](https://docs.pylonsproject.org/projects/pyramid/en/latest/narr/urldispatch.html#custom-route-predicates)\ndocumentation page shows the following example for URL matchdict conversion:\n\n```python\ndef integers(*segment_names):\n    def predicate(info, request):\n        match = info['match']\n        for segment_name in segment_names:\n            try:\n                match[segment_name] = int(match[segment_name])\n            except (TypeError, ValueError):\n                pass\n        return True\n    return predicate\n\nymd_to_int = integers('year', 'month', 'day')\n\nconfig.add_route('ymd', '/{year}/{month}/{day}',\n                 custom_predicates=(ymd_to_int,))\n```\n\nThis code ensures both that the route will not match unless predicate executes\nsuccesfully (returns `True`) and that the view will see integer values for keys\n`year`, `month` and `day` in `request.matchdict`. While this is very useful it\nis unfortunately deprecated functionality. Sice pyramid-1.5 you will get a\ndeprecation warning when using `custom_predicates` in routes or views.\n\nTo replace this functionality with supported mechanisms we've implemented a\ngeneric new-style route predicate class. To use this class in your routes you\nfirst have to configure it as described in [How to use](#how-to-use). Then in\nthe example in the previous section the view configs for route `parent_pk`\nshould change as follows:\n\n```python\n@view_config(route_name='parent_pk', request_method='GET', attr='get',\n    convert_matchdict=(int, 'id'))\n@view_config(route_name='parent_pk', request_method='POST', attr='update',\n    convert_matchdict=(int, 'id'))\n@view_config(route_name='parent_pk', request_method='DELETE', attr='delete',\n    convert_matchdict=(int, 'id'))\n```\n\nPlease note that while in the old `custom_predicates` method the conversion of\nthe matchdict parameters was done at route level, the new-style route predicates\ndo not have access to the matchdict. Therefore we have to use view predicates to\nachieve the same.\n\nAfter these changes you no longer need the `int()` cast in the\n`identity_filter()` method. You'll also avoid the need to catch the `ValueError`\nexception.\n\n### CatchallPredicate\n\nThis is a supporting predicate to be used with [CatchallView](#catchallview). It\nassumes the route contains a fizzle parameter of the form `{catchall:.*}` (NOT\n`*catchall`, since the star format creates an array of string values from the\nmatch) that is then parsed internally and converted to values better suited for the [CatchallView](#catchallview) class.\n\n### CatchallView\n\nThis is an extension of the [CrudView](#crudview) class that adds support for a\nfar richer route format based on internal parsing done by the [CatchallPredicate](#catchallpredicate) and has the ability to:\n\n- expose multiple entity types in a single place\n- offer arbitrary eager loading depth, as specified in the route's loading hints\n- drill into both dynamic and static relationships\n- offer slice syntax for easier pagination\n\nTo use this class:\n\n```python\n# setup route\nconfig.add_route(\"catchall\", '{catchall:.*}')\n\n# declare the class\n\n@view_defaults(renderer='json', catchall={\n    'parent': Parent,\n    'child': Child\n})\n@view_config(route_name=\"catchall\", attr='process')\nclass MyCatchallView(CatchallView):\n    pass\n```\n\nThis code is enough to expose routes such as:\n\n- `GET /parent` or `GET /child` to list all parents or children\n- `GET /parent@1` or `GET /child@1` to get parent with id=1 or child with id=1\n- `POST /parent` or `POST /child` to add a new parent\n- `POST /parent@1` to update properties for parent with id=1\n- `DELETE /parent@1`, `DELETE /child@1` to delete parent with id=1 or child with\n  id=1\n\nIn other words, both entity types `Parent` and `Child` are accessible from a\nsingle point.\n\n#### Hints syntax\n\nHowever, from your application's perspective alllowing access to\n`Child` at the root level might not be something useful, in other words you\nmight want your API to regard `Child` as tightly bound to `Parent`. CatchallView\nallows you to get a parent entity and all children attached in one go using `GET\n/parent@1:*children`. The CatchallView will see the portion of the route coming\nafter the column character as a list of loading hints for `Parent` entity. In\nthis case, it attaches a `selectinload(Parent.children)` option to the query.\n\nThe hints will also allow you to hide properties that might be too large, by\ndeferring them. I.e. if you added a `blob` property on `Parent` and the caller\nmight want to avoid retrieving it, they could call `GET /parent@1:-blob`.\nConversely, if the `blob` property is marked as a deferred column in the model\ndeclaration but the caller would want it included in the response they can\nundefer it by calling `GET /parent@1:+blob`.\n\nIf we also added a `blob` column for the `Child` entity (let's assume it's a\ndeferred column in the code), the caller can get a parent with all children\nincluding the blob for each by calling `GET /parent@1:*children(+blob)`.\nMultiple hints can be provided by comma separating them. This is also the case\nfor relationship hints:\n\n- `GET /parent@1:-blob,*children` means \"load `Parent` with all `children`\n  included and defer loading the column `Parent.blob`\".\n- `GET /parent@1:-blob,*children(+blob,-blob2,*second_parent)` means \"load `Parent`\n  with all `children` included, defer column `Parent.blob` and `Child.blob2` and\n  undefer column `Child.blob`. For each child also load the relationship `Child.second_parent`.\n\nThe hints can have arbitrary depth. Each relationship hint can have hints\nreferring to the entities of that relationship.\n\nHints are also applicable to listing requests: `GET /parent:*children` will\neffectively retrieve all parents and all associated children.\n\nPlease note: dynamic relationship properties cannot be the target of a\nrelationship hint.\n\n#### Drilldown support\n\nIf the caller wanted to retrieve just the children of a parent of known id they\ncould call `GET /parent@1/children`. The last bit of the route is not a hint,\nit's a drilldown specifier. This constructs a query that retrieves all children\nfor parent with id=1, by reading the foreign key constraint of relationship\n`Parent.children`.\n\nThe drilldown supports both normal relationship properties as well as dynamic\nrelationship properties. It automatically determines if the target property is a\nlist or a single entity (i.e. `GET /child@1/parent` also works). All hints\nprovided must come after the drilldown specifier and they will refer to the\nentities in the relationship being drilled down into. For example, in the request\n`GET /parent@1/children:+blob` the hint will undefer loading of column\n`Child.blob`.\n\nIf the property being drilled into is a collection all [Filtering, sorting and\npagination](#filtering-sorting-pagination) considerations apply.\n\n#### Single element from collection\n\nIf the request either refers to a collection property via\n[Drilldown](#drilldown-support) or refers to a collection of entities because it\ndoes not contain a primary key specifier, the caller can select a single item\nfrom the list by using subscript notation. For example, `GET\n/parent@1/children[0]` will retrieve the first child of the `Parent.children`\ncollection. [Filtering and sorting](#filtering-sorting-pagination) are applied\nfirst.\n\n#### Filtering, sorting, pagination\n\nFiltering, sorting and pagination are applied as described in the\n[CRUDView](#crudview) section. Only `auto_filters` and `auto_order` are used.\nSupport for custom expressions is upcoming.\n\nPagination as supported by [CRUDView](#crudview) is also supported however the\nsame subscript notation as described in the previous section can be used for\nslicing: `GET /parent[0:10]?order_by=data+desc` retrieves the first 10 `Parent`\nentities in descending `data` order.\n\n#### Polymorphic casting\n\nSuppose `Parent` is a polymorphic type defined similar to the following:\n\n```python\nclass Parent(Base):\n    __tablename__ = 'parent'\n    id = Column(Integer, primary_key=True)\n    _type = Column('type', Text)\n    data = Column(Text)\n\n    __mapper_args__ = dict(\n        polyomrphic_on=_type\n    )\n```\n\nand derived classes defined as follows:\n\n```python\nclass ParentFather(Parent):\n    __mapper_args__ = dict(\n        polymorphic_identity='father'\n    )\nclass ParentMother(Parent):\n    __mapper_args__ = dict(\n        polymorphic_identity='mother'\n    )\n```\n\nIf route `/parent` points to class `Parent` we can use polymorphic casting to access derived types; i.e. `/parent!father` will point to class `ParentFather` and `/parent!mother` will point to class `ParentMother`. The polymorphic casting syntax is `/<route>!<identity>` where `<identity>` refers to the `polymorphic_identity` value defined in each derived class' mapper arguments.\n\nUsing the polymorphic casting syntax exposes all derived class' fields and relationships in the resulting JSON, exposes all fields to `auto_order` and `auto_filters` output, allows hints to refer to derived class` fields and relationships.\n\nCreating a derived class instance is also possible by performing a `POST /parent!<identity>`.\n\nPolymorphic casting is also supported for drilldown collections, i.e. `GET /parent@1/children!girl`. This only works for non-dynamic collections.\n\n#### Polymorphic loading hints\n\nSometimes you may want to access a collection like `/parent` without polymorphic casting to get acess to `Parent`s of all types but may wish to provide specific loading hints for each dervide type. Provided the derived classes had specific collections and fields (say, `father_data`, `mother_data` were relationships defined specifically for `ParentFather` and `ParentMother` respectively) they can be referred to in the loading hints as such:\n\n`/parent:!father(*father_data),!mother(*mother_data))`\n\nIt's necessary to declare `with_polymorphic='*'` in the base class mapper arguments for the loading hints to take effect. At the moment py-liant does not offer a mechanism to force polymorphic loading when not defined in the mapper.\n\nPolymorphic loading hints can also be applied to relationships with polymorphic classes. Consider that `Child` was polymorphic and had `ChildGirl` and `ChildBoy` definitions with discrimiators set to the values `\"girl\"` and `\"boy\"`. Accessing the `children` collection of `Parent` would not normally allow you to specify loading hints for properties that were not generic. However you can use the following hints to specify eager loading for the derived class specific relationships:\n\n`/parent:*children(!boy(*boy_data),!girl(*girl_data))`\n\n#### Polymorphic identity\n\nThe identity value used in both types of polymorphic functionality described above is automatically cast to the polymorphic identifier type. In the examples above the type was string but any supported type can be used. [Enumerables](#enumattrs-and-pythonenum) are encouraged.\n\n#### Implicit filters\n\nWhen defining the catchall view targets using `@view_config`'s `catchall` parameter dictionary, the value passed for each key can be richer than just a target type. You can pass a tuple, an array, a dictionary or an instance of `CatchallTarget`. When passing a tuple, array or dictionary it is passed unmodified to the constructor of `CatchallTarget`.\n\nOne possible use for this is to associate a set of filters with a target type. The filter would be applied in addition to any filters provided in the query parameters of the request, except when using the primary key access syntax (`/target@pkey`).\n\nFor example:\n\n```python\n@view_defaults(renderer='json', catchall={\n    'parent': {'cls': Parent, 'filters': Parent.active.is_(True)\n})\n@view_config(route_name=\"catchall\", attr='process')\nclass MyCatchallView(CatchallView):\n    pass\n```\n\nwould ensure that only `Parent` instances with a boolean property `active` set to True would be returned except when accessed using the primary key. Multiple conditions can be provided either by providing an array of conditions (all are applied) or constructing a more complex SQL expression using logic operators (`sql.and_`, `sql.or_`, etc).\n\nFilters can also be defined as a callable that accepts the pyramid request as an argument and returns\nthe filter(s) dynamically. This is useful to provide a substitute for [CRUDView](#crudview)'s context filters.\n\n#### Hint profiles\n\nThe `CatchallTarget.profiles` property can be used to provide quick access to loading hint profiles defined server-side. Consider the following example:\n\n```python\n@view_defaults(renderer='json', catchall={\n    'parent': {'cls': Parent, 'profiles': {\n        'with_children': '*children',\n        'with_data': '*data'\n    }})\n@view_config(route_name=\"catchall\", attr='process')\nclass MyCatchallView(CatchallView):\n    pass\n```\n\nThe profiles can be accessed in an HTTP request using the following syntax:\n\n`GET /praent:with_children`\n\nThe hints in the profile can be overridden in the request, or other hints can be provided on top of the ones in the profile:\n\n`GET /parent:with_children:*data`\n\nThe full syntax of the loading hints is available in the profile definition.\n\n### JsonGuardProvider\n\nFor security considerations the flexibility offered by this library can be\ndetrimental. Model classes can contain references to entities that need to be\nprotected from the API, both in terms of reading them (when using\n[CatchallView](#catchallview)) and in terms of updating them (concerns [any\ninsert/update method](#monkeypatch-objapplychanges)).\n\nThe `JsonGuardProvider` interface allows you to add security fencing for four\nareas:\n\n- method `guardSerialize` allows you to control how much information gets\n  serialized to JSON\n- method `guardUpdate` allows you to control what can be written into the\n  entities whenever `obj.apply_changes()` get called\n- method `guardHints` allows you to control what [CatchallView\n  hints](#hints-syntax) are permitted\n- method `guardDrilldown` allows you to control what properties can be\n  [drilled down](#drilldown-support) into via `CatchallView`\n\nTo use a `JsonGuardProvider`, implement this interface in a Pyramid\n[context](https://docs.pylonsproject.org/projects/pyramid/en/latest/narr/urldispatch.html#route-factories)\nand attach it to the route and view using `add_route`'s `factory`.\n\nFor example:\n\n```python\nfrom py_liant.interfaces import JsonGuardProvider\n\nclass MyContext(JsonGuardProvider):\n    request = None\n\n    # provide some ACLs, for use with ACLAutorizationPolicy\n    def __acl__(self):\n        # let's assume any authenticated user should have read access\n        if self.request.method == 'GET':\n            return [(Allow, Authenticated, \"process\")]\n        # if request verb is POST or DELETE, require admin role\n        return [(Allow, \"role:admin\", \"process\")]\n\n    def __init__(self, request):\n        # we need to look at the request in the implementation\n        self.request = request\n\n    def guardSerialize(self, obj, value):\n        # always hide Child.second_parent\n        if isinstance(obj, Child) and 'second_parent' in value:\n            # do NOT modify obj, just change value (JsonObject)\n            del value.second_parent\n\n    def guardUpdate(self, obj, data, for_update=True):\n        # apply custom changes to the input data, for example encrypt passwords\n        if isinstance(obj, User) and 'password' in data:\n            # for example passwords can be encrypted\n            data.password = hash(data.password)\n\n        # or prevent certain properties being written into by the update\n        if isinstance(obj, Parent):\n            if 'property' in data:\n                del data.property\n\n        # or apply mandatory changes to certain objects\n        # TrackedInstanceMixin could be a mixin that adds 'added' and\n        # 'last_updated' columns to entities\n        if isinstance(obj, TrackedInstanceMixin):\n            # for_update is set to true when obj is newly instantiated\n            if not for_update:\n                obj.added = datetime.now(timezone.utc)\n            obj.last_updated = datetime.now(timezone.utc)\n\n        # if returning falsey value processing for this entity and all\n        # descendants is prevented\n        return True\n\n    def guardHints(self, cls, hints):\n        # maniupate the hints provided by the caller\n\n        # e.g. remove any hint for Parent.data\n        if cls is Parent and Parent.data in hints:\n            del hints[Parent.data]\n\n        # or add default hints for certain classes\n        if cls is Child and Child.data not in hints:\n            hints[Child.data] = ('-', None)\n\n        if cls is Child and Child.parent not in hints:\n            hints[Child.parent] = ('*', [('+', Parent.blob)])\n\n    def guardDrilldown(self, prop) -> bool:\n        if prop is Parent.children:\n            return False\n        return True\n\n# change the rotue definition to include context factory\nconfig.add_route(\"catchall\", '{catchall:.*}', factory=MyContext)\n```\n\n### SearchPathSetter\n\nThis is a PostgreSQL specific addition that can be used to set up the schema\nsearch path for all newly created database connection. It's implemented as a\nSQLAlchemy `PoolListener` (deprecated since version 0.7). A replacement that\nuses the modern events API is currently in the works.\n\nIt is very unlikely you will need to use this class in your project unless you\nneed to use multi-tenant databases with configurable schemas.\n\n### EnumAttrs and PythonEnum\n\n`PythonEnum` is a custom implementation of `sqlalchemy.types.Enum` that is\nuseful in PostgreSQL for declaring named enum types.\n\nUsage:\n\n```python\nfrom enum import Enum\nfrom py_liant.enum import EnumAttrs, PythonEnum\n\n# in PostgreSQL this will generate:\n# CREATE TYPE user_type AS ENUM ('admin', 'operator', 'user')\n@EnumAttrs('user_type')\nclass user_type(Enum):\n    admin = 'admin'\n    operator = 'oeprator'\n    user = 'user'\n\nclass User(Base):\n    __tablename__ = 'parent'\n    id = Column(Integer, primary_key=True)\n    name = Column(Text)\n    user_type = Column(PythonEnum(user_type))\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/tripsolutions/py-liant",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "py-liant",
+    "package_url": "https://pypi.org/project/py-liant/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/py-liant/",
+    "project_urls": {
+      "Homepage": "https://github.com/tripsolutions/py-liant"
+    },
+    "release_url": "https://pypi.org/project/py-liant/0.8.7/",
+    "requires_dist": [
+      "SQLAlchemy",
+      "isodate",
+      "pyparsing",
+      "pyramid",
+      "python-dateutil",
+      "simplejson",
+      "transaction"
+    ],
+    "requires_python": ">=3.4.0",
+    "summary": "Glue together pyramid, sqlalchemy, simplejson to provide a read-write, object-graph-aware JSON API",
+    "version": "0.8.7",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11050799,
+  "releases": {
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "354eb3eddb012062c92075e97dd16bb661f54e81e33bef490d1fe0ced286c5e9",
+          "md5": "469bed59c0aed15a75b46c61b0975e0b",
+          "sha256": "a38c0f481cb3edf8aca830a51468a25a5305ff8debe9f23c21b2b6790e3bcb65"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.6.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "469bed59c0aed15a75b46c61b0975e0b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 25532,
+        "upload_time": "2019-08-16T14:03:43",
+        "upload_time_iso_8601": "2019-08-16T14:03:43.198435Z",
+        "url": "https://files.pythonhosted.org/packages/35/4e/b3eddb012062c92075e97dd16bb661f54e81e33bef490d1fe0ced286c5e9/py_liant-0.6.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40d834998d092104ab04791dfcd5d1f9be61a9a524b64c18a11d43871f0612d7",
+          "md5": "8a3468842440bde9c24bd52d9529f180",
+          "sha256": "87164bd271a45ef39926e78a85c8c86bb48f87ed6f1c774fabecb578619ee822"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8a3468842440bde9c24bd52d9529f180",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 37489,
+        "upload_time": "2019-08-16T14:03:45",
+        "upload_time_iso_8601": "2019-08-16T14:03:45.784634Z",
+        "url": "https://files.pythonhosted.org/packages/40/d8/34998d092104ab04791dfcd5d1f9be61a9a524b64c18a11d43871f0612d7/py_liant-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f6a1637fded5cb686ea2be2c8a28506cc9c5246dfd663b432b7a5c4c7cbd83f2",
+          "md5": "dd8ce9626266f31dec9b91b455df01d1",
+          "sha256": "d97801ed0a1b9b11ef2005c1a214fb142929f6676f6cad600ec86e1c0e5b607e"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dd8ce9626266f31dec9b91b455df01d1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.4.0",
+        "size": 30728,
+        "upload_time": "2020-08-20T12:58:00",
+        "upload_time_iso_8601": "2020-08-20T12:58:00.438584Z",
+        "url": "https://files.pythonhosted.org/packages/f6/a1/637fded5cb686ea2be2c8a28506cc9c5246dfd663b432b7a5c4c7cbd83f2/py_liant-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d95ba9d1fc4ca2dab28da566b855d4f340ca528d4f2a0e777755ebd39f4a65d1",
+          "md5": "95584ed7120eea7681f64763d6f68c5d",
+          "sha256": "92e95f47222c91c3b06d56d7c9f70a7453d4f05e1d71a4a458a1453160f7e881"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "95584ed7120eea7681f64763d6f68c5d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 47253,
+        "upload_time": "2020-08-20T12:58:03",
+        "upload_time_iso_8601": "2020-08-20T12:58:03.066780Z",
+        "url": "https://files.pythonhosted.org/packages/d9/5b/a9d1fc4ca2dab28da566b855d4f340ca528d4f2a0e777755ebd39f4a65d1/py_liant-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7df08ca70e1216d81d7d99af1a3a969af088df40655a7eee6809f384e029619",
+          "md5": "6b7421213b257e022bae2bc76f16099a",
+          "sha256": "3c5865832bcb9f9fef148be5b015f3aacb990f40acd07eccacd93bd0383a1874"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6b7421213b257e022bae2bc76f16099a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.4.0",
+        "size": 31744,
+        "upload_time": "2020-08-21T15:11:24",
+        "upload_time_iso_8601": "2020-08-21T15:11:24.500713Z",
+        "url": "https://files.pythonhosted.org/packages/a7/df/08ca70e1216d81d7d99af1a3a969af088df40655a7eee6809f384e029619/py_liant-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94c7a4bd53c9436f1e01691d2f26202b43ff39a98a9d050cb14ffbb638d8cfb4",
+          "md5": "4b136a3793b6689e2056a8a7082dde69",
+          "sha256": "ceec3b1eb76ef8311f61003ab09ec42d6af6c8e7961cbce9ee4410fc8b05a92f"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4b136a3793b6689e2056a8a7082dde69",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 49950,
+        "upload_time": "2020-08-21T15:11:28",
+        "upload_time_iso_8601": "2020-08-21T15:11:28.470884Z",
+        "url": "https://files.pythonhosted.org/packages/94/c7/a4bd53c9436f1e01691d2f26202b43ff39a98a9d050cb14ffbb638d8cfb4/py_liant-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bbf606c2caaab6863ed478da6ab3d0d6b12478194c5bb08ae27018fa7a447a3f",
+          "md5": "2b5a15a19dc9aad3103825c3f87bb94b",
+          "sha256": "b983e74b275c771e4a3d36e0f5e31766e91394c9cd23fb632d49e4ef45cdd64e"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2b5a15a19dc9aad3103825c3f87bb94b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 31972,
+        "upload_time": "2021-03-25T18:41:02",
+        "upload_time_iso_8601": "2021-03-25T18:41:02.190770Z",
+        "url": "https://files.pythonhosted.org/packages/bb/f6/06c2caaab6863ed478da6ab3d0d6b12478194c5bb08ae27018fa7a447a3f/py_liant-0.8.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a917764713e5133207dc77e6db22c745acc1576dfb4718f122a7407dc1d5524b",
+          "md5": "67b1930d72aec4845cb2e74bdc611932",
+          "sha256": "94b18e6f3f8e5c959f390325a18ec55c35dc2cd6ed7cb7525f14871562282879"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "67b1930d72aec4845cb2e74bdc611932",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51495,
+        "upload_time": "2021-03-25T18:41:04",
+        "upload_time_iso_8601": "2021-03-25T18:41:04.489688Z",
+        "url": "https://files.pythonhosted.org/packages/a9/17/764713e5133207dc77e6db22c745acc1576dfb4718f122a7407dc1d5524b/py_liant-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d91ffe2ff82d8e11a5589bd5841a8fe98f718544af01c81f6e74165e3c0c648e",
+          "md5": "9f43c0c5e0d0be904e3fb864a63d11ba",
+          "sha256": "a21416389310dbd4eb5a883a7b96bff0d3e37bb7f7161267b2a84584827ad821"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9f43c0c5e0d0be904e3fb864a63d11ba",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 31971,
+        "upload_time": "2021-03-26T11:24:30",
+        "upload_time_iso_8601": "2021-03-26T11:24:30.395004Z",
+        "url": "https://files.pythonhosted.org/packages/d9/1f/fe2ff82d8e11a5589bd5841a8fe98f718544af01c81f6e74165e3c0c648e/py_liant-0.8.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4640b383d3efaa1f39ab5653663672fb4c2475f0b0a34c9860f6a0d236e5e036",
+          "md5": "e92b750c5895c957de932bba08853191",
+          "sha256": "27b187f6f01815faaa252bb4842795cb968998ca5b3dba99fef8272ffe6cd981"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e92b750c5895c957de932bba08853191",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51500,
+        "upload_time": "2021-03-26T11:24:33",
+        "upload_time_iso_8601": "2021-03-26T11:24:33.537945Z",
+        "url": "https://files.pythonhosted.org/packages/46/40/b383d3efaa1f39ab5653663672fb4c2475f0b0a34c9860f6a0d236e5e036/py_liant-0.8.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cff192d74c48c4fa792bcfdfe38007e0d0d13fd2fbd483825aed61b6d8ae80f2",
+          "md5": "384d7b5c31dcb2c75a6c1c091ac36279",
+          "sha256": "a335b13364a6d8e85dfae24bb360ac05a4ee1cf03e1b5636dbd31562f0d23419"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "384d7b5c31dcb2c75a6c1c091ac36279",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 31990,
+        "upload_time": "2021-03-30T15:56:47",
+        "upload_time_iso_8601": "2021-03-30T15:56:47.366302Z",
+        "url": "https://files.pythonhosted.org/packages/cf/f1/92d74c48c4fa792bcfdfe38007e0d0d13fd2fbd483825aed61b6d8ae80f2/py_liant-0.8.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21d61d753575b773e36fd91cd419268000117592e6668bcb865c579085ecc73e",
+          "md5": "0262cf5cd3ba123d24ffa2c231b3910a",
+          "sha256": "80d3e324cce7cafed68ffad66e2369141080c1f5a37f9b4ddc4d5c086c5c5e80"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0262cf5cd3ba123d24ffa2c231b3910a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51505,
+        "upload_time": "2021-03-30T15:56:49",
+        "upload_time_iso_8601": "2021-03-30T15:56:49.464216Z",
+        "url": "https://files.pythonhosted.org/packages/21/d6/1d753575b773e36fd91cd419268000117592e6668bcb865c579085ecc73e/py_liant-0.8.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a837dc20fdd70e691e673dae69109d787e34da53c7546a6fef76e14f77d5cd2",
+          "md5": "c30cd177ad2baf85f6a7009a98283e35",
+          "sha256": "d69a75a133ca938de79abfd7ad17be18e474fc637c60e234aa901eafb14d7463"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c30cd177ad2baf85f6a7009a98283e35",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 32057,
+        "upload_time": "2021-03-30T16:58:02",
+        "upload_time_iso_8601": "2021-03-30T16:58:02.062176Z",
+        "url": "https://files.pythonhosted.org/packages/8a/83/7dc20fdd70e691e673dae69109d787e34da53c7546a6fef76e14f77d5cd2/py_liant-0.8.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "29f3c9b5e1f5680e47ab962e58276cb3e11867cec5c5410e4da23da2958b67ff",
+          "md5": "175e7f72987242d05c688e4dc4e09798",
+          "sha256": "97a67c3194529c47855dfc58504ffd91745e4b352aea4a455d141609dffadb47"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "175e7f72987242d05c688e4dc4e09798",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51571,
+        "upload_time": "2021-03-30T16:58:03",
+        "upload_time_iso_8601": "2021-03-30T16:58:03.976071Z",
+        "url": "https://files.pythonhosted.org/packages/29/f3/c9b5e1f5680e47ab962e58276cb3e11867cec5c5410e4da23da2958b67ff/py_liant-0.8.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2cb13c888e64b340a9ae2ea9d4de069532d7c2e9fd89d32dd47613c03b69bbaf",
+          "md5": "f990dbbac0cff7d9f38ec036707752b0",
+          "sha256": "d538912fb089ee81c2a6bab3eaf34348b3ddbeaab154efa221372c9ffd4ecf92"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.5-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f990dbbac0cff7d9f38ec036707752b0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 32051,
+        "upload_time": "2021-03-31T09:58:20",
+        "upload_time_iso_8601": "2021-03-31T09:58:20.883993Z",
+        "url": "https://files.pythonhosted.org/packages/2c/b1/3c888e64b340a9ae2ea9d4de069532d7c2e9fd89d32dd47613c03b69bbaf/py_liant-0.8.5-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0f613611faaba9d9d3322d832118132a6b6270e1b7eb1301b301b17c34424ac",
+          "md5": "0bfed2abf5f4cc58d45aefcfa6e6684f",
+          "sha256": "d7d2916ec21383576edd7de66fdf7691461ebad4d8f2aae5606340d8e6a98df7"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0bfed2abf5f4cc58d45aefcfa6e6684f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51556,
+        "upload_time": "2021-03-31T09:58:22",
+        "upload_time_iso_8601": "2021-03-31T09:58:22.538400Z",
+        "url": "https://files.pythonhosted.org/packages/f0/f6/13611faaba9d9d3322d832118132a6b6270e1b7eb1301b301b17c34424ac/py_liant-0.8.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf136d6d727caf1811381d068b38d298cab1db04698155ac740b5180f441f61a",
+          "md5": "263810b4672c81b0bafeab80e3a93f9e",
+          "sha256": "0d7220685f5a48af2b564604603a85254c520d18560c5523401e15f9b4bbc8f9"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.6-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "263810b4672c81b0bafeab80e3a93f9e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 32074,
+        "upload_time": "2021-04-01T20:40:34",
+        "upload_time_iso_8601": "2021-04-01T20:40:34.372329Z",
+        "url": "https://files.pythonhosted.org/packages/bf/13/6d6d727caf1811381d068b38d298cab1db04698155ac740b5180f441f61a/py_liant-0.8.6-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "203b222931dfbdc7dbe09e17c0a1e2263f072b0cd79d3347db57b85a8adfb661",
+          "md5": "61b49455c276f2e51c4b880ead5bad07",
+          "sha256": "6893af5b9563cfbbd1022ca9562e637700620225b1f56a6e3b2d0220c89f0ab3"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "61b49455c276f2e51c4b880ead5bad07",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51575,
+        "upload_time": "2021-04-01T20:40:36",
+        "upload_time_iso_8601": "2021-04-01T20:40:36.322177Z",
+        "url": "https://files.pythonhosted.org/packages/20/3b/222931dfbdc7dbe09e17c0a1e2263f072b0cd79d3347db57b85a8adfb661/py_liant-0.8.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ac259ab32d85086ab7e36ef92d7179150f388a018fb9183d3a17e542f12c3cb",
+          "md5": "b4819399b2afb6655c62373c934868da",
+          "sha256": "eed3d0610be2483c14afa25673851f9b29fa71f3abc6deed9ba5fb9a40ce3797"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.7-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b4819399b2afb6655c62373c934868da",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.4.0",
+        "size": 32170,
+        "upload_time": "2021-07-30T14:10:18",
+        "upload_time_iso_8601": "2021-07-30T14:10:18.952375Z",
+        "url": "https://files.pythonhosted.org/packages/2a/c2/59ab32d85086ab7e36ef92d7179150f388a018fb9183d3a17e542f12c3cb/py_liant-0.8.7-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee8277011db5b4b306a5ef5ed16d2ad360ed88bb1d1584da409b755ce607b452",
+          "md5": "3bad4e875091e566bd665488eefce6e1",
+          "sha256": "ef3e8fd3f6af55be8789f3a8df84dcb56538def8f9a7af58c084116d1fe92282"
+        },
+        "downloads": -1,
+        "filename": "py_liant-0.8.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3bad4e875091e566bd665488eefce6e1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.4.0",
+        "size": 51814,
+        "upload_time": "2021-07-30T14:10:21",
+        "upload_time_iso_8601": "2021-07-30T14:10:21.160508Z",
+        "url": "https://files.pythonhosted.org/packages/ee/82/77011db5b4b306a5ef5ed16d2ad360ed88bb1d1584da409b755ce607b452/py_liant-0.8.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2ac259ab32d85086ab7e36ef92d7179150f388a018fb9183d3a17e542f12c3cb",
+        "md5": "b4819399b2afb6655c62373c934868da",
+        "sha256": "eed3d0610be2483c14afa25673851f9b29fa71f3abc6deed9ba5fb9a40ce3797"
+      },
+      "downloads": -1,
+      "filename": "py_liant-0.8.7-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b4819399b2afb6655c62373c934868da",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=3.4.0",
+      "size": 32170,
+      "upload_time": "2021-07-30T14:10:18",
+      "upload_time_iso_8601": "2021-07-30T14:10:18.952375Z",
+      "url": "https://files.pythonhosted.org/packages/2a/c2/59ab32d85086ab7e36ef92d7179150f388a018fb9183d3a17e542f12c3cb/py_liant-0.8.7-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ee8277011db5b4b306a5ef5ed16d2ad360ed88bb1d1584da409b755ce607b452",
+        "md5": "3bad4e875091e566bd665488eefce6e1",
+        "sha256": "ef3e8fd3f6af55be8789f3a8df84dcb56538def8f9a7af58c084116d1fe92282"
+      },
+      "downloads": -1,
+      "filename": "py_liant-0.8.7.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3bad4e875091e566bd665488eefce6e1",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.4.0",
+      "size": 51814,
+      "upload_time": "2021-07-30T14:10:21",
+      "upload_time_iso_8601": "2021-07-30T14:10:21.160508Z",
+      "url": "https://files.pythonhosted.org/packages/ee/82/77011db5b4b306a5ef5ed16d2ad360ed88bb1d1584da409b755ce607b452/py_liant-0.8.7.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

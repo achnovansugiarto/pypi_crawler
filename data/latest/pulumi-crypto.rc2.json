@@ -1,0 +1,184 @@
+{
+  "info": {
+    "author": "Sam McKelvie",
+    "author_email": "dev@mckelvie.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "pulumi-crypto: Python implementation of Pulumi passphrase encryption and decryption\n=================================================\n\n[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)\n[![Latest release](https://img.shields.io/github/v/release/sammck/pulumi-crypto.svg?style=flat-square&color=b44e88)](https://github.com/sammck/pulumi-crypto/releases)\n\nA Python commandline tool and cipher library that can verify Pulumi passphrases and encrypt/decrypt Pulumi passphrase-protected secrets as found in stack config files and exported stack state files. Can also be used for general passphrase-based encryption/decryption of string values.\n\nTable of contents\n-----------------\n\n* [Introduction](#introduction)\n* [Details](#pulumi-passphrase-encryption-details)\n* [Installation](#installation)\n* [Usage](#usage)\n  * [Command line](#command-line)\n  * [API](api)\n* [Known issues and limitations](#known-issues-and-limitations)\n* [Getting help](#getting-help)\n* [Contributing](#contributing)\n* [License](#license)\n* [Authors and history](#authors-and-history)\n\n\nIntroduction\n------------\n\nPython package `pulumi-crypto` provides a command-line tool as well as a runtime API for Pulumi-compatible encryption and decryption of secret strings using a passphrase. It can also be used for general passphrase-based encryption/decryption of secret strings.\n\nSome key features of pulumi-crypto:\n\n* 100% compatible with current Pulumi passphrase secret provider.\n* Does not depend on any installed pulumi tools or libraries.\n* Can operate on secrets in pulumi stack config files and backend state files without having a complete or consistent stack.\n* Can be used to automate construction of stack config files before a stack exists.\n* Allows separation of reading/writing Pulumi config files and deployment export data (which does not\n  require knowledge of the correct passphrase) from encryption/decryption of secrets (which requires knowledge of the passphrase).\n\nThis package was originally developed as part of a solution to work around a limitation of the current pulumi release--there is currently no easy way to get/set nonsecret config properties or stack deployment outputs without knowing the correct passphrase, even if the passphrase is irrelevant for that task. By directly implementing a private version of `pulumi config` and `pulumi stack output` it is possible to defer use of the passphrase until it is needed, and allow working with encrypted inputs/outputs as well as nonsecret inputs and outputs, without knowledge of the passphrase.\n\nPulumi passphrase encryption details\n------------------------------------\nSymmetric 256-bit AES encryption in GCM mode is used, with a 12-byte nonce, resulting in ciphertext\nfor each secret that has a 16-byte validation digest attached. This prevents correlation of repeated encryption of identical plaintext, and ensures integrity of roundtrip encrypt/decrypt and a hard\nfailure if the wrong key is used to decrypt.\n\nThe 256-bit AES key is deterministically derived from the passphrase and a random 64-bit salt using PBKDF2,\nwith 1,000,000 iterations of SHA-256 HMAC. This takes around a second to compute on average hardware, making it resistant to dictionary attacks if a weak passphrase is used. A single salt, and hence a single 256-bit AES key, is used for encryption of all secrets in a given stack config file, or in a given stack's backend deployment state, so this expensive hashing is only done once each time a config file or deployment state needs to be encrypted/decrypted.\n\n### Salt state string\nTo recover the 256-bit symmetric AES key, and hence to decrypt secrets, the decrypter must know the passphrase as well as the passphrase salt that was used to generate the key. For this reason, the passphrase salt must be stored alongside encrypted data. Since the same passphrase salt and AES key are used to encrypt all secrets in a single document (e.g., a Pulumi stack config file or exported stack deployment document), the passphrase salt only needs to be recorded once per document. To serve that purpose, and also to provide a way to verify correctness of a passphrase without decrypting secrets, Pulumi defines a \"salt state\" string as:\n```python\n\"v1:\" + b64encode(passphrase_salt) + \":\" + encrypt(\"pulumi\")\n```\nwhere `encrypt(\"pulumi\")` is the result of encrypting the literal string \"pulumi\" with the AES key derived from the passphrase and attached\npassphrase_salt. This provides a way to verify the correctness of a passphrase with only the passphrase and the \"salt state\" string.\n\nFor Pulumi stack config files (e.g., \"Pulumi._stack-name_.yaml\"), the salt state string is persisted in top-level property \"encryptionsalt\". \n\nFor Pulumi stack deployment export JSON documents, the salt state string is persisted in `deployment[\"secrets_providers\"][\"state\"][\"salt\"]`\n\nNote that either the passphrase or the passphrase salt salt may be changed at any time if the salt state string is updated in the relevant document and all secrets are reencrypted using the new passphrase and salt.\n\nIt is not necessary for the passphrase salt or the salt state string to be the same for the Pulumi stack config file and the backend deployment state. While not technically required, as a practical matter, the passphrase must be the same for both, since the Pulumi CLI and SDK provide no means to differentiate between the two.\n\n### Pulumi stack config files\nPulumi stack config files are YAML documents (e.g., \"Pulumi._stack-name_.yaml\") that represent a dict. They maintain the salt state string in top-level property \"encryptionsalt\".\n\nConfiguration properties are presented in a child dict named \"config\". Each property of this dict represents a single stack configuration\nproperty. All configuration properties are simple strings; however _secret_ configuration properties are represented in the config file\nas dicts with a single property, \"secure\", which holds a string that is the ciphertext that when decrypted will produce the configuration property's plaintext value.\n\n### Pulumi stack deployment export document\nA Pulumi stack deployment export document including encrypted secrets can be produced with:\n\n```bash\npulumi stack export\n```\n\nThe result is is a JSON document that represent a dict. It maintains the salt state string in `deployment[\"secrets_providers\"][\"state\"][\"salt\"]`.\n\nEncrypted secret values may appear anywhere within the deployment export document. Secrets may be any JSON value type.\nPrior to encryption, each secret value is serialized to JSON. Each encrypted secret value is represented as a dict:\n\n```json\n{\n  \"4dabf18193072939515e22adb298388d\": \"1b47061264138c4ac30d75fd1eb44270\",\n  \"ciphertext\": encrypter.encrypt(json.dumps(unencrypted_secret_jsonable_value))\n}\n```\n\nwhere \"4dabf18193072939515e22adb298388d\" and \"1b47061264138c4ac30d75fd1eb44270\" are\nhard-coded, unlikely-to-collide values used to identify the dict as containing\na secret value.\n\nSimilary, decrypted secret values seen by `pulumi stack export --show-secrets` are represented as:\n```json\n{\n  \"4dabf18193072939515e22adb298388d\": \"1b47061264138c4ac30d75fd1eb44270\",\n  \"plaintext\": json.dumps(unencrypted_secret_jsonable_value)\n}\n```\n\nFor example:\n```bash\n$ pulumi stack --stack dev export\n...\n  outputs: {\n    exposed_input: \"Paul is alive\",\n    public_ip: \"192.168.1.1\",\n    secret_input: {\n      4dabf18193072939515e22adb298388d: \"1b47061264138c4ac30d75fd1eb44270\",\n      ciphertext: \"v1:NlYqG/v5PGnurF8e:Ih/CeRbpVH/nqNdAwlU8GphacTkgQTdYay9nRxJqqg==\"\n    },\n    secret_output: {\n      4dabf18193072939515e22adb298388d: \"1b47061264138c4ac30d75fd1eb44270\",\n      ciphertext: \"v1:C7zJC50FGL7rIvrq:6wLzal+3/7n3kMD5sZfBmUsYJcrN1WlTrc1jid4HnanyJHhZ\"\n    },\n    url: \"http://192.168.1.1\"\n  }\n...\n$ pulumi stack --stack dev export --show-secrets\n...\n  \"outputs\": {\n    \"exposed_input\": \"Paul is alive\",\n    \"public_ip\": \"192.168.1.1\",\n    \"secret_input\": {\n        \"4dabf18193072939515e22adb298388d\": \"1b47061264138c4ac30d75fd1eb44270\",\n        \"plaintext\": \"\\\"Paul is alive\\\"\"\n    },\n    \"secret_output\": {\n        \"4dabf18193072939515e22adb298388d\": \"1b47061264138c4ac30d75fd1eb44270\",\n        \"plaintext\": \"\\\"John is the Walrus\\\"\"\n    },\n    \"url\": \"http://192.168.1.1\"\n  },\n...\n```\n\nNote that even the plaintext values in this case contain JSON text that must be run through `json.loads()`\nto get the actual secret value.\n\nIn the case of the convenient Pulumi CLI `stack output --json` command (which is really just a filter\non `pulumi stack export`), such wrapping dicts are removed--encrypted\nvalues are replaced with the string \"[secret]\", and decrypted values are deserialized from their\nJSON representation and inserted into the stack output object; e.g., .\n```bash\n$ pulumi stack --stack dev output --json --show-secrets\n{\n  \"exposed_input\": \"Paul is alive\",\n  \"public_ip\": \"192.168.1.1\",\n  \"secret_input\": \"Paul is alive\",\n  \"secret_output\": \"John is the Walrus\",\n  \"url\": \"http://192.168.1.1\"\n}\n$ pulumi stack --stack dev output --json\n{\n  \"exposed_input\": \"Paul is alive\",\n  \"public_ip\": \"192.168.1.1\",\n  \"secret_input\": \"[secret]\",\n  \"secret_output\": \"[secret]\",\n  \"url\": \"192.168.1.1\"\n}\n```\nFor this reason, if you wish to work with encrypted Pulumi secret outputs without relying on the Pulumi command line or runtime to perform decryption, you can get the encrypted outputs directly from the exported deployment state.\n\nInstallation\n------------\n\n### Prerequisites\n\n**Python**: Python 3.7+ is required. See your OS documentation for instructions.\n\n### From PyPi\n\nThe current released version of `pulumi-crypto` can be installed with \n\n```bash\npip3 install pulumi-crypto\n```\n\n### From GitHub\n\n[Poetry](https://python-poetry.org/docs/master/#installing-with-the-official-installer) is required; it can be installed with:\n\n```bash\ncurl -sSL https://install.python-poetry.org | python3 -\n```\n\nClone the repository and install pulumi-crypto into a private virtualenv with:\n\n```bash\ncd <parent-folder>\ngit clone https://github.com/sammck/pulumi-crypto.git\ncd pulumi-crypto\npoetry install\n```\n\nYou can then launch a bash shell with the virtualenv activated using:\n\n```bash\npoetry shell\n```\n\nUsage\n=====\n\nCommand Line\n------------\n\nExample usage:\n\n```bash\n$ export PULUMI_PASSPHRASE='very-hard-to-guess'\n$ export PULUMI_SALT_STATE=\"$(pulumi-crypto get-salt-state --new)\"\n$ PLAINTEXT=\"My Secret\"\n$ CIPHERTEXT=\"$(pulumi-crypto encrypt \"$PLAINTEXT\")\"\n$ echo \"CIPHERTEXT=$CIPHERTEXT\"\n$ DECRYPTED=\"$(pulumi-crypto -r decrypt \"$CIPHERTEXT\")\"\n$ echo \"DECRYPTED=$DECRYPTED\"\n```\n\nAPI\n---\n\n```python\n#!/usr/bin/env python3\n\nimport os\nfrom pulumi_crypto import PassphraseCipher\n\npassphrase = 'very-hard-to-guess'\n\n# if salt_state is set to None here, then a new salt and a new salt_state will be generated\nsalt_state = 'v1:yBsIOwOeOOU=:v1:jIw90Zn+5pikf6dI:SM6iyYeEiHNoQ3i55lR9T4EtfpyUZw=='\n\ncipher = PassphraseCipher(\n    passphrase,\n    salt_state=salt_state\n  )\n\nprint(f\"salt state={cipher.salt_state}\")\n\nplaintext = 'My Secret'\nprint(f\"plaintext={plaintext}\")\n\nciphertext = cipher.encrypt(plaintext)\nprint(f\"ciphertext={ciphertext}\")\n\ndecrypted = cipher.decrypt(ciphertext)\nprint(f\"decrypted={decrypted}\")\n```\n\nKnown issues and limitations\n----------------------------\n\n* TBD.\n\nGetting help\n------------\n\nPlease report any problems/issues [here](https://github.com/sammck/pulumi-crypto/issues).\n\nContributing\n------------\n\nPull requests welcome.\n\nLicense\n-------\n\npulumi-crypto is distributed under the terms of the [MIT License](https://opensource.org/licenses/MIT).  The license applies to this file and other files in the [GitHub repository](http://github.com/sammck/pulumi-crypto) hosting this file.\n\nAuthors and history\n---------------------------\n\nThe author of pulumi-crypto is [Sam McKelvie](https://github.com/sammck).\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/sammck/pulumi-crypto",
+    "keywords": "password,passphrase,secret,Pulumi,crypto,encryption,decryption",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pulumi-crypto",
+    "package_url": "https://pypi.org/project/pulumi-crypto/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pulumi-crypto/",
+    "project_urls": {
+      "Homepage": "https://github.com/sammck/pulumi-crypto",
+      "Repository": "https://github.com/sammck/pulumi-crypto.git"
+    },
+    "release_url": "https://pypi.org/project/pulumi-crypto/1.1.0/",
+    "requires_dist": [
+      "pycryptodomex (>=3.14.1,<4.0.0)",
+      "Pygments (>=2.12.0,<3.0.0)",
+      "PyYAML (>=6.0,<7.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "Python implementation of Pulumi passphrase encryption/decryption",
+    "version": "1.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13858486,
+  "releases": {
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba31f0a51e7ba51be32033d45cf51132499bf63f9deac1e3a4b2ec0a09aececc",
+          "md5": "df9b73a13a9d8ea584348911e61b9509",
+          "sha256": "b6326d04f8aae4f882e3f4d8a1d97a40ec47e3fdab1398976ccd13d8a32c5c47"
+        },
+        "downloads": -1,
+        "filename": "pulumi_crypto-1.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "df9b73a13a9d8ea584348911e61b9509",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 19956,
+        "upload_time": "2022-05-17T21:57:03",
+        "upload_time_iso_8601": "2022-05-17T21:57:03.824322Z",
+        "url": "https://files.pythonhosted.org/packages/ba/31/f0a51e7ba51be32033d45cf51132499bf63f9deac1e3a4b2ec0a09aececc/pulumi_crypto-1.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "578076978f54cbdef5d532746f6398d08ff60fd3e7f50c88cb08a1f981cbbf09",
+          "md5": "853da4ea1b6870c201ec81b8d9681694",
+          "sha256": "028dc215f9beec5f42531a649e345b7fa416263f757d83632e6068e1950d20b9"
+        },
+        "downloads": -1,
+        "filename": "pulumi-crypto-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "853da4ea1b6870c201ec81b8d9681694",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 22197,
+        "upload_time": "2022-05-17T21:57:01",
+        "upload_time_iso_8601": "2022-05-17T21:57:01.783163Z",
+        "url": "https://files.pythonhosted.org/packages/57/80/76978f54cbdef5d532746f6398d08ff60fd3e7f50c88cb08a1f981cbbf09/pulumi-crypto-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d08c57193887005088e5b8926c724cb0f03a1e7ae6d0c6904650e39fbcdf44bd",
+          "md5": "a3293eca65efd93a8989b6490a3e3502",
+          "sha256": "06075e184441212ce38810223d1655800012689d7286ad3663c5e8594c37bbe4"
+        },
+        "downloads": -1,
+        "filename": "pulumi_crypto-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a3293eca65efd93a8989b6490a3e3502",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 22925,
+        "upload_time": "2022-05-18T23:32:49",
+        "upload_time_iso_8601": "2022-05-18T23:32:49.041721Z",
+        "url": "https://files.pythonhosted.org/packages/d0/8c/57193887005088e5b8926c724cb0f03a1e7ae6d0c6904650e39fbcdf44bd/pulumi_crypto-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60a469950205305676f3a00e39212cc35f5705c9790bbc068b02581581d3eb2a",
+          "md5": "67e53975186ecd8456664e382f0c5703",
+          "sha256": "afb2feac77b1e9df202a30d53093ad16ad564e5cc5f99379e34803b609ba3e4f"
+        },
+        "downloads": -1,
+        "filename": "pulumi-crypto-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "67e53975186ecd8456664e382f0c5703",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 23712,
+        "upload_time": "2022-05-18T23:32:47",
+        "upload_time_iso_8601": "2022-05-18T23:32:47.641250Z",
+        "url": "https://files.pythonhosted.org/packages/60/a4/69950205305676f3a00e39212cc35f5705c9790bbc068b02581581d3eb2a/pulumi-crypto-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d08c57193887005088e5b8926c724cb0f03a1e7ae6d0c6904650e39fbcdf44bd",
+        "md5": "a3293eca65efd93a8989b6490a3e3502",
+        "sha256": "06075e184441212ce38810223d1655800012689d7286ad3663c5e8594c37bbe4"
+      },
+      "downloads": -1,
+      "filename": "pulumi_crypto-1.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a3293eca65efd93a8989b6490a3e3502",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 22925,
+      "upload_time": "2022-05-18T23:32:49",
+      "upload_time_iso_8601": "2022-05-18T23:32:49.041721Z",
+      "url": "https://files.pythonhosted.org/packages/d0/8c/57193887005088e5b8926c724cb0f03a1e7ae6d0c6904650e39fbcdf44bd/pulumi_crypto-1.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "60a469950205305676f3a00e39212cc35f5705c9790bbc068b02581581d3eb2a",
+        "md5": "67e53975186ecd8456664e382f0c5703",
+        "sha256": "afb2feac77b1e9df202a30d53093ad16ad564e5cc5f99379e34803b609ba3e4f"
+      },
+      "downloads": -1,
+      "filename": "pulumi-crypto-1.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "67e53975186ecd8456664e382f0c5703",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 23712,
+      "upload_time": "2022-05-18T23:32:47",
+      "upload_time_iso_8601": "2022-05-18T23:32:47.641250Z",
+      "url": "https://files.pythonhosted.org/packages/60/a4/69950205305676f3a00e39212cc35f5705c9790bbc068b02581581d3eb2a/pulumi-crypto-1.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

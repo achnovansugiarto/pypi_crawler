@@ -1,0 +1,317 @@
+{
+  "info": {
+    "author": "Che-Hsun Liu",
+    "author_email": "chehsunliu@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Framework :: Pytest",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Software Development :: Quality Assurance",
+      "Topic :: Software Development :: Testing"
+    ],
+    "description": "# pytest-stepfunctions\n\n![GitHub Actions/CI](https://github.com/chehsunliu/pytest-stepfunctions/workflows/CI/badge.svg)\n[![codecov](https://codecov.io/gh/chehsunliu/pytest-stepfunctions/branch/master/graph/badge.svg)](https://codecov.io/gh/chehsunliu/pytest-stepfunctions)\n[![pypi-version](https://img.shields.io/pypi/v/pytest-stepfunctions)](https://pypi.python.org/pypi/pytest-stepfunctions)\n[![pypi-downloads](https://img.shields.io/pypi/dm/pytest-stepfunctions.svg)](https://pypistats.org/packages/pytest-stepfunctions)\n[![pypi-pyversions](https://img.shields.io/pypi/pyversions/pytest-stepfunctions)](https://pypi.python.org/pypi/pytest-stepfunctions)\n\nA pytest fixture that makes you able to mock Lambda code during AWS StepFunctions local testing.\n\n## Table of Contents\n\n- [Overview](#overview)\n- [Installing](#installing)\n- [Getting Started](#getting-started)\n  * [Creating a State Machine](#creating-a-state-machine)\n  * [Mocking the EMR Client in the Lambda Code](#mocking-the-emr-client-in-the-lambda-code)\n  * [Starting Execution and Validating Results](#starting-execution-and-validating-results)\n  * [Running the Test with the Step Functions JAR](#running-the-test-with-the-step-functions-jar)\n  * [Running the Test with the Step Functions Docker Image](#running-the-test-with-the-step-functions-docker-image)\n- [Contributing](#contributing)\n- [Known Issues](#known-issues)\n\n## Overview\n\nAWS provides local Step Functions as a JAR and a Docker image for the quick testing without deployment. They described how to perform such task in [this article](https://docs.aws.amazon.com/step-functions/latest/dg/sfn-local-lambda.html) as well. I got excited at the very beginning, but soon ended up frustrated for still being unable to mock Lambda functions' external dependencies. Then I thought: what if initiate a Python thread with a fake Lambda service and use this fake service to execute Lambda functions? Fortunately, It works!\n\n## Installing\n\nUse pip to install:\n\n```bash\n$ pip install pytest-stepfunctions\n```\n\n## Getting Started\n\nSuppose there is a state machine that simply collects all the EMR cluster unique identifiers. Here is the state machine definition:\n\n```json\n{\n  \"StartAt\": \"ListIds\",\n  \"States\": {\n    \"ListIds\": {\n      \"Type\": \"Task\",\n      \"Resource\": \"${ListIdsLambdaArn}\",\n      \"ResultPath\": \"$.cluster_ids\",\n      \"End\": true\n    }\n  }\n}\n```\n\nand the Lambda code `my/pkg/emr.py`:\n\n```python\nimport boto3\n\n\ndef list_ids(*args, **kwargs):\n    emr_client = boto3.client(\"emr\")\n    response = emr_client.list_clusters()\n\n    return [item[\"Id\"] for item in response[\"Clusters\"]]\n```\n\n### Creating a State Machine\n\nIn the test file `tests/test_foo.py`, create a Step Functions client with endpoint URL pointed to our Step Functions service, and use this client to create a state machine resource by using the definition above\n\n```python\nfrom string import Template\n\nimport boto3\n\n\ndef test_bar(aws_stepfunctions_endpoint_url):\n    definition_template = Template(\"\"\"\n    {\n      \"StartAt\": \"ListIds\",\n      \"States\": {\n        \"ListIds\": {\n          \"Type\": \"Task\",\n          \"Resource\": \"${ListIdsLambdaArn}\",\n          \"ResultPath\": \"$.cluster_ids\",\n          \"End\": true\n        }\n      }\n    }\n    \"\"\")\n    list_ids_lambda_arn = \"arn:aws:lambda:us-east-1:123456789012:function:my.pkg.emr.list_ids\"\n    definition = definition_template.safe_substitute(ListIdsLambdaArn=list_ids_lambda_arn)\n\n    sfn_client = boto3.client(\"stepfunctions\", endpoint_url=aws_stepfunctions_endpoint_url)\n    state_machine_arn = sfn_client.create_state_machine(\n        name=\"list-ids\", definition=definition, roleArn=\"arn:aws:iam::012345678901:role/DummyRole\"\n    )[\"stateMachineArn\"]\n```\n\nNote the internal fake Lambda service in pytest-stepfunctions will parse Lambda ARNs to recognize what to call.\n\n### Mocking the EMR Client in the Lambda Code\n\nHere uses the [pytest-mock](https://github.com/pytest-dev/pytest-mock/) fixture to temporarily patch the `boto3` module inside the Lambda code. `botocore.stub.Stubber` is also applied to make sure the mock request parameters and response content are all valid:\n\n```python\nfrom botocore.stub import Stubber\n\n\ndef test_bar(aws_stepfunctions_endpoint_url, mocker):\n    ...\n\n    emr_client = boto3.client(\"emr\")\n    mocker.patch(\"my.pkg.emr.boto3\", autospec=True).client.return_value = emr_client\n\n    stubber = Stubber(emr_client)\n    stubber.add_response(\n        \"list_clusters\", service_response={\"Clusters\": [{\"Id\": \"j-00001\"}, {\"Id\": \"j-00002\"}]}\n    )\n```\n\n### Starting Execution and Validating Results\n\nStart and wait until the execution status is not `RUNNING`:\n\n```python\nimport json\nimport time\n\n\ndef test_bar(aws_stepfunctions_endpoint_url, mocker):\n    ...\n\n    execution_arn = sfn_client.start_execution(\n        stateMachineArn=state_machine_arn, name=\"list-ids-exec\", input=\"{}\"\n    )[\"executionArn\"]\n\n    with stubber:\n        while True:\n            response = sfn_client.describe_execution(executionArn=execution_arn)\n            if response[\"status\"] != \"RUNNING\":\n                break\n            time.sleep(0.5)\n\n    stubber.assert_no_pending_responses()\n    assert \"SUCCEEDED\" == response[\"status\"]\n    assert [\"j-00001\", \"j-00002\"] == json.loads(response[\"output\"])[\"cluster_ids\"]\n```\n\n### Running the Test with the Step Functions JAR\n\nThe JAR is available [here](https://docs.aws.amazon.com/step-functions/latest/dg/sfn-local.html). Download and execute it first:\n\n```bash\n$ java -jar /path/to/StepFunctionsLocal.jar \\\n    --lambda-endpoint http://localhost:13000 \\\n    --step-functions-endpoint http://localhost:8083 \\\n    --wait-time-scale 0\nStep Functions Local\nVersion: 1.4.0\nBuild: 2019-09-18\n2020-07-06 18:40:28.284: Configure [Lambda Endpoint] to [http://localhost:13000]\n2020-07-06 18:40:28.285: Configure [Step Functions Endpoint] to [http://localhost:8083]\n2020-07-06 18:40:28.323: Loaded credentials from profile: default\n2020-07-06 18:40:28.324: Starting server on port 8083 with account 123456789012, region us-east-1\n```\n\nThen run the test with the following command:\n\n```bash\n$ python -m pytest -v \\\n    --pytest-stepfunctions-endpoint-url=http://0.0.0.0:8083 \\\n    --pytest-stepfunctions-lambda-address=0.0.0.0 \\\n    --pytest-stepfunctions-lambda-port=13000 \\\n    ./tests\n=============================== test session starts ================================\nplatform linux -- Python 3.7.3, pytest-5.4.3, py-1.9.0, pluggy-0.13.1 -- /tmp/gg/venv/bin/python\ncachedir: .pytest_cache\nrootdir: /tmp/gg\nplugins: mock-3.1.1, stepfunctions-0.1a2\ncollected 1 item\n\ntests/test_foo.py::test_bar PASSED                                           [100%]\n\n================================ 1 passed in 1.01s =================================\n```\n\n### Running the Test with the Step Functions Docker Image\n\nI personally recommend this way as it is much easier to reproduce the testing environment.\n\nThis is the `Dockerfile`\n\n```dockerfile\nFROM python:3.7\n\nWORKDIR /app\n\nCOPY ./my ./my\nCOPY ./tests ./tests\nRUN pip install pytest pytest-stepfunctions pytest-mock boto3\n```\n\nand the `docker-compose.yml` for Docker Compose:\n\n```yaml\nversion: \"3.2\"\n\nservices:\n  tester:\n    build:\n      context: .\n      dockerfile: ./Dockerfile\n    environment:\n      AWS_DEFAULT_REGION: us-east-1\n      AWS_ACCESS_KEY_ID: xxx\n      AWS_SECRET_ACCESS_KEY: xxx\n    command: >\n      bash -c \"python -m pytest -v\n      --pytest-stepfunctions-endpoint-url=http://sfn-endpoint:8083\n      --pytest-stepfunctions-lambda-address=0.0.0.0\n      --pytest-stepfunctions-lambda-port=13000\n      ./tests\"\n\n  sfn-endpoint:\n    image: amazon/aws-stepfunctions-local:1.5.1\n    environment:\n      AWS_DEFAULT_REGION: us-east-1\n      AWS_ACCESS_KEY_ID: xxx\n      AWS_SECRET_ACCESS_KEY: xxx\n      WAIT_TIME_SCALE: 0\n      STEP_FUNCTIONS_ENDPOINT: http://sfn-endpoint:8083\n      LAMBDA_ENDPOINT: http://tester:13000\n```\n\nThen run the following command to run the test:\n\n```bash\n$ docker-compose up --build --exit-code-from tester\n```\n\n## Contributing\n\nHere are the tools required:\n\n- Docker and Docker Compose\n- GNU Make\n- [pip-tools](https://github.com/jazzband/pip-tools)\n\nSet up a virtual environment for your IDE:\n\n```bash\n$ python -m venv venv\n$ source ./venv/bin/activate\n(venv) $ pip-sync ./dev-requirements.txt ./requirements.txt\n```\n\nRun the tests and linters:\n\n```bash\n$ make lint test\n```\n\n## Known Issues\n\n1. Nested workflows are very slow: if a state machine contains lots of nested state machines, the execution will be extremely slow even `WAIT_TIME_SCALE` is set to 0. This is a known performance issue in the official JAR.\n2. AWS Service integrations other than Lambda are not supported yet. Services like EMR even have no endpoint option in the official JAR. A possible workaround for some cases is calling them by invoking Lambda functions.   \n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/chehsunliu/pytest-stepfunctions",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pytest-stepfunctions",
+    "package_url": "https://pypi.org/project/pytest-stepfunctions/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/pytest-stepfunctions/",
+    "project_urls": {
+      "Homepage": "https://github.com/chehsunliu/pytest-stepfunctions"
+    },
+    "release_url": "https://pypi.org/project/pytest-stepfunctions/0.1.1/",
+    "requires_dist": [
+      "pytest"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A small description",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10292527,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c79fc1517726fab66dc2537406637ad9928fbaaae94ff9ecb3d42e074210e41",
+          "md5": "6793dec2e384297722db13b7d4085208",
+          "sha256": "46c1486c26bc705fb345297fdb78986fec2aa9d3b4294e8c694b99be9ab189f1"
+        },
+        "downloads": -1,
+        "filename": "pytest_stepfunctions-0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6793dec2e384297722db13b7d4085208",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 7901,
+        "upload_time": "2020-07-07T01:27:00",
+        "upload_time_iso_8601": "2020-07-07T01:27:00.610443Z",
+        "url": "https://files.pythonhosted.org/packages/1c/79/fc1517726fab66dc2537406637ad9928fbaaae94ff9ecb3d42e074210e41/pytest_stepfunctions-0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1852695256d8513652df8cc74b426ff363ada6cbd8848bd8772c3608d85c591e",
+          "md5": "ccb44d874dab629fca68aecbae370713",
+          "sha256": "56bcd2f94f4e313542bc41f163e079c367d208e58ef26e5cf54976a6819a12eb"
+        },
+        "downloads": -1,
+        "filename": "pytest-stepfunctions-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ccb44d874dab629fca68aecbae370713",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25445,
+        "upload_time": "2020-07-07T01:27:01",
+        "upload_time_iso_8601": "2020-07-07T01:27:01.546688Z",
+        "url": "https://files.pythonhosted.org/packages/18/52/695256d8513652df8cc74b426ff363ada6cbd8848bd8772c3608d85c591e/pytest-stepfunctions-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1769ca49641a6aeca2eda6e024d09b46931ab44f6ebd58200ea594a0db35af00",
+          "md5": "5add31ba73e63cfcfb9e0659322e0ecf",
+          "sha256": "76bd42b718bf345ef9501b3a024dbad3fd7d3d7ebf0a7a6a5e9d4f3cb6ad3da7"
+        },
+        "downloads": -1,
+        "filename": "pytest_stepfunctions-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5add31ba73e63cfcfb9e0659322e0ecf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 8113,
+        "upload_time": "2021-05-08T05:22:54",
+        "upload_time_iso_8601": "2021-05-08T05:22:54.654162Z",
+        "url": "https://files.pythonhosted.org/packages/17/69/ca49641a6aeca2eda6e024d09b46931ab44f6ebd58200ea594a0db35af00/pytest_stepfunctions-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3025607910bfb5c612a84f9b7ec08cc6de25a480aad3785c7a23bbb956a5dec0",
+          "md5": "e7910bfd2cb5ba2fecd0707d8e92f008",
+          "sha256": "b3d1a2df7cef142f235a4be44d8c69ee60175db6de9385d5a9a2d2242af7b914"
+        },
+        "downloads": -1,
+        "filename": "pytest-stepfunctions-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e7910bfd2cb5ba2fecd0707d8e92f008",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25852,
+        "upload_time": "2021-05-08T05:22:55",
+        "upload_time_iso_8601": "2021-05-08T05:22:55.791340Z",
+        "url": "https://files.pythonhosted.org/packages/30/25/607910bfb5c612a84f9b7ec08cc6de25a480aad3785c7a23bbb956a5dec0/pytest-stepfunctions-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9d8fae07341c2f04e1eb44b743d899842ae18e4f0472dc646b7a63bcc553d1f8",
+          "md5": "f9807280c87bd0865578db16eb83e275",
+          "sha256": "a41d7e5e8522f1e7d47027ba5463620f18266604de81002b4ff7fd1b70df7adf"
+        },
+        "downloads": -1,
+        "filename": "pytest_stepfunctions-0.1a0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f9807280c87bd0865578db16eb83e275",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 2525,
+        "upload_time": "2020-06-29T19:31:33",
+        "upload_time_iso_8601": "2020-06-29T19:31:33.520424Z",
+        "url": "https://files.pythonhosted.org/packages/9d/8f/ae07341c2f04e1eb44b743d899842ae18e4f0472dc646b7a63bcc553d1f8/pytest_stepfunctions-0.1a0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bbbc73c393c68c413701c13e7aa13c957b1260747bdc8c1d2f111727a4bf5968",
+          "md5": "7538b91e25d990fb34991138b955ffa1",
+          "sha256": "d4f63d29948e23aa2c5ba58891017a7ddc5c54cc252e77e5c719936746bc9c68"
+        },
+        "downloads": -1,
+        "filename": "pytest-stepfunctions-0.1a0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7538b91e25d990fb34991138b955ffa1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 13109,
+        "upload_time": "2020-06-29T19:31:35",
+        "upload_time_iso_8601": "2020-06-29T19:31:35.790777Z",
+        "url": "https://files.pythonhosted.org/packages/bb/bc/73c393c68c413701c13e7aa13c957b1260747bdc8c1d2f111727a4bf5968/pytest-stepfunctions-0.1a0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "381e509e8ccebf009bf82e9b6dedaed4c517837719c47cb23fa63b4d2cab0072",
+          "md5": "1f1595477c2702821fc27501a1ec33fe",
+          "sha256": "797154daa8a655dd50c7e6c6d377db9422f63a7fec17d239231380d23b1150d9"
+        },
+        "downloads": -1,
+        "filename": "pytest_stepfunctions-0.1a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1f1595477c2702821fc27501a1ec33fe",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 2640,
+        "upload_time": "2020-06-29T20:03:59",
+        "upload_time_iso_8601": "2020-06-29T20:03:59.117066Z",
+        "url": "https://files.pythonhosted.org/packages/38/1e/509e8ccebf009bf82e9b6dedaed4c517837719c47cb23fa63b4d2cab0072/pytest_stepfunctions-0.1a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97f133e6d1a32e68368592187c1a3f448bbd3fb70d63b98106067792672d6077",
+          "md5": "6ffb2d6a25aaede19fa34d2d36f005f4",
+          "sha256": "178505b7598893797b538e82364a6373d8b2e7458651f97fe07263efa009c971"
+        },
+        "downloads": -1,
+        "filename": "pytest-stepfunctions-0.1a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ffb2d6a25aaede19fa34d2d36f005f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 13328,
+        "upload_time": "2020-06-29T20:03:59",
+        "upload_time_iso_8601": "2020-06-29T20:03:59.909641Z",
+        "url": "https://files.pythonhosted.org/packages/97/f1/33e6d1a32e68368592187c1a3f448bbd3fb70d63b98106067792672d6077/pytest-stepfunctions-0.1a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "736192fb5e1030bf1bdef87970ac28c24f28caba9d38afe541f1eb4f00132511",
+          "md5": "ad2fccfff446fdb58ea734fc8f96f6af",
+          "sha256": "9cffe4542ef98ec7da4b9feaa95885d5ed03d354e7fa79bce0a5ca7067b1ec30"
+        },
+        "downloads": -1,
+        "filename": "pytest_stepfunctions-0.1a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ad2fccfff446fdb58ea734fc8f96f6af",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 5029,
+        "upload_time": "2020-07-03T17:26:24",
+        "upload_time_iso_8601": "2020-07-03T17:26:24.048249Z",
+        "url": "https://files.pythonhosted.org/packages/73/61/92fb5e1030bf1bdef87970ac28c24f28caba9d38afe541f1eb4f00132511/pytest_stepfunctions-0.1a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee581b86a1184bd97267abc6239a0eca6c03612c8830d8cc3c449829ead9ad1d",
+          "md5": "98a4d80336b6f38b8ffc0f18ca163dc6",
+          "sha256": "ce70a845b381ca4c7d5c912c59d9007f56a7625c74fe761aded90e8e2ad0fabc"
+        },
+        "downloads": -1,
+        "filename": "pytest-stepfunctions-0.1a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "98a4d80336b6f38b8ffc0f18ca163dc6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17138,
+        "upload_time": "2020-07-03T17:26:24",
+        "upload_time_iso_8601": "2020-07-03T17:26:24.750152Z",
+        "url": "https://files.pythonhosted.org/packages/ee/58/1b86a1184bd97267abc6239a0eca6c03612c8830d8cc3c449829ead9ad1d/pytest-stepfunctions-0.1a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1769ca49641a6aeca2eda6e024d09b46931ab44f6ebd58200ea594a0db35af00",
+        "md5": "5add31ba73e63cfcfb9e0659322e0ecf",
+        "sha256": "76bd42b718bf345ef9501b3a024dbad3fd7d3d7ebf0a7a6a5e9d4f3cb6ad3da7"
+      },
+      "downloads": -1,
+      "filename": "pytest_stepfunctions-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5add31ba73e63cfcfb9e0659322e0ecf",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 8113,
+      "upload_time": "2021-05-08T05:22:54",
+      "upload_time_iso_8601": "2021-05-08T05:22:54.654162Z",
+      "url": "https://files.pythonhosted.org/packages/17/69/ca49641a6aeca2eda6e024d09b46931ab44f6ebd58200ea594a0db35af00/pytest_stepfunctions-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3025607910bfb5c612a84f9b7ec08cc6de25a480aad3785c7a23bbb956a5dec0",
+        "md5": "e7910bfd2cb5ba2fecd0707d8e92f008",
+        "sha256": "b3d1a2df7cef142f235a4be44d8c69ee60175db6de9385d5a9a2d2242af7b914"
+      },
+      "downloads": -1,
+      "filename": "pytest-stepfunctions-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "e7910bfd2cb5ba2fecd0707d8e92f008",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 25852,
+      "upload_time": "2021-05-08T05:22:55",
+      "upload_time_iso_8601": "2021-05-08T05:22:55.791340Z",
+      "url": "https://files.pythonhosted.org/packages/30/25/607910bfb5c612a84f9b7ec08cc6de25a480aad3785c7a23bbb956a5dec0/pytest-stepfunctions-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,137 @@
+{
+  "info": {
+    "author": "Alex Tkachenko",
+    "author_email": "preusx.dev@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 2 - Pre-Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Topic :: Utilities"
+    ],
+    "description": "# Django configurable affectors\n\nUnified interface to create affector/filters configurations.\n\n## Installation\n\n```sh\npip install px-django-massaffect\n```\n\n## Configuration\n\nLibrary allows to define any amount of filter sets. So to use filtering capabilities you should generate base classes and define adapters to apply filter.\n\nFirst - create root affector model, that all other affectors will inherit from.\n\n`models/something.py`\n```python\nfrom pxd_massaffect.models import make_formula_field\n\n\nclass SomethingThatCanAffect(models.Model):\n  # Simple text field, where user may define affectors formula.\n  filters_formula = make_formula_field()\n```\n\n`models/affector.py`\n```python\nfrom pxd_massaffect.models import make_config_base\n\n\n# Affector model for any other affector to inherit from:\nclass Affector(make_config_base(\n  # Abstract model name prefix.\n  'affector',\n  # Parent model, that will store configurations inside.\n  'yourapp.SomethingThatCanAffect',\n  # Related name to find all affectors.\n  related_name='affectors',\n  # Your app label. Not required.\n  app_label='yourapp',\n)):\n  # Each of your affectors instance fill have a variable name to use in\n  # affecting formula.\n  # You may change prefix to any simple string. Simpler - better)\n  variable_prefix = 'F'\n```\n\nNow you may define any particular affector you want. You'll need a configuration model and affector adapter to apply filtering:\n\n`models/affectors.py` - Config\n```python\nfrom .affector import Affector\n\n\nclass CategoriesAffectorConfig(Affector):\n  categories = models.ManyToManyField(Category)\n```\n\n`affector_adapters.py` - Adapters storage:\n```python\nfrom django.db import models\nfrom pxd_massaffect.registry import AffectDescriptor, AffectAdapter\n\nfrom .models import CategoriesAffectorConfig, ModelThatCanBeAffected\n\n\nclass CategoriesAffectAdapter(AffectAdapter):\n  # By implementing `affect_Q` or `affect_queryset` we are making affector\n  # capable of queryset handling.\n  def affect_Q(self, config: CategoriesAffectorConfig, **kw) -> models.Q:\n    return models.Q(category__in=config.categories.all())\n\n  # If we want to affect some list of models instances we should\n  # implement either `affect_item` or `affect_items`.\n  def affect_item(self, config: CategoriesAffectorConfig, item, **kw):\n    return item.category_id in {x.pk for x in config.categories.all()}\n\n\n# Now, to register filter we need to have a filter descriptor instance:\ncategories_affector = AffectDescriptor(\n  CategoriesAffectorConfig,\n  CategoriesAffectAdapter({ModelThatCanBeAffected}),\n)\n```\n\nThen you need to define your affectors registry:\n\n`affectors_registry.py`\n```python\nfrom pxd_massaffect.registry import AffectRegistry\n\nfrom .affector_adapters import categories_affector\n\n\nregistry = AffectRegistry()\n\n# Add affect descriptors to a registry:\nregistry.multiregister([\n  categories_affector,\n  # or\n  'yourapp.affector_adapters.categories_affector',\n])\n```\n\n### Admin interface\n\nAll your affectors will be presented through 1 inline set:\n\n```python\nfrom pxd_massaffect.admin import AffectConfigSetInline, AffectConfigInline\n\nfrom .affectors_registry import registry\nfrom .models import Affector\n\n\nclass AffectorSetInline(AffectConfigSetInline):\n  registry = registry\n  model = Affector\n```\n\nAnd add this inline to a `SomethingThatCanAffect` model admin definition:\n\n```python\nfrom django.contrib import admin\n\nimport nested_admin\nfrom .models import SomethingThatCanAffect\n\nfrom .affectors_admin import AffectorSetInline\n\n\n@admin.register(SomethingThatCanAffect)\nclass SomethingThatCanAffectAdmin(nested_admin.NestedPolymorphicModelAdmin):\n  inlines = [\n    AffectorSetInline,\n  ]\n```\n\n## Usage\n\nAll that configuration above was made for you to be able to:\n\n1. Calculate something during db selection request and add that calculation to annotation field.\n2. Calculate something for each element in list and get back result.\n\nFor that purpose there are two classes: `Affector` and `ParentsAffector`.\n\n`Affector` is a basic class takes arbitrary configuration instances and runs them for a set of objects/queryset.\n\nWhen `ParentsAffector` is a little bit more complicated, because it collects affector configurations and resolving formulas from \"parent\" instances passed inside and then uses `Affector` to get the result.\n\n```python\nfrom pxd_massaffect.affector import (\n  Affector, ParentsAffector,\n  and_resolver, or_resolver,\n  make_formula_resolver,\n)\nfrom .affectors_registry import registry\n\n\naffector = Affector(registry)\n\n\nclass SomethingAffector(ParentsAffector):\n  affector = affector\n\n  # Based on formula from 'filters_formula' configurations will be resolved\n  # for each passed parent:\n  def get_parent_resolver(self, parent: SomethingThatCanAffect):\n    return make_formula_resolver(parent.filters_formula)\n\n\nsomething = SomethingThatCanAffect.objects.first()\nsomething_affector = SomethingAffector([something])\n# QuerySet will have additional annotation fields with result.\n# And `fields_map` is the mapping parent->field_name.\n# This way you can choose how you want to interpolate/query that data by\n# yourself.\nqueryset, fields_map = something_affector.affect_queryset(\n  SomeAffectableModel.objects.all()\n)\n# > (queryset, {something: 'autogenerated_field_name'})\n\n# Line above with usage of base Affector class could look something like that:\nqueryset, field_name = affector.affect_queryset(\n  # Passing list of affectors\n  something.affectors.all(),\n  # Queryset to affect\n  SomeAffectableModel.objects.all(),\n  # Formula resolver. By default it will be a \"bitwise and\" conjunction:\n  resolver=make_formula_resolver(something.filters_formula),\n  # Additional kwargs to adapters:\n  kwargs={},\n)\n# > (queryset, 'autogenerated_field_name')\n# But `ParentsAffector` is more suitable for multiple parents handling at once.\n\n# After that you may do anything with that field:\nqueryset.filter(**{field_name: True})\n```\n\nSame logic could be used for a lists of objects. You just need to change the method from `affect_queryset` to `affect_items`.\n# Changelog\nAll notable changes to this project will be documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),\nand this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n## [Unreleased]\n\n## [0.1.2]\n### Added\n- Default value configuration for affector result.\n\n## [0.1.1]\n### Fixed\n- `affect_Q` method kwargs passing.\n\n## [0.1.0]\nInitial version.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "px-django-massaffect",
+    "package_url": "https://pypi.org/project/px-django-massaffect/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/px-django-massaffect/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/px-django-massaffect/0.1.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "Factory to make modular model multi-configurations.",
+    "version": "0.1.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15890622,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3ac10d124ede9ba42fbf18132c7837e28da09b05901386ee15ce2a80f332cf6",
+          "md5": "3af92e9b73d23498cae1c5c343b143be",
+          "sha256": "99aae7bc90fd1dc2f1d76f177e5d66b713974f179c92efd5889b2f0188c8c680"
+        },
+        "downloads": -1,
+        "filename": "px-django-massaffect-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3af92e9b73d23498cae1c5c343b143be",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 23860,
+        "upload_time": "2022-11-18T12:51:13",
+        "upload_time_iso_8601": "2022-11-18T12:51:13.216030Z",
+        "url": "https://files.pythonhosted.org/packages/a3/ac/10d124ede9ba42fbf18132c7837e28da09b05901386ee15ce2a80f332cf6/px-django-massaffect-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b5f5edf04e0f68cd1dd9581187971608a2f915109bd2a9ea0563f932b8c97f9",
+          "md5": "3581260dae4d8b861fb416b5ddc2da0d",
+          "sha256": "6066169b379b87a15deda964ace3fbfa8ea384442dd67f337d2ef696de4b19a7"
+        },
+        "downloads": -1,
+        "filename": "px-django-massaffect-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3581260dae4d8b861fb416b5ddc2da0d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 23872,
+        "upload_time": "2022-11-22T12:26:11",
+        "upload_time_iso_8601": "2022-11-22T12:26:11.871078Z",
+        "url": "https://files.pythonhosted.org/packages/2b/5f/5edf04e0f68cd1dd9581187971608a2f915109bd2a9ea0563f932b8c97f9/px-django-massaffect-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "17009377123bb8f6b133613c7cbcf21ae7d2a76cde3a4c83c225bf9218de227c",
+          "md5": "a86695045e96b75fdf9eb8b1d96da257",
+          "sha256": "12f86b8b2b19a1cacdce78a0d2ac6fc0f66a01b54a245a72a19fc51b6ca9f38b"
+        },
+        "downloads": -1,
+        "filename": "px-django-massaffect-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a86695045e96b75fdf9eb8b1d96da257",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 23940,
+        "upload_time": "2022-11-25T14:17:03",
+        "upload_time_iso_8601": "2022-11-25T14:17:03.021790Z",
+        "url": "https://files.pythonhosted.org/packages/17/00/9377123bb8f6b133613c7cbcf21ae7d2a76cde3a4c83c225bf9218de227c/px-django-massaffect-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "17009377123bb8f6b133613c7cbcf21ae7d2a76cde3a4c83c225bf9218de227c",
+        "md5": "a86695045e96b75fdf9eb8b1d96da257",
+        "sha256": "12f86b8b2b19a1cacdce78a0d2ac6fc0f66a01b54a245a72a19fc51b6ca9f38b"
+      },
+      "downloads": -1,
+      "filename": "px-django-massaffect-0.1.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a86695045e96b75fdf9eb8b1d96da257",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 23940,
+      "upload_time": "2022-11-25T14:17:03",
+      "upload_time_iso_8601": "2022-11-25T14:17:03.021790Z",
+      "url": "https://files.pythonhosted.org/packages/17/00/9377123bb8f6b133613c7cbcf21ae7d2a76cde3a4c83c225bf9218de227c/px-django-massaffect-0.1.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

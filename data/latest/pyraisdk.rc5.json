@@ -1,0 +1,314 @@
+{
+  "info": {
+    "author": "Xiaodong Yang",
+    "author_email": "xiaoyan@microsoft.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# pyraisdk\n\n## Overview\n\nAML models are meant to be deployed to GPU instances to provide inference service. If the code that operates the model uses the GPU for inferencing in each request separately,\nthe overall performance of the model will be quite inefficent. This SDK has APIs that can allocate batches of inference requests to run on the GPU in a separate thread, thereby considerably\nimproving the usage efficiency of GPU and making the model more performant. \n\nThe SDK also collects telemetry data for each so the performance of the model can be evaluated and tracked and provides logging primitives that can be used\nto produce additional troubleshooting information.\n\n\n## Using pyraisdk\n\n### Integrating with Model\nFollow the steps below to integrate pyraisdk.\n\n1. In environment configuration, list latest [pyraisdk version](https://github.com/microsoft/rai-orchestrator/blob/master/pyraisdk/pyproject.toml#L3) as a dependency.\n2. Import resources from pyraisdk\n  ```\n  from pyraisdk import rlog\n  from pyraisdk.dynbatch import BaseModel, DynamicBatchModel\n  ```\n3. Implement `BaseModel` class, which includes methods `preprocess()` and `predict()`, to define how data must be preprocessed and how inferences are made.\n4. At process start (e.g. in `init()` function if deploying with scoring script), initialize logging, instantiate object of class that implements `BaseModel`, and define global variable for batched model as shown below. \n  ```\n  rlog.initialize()\n  \n  global batched_model\n  malware_model = MalwareModel()\n  batched_model = DynamicBatchModel(malware_model)\n  ```\n5. In request handler (e.g. in `run()` function if deploying with scoring script), pass list of requests to the batched model's `predict()` method and return results. Under-the-hood, pyraisdk creates batches and uses your model's `preprocess()` and `predict()` methods to generate results.\n  ```\n  return batched_model.predict(json.loads(request_data)['data'])\n  ```\n6. Optionally log additional structured and unstructured events using `EventLogger` [methods](https://github.com/microsoft/rai-orchestrator/blob/master/pyraisdk/pyraisdk/rlog/log.py). It is not necessary to log latency information, as pyraisdk does so automatically.\n\n### Configuring CD Pipeline\nIn addition to following the CD pipeline's [developer guidelines](https://github.com/microsoft/rai-orchestrator/blob/master/cicd/cd/regional/raicd/README.md#prerequisites-to-adding-or-modifying-endpoint-configurations) to onboard your model to RAI's deployment infrastructure, you must configure `BatchingConfig` for each deployment target to which your model will be deployed. To do so, \n1. Open the appropriate configuration file under `deployment-target-configs/../*.json`\n2. Configure the model's `Version`, `InstanceType` / SKU, and `BatchingConfig` as shown below\n  ```json\n  {\n\t  \"Name\": \"MalwareNeural\",\n\t  \"Version\": 19,\n      \"InstanceType\": \"Standard_NC6s_v3\",\n      \"BatchingConfig\": {\n          \"MaxBatchSize\": 12,\n          \"IdleBatchSize\": 5,\n          \"MaxBatchInterval\": 0.002\n      }\n  }\n  ```\nWhen the CD pipeline deploys the model to an AML online deployment, it exports environment variables for each `BatchingConfig` field, which pyraisdk utilizes at process start to configure batching parameters. The CD pipeline also exports environment variables to enable pyraisdk to log to RAI's Azure Data Explorer clusters.\n\n### Test or Deploy without RAI CD Pipeline\n\nTest or Deploy independetly outside of RAI CD Pipeline, it's required to set environment variables for `BatchingConfig` manually before object of `DynamicBatchModel` is created. Refer to [Batching Parameter](#batching-parameter-attention). \n\nTo enable log publishing (to eventhub), there are another several environment variables need to be set, refer to following logging part. It's optional.\n\n\n## Dynamic Batching Support\n\nThere are APIs you **must** implement in your model to support batching of inference requests for best model performance. Those APIs allow the SDK\nto distribute load efficiently to the GPU instances. The APIs are:\n\n* ```preprocess``` Modifies the input to the model, if necessary. For example, if your model needs the input in a special JSON format instead of as a list\nof strings, you can do that modification in the *preprocess* method.\n* ```predict``` Executes the model inference for a list of input strings\n\n### Batching Parameter (**Attention**)\n\nBatching parameters are mandatory and should be ready before DynamicBatchModel is created. They are set through environment variables:\n- **PYRAISDK_MAX_BATCH_SIZE** (int): Max size of each processing batch.\n- **PYRAISDK_IDLE_BATCH_SIZE** (int): If there's no more data in queue, a new batch will be launched when size reaches this value.\n- **PYRAISDK_MAX_BATCH_INTERVAL** (float): Max interval in seconds to wait for items. When waiting time exceeds, will launch a batch immediately.\n\n\n### Usage Examples\n\nBuild `YourModel` class inherited from `pyraisdk.dynbatch.BaseModel`.\n\n```python\nfrom typing import List\nfrom pyraisdk.dynbatch import BaseModel\n\nclass YourModel(BaseModel):\n    def predict(self, items: List[str]) -> List[int]:\n        rs = []\n        for item in items:\n            rs.append(len(item))\n        return rs\n            \n    def preprocess(self, items: List[str]) -> List[str]:\n        rs = []\n        for item in items:\n            rs.append(f'[{item}]')\n        return rs\n```\n\nInitialize a `pyraisdk.dynbatch.DynamicBatchModel` with `YourModel` instance, and call `predict / predict_one` for inferencing.\n\n```python\nfrom pyraisdk.dynbatch import DynamicBatchModel\n\n# prepare model\nsimple_model = YourModel()\nbatch_model = DynamicBatchModel(simple_model)\n\n# predict\nitems = ['abc', '123456', 'xyzcccffaffaaa']\npredictions = batch_model.predict(items)\nassert predictions == [5, 8, 16]\n\n# predict_one\nitem = 'abc'\nprediction = batch_model.predict_one(item)\nassert prediction == 5\n```\n\nConcurrent requests to `predict / predict_one`, in different threads.\n\n```python\nfrom threading import Thread\nfrom pyraisdk.dynbatch import DynamicBatchModel\n\n# prepare model\nsimple_model = YourModel()\nbatch_model = DynamicBatchModel(simple_model)\n\n# thread run function\ndef run(name, num):\n    for step in range(num):\n        item = f'{name}-{step}'\n        prediction = batch_model.predict_one(item)\n        assert prediction == len(item) + 2\n\n# start concurrent inference\nthreads = [Thread(target=run, args=(f'{tid}', 100)) for tid in range(20)]\nfor t in threads:\n    t.start()\nfor t in threads:\n    t.join()\n```\n\n## Loging & Events\n\n### Description\nThis module is for logging and event tracing.\n\n### interface\n\n```python\ndef initialize(\n    eh_hostname: Optional[str] = None,\n    client_id: Optional[str] = None,\n    eh_conn_str: Optional[str] = None,\n    eh_structured: Optional[str] = None,\n    eh_unstructured: Optional[str] = None,\n    role: Optional[str] = None,\n    instance: Optional[str] = None,\n    sys_metrics_enable: bool = True,\n)\n```\n\nParameter description for `initialize`:\n- **eh_hostname**: Fully Qualified Namespace aka EH Endpoint URL (*.servicebus.windows.net). Default, read `${EVENTHUB_NAMESPACE}.servicebus.windows.net`\n- **client_id**: client_id of service principal. Default, read $UAI_CLIENT_ID\n- **eh_conn_str**: connection string of eventhub namespace. Default, read $EVENTHUB_CONN_STRING\n- **eh_structured**: structured eventhub name. Default, read $EVENTHUB_AUX_STRUCTURED\n- **eh_unstructured**: unstructured eventhub name. Default, read $EVENTHUB_AUX_UNSTRUCTURED\n- **role**: role, Default: `RemoteModel`\n- **instance**: instance, Default: `${MODEL_NAME}|${ENDPOINT_VERSION}|{hostname}` or `${MODEL_NAME}|${ENDPOINT_VERSION}|{_probably_unique_id()}`\n- **sys_metrics_enable**: Whether to enable auto metrics reporting periodically for system info like gpu, memory and gpu. Default: True\n\n```python\ndef event(self, key: str, code: str, numeric: float, detail: str='', corr_id: str='', elem: int=-1)\ndef infof(self, format: str, *args: Any)\ndef infocf(self, corr_id: str, elem: int, format: str, *args: Any)\ndef warnf(self, format: str, *args: Any)\ndef warncf(self, corr_id: str, elem: int, format: str, *args: Any)\ndef errorf(self, format: str, *args: Any)\ndef errorcf(self, corr_id: str, elem: int, ex: Optional[Exception], format: str, *args: Any)\ndef fatalf(self, format: str, *args: Any)\ndef fatalcf(self, corr_id: str, elem: int, ex: Optional[Exception], format: str, *args: Any)\n```\n\n### examples\n\n```python\n# export EVENTHUB_AUX_UNSTRUCTURED='ehunstruct'\n# export EVENTHUB_AUX_STRUCTURED='ehstruct'\n# export UAI_CLIENT_ID='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n# export EVENTHUB_NAMESPACE='raieusdev-eh-namespace'\n\nfrom pyraisdk import rlog\nrlog.initialize()\n\nrlog.infof('this is a info message %s', 123)\nrlog.event('LifetimeEvent', 'STOP_GRACEFUL_SIGNAL', 0, 'detail info')\n```\n\n```python\n# export EVENTHUB_AUX_UNSTRUCTURED='ehunstruct'\n# export EVENTHUB_AUX_STRUCTURED='ehstruct'\n# export EVENTHUB_CONN_STRING='<connection string>'\n\nfrom pyraisdk import rlog\nrlog.initialize()\n\nrlog.infocf('corrid', -1, 'this is a info message: %s', 123)\nrlog.event('RequestDuration', '200', 0.01, 'this is duration in seconds')\n```\n\n```python\nfrom pyraisdk import rlog\nrlog.initialize(eh_structured='ehstruct', eh_unstructured='ehunstruct', eh_conn_str='<eventhub-conn-str>')\n\nrlog.errorcf('corrid', -1, Exception('error msg'), 'error message: %s %s', 1,2)\nrlog.event('CpuUsage', '', 0.314, detail='cpu usage', corr_id='corrid', elem=-1)\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pyraisdk",
+    "package_url": "https://pypi.org/project/pyraisdk/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pyraisdk/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/pyraisdk/0.3.1/",
+    "requires_dist": [
+      "azure-eventhub (>=5.10.1,<6.0.0)",
+      "azure-identity (>=1.7.0,<2.0.0)",
+      "dataclasses-json (>=0.5.7,<0.6.0)",
+      "psutil (>=5.6.3,<6.0.0)",
+      "flask"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "",
+    "version": "0.3.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17480036,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ebff707281f7afd9fd5c6dedcc04c62dce430adc81288aaeaa313f095f927140",
+          "md5": "eb537f439a4db2710a5cef278cb188d0",
+          "sha256": "0b290db898096fdcc5b486c71f9eea01a066f5af7d508eb44122f09899fe5328"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eb537f439a4db2710a5cef278cb188d0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14123,
+        "upload_time": "2022-12-09T06:32:24",
+        "upload_time_iso_8601": "2022-12-09T06:32:24.199529Z",
+        "url": "https://files.pythonhosted.org/packages/eb/ff/707281f7afd9fd5c6dedcc04c62dce430adc81288aaeaa313f095f927140/pyraisdk-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93f77559c1b3a90739353be48f2b6baeed1e924fab8e306ff2c43e3ee3bc49ef",
+          "md5": "39f075d36f02fe9b67bcc33826ecf759",
+          "sha256": "83540d878e3a30a67ceeecd7a1f8e9591442ad399238aae5f0f1bcbe1bd9d601"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "39f075d36f02fe9b67bcc33826ecf759",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 12742,
+        "upload_time": "2022-12-09T06:32:26",
+        "upload_time_iso_8601": "2022-12-09T06:32:26.821921Z",
+        "url": "https://files.pythonhosted.org/packages/93/f7/7559c1b3a90739353be48f2b6baeed1e924fab8e306ff2c43e3ee3bc49ef/pyraisdk-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ce9960d3f7b80a0c2f71b64c3b9505a535eeaf9a0fedd75e8ec869014fb5bab",
+          "md5": "e5fb7604b38a8c8dbb299efdec836592",
+          "sha256": "3524aad886d82c02a6d0559d8d0100c09b8f1ea38cc2013e658febd005e91dc2"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e5fb7604b38a8c8dbb299efdec836592",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20084,
+        "upload_time": "2023-02-28T03:43:57",
+        "upload_time_iso_8601": "2023-02-28T03:43:57.602456Z",
+        "url": "https://files.pythonhosted.org/packages/1c/e9/960d3f7b80a0c2f71b64c3b9505a535eeaf9a0fedd75e8ec869014fb5bab/pyraisdk-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e6cacee94e380ef7af70af84e9b023d63baa8d215d52c749868b794bd68aa84",
+          "md5": "9503624ef0fc3a4b78b16f5b7cd5422e",
+          "sha256": "efc2936e98dbda9137ad291e4a45bc3f85e7156f9c4299ec398ce8c6d021e271"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9503624ef0fc3a4b78b16f5b7cd5422e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17517,
+        "upload_time": "2023-02-28T03:43:59",
+        "upload_time_iso_8601": "2023-02-28T03:43:59.630036Z",
+        "url": "https://files.pythonhosted.org/packages/5e/6c/acee94e380ef7af70af84e9b023d63baa8d215d52c749868b794bd68aa84/pyraisdk-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6594a87f032590e189cc6158b91be9fc5653636e2c2104c9239b73be90a36d2",
+          "md5": "e4d5156c2857a9937d8638babffbb633",
+          "sha256": "988f33c0a3b7da035acfb9c282d98a719172d1fdff2ee5478646c2e2797a65f9"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e4d5156c2857a9937d8638babffbb633",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20100,
+        "upload_time": "2023-03-09T04:35:24",
+        "upload_time_iso_8601": "2023-03-09T04:35:24.750082Z",
+        "url": "https://files.pythonhosted.org/packages/a6/59/4a87f032590e189cc6158b91be9fc5653636e2c2104c9239b73be90a36d2/pyraisdk-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f39e57e3a8fef72075e595b5244ffa190930850ede4496a6228e1b6be02780f",
+          "md5": "af24b5a04bdf97384d0757932f27329b",
+          "sha256": "67ea65eefbabccf1d3c05ebe54e38623d9ae1d542487b5533e23b75c334e4960"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af24b5a04bdf97384d0757932f27329b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17525,
+        "upload_time": "2023-03-09T04:35:27",
+        "upload_time_iso_8601": "2023-03-09T04:35:27.147906Z",
+        "url": "https://files.pythonhosted.org/packages/1f/39/e57e3a8fef72075e595b5244ffa190930850ede4496a6228e1b6be02780f/pyraisdk-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "596b6d9e8380a463ebef291a7d76373bb07843366312255c3db00fd2b79157aa",
+          "md5": "f7ce62a88c9bee76ef54c865294dda8e",
+          "sha256": "60e4db7f880d68cde850d82a3bc3ebd0dce6d3aa909df02d92c3c9c20febcccd"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f7ce62a88c9bee76ef54c865294dda8e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20531,
+        "upload_time": "2023-03-16T03:44:51",
+        "upload_time_iso_8601": "2023-03-16T03:44:51.036326Z",
+        "url": "https://files.pythonhosted.org/packages/59/6b/6d9e8380a463ebef291a7d76373bb07843366312255c3db00fd2b79157aa/pyraisdk-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "563942443e21ba04813c972a6a9e269b3832a8e97502ce1155edb2a6df289fb4",
+          "md5": "8efee6627b656d3ef31cf59b80d0ee2b",
+          "sha256": "53ed8bc605c165cc31a90754c6a97608bc398a3d5c2dbc57c3fdd27bfdcb71f3"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8efee6627b656d3ef31cf59b80d0ee2b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18236,
+        "upload_time": "2023-03-16T03:44:52",
+        "upload_time_iso_8601": "2023-03-16T03:44:52.879978Z",
+        "url": "https://files.pythonhosted.org/packages/56/39/42443e21ba04813c972a6a9e269b3832a8e97502ce1155edb2a6df289fb4/pyraisdk-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c9f9301a435b6d3c2fba09c439830c3b09a36d8c2501edc803c97f29cc9e60c4",
+          "md5": "99c7957ff4ddf30eb4595767e46b36f7",
+          "sha256": "7bbd0415c551bab00638735a156b3d1c6dae3ff87642ef248e2076aafb0ec898"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "99c7957ff4ddf30eb4595767e46b36f7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21405,
+        "upload_time": "2023-03-28T15:32:59",
+        "upload_time_iso_8601": "2023-03-28T15:32:59.503238Z",
+        "url": "https://files.pythonhosted.org/packages/c9/f9/301a435b6d3c2fba09c439830c3b09a36d8c2501edc803c97f29cc9e60c4/pyraisdk-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ba49e411093a596af9f0cc22de7c94041b374084f8254f163336b3bed5bbe62",
+          "md5": "e4f8dd6651e46f7bee7e161c6cacda3e",
+          "sha256": "d65f0211bc48416f033a1d9f7724b6c39fd2ca385ea13a7a086cc4786ca0eb81"
+        },
+        "downloads": -1,
+        "filename": "pyraisdk-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e4f8dd6651e46f7bee7e161c6cacda3e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19915,
+        "upload_time": "2023-03-28T15:33:00",
+        "upload_time_iso_8601": "2023-03-28T15:33:00.904928Z",
+        "url": "https://files.pythonhosted.org/packages/1b/a4/9e411093a596af9f0cc22de7c94041b374084f8254f163336b3bed5bbe62/pyraisdk-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c9f9301a435b6d3c2fba09c439830c3b09a36d8c2501edc803c97f29cc9e60c4",
+        "md5": "99c7957ff4ddf30eb4595767e46b36f7",
+        "sha256": "7bbd0415c551bab00638735a156b3d1c6dae3ff87642ef248e2076aafb0ec898"
+      },
+      "downloads": -1,
+      "filename": "pyraisdk-0.3.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "99c7957ff4ddf30eb4595767e46b36f7",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 21405,
+      "upload_time": "2023-03-28T15:32:59",
+      "upload_time_iso_8601": "2023-03-28T15:32:59.503238Z",
+      "url": "https://files.pythonhosted.org/packages/c9/f9/301a435b6d3c2fba09c439830c3b09a36d8c2501edc803c97f29cc9e60c4/pyraisdk-0.3.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1ba49e411093a596af9f0cc22de7c94041b374084f8254f163336b3bed5bbe62",
+        "md5": "e4f8dd6651e46f7bee7e161c6cacda3e",
+        "sha256": "d65f0211bc48416f033a1d9f7724b6c39fd2ca385ea13a7a086cc4786ca0eb81"
+      },
+      "downloads": -1,
+      "filename": "pyraisdk-0.3.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "e4f8dd6651e46f7bee7e161c6cacda3e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 19915,
+      "upload_time": "2023-03-28T15:33:00",
+      "upload_time_iso_8601": "2023-03-28T15:33:00.904928Z",
+      "url": "https://files.pythonhosted.org/packages/1b/a4/9e411093a596af9f0cc22de7c94041b374084f8254f163336b3bed5bbe62/pyraisdk-0.3.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

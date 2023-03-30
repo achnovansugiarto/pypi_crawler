@@ -1,0 +1,357 @@
+{
+  "info": {
+    "author": "David Jetter",
+    "author_email": "davidajetter@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# pydantic-dynamo\nA Python repository over DynamoDB leveraging the excellent \n[Pydantic](https://docs.pydantic.dev/) library to model records.\n\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n\n## Contributing\n\nPlease see [the contributing guide](./contributing.md).\n\n## Installation\nInstall from PyPI `pip install pydantic-dynamo`\n\nOr even better, use [Poetry](https://python-poetry.org/docs/) `poetry add pydantic-dynamo`\n\n## Usage\n\nThe intended usage of this package is a low-to-medium complexity application. You will lose\nsome benefits of the single-table pattern, specifically the ability to query\nand retrieve objects of different types in one connection. For most use cases except\nthe most complex examples, access patterns can be implemented to utilize the `list`/`list_between`\nand `get_batch` functions, documented below, to prevent N+1 queries.\n\nThis package assumes the specified table already exists and the application it is\nrunning from has sufficient access to the table.\n\nCurrently, the package requires the table be created with a partition key named \n`_table_item_id` and a sort key named `_table_content_id`.\n\nThe following IAM permissions are required:\n\n```yaml\n- dynamodb:BatchGetItem\n- dynamodb:BatchWriteItem\n- dynamodb:GetItem\n- dynamodb:PutItem\n- dynamodb:Query\n- dynamodb:UpdateItem\n```\n\n### Modeling\nCreate a Pydantic model specifically for storage. This should generally not be shared\nin API contracts or other external interfaces to adhere to single-responsibility principle.\n\n```python\nfrom pydantic import BaseModel\nfrom typing import Optional\n\nclass FilmActor(BaseModel):\n    id: str\n    name: str\n    review: Optional[str]\n    \n```\n\n### Instantiation\nThe repository configuration will dictate the prefix values used for the partition and sort\nkey attributes. Once data is saved, these values cannot be changed without losing\naccess to previously saved data.\n\n`partition_prefix` can be used to categorize data and potentially implement\nrow-based access control. See [DynamoDB docs](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/specifying-conditions.html)\nand [IAM Condition docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition.html).\n**Access control in this manner is only theoretical right now and has not been fully tested.**\n\n`partition_name` is used in conjunction with the `partition_prefix`, with a `#` delimiter,\nto form the partition key value of items within the repository. Individual items can then be\nsaved with their own partition ID value to allow querying based on the sort key values only,\nor they can be saved without their own partition ID to allow querying across the entire \nrepository.\n\n`content_type` is used as the prefix of the sort key value. Typically, this should be set\nto the snake-cased version of the pydantic class name, eg: `movie_character`.\n\nIf all repositories are sharing a single table, it's important that each repository \nhas a different combination of the above three values to ensure that the data is segmented.\nYou can choose to point repositories to different tables, but managing capacity becomes\na more complicated problem, which is outside the scope of this library.\n\nThere are two ways to instantiate a repository instance:\n\nThrough the `build` method that will generate the boto3 session and table objects:\n\n```python\nfrom pydantic_dynamo.repository import DynamoRepository\nrepo = DynamoRepository[FilmActor].build(\n    table_name=\"dynamodb-table-name\",\n    item_class=FilmActor,\n    partition_prefix=\"content\",\n    partition_name=\"movies\",\n    content_type=\"character\",\n)\n```\n\nOr directly to the `__init__` if you want control over how the boto3 objects are created:\n\n```python\nfrom pydantic_dynamo.repository import DynamoRepository\nfrom boto3 import Session\n\nresource = Session().resource(\"dynamodb\")\ntable = resource.Table(\"dynamodb-table-name\")\n\nrepo = DynamoRepository[FilmActor](\n    item_class=FilmActor,\n    partition_prefix=\"content\",\n    partition_name=\"movies\",\n    content_type=\"character\",\n    table=table,\n    resource=resource\n)\n```\n### Saving Data\n\nData is saved using an instance of the generic `PartitionedContent[ObjT]` class found in \n[models.py](./pydantic_dynamo/models.py). The `partition_ids` and `content_ids` are `List[str]`. \nEach value in the list is eventually concatenated, and prefixed with the repository's configured values.\n\nParticularly for the `content_ids` field, you can leverage this to achieve degrees of query-ability for\nmore complex use cases, eg: `content_ids=[\"usa\", \"ny\", \"saratoga\", \"12020\"]` will result in a \nsort key value of `usa#ny#saratoga#12020` that can be efficiently queried with DynamoDB's `begins_with`\ncondition, utilized in this library's `list` function.\n\nIt's wise to ensure that any values being used in the partition and content IDs are also retained as \nfields on the model object as well, which will make updates easier to perform.\n\n#### Put Single Item\n\nThis is logically similar to the DynamoDB Put operation, and will overwrite an existing item with \nidentical partition and content IDs.\n\n```python\nfrom pydantic_dynamo.models import PartitionedContent\nfrom uuid import uuid4\n\nid1 = str(uuid4())\nactor1 = FilmActor(id=id1, name=\"Daniel Day-Lewis\")\n\nrepo.put(\n    PartitionedContent[FilmActor](\n        partition_ids=[], content_ids=[id1], item=actor1\n    )\n)\n```\n\n#### Put Multiple Items\n\nWhen saving more than one item, you can use a batch operation that will utilize DynamoDB's `write_batch` \noperation, which will more efficiently buffer data and minimize the total number of network calls compared to calling\n`put` in a loop.\n\n```python\nfrom pydantic_dynamo.models import PartitionedContent\nfrom uuid import uuid4\n\nid1 = str(uuid4())\nactor1 = FilmActor(id=id1, name=\"Daniel Day-Lewis\")\nid2 = str(uuid4())\nactor2 = FilmActor(id=id2, name=\"Steve Buscemi\")\n\n\nrepo.put_batch(\n    (\n        PartitionedContent[FilmActor](\n            partition_ids=[], content_ids=[id1], item=actor1\n        ),\n        PartitionedContent[FilmActor](\n            partition_ids=[], content_ids=[id2], item=actor2\n        ),\n    )\n)\n```\n\n#### Update an item\n\nNB: Please review the limitation in [issue #1](https://github.com/david-a-jetter/pydantic-dynamo/issues/1)\n\nUpdates are handled in a somewhat more complex and manual manner using an `UpdateCommand` object. \nSince this is constructed by sending `Dict[str, Any]`, dictionary entries are validated against\nthe pydantic model's schema before sending data to DynamoDB.\n\n`set_commands` can be used to map attributes' names to a new value.\n`increment_attrs` can be used to increment attributes' current values by some integer.\n`append_attrs` can be used to extend a `List` attribute's values\n\n`current_version` can be used to enforce a check on the object's version number to\nadhere to an object versioning pattern. Since there isn't a way the repo currently returns\nand object's version, this is not useful at the moment but is an experiment in progress.\n\n\n```python\nfrom pydantic_dynamo.models import UpdateCommand\n\nrepo.update(\n    partition_id=None,\n    content_id=[id1],\n    command=UpdateCommand(\n        set_commands={\"review\": \"Talented, but unfriendly in Gangs of New York\"}\n    )\n)\n\n```\n\n### Reading Data\n\n#### Get Item\n\nFinally, something simple to document. This gets a single item by its partition and content IDs,\nreturning `None` if no item is found.\n\nThis example would retrieve just the first actor item.\n```python\nfrom typing import Optional\n\nitem: Optional[FilmActor] = repo.get(partition_id=None, content_id=[id1])\n```\n\n#### Get Multiple Items\n\nThis leverages DynamoDB's `batch_get_item` API to collect multiple items by their partition and content IDs.\nThis is often useful after having collected a previous set of records that have potentially related\nitems that you want to retrieve, and then associate the two in a subsequent mapping logic layer.\n\nThis example would retrieve both actor items in a single network request.\n```python\nfrom typing import List\n\nitems: List[FilmActor] = repo.get_batch([(None, [id1]), (None, [id2])])\n\n```\n\n#### Listing Items\nThe following two functions leverage DynamoDB's `query` API and offers the ability \nto filter on content ID values, change sort order, limit the quantity of items. \n\nNB: These returns an `Iterator` type, which will not execute any query until it begins iteration.\n\nYou may also pass an optional `FilterCommand` to filter on non-key attributes. All fields\non this object are optional, and are applied utilizing `and` logic.\n\n\n```python\nfrom pydantic_dynamo.models import FilterCommand\n\n# Find actors without a `review` attribute\nfilter1 = FilterCommand(\n    not_exists={\"review\"}\n)\n\n# Find actors who are talented but unfriendly in Gangs of New York\nfilter2 = FilterCommand(\n    equals={\"review\": \"Talented, but unfriendly in Gangs of New York\"}\n)\n\n# Find actors who are not talented but unfriendly in Gangs of New York\nfilter3 = FilterCommand(\n    not_equals={\"review\": \"Talented, but unfriendly in Gangs of New York\"}\n)\n\n```\n\n##### List\nThis function supports filter items with a `begins_with` filter on their content IDs.\n\nThis example would retrieve all actor items.\n```python\nfrom typing import Iterator\n\nitems: Iterator[FilmActor] = repo.list(\n    partition_id=None,\n    content_prefix=None,\n    sort_ascending=True, # default order by sort key value\n    limit=None,\n    filters=None\n)\n```\n\n##### List Between\nThis function supports filter items with a `between` filter on their content IDs.\n\nNB: If `content_start == content_end` this will revert to calling `list` using `begins_with`.\n\nThis example would retrieve all actor items. It's a lame example and should be updated\nwith something more interesting. A common use case is to include an ISO-formatted datetime\nvalue at the end of a content ID, and you can retrieve all values in a given partition\nbetween two specified datetimes.\n```python\nfrom typing import Iterator\n\nitems: Iterator[FilmActor] = repo.list_between(\n    partition_id=None,\n    content_start=None,\n    content_end=None,\n    sort_ascending=True, # default order by sort key value\n    limit=None,\n    filters=None\n)\n\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/david-a-jetter/pydantic-dynamo",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pydantic-dynamo",
+    "package_url": "https://pypi.org/project/pydantic-dynamo/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pydantic-dynamo/",
+    "project_urls": {
+      "Homepage": "https://github.com/david-a-jetter/pydantic-dynamo"
+    },
+    "release_url": "https://pypi.org/project/pydantic-dynamo/0.1.5/",
+    "requires_dist": [
+      "boto3 (>=1.20.32,<2.0.0)",
+      "pydantic (>=1.10.5,<2.0.0)",
+      "botocore (>=1.23.32,<2.0.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "",
+    "version": "0.1.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17484951,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d048802d1d023d4f1d9c4c88b22f5e374e348547b421a3bfcf8c53d7fb38f6d3",
+          "md5": "5fb33739e9121b30951899c61da9107c",
+          "sha256": "bf343fc5a4eae1634e1a80319e4d5576acf3ffdde4ecb908b256be27b9ef89b1"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5fb33739e9121b30951899c61da9107c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12330,
+        "upload_time": "2023-03-08T00:11:53",
+        "upload_time_iso_8601": "2023-03-08T00:11:53.732451Z",
+        "url": "https://files.pythonhosted.org/packages/d0/48/802d1d023d4f1d9c4c88b22f5e374e348547b421a3bfcf8c53d7fb38f6d3/pydantic_dynamo-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24adbef7ce8eb0a67b47505e218a907d0fec32238ae4b95d17118ee94f6cf064",
+          "md5": "2e63f5cbce843f5a28719182547b150a",
+          "sha256": "1559e14add6ce8ad6fa4bd77874e895acfb259a3d1b0fa41fd239a5f8ab95c13"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2e63f5cbce843f5a28719182547b150a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12908,
+        "upload_time": "2023-03-08T00:11:55",
+        "upload_time_iso_8601": "2023-03-08T00:11:55.859789Z",
+        "url": "https://files.pythonhosted.org/packages/24/ad/bef7ce8eb0a67b47505e218a907d0fec32238ae4b95d17118ee94f6cf064/pydantic_dynamo-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1235dce202616eb84e3fe11718d44feeb360596bfd71d2521615a80252fb832b",
+          "md5": "c84a0dede6ce2e06ecb19ba976da559a",
+          "sha256": "6349f9f93d3b3e401e56baeeb85a4055fc340a0db7bfc39c3dcbcd7b9566084f"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c84a0dede6ce2e06ecb19ba976da559a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12329,
+        "upload_time": "2023-03-08T00:15:23",
+        "upload_time_iso_8601": "2023-03-08T00:15:23.052639Z",
+        "url": "https://files.pythonhosted.org/packages/12/35/dce202616eb84e3fe11718d44feeb360596bfd71d2521615a80252fb832b/pydantic_dynamo-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f97625faaf7680842f38572b7aea1926d66ba2ea8ea891f8db4af49952c3f92d",
+          "md5": "cc952101965bdc1c8b73de19158b99c1",
+          "sha256": "9120e170452073a22b8ece0d49db68f72de9a4432703cb078df0f7a6c16786b4"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc952101965bdc1c8b73de19158b99c1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12916,
+        "upload_time": "2023-03-08T00:15:26",
+        "upload_time_iso_8601": "2023-03-08T00:15:26.047494Z",
+        "url": "https://files.pythonhosted.org/packages/f9/76/25faaf7680842f38572b7aea1926d66ba2ea8ea891f8db4af49952c3f92d/pydantic_dynamo-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fcd69d671aa992b34f5306b353764f4e2fae9999a5b63b73e46ba027e73fb59b",
+          "md5": "b33ec9dbe04830ab5ce5ddcb123ebb7d",
+          "sha256": "b855af95902a25fe0fd4d37334c9d636714bca79df2ca3a1aee36ffa9758bf52"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b33ec9dbe04830ab5ce5ddcb123ebb7d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12321,
+        "upload_time": "2023-03-08T00:17:00",
+        "upload_time_iso_8601": "2023-03-08T00:17:00.916429Z",
+        "url": "https://files.pythonhosted.org/packages/fc/d6/9d671aa992b34f5306b353764f4e2fae9999a5b63b73e46ba027e73fb59b/pydantic_dynamo-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "521427b7e0c138ffb08b88d68c41d1844bbc05385ea1610e43dc4a1d88fae1bb",
+          "md5": "2cb62a2cb16cdbbbf86df94b8be066f2",
+          "sha256": "ef26083963eb68822b6b0fcb4359d304a41598e293736977f1f8700e0ff87e08"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2cb62a2cb16cdbbbf86df94b8be066f2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12895,
+        "upload_time": "2023-03-08T00:17:02",
+        "upload_time_iso_8601": "2023-03-08T00:17:02.495514Z",
+        "url": "https://files.pythonhosted.org/packages/52/14/27b7e0c138ffb08b88d68c41d1844bbc05385ea1610e43dc4a1d88fae1bb/pydantic_dynamo-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f3ea324bc453bf7d85e55eae396cbf46acf9fe8e79cb294e362dabe64d049e1",
+          "md5": "b8683e8a35bf2097c44c4c334be3fe30",
+          "sha256": "6db244cb054fcebfab2d3d76f8e4f9a1808731aeddc185853a3876a8010baced"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b8683e8a35bf2097c44c4c334be3fe30",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12333,
+        "upload_time": "2023-03-08T00:29:10",
+        "upload_time_iso_8601": "2023-03-08T00:29:10.952029Z",
+        "url": "https://files.pythonhosted.org/packages/1f/3e/a324bc453bf7d85e55eae396cbf46acf9fe8e79cb294e362dabe64d049e1/pydantic_dynamo-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87409aa46f0fdf42731010a4e3b997df856424dd9146062afd45b88da5443507",
+          "md5": "547d585fa47808fac8e7c32810d0ebfc",
+          "sha256": "83c967794a373f1b0350d334e1fcb778a6c3e7d1af201e44a4529172d4e0f3c4"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "547d585fa47808fac8e7c32810d0ebfc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12928,
+        "upload_time": "2023-03-08T00:29:12",
+        "upload_time_iso_8601": "2023-03-08T00:29:12.155222Z",
+        "url": "https://files.pythonhosted.org/packages/87/40/9aa46f0fdf42731010a4e3b997df856424dd9146062afd45b88da5443507/pydantic_dynamo-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d3d0e265eefd8843073d8cfb22aa2337820b0662475efb60ad1da59fb241ae74",
+          "md5": "c463064c2373b3a0b91bae583869b559",
+          "sha256": "d442e3c8182092b08e4bbe91f1cc99b0451acac36ee944243bfd586fed6cdc07"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c463064c2373b3a0b91bae583869b559",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12323,
+        "upload_time": "2023-03-08T00:53:21",
+        "upload_time_iso_8601": "2023-03-08T00:53:21.922947Z",
+        "url": "https://files.pythonhosted.org/packages/d3/d0/e265eefd8843073d8cfb22aa2337820b0662475efb60ad1da59fb241ae74/pydantic_dynamo-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e8f45974f3a10828d0b87d40c4085033f19a9d6911ff31eb1baa9898b81a3bb",
+          "md5": "999f5be5e4e6de5af7d049ec284d10ee",
+          "sha256": "37bf569374caa6a684762cf457d5bc976c52834eecb8b53777ad41aa7a133999"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "999f5be5e4e6de5af7d049ec284d10ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12901,
+        "upload_time": "2023-03-08T00:53:23",
+        "upload_time_iso_8601": "2023-03-08T00:53:23.518938Z",
+        "url": "https://files.pythonhosted.org/packages/8e/8f/45974f3a10828d0b87d40c4085033f19a9d6911ff31eb1baa9898b81a3bb/pydantic_dynamo-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3a8ecfb8879ac8747b8d776a0822d3c524664ec145ae585eb43ebc3a0fbab4b9",
+          "md5": "2855f889abc21b731de6d13bae7de086",
+          "sha256": "9387d7b6aefa7b8f1d089253dabac9c9f4dff6c962c0ee6b3f8145a20d4dd4ad"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2855f889abc21b731de6d13bae7de086",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 12441,
+        "upload_time": "2023-03-29T00:18:48",
+        "upload_time_iso_8601": "2023-03-29T00:18:48.565480Z",
+        "url": "https://files.pythonhosted.org/packages/3a/8e/cfb8879ac8747b8d776a0822d3c524664ec145ae585eb43ebc3a0fbab4b9/pydantic_dynamo-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97df98fda9b364d66a7883ec9024402a498eabff1a9514441fb06a21b79964d0",
+          "md5": "d58d2f4bbc189cc759598fb588bc194f",
+          "sha256": "0aa2995af2056deca38ab6106efbcabfe906a2e0d495af1801ae5cce40f9ca44"
+        },
+        "downloads": -1,
+        "filename": "pydantic_dynamo-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d58d2f4bbc189cc759598fb588bc194f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 13078,
+        "upload_time": "2023-03-29T00:18:50",
+        "upload_time_iso_8601": "2023-03-29T00:18:50.236601Z",
+        "url": "https://files.pythonhosted.org/packages/97/df/98fda9b364d66a7883ec9024402a498eabff1a9514441fb06a21b79964d0/pydantic_dynamo-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3a8ecfb8879ac8747b8d776a0822d3c524664ec145ae585eb43ebc3a0fbab4b9",
+        "md5": "2855f889abc21b731de6d13bae7de086",
+        "sha256": "9387d7b6aefa7b8f1d089253dabac9c9f4dff6c962c0ee6b3f8145a20d4dd4ad"
+      },
+      "downloads": -1,
+      "filename": "pydantic_dynamo-0.1.5-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "2855f889abc21b731de6d13bae7de086",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 12441,
+      "upload_time": "2023-03-29T00:18:48",
+      "upload_time_iso_8601": "2023-03-29T00:18:48.565480Z",
+      "url": "https://files.pythonhosted.org/packages/3a/8e/cfb8879ac8747b8d776a0822d3c524664ec145ae585eb43ebc3a0fbab4b9/pydantic_dynamo-0.1.5-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "97df98fda9b364d66a7883ec9024402a498eabff1a9514441fb06a21b79964d0",
+        "md5": "d58d2f4bbc189cc759598fb588bc194f",
+        "sha256": "0aa2995af2056deca38ab6106efbcabfe906a2e0d495af1801ae5cce40f9ca44"
+      },
+      "downloads": -1,
+      "filename": "pydantic_dynamo-0.1.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "d58d2f4bbc189cc759598fb588bc194f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 13078,
+      "upload_time": "2023-03-29T00:18:50",
+      "upload_time_iso_8601": "2023-03-29T00:18:50.236601Z",
+      "url": "https://files.pythonhosted.org/packages/97/df/98fda9b364d66a7883ec9024402a498eabff1a9514441fb06a21b79964d0/pydantic_dynamo-0.1.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

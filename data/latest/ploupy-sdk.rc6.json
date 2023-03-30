@@ -1,0 +1,362 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Alexandre Goumaz <alexandre.goumaz@plouc314.ch>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10"
+    ],
+    "description": "# [Ploupy Python SDK](https://github.com/Plouc314/ploupy-python-sdk)\n\n## Installation\n\n```\npip install ploupy-sdk\n```\n\n> **Note**  \n> This library requires python 3.10 or higher\n\n## Getting started\n\nHere is a minimal example:\n\n```python\nimport ploupy as pp\n\nclass MyBehaviour(pp.Behaviour):\n    pass  # the bot code goes here\n\nBOT_KEY = \"...\" # the key given when creating the bot\n\nbot = pp.Bot(bot_key=BOT_KEY, behaviour_class=MyBehaviour)\n\nif __name__ == \"__main__\":\n    bot.run()\n```\n\n## Behaviour\n\nThe SDK is events driven. Define the bot by inheriting from the `Behaviour` class\nand overriding callback methods.\n\n### Callbacks\n\nAll callbacks are asynchronous methods, to allow to perform orders and other IO bound\ntasks. They are automatically called when receiving updates from the server.\n\n> **Warning**  \n> Time-consuming tasks (typically where there is a `sleep` call) should not be executed\n> directly in a callback, as this could block another callback from being executed.\n> Instead use the `start_background_task` to execute the task in parrallel.\n\n```python\n# this function is very time-consuming\n# calling directly in on_turret_build would\n# potentially delay other callbacks by several seconds\nasync def time_consuming_task(behaviour: pp.Behaviour) -> None:\n    \n    # wait for 5 seconds to give opponents a chance\n    await pp.sleep(5)\n\n    tile = behaviour.map.get_tile((10,10))\n\n    # build a new factory\n    await behaviour.place_order(pp.BuildFactoryOrder(tile))\n\n\nclass MyBehaviour(pp.Behaviour):\n\n    async def on_turret_build(self, turret: pp.Turret, player: pp.Player) -> None:\n        # check that it is the bot that builded the turret\n        if player is not self.player:\n            return\n\n        # acquire a new tech, this is IO bound (thus the await)\n        # but not time-consuming (a requests over a websocket)\n        await self.place_order(pp.AcquireTechOrder(pp.Techs.TURRET_SCOPE))\n\n        # start a task in parrallel to avoid delaying other callbacks\n        pp.start_background_task(time_consuming_task, self)\n```\n\n### Attributes\n\nThe `Behaviour` class expose some useful instances of the game,\nsuch as: \n- `game (Game)`: the game instance\n- `map (Map)`: the game's map\n- `player (Player)`: the bot's Player\n- `config (GameConfig)`: The game configuration\n\nHere is an example of a bot that build a factory as soon as he can:\n\n```python\nimport ploupy as pp\n\nclass MyBehaviour(pp.Behaviour):\n\n    async def on_income(self, money: int) -> None:\n        # select the tile to build the factory on\n        # using Map instance exposed by Behaviour class\n        # and the bot's Player instance\n        tiles = self.map.get_buildable_tiles(self.player)\n        if len(tiles) == 0:\n            return\n        \n        # get one of the possible tiles\n        tile = tiles.pop() # tiles is a set\n\n        # check if the bot has enough money\n        # using GameConfig instance exposed by Behaviour class\n        if money >= self.config.factory_price:\n            # send an action to the server\n            # this can failed if all the necessary conditions aren't\n            # met to perform the action\n            try:\n                await self.build_factory(tile.coord)\n            except pp.ActionFailedException:\n                return\n```\n\n### Tiles & geometry\n\nThe `geometry` module and `Map` class provide utility functions / methods to\nwork with coordinates / tiles.\n\nHere is an example of a bot that will try to build a turret when attacked:\n\n```python\nimport ploupy as pp\n\nclass MyBehaviour(pp.Behaviour):\n\n    async def on_probes_attack(\n        self,\n        probes: list[pp.Probe],\n        attacked_player: pp.Player,\n        attacking_player: pp.Player,\n    ) -> None:\n        # check that it is the bot that is attacked\n        if attacked_player is not self.player:\n            return\n\n        # get the center of where the probes are attacking\n        target = pp.geometry.center([probe.target for probe in probes])\n\n        # get tiles where a turret could be built\n        tiles = self.map.get_buildable_tiles(self.player)\n\n        # if none are buildable then too bad...\n        if len(tiles) == 0:\n            return\n\n        # get the tile that is as close as possible to the center of the attack\n        tile = pp.geometry.closest_tile(tiles, target)\n\n        # place an order on \"build turret\" action, the action will be performed\n        # when the necessary conditions are met\n        await self.place_order(\n            pp.BuildTurretOrder(\n                tile,\n                with_timeout=2.0, # maximum time (sec) before aborting the order\n            )\n        )\n\n```\n\n### Stages\n\nAs the complexity of the bot grows, it can become very handy to encapsulate different\ntypes of behaviour. This can be done by defining multiple `BehaviourStage` (which is essentially\nthe same as `Behaviour`) and grouping them in a `BehaviourDispatcher`.\n\nHere is an example that splits the game into different stages:\n\n```python\nimport ploupy as pp\n\nclass EarlyStage(pp.BehaviourStage):\n    def __init__(self, dispatcher: pp.BehaviourDispatcher) -> None:\n        super().__init__(dispatcher, \"early\")  # specify stage name\n\n    ...  # the bot's behaviour in early game\n\nclass MidStage(pp.BehaviourStage):\n    def __init__(self, dispatcher: pp.BehaviourDispatcher) -> None:\n        super().__init__(dispatcher, \"mid\")\n    \n    async def on_income(self, money: int) -> None:\n        \n        # switch of BehaviourStage\n        await self.set_current_stage(\"end\")\n\nclass EndStage(pp.BehaviourStage):\n    def __init__(self, dispatcher: pp.BehaviourDispatcher) -> None:\n        super().__init__(dispatcher, \"end\")\n\n    async def on_stage(self) -> None:\n        ...  # this callback is called when the stage is selected as current stage\n\n# regroup all stages into one behaviour\nclass BotBehaviour(pp.BehaviourDispatcher):\n    def __init__(self, uid: str, game: pp.Game) -> None:\n        super().__init__(uid, game)\n\n        self.add_stage(EarlyStage(self))\n        self.add_stage(MidStage(self))\n        self.add_stage(EndStage(self))\n\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ploupy-sdk",
+    "package_url": "https://pypi.org/project/ploupy-sdk/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/ploupy-sdk/",
+    "project_urls": {
+      "Homepage": "https://github.com/Plouc314/ploupy-python-sdk"
+    },
+    "release_url": "https://pypi.org/project/ploupy-sdk/0.2.1/",
+    "requires_dist": [
+      "requests",
+      "toml (>=0.10.2)",
+      "numpy (>=1.22.4)",
+      "python-socketio[asyncio_client] (>=5.7.1)",
+      "pydantic (>=1.9.0)",
+      "pyjwt (>=2.4.0)",
+      "colorlog (>=6.6.0)",
+      "scipy (>=1.7.3)"
+    ],
+    "requires_python": ">=3.10",
+    "summary": "SDK for writing bots in ploupy.plouc314.ch",
+    "version": "0.2.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15127952,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2183b2684347ee468c5aa2735f1e0965e1790c00727da5087e39a483b097cdd5",
+          "md5": "e58d2f7e0a42aebaaa8319917c4fe957",
+          "sha256": "219b50a511ac0271621aa22f2270b441b9b47d8be3b66db5a768dd4ade2820e7"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e58d2f7e0a42aebaaa8319917c4fe957",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 28089,
+        "upload_time": "2022-08-15T16:37:57",
+        "upload_time_iso_8601": "2022-08-15T16:37:57.618209Z",
+        "url": "https://files.pythonhosted.org/packages/21/83/b2684347ee468c5aa2735f1e0965e1790c00727da5087e39a483b097cdd5/ploupy_sdk-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "382c5338bb1c137574a576a67be3520a99143121d958cf829b5f3274509c21e1",
+          "md5": "ed5022fcb121d45d811e5fa4c1ceb002",
+          "sha256": "f4716657bfd777948433985ff719ccf64c0a42e50410eeb2fa8f317097e68929"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed5022fcb121d45d811e5fa4c1ceb002",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 22213,
+        "upload_time": "2022-08-15T16:38:01",
+        "upload_time_iso_8601": "2022-08-15T16:38:01.303169Z",
+        "url": "https://files.pythonhosted.org/packages/38/2c/5338bb1c137574a576a67be3520a99143121d958cf829b5f3274509c21e1/ploupy-sdk-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce18c12cef3fae3606feee8b5a8440d68386ec3f8edafde1e820c917ab07f2e5",
+          "md5": "443988891c5480630b0b13e08c30c81c",
+          "sha256": "a0031043a1297e171fced468d2829b35cfa0d95ea96229af046191e39e23ddce"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "443988891c5480630b0b13e08c30c81c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 28103,
+        "upload_time": "2022-08-15T16:37:59",
+        "upload_time_iso_8601": "2022-08-15T16:37:59.152939Z",
+        "url": "https://files.pythonhosted.org/packages/ce/18/c12cef3fae3606feee8b5a8440d68386ec3f8edafde1e820c917ab07f2e5/ploupy_sdk-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2eb507fddbb8d05fbae4bb5eaddf22777283ab1adf9fd76d47687e3539a75b2d",
+          "md5": "ecbe71fd719b4f765445ee9068ac295f",
+          "sha256": "e8831d7c1bdd5356f7b46826395c5e01a2e91cb2c42130babd2ffc37aaa16ddf"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ecbe71fd719b4f765445ee9068ac295f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 22252,
+        "upload_time": "2022-08-15T16:38:03",
+        "upload_time_iso_8601": "2022-08-15T16:38:03.103393Z",
+        "url": "https://files.pythonhosted.org/packages/2e/b5/07fddbb8d05fbae4bb5eaddf22777283ab1adf9fd76d47687e3539a75b2d/ploupy-sdk-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd64cbbc9602f299db8e67663a520259af5696794573dd09b841ba1aca8c79c0",
+          "md5": "374fb59ecda5e72e9d9f17e002629a32",
+          "sha256": "48b2fe495791e0d1df5241d591ba8568dc3868f1b2f32c8f6bb2923729d795de"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "374fb59ecda5e72e9d9f17e002629a32",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 37502,
+        "upload_time": "2022-08-18T14:18:51",
+        "upload_time_iso_8601": "2022-08-18T14:18:51.296782Z",
+        "url": "https://files.pythonhosted.org/packages/cd/64/cbbc9602f299db8e67663a520259af5696794573dd09b841ba1aca8c79c0/ploupy_sdk-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49a9e0c79c63231dd63fc416bfe185a762eb4e8d7ff18408d6d33f882788ad13",
+          "md5": "d0327d54d6bfbb7f946ba1f45698a348",
+          "sha256": "e5317d0e62988d00e1440fa05f395943369b23a596b6ce366eb24a517a434610"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d0327d54d6bfbb7f946ba1f45698a348",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 29889,
+        "upload_time": "2022-08-18T14:18:53",
+        "upload_time_iso_8601": "2022-08-18T14:18:53.195343Z",
+        "url": "https://files.pythonhosted.org/packages/49/a9/e0c79c63231dd63fc416bfe185a762eb4e8d7ff18408d6d33f882788ad13/ploupy-sdk-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86dd1eb3d570b2d370650f773cde45158003e2b1c22e97debd8e0b58ff4e087d",
+          "md5": "45370965be66c403f5811344c72e403a",
+          "sha256": "fbe441445ce19bc01d1f90e11c40c3daba445b584bc041362966220add898a10"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "45370965be66c403f5811344c72e403a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 39125,
+        "upload_time": "2022-08-27T15:53:15",
+        "upload_time_iso_8601": "2022-08-27T15:53:15.033375Z",
+        "url": "https://files.pythonhosted.org/packages/86/dd/1eb3d570b2d370650f773cde45158003e2b1c22e97debd8e0b58ff4e087d/ploupy_sdk-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "682e3012e9261b898091502477ae87466078031d96e28018d343bbac2de93b01",
+          "md5": "9c89705b5d2fd66357de57e0d3632519",
+          "sha256": "666421c024db493e92a1a34eb98efc6cf609e774cc7168c2d5a7e34c50d2b3a1"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9c89705b5d2fd66357de57e0d3632519",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 31379,
+        "upload_time": "2022-08-27T15:53:19",
+        "upload_time_iso_8601": "2022-08-27T15:53:19.088897Z",
+        "url": "https://files.pythonhosted.org/packages/68/2e/3012e9261b898091502477ae87466078031d96e28018d343bbac2de93b01/ploupy-sdk-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02ce1d2d30ff2d18368441d4312167b1520db9b6afa7d997d58e6c9bff005312",
+          "md5": "fcb1f35b6ccd2f69add4da9b6729b75d",
+          "sha256": "18e0defe6d9d94a29490684f0336b2083184b52cef0af6601df2b39f6a8f756b"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fcb1f35b6ccd2f69add4da9b6729b75d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 42562,
+        "upload_time": "2022-09-04T08:25:57",
+        "upload_time_iso_8601": "2022-09-04T08:25:57.963541Z",
+        "url": "https://files.pythonhosted.org/packages/02/ce/1d2d30ff2d18368441d4312167b1520db9b6afa7d997d58e6c9bff005312/ploupy_sdk-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8faad92ba30dd5a19fd22b4eaf272acd838384d497253fde81f0e53cec257e39",
+          "md5": "e49f349d116fd3b152fff9f4a7c36464",
+          "sha256": "a7707ef0a8bc461cbe3ef8b862add2b4119b16065d71fb2d99dcf495a7c23559"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e49f349d116fd3b152fff9f4a7c36464",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 35560,
+        "upload_time": "2022-09-04T08:26:03",
+        "upload_time_iso_8601": "2022-09-04T08:26:03.433005Z",
+        "url": "https://files.pythonhosted.org/packages/8f/aa/d92ba30dd5a19fd22b4eaf272acd838384d497253fde81f0e53cec257e39/ploupy-sdk-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b499bca0f614e8f14cdf429b123ef8b0601d350e61db12a5e5648453604c537",
+          "md5": "e302e02140be966dd3c5478d73a7b476",
+          "sha256": "1db0876205dc4b8dcd171409f807796921eead645e04156daedb5eb954913607"
+        },
+        "downloads": -1,
+        "filename": "ploupy_sdk-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e302e02140be966dd3c5478d73a7b476",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.10",
+        "size": 42779,
+        "upload_time": "2022-09-17T15:20:35",
+        "upload_time_iso_8601": "2022-09-17T15:20:35.522738Z",
+        "url": "https://files.pythonhosted.org/packages/0b/49/9bca0f614e8f14cdf429b123ef8b0601d350e61db12a5e5648453604c537/ploupy_sdk-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9bc93508a9acdbea6d9276532c222f13e4251763fe0d65a4b75bdab8ea31d509",
+          "md5": "3a47eb1c699bcb862bb2988d2ad99538",
+          "sha256": "3963d9ed7fdf8c8509a59c857c83a1eb0a0eafd45a31f2b3e389f9ef8e7671fb"
+        },
+        "downloads": -1,
+        "filename": "ploupy-sdk-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3a47eb1c699bcb862bb2988d2ad99538",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.10",
+        "size": 35689,
+        "upload_time": "2022-09-17T15:20:41",
+        "upload_time_iso_8601": "2022-09-17T15:20:41.590933Z",
+        "url": "https://files.pythonhosted.org/packages/9b/c9/3508a9acdbea6d9276532c222f13e4251763fe0d65a4b75bdab8ea31d509/ploupy-sdk-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0b499bca0f614e8f14cdf429b123ef8b0601d350e61db12a5e5648453604c537",
+        "md5": "e302e02140be966dd3c5478d73a7b476",
+        "sha256": "1db0876205dc4b8dcd171409f807796921eead645e04156daedb5eb954913607"
+      },
+      "downloads": -1,
+      "filename": "ploupy_sdk-0.2.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e302e02140be966dd3c5478d73a7b476",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.10",
+      "size": 42779,
+      "upload_time": "2022-09-17T15:20:35",
+      "upload_time_iso_8601": "2022-09-17T15:20:35.522738Z",
+      "url": "https://files.pythonhosted.org/packages/0b/49/9bca0f614e8f14cdf429b123ef8b0601d350e61db12a5e5648453604c537/ploupy_sdk-0.2.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9bc93508a9acdbea6d9276532c222f13e4251763fe0d65a4b75bdab8ea31d509",
+        "md5": "3a47eb1c699bcb862bb2988d2ad99538",
+        "sha256": "3963d9ed7fdf8c8509a59c857c83a1eb0a0eafd45a31f2b3e389f9ef8e7671fb"
+      },
+      "downloads": -1,
+      "filename": "ploupy-sdk-0.2.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3a47eb1c699bcb862bb2988d2ad99538",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.10",
+      "size": 35689,
+      "upload_time": "2022-09-17T15:20:41",
+      "upload_time_iso_8601": "2022-09-17T15:20:41.590933Z",
+      "url": "https://files.pythonhosted.org/packages/9b/c9/3508a9acdbea6d9276532c222f13e4251763fe0d65a4b75bdab8ea31d509/ploupy-sdk-0.2.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

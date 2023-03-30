@@ -1,0 +1,288 @@
+{
+  "info": {
+    "author": "Yuvi Panda",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# python-popularity-contest\n\n[![codecov](https://codecov.io/gh/yuvipanda/python-popularity-contest/branch/main/graph/badge.svg?token=QD438CBG0S)](https://codecov.io/gh/yuvipanda/python-popularity-contest)\n[![PyPI version](https://badge.fury.io/py/popularity-contest.svg)](https://badge.fury.io/py/popularity-contest)\n![GitHub Actions](https://github.com/yuvipanda/python-popularity-contest/actions/workflows/lint-and-test.yaml/badge.svg)\n\nIn interactive computing installations, figuring out which python\nlibraries are in use is extremely helpful in managing environments\nfor users.\n\npython-popularity-contest collects pre-aggregated, anonymized data\non which installed libraries are being actively used by your users.\n\nNamed after the [debian popularity contest](https://popcon.debian.org/)\n\n## What data is collected?\n\nWe want to collect just enough data to help with the following tasks:\n\n1. Remove unused library that have never been imported. These can\n   probably be removed without a lot of breakage for individual\n   users\n\n2. Provide aggregate statistics about the 'popularity' of a library\n   to add a data point for understanding how important a particular library is\n   to a group of users. This can help with funding requests, better\n   training recommendations, etc.\n\nTo collect the smallest amount of data possible, we aggregate this at\nsource. Only overall global counts are stored, without any individual\nrecord of each source. This is much better than storing per-user or\nper-process records.\n\nThe data we have will be a time series for each library, representing the\ncumulative count of processes where any module from this library was imported.\nThis is designed as a [prometheus\ncounter](https://prometheus.io/docs/concepts/metric_types/#counter), which is\nhow eventually queries are written.\n\n## Collection infrastructure\n\n`popularity_contest` emits metrics over the [statsd](https://github.com/statsd/statsd)\nprotocol, so you need a statsd server running to collect and aggregate\nthis information. Since statsd only stores global aggregate counts, we\nnever collect data beyond what we need.\n\nThe recommended collection pipeline is:\n\n1. [prometheus_statsd](https://github.com/prometheus/statsd_exporter) as\n   the statsd server metrics are sent to.\n\n   A [mapping rule](https://github.com/prometheus/statsd_exporter#glob-matching)\n   to convert the statsd metrics into usable prometheus metrics, with\n   helpful labels for library names. Instaed of many metrics named like\n   `python_popcon_library_used_<library-name>`, we can get a better\n   `python_popcon_library_used{library=\"<library-name>\"}`. A mapping\n   rule that works with the default statsd metric name structure would\n   look like:\n\n   ```yaml\n      mappings:\n      - match: \"python_popcon.library_used.*\"\n        name: \"python_popcon_library_used\"\n        labels:\n          library: \"$1\"\n   ```\n\n   You can add additional labels here if you would like.\n\n3. A [prometheus server](https://prometheus.io/) that scrapes the metrics\n   from prometheus_statsd and stores it in a queryable form. A tool like\n   [grafana](https://grafana.com/) is used to visualize the results.\n\n### Kubernetes setup\n\nIf you are running a kubernetes cluster of some sort, you probably already\nhave prometheus running for metrics collection. prometheus_statsd has\na [helm chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-statsd-exporter)\nthat can be deployed easily on cluster. Here is a sample helm config:\n\n```yaml\nservice:\n    # Tell prometheus server we want metrics scraped from port 9102\n    annotations:\n        prometheus.io/scrape: \"true\"\n        prometheus.io/port: \"9102\"\n\nstatsd:\n    mappingConfig: |-\n        mappings:\n        - match: \"python_popcon.library_used.*\"\n        name: \"python_popcon_library_used\n        labels:\n            library: \"$1\"\n```\n\nThe prometheus-statsd chart has [a bug](https://github.com/prometheus-community/helm-charts/issues/1153)\nwhere `mappingConfig` does not take effect until you restart the prometheus-statsd\npod.\n\n## Installing\n\n`popularity-contest` is available from PyPI, and can be installed\nwith `pip`.\n\n```bash\npython3 -m pip install popularity-contest\n```\n\nIt must be installed in the environment we want instrumented.\n\n## Usage\n\n### Activation\n\nAfter installation, the popularity_contest reporter must be explicitly\nset up. You can enable reporting for all IPython sessions (and hence Jupyter\nNotebook sessions) with an [IPython startup\nscript](https://switowski.com/blog/ipython-startup-files).\n\nThe startup script just needs one line:\n\n```python\nimport popularity_contest.reporter\npopularity_contest.reporter.setup_reporter()\n```\n\nSince the instrumentation is usually set up by an admin and not\nthe user, the preferred path for the script is inside `sys.prefix` - the\nlocation of your virtual environment. For example, if you have a\nconda environment installed in `/opt/conda`, you can put the file in\n`/opt/conda/etc/ipython/startup/000-popularity-contest.py`. This\nway, it also gets loaded before any user specific IPython startup\nscripts.\n\nOnly modules imported *after* the reporter is set up with\n`popularity_contest.reporter.setup_reporter()` will be counted.  This reduces\nnoise from baseline libraries (like `IPython` or `six`) that are used invisibly\nby everyone.\n\n### Statsd server connection info\n\n`popularity_contest` expects the following environment variables\nto be set.\n\n1. `PYTHON_POPCONTEST_STATSD_HOST` - the hostname or IP address of\n   the server statsd packets will be sent to.\n2. `PYTHON_POPCONTEST_STATSD_PORT` - the port to send statsd packets\n   to. With the recommended `prometheus_statsd` setup, this will be\n   `9125`.\n3. `PYTHON_POPCONTEST_STATSD_PREFIX` - the prefix each statsd metric\n   will have, defaults to `python_popcon.library_used`. So\n   each metric in statsd will be of the form\n   `python_popcon.library_used.<library-name>`.\n\n   You can put additional information in this prefix, and use that\n   to extract more labels in prometheus. For example, in a\n   [zero-to-jupyterhub on k8s](https://z2jh.jupyter.org) setup,\n   you can add information about the current hub namespace like this:\n\n   ```yaml\n   hub:\n     extraConfig:\n       07-popularity-contest: |\n         import os\n         pod_namespace = os.environ['POD_NAMESPACE']\n         c.KubeSpawner.environment.update({\n            'PYTHON_POPCONTEST_STATSD_PREFIX': f'python_popcon.namespace.{pod_namespace}.library_used'\n         })\n   ```\n\n   A mapping rule can be added to `prometheus_statsd` to extract the namespace.\n\n   ```yaml\n      mappings:\n      - match: \"python_popcon.namespace.*.library_used.*\"\n        name: \"python_popcon_library_used\"\n        labels:\n          namespace: \"$1\"\n          library: \"$2\"\n   ```\n\n   The prometheus metrics produced out of this will be of the form\n   `python_popcon_library_used{library=\"<library-name>\", namespace=\"<namespace>}`\n\n## Privacy\n\nCollecting limited, pre-aggregated data helps preserve privacy as much as\npossible, and might be sufficient in cases where other data with more\nprivate information (like usernames tied to activity times, etc).\n\nHowever, side channel attacks are still possible if the entire\nset of timeseries data is available. Individual users might have specific\npatterns of modules they use, and this might be discernable with enough\nanalysis. If some libraries are uniquely used only by particular users,\nthis analysis becomes easier. Further aggregation of the data, redaction\nof information about modules that don't have a lot of use, etc are methods\nthat can be used to further anonymize this dataset, based on your needs.\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/yuvipanda/python-popularity-contest",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "popularity-contest",
+    "package_url": "https://pypi.org/project/popularity-contest/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/popularity-contest/",
+    "project_urls": {
+      "Homepage": "https://github.com/yuvipanda/python-popularity-contest"
+    },
+    "release_url": "https://pypi.org/project/popularity-contest/0.4.1/",
+    "requires_dist": [
+      "statsd",
+      "importlib-metadata"
+    ],
+    "requires_python": "",
+    "summary": "Privacy-friendly data collection of the libraries your users are using",
+    "version": "0.4.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10878745,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f5c30005999b58b57a18bce705e3fd38cdeedc9ffd23a46605498e504261440",
+          "md5": "94b058dc67ef0cf4842cb96adeee8902",
+          "sha256": "823b648d90bace9cf2dd3c5e9739fe9cc80db36208c00cac189e7780bb38f68b"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "94b058dc67ef0cf4842cb96adeee8902",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3291,
+        "upload_time": "2021-07-08T17:30:08",
+        "upload_time_iso_8601": "2021-07-08T17:30:08.462276Z",
+        "url": "https://files.pythonhosted.org/packages/9f/5c/30005999b58b57a18bce705e3fd38cdeedc9ffd23a46605498e504261440/popularity_contest-0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "95ca852d9cdc78ffd473254af3cd70b5516e3a49b26f8f374d5de5d04d9bfb57",
+          "md5": "cd33b32cc19d9e016ec7a424a66a4293",
+          "sha256": "698fd135d9fcd6abdb1a0715252a9638a52cb2ed7fca1b942b7ac5eceae496f4"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cd33b32cc19d9e016ec7a424a66a4293",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3314,
+        "upload_time": "2021-07-08T19:42:00",
+        "upload_time_iso_8601": "2021-07-08T19:42:00.168150Z",
+        "url": "https://files.pythonhosted.org/packages/95/ca/852d9cdc78ffd473254af3cd70b5516e3a49b26f8f374d5de5d04d9bfb57/popularity_contest-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "26d9297639ef28716d473cb4f2e9f7917c9582799909bb01a7cee36abe681fe9",
+          "md5": "6baa6be057213fca03e5d5d3d1673d91",
+          "sha256": "b2f6695abf54e05d8bb0923f2d37ab1114445fdd643c1aaf9ac1a200b1584580"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6baa6be057213fca03e5d5d3d1673d91",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3357,
+        "upload_time": "2021-07-09T11:16:03",
+        "upload_time_iso_8601": "2021-07-09T11:16:03.038807Z",
+        "url": "https://files.pythonhosted.org/packages/26/d9/297639ef28716d473cb4f2e9f7917c9582799909bb01a7cee36abe681fe9/popularity_contest-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3a9a5a636b171fdb1f5be8e4c880bfd5a8de7db48eaa6dd5cb9abfb22fc934ca",
+          "md5": "e20952127269da7de31af23963adb6ef",
+          "sha256": "96115db62e79da0293c301ddf7d60ff05aef7608315c3f120ba5c489ffc8a42f"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e20952127269da7de31af23963adb6ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 4039,
+        "upload_time": "2021-07-10T17:48:28",
+        "upload_time_iso_8601": "2021-07-10T17:48:28.457871Z",
+        "url": "https://files.pythonhosted.org/packages/3a/9a/5a636b171fdb1f5be8e4c880bfd5a8de7db48eaa6dd5cb9abfb22fc934ca/popularity_contest-0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ccf94b9c485e655cb963c0cfdfbd31edea84a931bc1df54d617285a6fa15a072",
+          "md5": "76ed7a953b7bad5253ec239c00c133b5",
+          "sha256": "eef3276330f2cdb754f39c5d08cec2a667adbfbd39722a640cd55704d6d0f8ae"
+        },
+        "downloads": -1,
+        "filename": "popularity-contest-0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "76ed7a953b7bad5253ec239c00c133b5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5939,
+        "upload_time": "2021-07-10T17:48:29",
+        "upload_time_iso_8601": "2021-07-10T17:48:29.492898Z",
+        "url": "https://files.pythonhosted.org/packages/cc/f9/4b9c485e655cb963c0cfdfbd31edea84a931bc1df54d617285a6fa15a072/popularity-contest-0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "14ee4d1a67a4d2e2a1d243233eb1aaaa663163305b5b387077047c7c57c74d28",
+          "md5": "a40cb4c59a26bfeadc8b9e1653b77bc6",
+          "sha256": "9a49e774c2bca8d2fd1809b6def6eccf1758504f2aed7127037c0083d666ecb6"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a40cb4c59a26bfeadc8b9e1653b77bc6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7044,
+        "upload_time": "2021-07-11T11:39:47",
+        "upload_time_iso_8601": "2021-07-11T11:39:47.272934Z",
+        "url": "https://files.pythonhosted.org/packages/14/ee/4d1a67a4d2e2a1d243233eb1aaaa663163305b5b387077047c7c57c74d28/popularity_contest-0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da8cf58825224b46062e547dacd0f6625704abd33d477f5171c955b472d349fe",
+          "md5": "33d03d757e8191ee9f5ca771070245c1",
+          "sha256": "1c0b37ea6208f1ed8c36e22ee4e35f09080d481bf186def89982fb96c49b9425"
+        },
+        "downloads": -1,
+        "filename": "popularity-contest-0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33d03d757e8191ee9f5ca771070245c1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6426,
+        "upload_time": "2021-07-11T11:39:48",
+        "upload_time_iso_8601": "2021-07-11T11:39:48.574478Z",
+        "url": "https://files.pythonhosted.org/packages/da/8c/f58825224b46062e547dacd0f6625704abd33d477f5171c955b472d349fe/popularity-contest-0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "634af038c414a564fc431e9ea895c2abc0d5ad81f5180f83ba3b08da58585362",
+          "md5": "49f16b27d9052f61cb78c97dae7f6317",
+          "sha256": "c8e6f1546620cdb7170761f3fc1a3f90f837fb74d267f1d623ae41956526f5c8"
+        },
+        "downloads": -1,
+        "filename": "popularity_contest-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "49f16b27d9052f61cb78c97dae7f6317",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7054,
+        "upload_time": "2021-07-11T14:12:14",
+        "upload_time_iso_8601": "2021-07-11T14:12:14.366535Z",
+        "url": "https://files.pythonhosted.org/packages/63/4a/f038c414a564fc431e9ea895c2abc0d5ad81f5180f83ba3b08da58585362/popularity_contest-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6368ee2d03461aa021669aa8d6bd1b79c5380f75a3078ac49993a62e2f50912",
+          "md5": "54b081abb81ae7d166cb912dd7a8e38f",
+          "sha256": "6e6ed6bdd01e0c2f21003ace9d996c1d2b705f3a94db261e9cbf0108b85c6193"
+        },
+        "downloads": -1,
+        "filename": "popularity-contest-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "54b081abb81ae7d166cb912dd7a8e38f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6411,
+        "upload_time": "2021-07-11T14:12:15",
+        "upload_time_iso_8601": "2021-07-11T14:12:15.595538Z",
+        "url": "https://files.pythonhosted.org/packages/d6/36/8ee2d03461aa021669aa8d6bd1b79c5380f75a3078ac49993a62e2f50912/popularity-contest-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "634af038c414a564fc431e9ea895c2abc0d5ad81f5180f83ba3b08da58585362",
+        "md5": "49f16b27d9052f61cb78c97dae7f6317",
+        "sha256": "c8e6f1546620cdb7170761f3fc1a3f90f837fb74d267f1d623ae41956526f5c8"
+      },
+      "downloads": -1,
+      "filename": "popularity_contest-0.4.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "49f16b27d9052f61cb78c97dae7f6317",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 7054,
+      "upload_time": "2021-07-11T14:12:14",
+      "upload_time_iso_8601": "2021-07-11T14:12:14.366535Z",
+      "url": "https://files.pythonhosted.org/packages/63/4a/f038c414a564fc431e9ea895c2abc0d5ad81f5180f83ba3b08da58585362/popularity_contest-0.4.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d6368ee2d03461aa021669aa8d6bd1b79c5380f75a3078ac49993a62e2f50912",
+        "md5": "54b081abb81ae7d166cb912dd7a8e38f",
+        "sha256": "6e6ed6bdd01e0c2f21003ace9d996c1d2b705f3a94db261e9cbf0108b85c6193"
+      },
+      "downloads": -1,
+      "filename": "popularity-contest-0.4.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "54b081abb81ae7d166cb912dd7a8e38f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 6411,
+      "upload_time": "2021-07-11T14:12:15",
+      "upload_time_iso_8601": "2021-07-11T14:12:15.595538Z",
+      "url": "https://files.pythonhosted.org/packages/d6/36/8ee2d03461aa021669aa8d6bd1b79c5380f75a3078ac49993a62e2f50912/popularity-contest-0.4.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,360 @@
+{
+  "info": {
+    "author": "Evert Timberg",
+    "author_email": "evert@everttimberg.io",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# PyCircuitBreaker\n\n[![PyPI Version](https://img.shields.io/pypi/v/pycircuitbreaker)](https://pypi.org/project/pycircuitbreaker/)\n[![Python Versions](https://img.shields.io/pypi/pyversions/pycircuitbreaker)](https://pypi.org/project/pycircuitbreaker/)\n[![MIT License](https://img.shields.io/pypi/l/pycircuitbreaker)](https://github.com/etimberg/pycircuitbreaker/blob/master/LICENSE)\n![CI Status](https://img.shields.io/github/workflow/status/etimberg/pycircuitbreaker/CI)\n[![Coverage Status](https://coveralls.io/repos/github/etimberg/pycircuitbreaker/badge.svg?branch=master)](https://coveralls.io/github/etimberg/pycircuitbreaker?branch=master)\n\nPython Implementation of the [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html). Inspired by [circuitbreaker](https://github.com/fabfuel/circuitbreaker) by Fabian Fuelling.\n\n## Installation\n\n```\npip install pycircuitbreaker\n```\n\n## Usage\n\nThe simplest usage of `pycircuitbreaker` is to decorate a function that can fail using `circuit`.\n\n```python\nfrom pycircuitbreaker import circuit\n\n@circuit\ndef function_that_can_fail():\n    ...\n```\n\nFor readiness probes (PaaS, k8s, ...) it is common to expose the different circuit breakers state.\n```python\nfrom pycircuitbreaker import circuit, CircuitBreakerRegistry\n\n\nregistry = CircuitBreakerRegistry()\n\n\n@app.route(\"/ready\")\ndef ready():\n    content = {\n        \"circuits\": {\n            cb.id: cb.state.name for cb in registry.get_circuits()\n        }\n    }\n    status = (\n        200 if len(list(registry.get_open_circuits())) == 0 else 500\n    )\n    return content, status, {\"Cache-Control\": \"no-cache\"}\n```\n\nNote that the registry is not automatically managed by the library, it is the application responsibility to register created circuit breakers.\n\nIt is also possible to reuse the same circuit breaker for different functions that rely on the same external dependency.\n```python\ndef db_breaker(func: Callable) -> Callable:\n    breaker = CircuitBreaker(\n        breaker_id=\"db\",\n        error_threshold=5,\n        recovery_timeout=30,\n        recovery_threshold=1,\n        exception_denylist=[DisconnectionError, TimeoutError],\n    )\n\n    @wraps(func)\n    def wrapper(*args: Any, **kwargs: Any) -> Any:\n        return breaker.call(func, *args, **kwargs)\n\n    return circuit_wrapper\n\n@db_breaker\ndef call_to_db():\n    ...\n\n@db_breaker\ndef another_call_to_db():\n    ...\n```\n\n### Complete usage example\n```python\nfrom pycircuitbreaker import CircuitBreakerRegistry, CircuitBreaker\n\n\nregistry = CircuitBreakerRegistry()\n\n\n@app.route(\"/ready\")\ndef ready():\n    content = {\n        \"circuits\": {\n            cb.id: cb.state.name for cb in registry.get_circuits()\n        }\n    }\n    status = (\n        200 if len(list(registry.get_open_circuits())) == 0 else 500\n    )\n    return content, status, {\"Cache-Control\": \"no-cache\"}\n\n\ndef db_breaker(func: Callable) -> Callable:\n    breaker = CircuitBreaker(\n        breaker_id=\"db\",\n        error_threshold=5,\n        recovery_timeout=30,\n        recovery_threshold=1,\n        exception_denylist=[DisconnectionError, TimeoutError],\n    )\n    registry.register(breaker)\n\n    @wraps(func)\n    def wrapper(*args: Any, **kwargs: Any) -> Any:\n        return breaker.call(func, *args, **kwargs)\n\n    return circuit_wrapper\n\n\n@db_breaker\ndef call_to_db():\n    ...\n\n\n@db_breaker\ndef another_call_to_db():\n    ...\n```\n\n### Reset Strategies\n\nBy default, pycircuitbreaker operates such that a single success resets the error state of a closed breaker. This makes sense for a service that rarely fails, but in certains cases this can pose a problem. If the `error_threshold` is set to `5`, but only 4/5 external requests fail, the breaker will never open. To get around this, the [strategy setting](#strategy) may be used. By setting this to `pycircuitbreaker.CircuitBreakerStrategy.NET_ERROR`, the net error count (errors - successes) will be used to trigger the breaker.\n\n## Configuration\n\nA number of configuration options can be provided to the `CircuitBreaker` class or the `circuit` decorator to control the behaviour of the breaker. When using the decorator, options should be passed as keyword arguments.\n\n### breaker_id\n\nThe ID of the breaker used in exception reporting or for logging purposes. If not specified, a `uuid4()` is created.\n\n### detect_error\n\nType: `Optional[Callable[Any, bool]]`\n\nThis option can be used to detect errors that do not raise exceptions. For example, if you have a function that returns a response object with a status code, we can detect errors that have a status code of 500.\n\n```python\nfrom pycircuitbreaker import circuit\n\ndef detect_500(response) -> bool:\n    return response.status_code == 500\n\n@circuit(detect_error=detect_500)\ndef request():\n    response = external_call()\n    return response\n```\n\n### error_threshold\n\nType: `Optional[int]`\nDefault: `5`\n\nThe number of sequential errors that must occur before the breaker opens. If 4 errors occur a single success will reset the error count to 0.\n\n### exception_denylist\n\nType: `Optional[Iterable[Exception]]`\n\nThere are cases where only certain errors should count as errors that can open the breaker. In the example below, we are using [requests](https://requests.readthedocs.io/en/master/) to call to an external service and then raise an exception on an error case. We only want the circuit breaker to open on timeouts to\nthe external service. \n\nNote that if this option is used, errors derived from those specified will also be included in the denylist.\n\n```python\nimport requests\nfrom pycircuitbreaker import circuit\n\n@circuit(exception_denylist=[requests.exceptions.Timeout])\ndef external_call():\n    response = requests.get(\"EXTERNAL_SERVICE\")\n    response.raise_for_status()\n```\n\n### exception_allowlist\n\nType: `Optional[Iterable[Exception]]`\n\nThis setting allows certain exceptions to not be counted as errors. Taking the same example as the exception_denylist setting, we can ignore `request.exceptions.HTTPError` only using the allowlist.\n\nNote that if this option is used, errors derived from those specified will also be included in the allowlist.\n\n```python\nimport requests\nfrom pycircuitbreaker import circuit\n\n@circuit(exception_allowlist=[requests.exceptions.HTTPError])\ndef external_call():\n    response = requests.get(\"EXTERNAL_SERVICE\")\n    response.raise_for_status()\n```\n\n### on_close\n\nType: `Optional[Callable[[CircuitBreaker], None]]`\n\nIf specified, this function is called when the breaker fully closes. This can be useful for logging messages.\n\n### on_open\n\nType: `Optional[Callable[[CircuitBreaker, Union[Exception, Any]], None]]`\n\nIf specified, this function is called when the breaker opens. The 2nd parameter to the function will be the exception that triggered the opening if exception detection was used. If the `detect_error` method was used, the wrapped function return value is passed as the 2nd parameter.\n\n### recovery_threshold\n\nType: `Optional[int]`\nDefault: `1`\n\nThis is the number of successful calls that must occur before the circuit breaker transitions from `CircuitBreakerState.HALF_OPEN` to `CircuitBreakerState.CLOSED`.\n\n### recovery_timeout\n\nType: `Optional[int]`\nDefault: 30\n\nThe number of seconds the breaker stays fully open for before test requests are allowed through.\n\n### strategy\n\nType: `Optional[pycircuitbreaker.CircuitBreakerStrategy]`\nDefault: `pycircuitbreaker.CircuitBreakerStrategy.SINGLE_RESET`\n\nControls how successes change the error count when the breaker is closed. By default, a single success resets the number of errors in the breaker.\n\nPossible options:\n* `CircuitBreakerStrategy.SINGLE_RESET`\n* `CircuitBreakerStrategy.NET_ERROR`\n\n## CircuitBreaker API\n\nThe public API of the `CircuitBreaker` class is described below.\n\n### error_count\n\nType: `int`\n\nThe number of errors stored in the breaker.\n\n### id\n\nThe ID of the breaker. If not supplied via the configuration `breaker_id` setting, this is a `uuid4()`.\n\n### open_time\n\nType: `datetime`\n\nThe UTC time the breaker last opened.\n\n### recovery_start_time\n\nType: `datetime`\n\nThe UTC time that the breaker is open until (when recovery begins).\n\n### state\n\nType: `CircuitBreakerState`\n\nThe state of the breaker.\n\n### success_count\n\nType: `int`\n\nThe number of successes stored in the breaker during the recovery period.\n\n## Roadmap\n\n1. Back circuit breaker state with Redis to share state among processes (e.g. for gunicorn)\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/etimberg/pycircuitbreaker",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pycircuitbreaker",
+    "package_url": "https://pypi.org/project/pycircuitbreaker/",
+    "platform": "any",
+    "project_url": "https://pypi.org/project/pycircuitbreaker/",
+    "project_urls": {
+      "Homepage": "https://github.com/etimberg/pycircuitbreaker"
+    },
+    "release_url": "https://pypi.org/project/pycircuitbreaker/0.5.0/",
+    "requires_dist": [
+      "pytest (>=5.3) ; extra == 'test'",
+      "pytest-cov ; extra == 'test'"
+    ],
+    "requires_python": "",
+    "summary": "Python implementation of the Circuit Breaker Pattern",
+    "version": "0.5.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10790281,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6520c53fe939d0e8cbbb7ff6c72e3c20b8d8fd893b974b9c2832e2ca7e3d1f1",
+          "md5": "60398f4c6dddb1acfb110046aebf9549",
+          "sha256": "814c7f601d6c1034788b0b092993606546f33ae6ebf09cd580b6c835f1330ef7"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "60398f4c6dddb1acfb110046aebf9549",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6151,
+        "upload_time": "2020-02-16T20:20:54",
+        "upload_time_iso_8601": "2020-02-16T20:20:54.846253Z",
+        "url": "https://files.pythonhosted.org/packages/d6/52/0c53fe939d0e8cbbb7ff6c72e3c20b8d8fd893b974b9c2832e2ca7e3d1f1/pycircuitbreaker-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "378788c104aab70e647a0096577337598558d98ab17e9cb304663887fd651f21",
+          "md5": "6bcea2087c83dc62332b510f5b59be88",
+          "sha256": "3c536571cac93f03e132fabf15af534d64b6f73ab843dcfe254ae4d1162f51cd"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6bcea2087c83dc62332b510f5b59be88",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5319,
+        "upload_time": "2020-02-16T20:20:56",
+        "upload_time_iso_8601": "2020-02-16T20:20:56.770857Z",
+        "url": "https://files.pythonhosted.org/packages/37/87/88c104aab70e647a0096577337598558d98ab17e9cb304663887fd651f21/pycircuitbreaker-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84c0153c1efe6213c9aa4bec705d315bb9b6778728846f94adccfe9036776d97",
+          "md5": "f8e1b68d388548b7624b1e7ccafe23aa",
+          "sha256": "cde0dc16745a117c63910591c366284d94076313b8e9af4554ea902a8c84b2c6"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f8e1b68d388548b7624b1e7ccafe23aa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7123,
+        "upload_time": "2020-02-17T21:58:47",
+        "upload_time_iso_8601": "2020-02-17T21:58:47.418441Z",
+        "url": "https://files.pythonhosted.org/packages/84/c0/153c1efe6213c9aa4bec705d315bb9b6778728846f94adccfe9036776d97/pycircuitbreaker-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a8d4fa3581a2397e8fc0e2c7705230fe300e00b2999c0f9060fd4908ed4935c",
+          "md5": "802db424e905a99e747e942a3d03e926",
+          "sha256": "0746d0f40ce32fd26d749add924c15cd22bce4030fa97c405ede95016b184080"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "802db424e905a99e747e942a3d03e926",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6624,
+        "upload_time": "2020-02-17T21:58:48",
+        "upload_time_iso_8601": "2020-02-17T21:58:48.859421Z",
+        "url": "https://files.pythonhosted.org/packages/6a/8d/4fa3581a2397e8fc0e2c7705230fe300e00b2999c0f9060fd4908ed4935c/pycircuitbreaker-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a31af72a71d951eef54f07a072d4a0b5016260efd831361e24ff69f9dd559ae1",
+          "md5": "e9d863095c2bc06a60646904dfd79b46",
+          "sha256": "313ef58c93496c4c888b65a71c48c4ee0e2d91e3314fa68415dc89553dce73f8"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e9d863095c2bc06a60646904dfd79b46",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8652,
+        "upload_time": "2020-04-10T23:03:47",
+        "upload_time_iso_8601": "2020-04-10T23:03:47.962070Z",
+        "url": "https://files.pythonhosted.org/packages/a3/1a/f72a71d951eef54f07a072d4a0b5016260efd831361e24ff69f9dd559ae1/pycircuitbreaker-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44adea8364e21f2d013e50c1d526753689a9e011739d2b516e6e674fa49e470e",
+          "md5": "15169cb8f118e8d5b8f5d00b0c3b3395",
+          "sha256": "f69610db3ca0fc110b72ea2d92309a2020a8b20b7dcc41de911164b7d129053e"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "15169cb8f118e8d5b8f5d00b0c3b3395",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8697,
+        "upload_time": "2020-04-10T23:03:49",
+        "upload_time_iso_8601": "2020-04-10T23:03:49.070235Z",
+        "url": "https://files.pythonhosted.org/packages/44/ad/ea8364e21f2d013e50c1d526753689a9e011739d2b516e6e674fa49e470e/pycircuitbreaker-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9467dcbd7c301500e017ff05b9f566d9e2cbe059110c203f37c6fdd29e471b11",
+          "md5": "39e9fa2d79f6191c974e884904409fba",
+          "sha256": "681972fbfcdc6638fdccef1ab6398db950961b1afccfe982a03a0d60c870553a"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "39e9fa2d79f6191c974e884904409fba",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8647,
+        "upload_time": "2021-05-22T21:10:21",
+        "upload_time_iso_8601": "2021-05-22T21:10:21.388419Z",
+        "url": "https://files.pythonhosted.org/packages/94/67/dcbd7c301500e017ff05b9f566d9e2cbe059110c203f37c6fdd29e471b11/pycircuitbreaker-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75e7db3c6e2acd0cbc97529e27f761eecf69eb02f1fb1536550c6ba52a05f669",
+          "md5": "d3e97cc8d7d7e4ae991f806767987ce3",
+          "sha256": "7bffba3da1a76a99f4e56186367c305893e6b0b7e91762ad84ec91ddd68bc1de"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d3e97cc8d7d7e4ae991f806767987ce3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9349,
+        "upload_time": "2021-05-22T21:10:22",
+        "upload_time_iso_8601": "2021-05-22T21:10:22.798784Z",
+        "url": "https://files.pythonhosted.org/packages/75/e7/db3c6e2acd0cbc97529e27f761eecf69eb02f1fb1536550c6ba52a05f669/pycircuitbreaker-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d7cc672f369fdd7456cea933c86642ec4623818a00f0e00d1903cf70b915429",
+          "md5": "2fd2f5221cf01a782625bfd168871292",
+          "sha256": "47d7657fee04ed2da8345055ee777e32098b079c1637cf12a58748fc292e2cf8"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2fd2f5221cf01a782625bfd168871292",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9374,
+        "upload_time": "2021-05-26T11:55:38",
+        "upload_time_iso_8601": "2021-05-26T11:55:38.176755Z",
+        "url": "https://files.pythonhosted.org/packages/8d/7c/c672f369fdd7456cea933c86642ec4623818a00f0e00d1903cf70b915429/pycircuitbreaker-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ecc48e95ccb38285e6e5ac375475f5e8500c4815da7606d5f0b1cae0b1f338b",
+          "md5": "414de9f559c2b5d656ea625e84b30bd3",
+          "sha256": "87ec4f5b9d42088cab28e5ce337df0a36d62166c08b21f8e690e722ab0af62b2"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "414de9f559c2b5d656ea625e84b30bd3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10680,
+        "upload_time": "2021-05-26T11:55:39",
+        "upload_time_iso_8601": "2021-05-26T11:55:39.381531Z",
+        "url": "https://files.pythonhosted.org/packages/1e/cc/48e95ccb38285e6e5ac375475f5e8500c4815da7606d5f0b1cae0b1f338b/pycircuitbreaker-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "479b684aff05729c845a5213bfbcea1f7d7dc8c335fb07315d7d66ecb87ed80a",
+          "md5": "af9f0f85de78dd1f2d7988b987707454",
+          "sha256": "0a240448d0b4cc6c2e3042e51093023614bce4dda36945f974b5f10b25f90b6c"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "af9f0f85de78dd1f2d7988b987707454",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9370,
+        "upload_time": "2021-06-30T21:47:06",
+        "upload_time_iso_8601": "2021-06-30T21:47:06.221628Z",
+        "url": "https://files.pythonhosted.org/packages/47/9b/684aff05729c845a5213bfbcea1f7d7dc8c335fb07315d7d66ecb87ed80a/pycircuitbreaker-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96853048bfae6b73c0e96950e35819553c67b4e12fe48d3d46ad19ca7d95c3a1",
+          "md5": "4c737e13f3b9ed67fcdcefdd704eb4ca",
+          "sha256": "2b40c3f109f4b9fea590e120af80d2bd0fae75ac107aafa1d60b7f6648d0c81c"
+        },
+        "downloads": -1,
+        "filename": "pycircuitbreaker-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c737e13f3b9ed67fcdcefdd704eb4ca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10687,
+        "upload_time": "2021-06-30T21:47:08",
+        "upload_time_iso_8601": "2021-06-30T21:47:08.176707Z",
+        "url": "https://files.pythonhosted.org/packages/96/85/3048bfae6b73c0e96950e35819553c67b4e12fe48d3d46ad19ca7d95c3a1/pycircuitbreaker-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "479b684aff05729c845a5213bfbcea1f7d7dc8c335fb07315d7d66ecb87ed80a",
+        "md5": "af9f0f85de78dd1f2d7988b987707454",
+        "sha256": "0a240448d0b4cc6c2e3042e51093023614bce4dda36945f974b5f10b25f90b6c"
+      },
+      "downloads": -1,
+      "filename": "pycircuitbreaker-0.5.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "af9f0f85de78dd1f2d7988b987707454",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 9370,
+      "upload_time": "2021-06-30T21:47:06",
+      "upload_time_iso_8601": "2021-06-30T21:47:06.221628Z",
+      "url": "https://files.pythonhosted.org/packages/47/9b/684aff05729c845a5213bfbcea1f7d7dc8c335fb07315d7d66ecb87ed80a/pycircuitbreaker-0.5.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "96853048bfae6b73c0e96950e35819553c67b4e12fe48d3d46ad19ca7d95c3a1",
+        "md5": "4c737e13f3b9ed67fcdcefdd704eb4ca",
+        "sha256": "2b40c3f109f4b9fea590e120af80d2bd0fae75ac107aafa1d60b7f6648d0c81c"
+      },
+      "downloads": -1,
+      "filename": "pycircuitbreaker-0.5.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "4c737e13f3b9ed67fcdcefdd704eb4ca",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 10687,
+      "upload_time": "2021-06-30T21:47:08",
+      "upload_time_iso_8601": "2021-06-30T21:47:08.176707Z",
+      "url": "https://files.pythonhosted.org/packages/96/85/3048bfae6b73c0e96950e35819553c67b4e12fe48d3d46ad19ca7d95c3a1/pycircuitbreaker-0.5.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

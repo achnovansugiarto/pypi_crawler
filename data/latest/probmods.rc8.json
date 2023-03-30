@@ -1,0 +1,316 @@
+{
+  "info": {
+    "author": "Wessel Bruinsma",
+    "author_email": "wessel.p.bruinsma@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# [ProbMods: Probabilistic Models](http://github.com/wesselb/probmods)\n\n[![CI](https://github.com/wesselb/probmods/workflows/CI/badge.svg)](https://github.com/wesselb/probmods/actions?query=workflow%3ACI)\n[![Coverage Status](https://coveralls.io/repos/github/wesselb/probmods/badge.svg?branch=master&service=github)](https://coveralls.io/github/wesselb/probmods?branch=master)\n[![Latest Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://wesselb.github.io/probmods)\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n\nAn interface to facilitate rapid development and deployment of probabilistic models\n\nContents:\n\n- [Installation](#installation)\n- [Manual](#manual)\n    - [What is the Problem?](#what-is-the-problem)\n    - [Basic Principles](#basic-principles)\n        - [Models and Instances](#models-and-instances)\n        - [Automatic Argument Casting: `@cast`](#automatic-argument-casting-cast)\n        - [Parameters Without Varz](#parameters-without-varz)\n        - [Details of Model Instantiation](#details-of-model-instantiation)\n        - [Automatic Model Instantiation: `@instancemethod`](#automatic-model-instantiation-instancemethod)\n        - [Description of Models](#description-of-models)\n        - [Prior and Posterior Methods: `@priormethod` and `@posteriormethod`]()\n    - [Model Fitting](#model-fitting)\n    - [`Transformed`](#transformed)\n    - [Automatic Model Tests](#automatic-model-tests)\n\n## Installation\n\nSee [the instructions here](https://gist.github.com/wesselb/4b44bf87f3789425f96e26c4308d0adc).\nThen simply\n\n```\npip install probmods\n```\n\n## Manual\n\n### What is the Problem?\n\nSuppose that we have implemented a probabilistic model, and we would like to\napply it to data.\nA typical way to do this would be to write a script roughly along the following\nlines:\n\n```python\nimport lab.tensorflow as B\nimport tensorflow as tf\nfrom stheno.tensorflow import EQ, GP\nfrom varz import Vars, minimise_l_bfgs_b\n\n# Increase regularisation for `float32`s.\nB.epsilon = 1e-6\n\n# Initial model parameters:\ninit_noise = 1e-2\ninit_variance = 1\ninit_length_scale = 1\n\n\ndef prior(vs):\n    \"\"\"Construct the prior of the model.\"\"\"\n    ps = vs.struct  # Dynamic parameter struct\n    variance = ps.variance.positive(init_variance)\n    length_scale = ps.length_scale.positive(init_length_scale)\n    noise = ps.noise.positive(init_noise)\n    return GP(variance * EQ().stretch(length_scale)), noise\n\n\ndef sample(vs, x):\n    \"\"\"Sample from the prior.\"\"\"\n    f, noise = prior(vs)\n    return f(x, noise).sample()\n\n\n# Create a variable container.\nvs = Vars(tf.float32)\n\n# Generate data by sampling from the prior.\nx = B.linspace(tf.float32, 0, 10, 100)\ny = sample(vs, x)\n\n\ndef objective(vs):\n    f, noise = prior(vs)\n    return -f(x, noise).logpdf(y)\n\n\n# Fit the model.\nminimise_l_bfgs_b(objective, vs, trace=True, jit=True)\n\n\ndef posterior(vs):\n    \"\"\"Construct the posterior.\"\"\"\n    f, noise = prior(vs)\n    post = f | (f(x, noise), y)\n    return post, noise\n\n\ndef predict(vs, x):\n    \"\"\"Make predictions at new input locations.\"\"\"\n    f, noise = posterior(vs)\n    return f(x).marginals()\n\n\n# Make predictions.\nmean, var = predict(vs, B.linspace(tf.float32, 10, 15, 100))\n```\n\nIn the example, we sample data from a Gaussian process using\n[Stheno](https://github.com/wesselb/stheno), learn hyperparameters for the\nGaussian process, and finally make predictions for new input locations.\nSeveral aspects are not completely satisfactory:\n\n* There is not one model object which you can conveniently pass around.\n  Instead, the initial model parameters are defined as global variables, and\n  the model is implemented with many functions (`prior`, `sample`,\n  `objective`, `posterior`, `predict`, ...) which all depend on\n  each other.\n  This is not a convenient interface.\n  If you wanted to share your model with someone else, so they could apply it\n  to their data, they would not be able to just insert your model in existing\n  code, but they would have to take your whole script.\n  Moreover, they even might have to adjust it  appropriately, for what if they\n  wanted to sample from the posterior or fit the posterior to some data?\n    \n* Since the script uses TensorFlow as a backend, you have to be careful\n  to convert everything to TensorFlow tensors of the appropriate data type.\n    \n* The script is not easily extensible.\n  What if you wanted to add in data normalisation by subtracting the mean\n  and dividing by the standard deviation?\n  Among other things, you would have to keep track of those parameters\n  and appropriately transform the predictions back to the original domain.\n  What if, in addition, your data was positive, so you would want to also\n  employ a log-transform?\n  The code now starts to become spaghetti-like.\n    \nThe package `probmods` aims to solve all of these problems.\nBelow is how the above model could be implemented with `probmods`:\n\n```python\nimport lab.tensorflow as B\nimport numpy as np\nimport tensorflow as tf\nfrom stheno import EQ, GP\n\nfrom probmods import Model, instancemethod, cast, Transformed\n\n# Increase regularisation for `float32`s.\nB.epsilon = 1e-6\n\n\nclass GPModel(Model):\n    def __init__(self, init_variance, init_length_scale, init_noise):\n        self.init_variance = init_variance\n        self.init_length_scale = init_length_scale\n        self.init_noise = init_noise\n\n    def __prior__(self):\n        \"\"\"Construct the prior of the model.\"\"\"\n        variance = self.ps.variance.positive(self.init_variance)\n        length_scale = self.ps.length_scale.positive(self.init_length_scale)\n        self.f = GP(variance * EQ().stretch(length_scale))\n        self.noise = self.ps.noise.positive(self.init_noise)\n\n    def __noiseless__(self):\n        \"\"\"Transform the model into a noiseless one.\"\"\"\n        self.noise = 0\n\n    @cast\n    def __condition__(self, x, y):\n        \"\"\"Condition the model on data.\"\"\"\n        self.f = self.f | (self.f(x, self.noise), y)\n\n    @instancemethod\n    @cast\n    def logpdf(self, x, y):\n        \"\"\"Compute the log-pdf.\"\"\"\n        return self.f(x).logpdf(y)\n\n    @instancemethod\n    @cast\n    def predict(self, x):\n        \"\"\"Make predictions at new input locations.\"\"\"\n        return self.f(x, self.noise).marginals()\n\n    @instancemethod\n    @cast\n    def sample(self, x):\n        \"\"\"Sample at new input locations.\"\"\"\n        return self.f(x, self.noise).sample()\n\n\n# This model object can easily be inserted anywhere in existing code and be\n# passed around.\nmodel = Transformed(\n    tf.float32,\n    GPModel(1, 1, 1e-1),\n    transform=\"normalise+positive\",\n)\n\n# Generate data by sampling from the prior.\nx = np.linspace(0, 10, 100)\ny = model.sample(x)\n\n# Fit the model and print the learned parameters.\nmodel.fit(x, y, trace=True, jit=True)\nmodel.vs.print()\n\n# Make predictions.\nx_new = np.linspace(10, 15, 100)\nposterior = model.condition(x, y)\nmean, var = posterior.predict(x_new)\n\n# But we can go on....\n\n# ...to sample from the posterior.\ny_new = posterior.sample(x_new)\n\n# Or to train the model parameters by _fitting the posterior_ to new data!\nposterior.fit(x_new, y_new, trace=True, jit=True)\n\n# Or to condition on even more data!\nposterior = posterior.condition(x_new, y_new)\n\n# Or to make more preditions!\nmean, var = posterior.predict(x_new)\n```\n\n### Basic Principles\n\n#### Models and Instances\n_Models_ are functions from _learnable parameters_ to _instances of models_.\nAn _instance of a model_, or simply an _instance_, is an object with concrete\nvalues for it's all parameters and which can do things like sample or compute\na log-pdf.\nMoreover, models can be parametrised by _non-learnabe parameters_, like \ninitial values for learnable parameters or parameters which define the structure\nof the model, like other submodels.\nIn this sense, models can interpreted as _configurations_\nor _templates_ for instances of models.\n\nFor example, consider\n\n```python\n>>> model = GPModel(init_variance=1, init_length_scale=1, init_noise=1e-2)\n```\n\nHere `model` is a model parametrised with initial values for learnable\nparameters.\nWe can try to sample from it, but this runs into an error, because, although the\ninitial values for the parameters of `model` are set, the actual parameters of\n`model` and the internals, such as the Gaussian process, are not yet created:\n\n```python\n>>> x = np.linspace(0, 10, 10)\n\n>>> model.sample(x)\nAttributeError: Parameter struct not available.\n```\n\n**Important assumption:**\nIt is assumed that models like `model` can safely be copied using `copy.copy`,\nwhich  performs a _shallow copy_.\nThis means that the constructor of a model should not do much more than\nmodel configuration through setting attributes.\nIf a shallow copy is not appropriate, you should implement `model.__copy__`.\n\nThe object `model` acts like a function from parameters to instances of model.\nTo demonstrate this, we first need to create parameters.\n`probmods` uses [Varz](https://github.com/wesselb/varz) manage parameters:\n\n```python\n>>> from varz import Vars\n\n>>> parameters = Vars(tf.float32)\n```\n\nThe object `parameters` will create and keep track of all parameters which\n`model` will use.\nWe can feed `parameters` to `model` to get an instance, which we can then\nsample from.\n\n```python\n>>> instance = model(parameters)\n\n>>> instance.sample(x)\narray([[ 0.58702797],\n       [ 0.40569574],\n       [ 0.42661083],\n       [ 1.1435565 ],\n       [ 0.02888119],\n       [-1.8267081 ],\n       [-0.5065604 ],\n       [ 0.7860895 ],\n       [-0.32402134],\n       [-2.4540234 ]], dtype=float32)\n```\n\nYou can check whether a model is instantiated or not with the property\n`instantiated`:\n\n```python\n>>> model.instantiated\nFalse\n\n>>> instance.instantiated\nTrue\n```\n\nRepresenting models as functions from parameters to instances has a number of\nbenefits:\n\n* *Transparancy:* You can always construct an instance simply by calling it \n    with parameters. As can sometimes be the case with objects, you do not\n    need to call particular methods in a particular sequence or worry about\n    other side effects.\n\n* *Efficiency:* Functions can be compiled using a JIT, which eliminates Python's\n    overhead and can create extremely efficient implementations:\n  \n    ```python\n    @jit\n    def pplp(parameters, x1, y1, x2, y2):\n        \"\"\"Compute the log-pdf of `(x1, y1)` given `(x2, y2)`.\"\"\"\n        posterior = model.condition(x2, y2)\n        return posterior(parameters).logpdf(x1, y1)\n    ```\n\n* *Composability:* Models can easily be used as components in bigger models.\n\n#### Automatic Argument Casting: `@cast`\n\nAlthough the internal variables of `instance` are TensorFlow tensors,\nyou can simply feed a NumPy array to `instance.sample`.\nFurthermore, the output of `instance.sample(x)` is a NumPy array, rather than a \nTensorFlow tensor:\n\n```python\n>>> x = np.linspace(0, 10, 10)\n\n>>> instance.sample(x)\narray([[0.58702797],\n       [0.40569574],\n       [0.42661083],\n       [1.1435565],\n       [0.02888119],\n       [-1.8267081],\n       [-0.5065604],\n       [0.7860895],\n       [-0.32402134],\n       [-2.4540234]], dtype=float32)\n```\n\nThis behaviour is due to the `@cast` decorator, which automatically\nconverts NumPy arguments  to the right framework (in this case, TensorFlow) and\nthe right data type (in this case, `tf.float32`).\nMoreover, if _only_ NumPy arguments were given, `@cast` then also converts\nback to the result to NumPy.\nFor example, if we were to pass a TensorFlow tensor, we would get a TensorFlow\ntensor back:\n\n```python\n>>> instance.sample(tf.constant(x, dtype=tf.float32))\n<tf.Tensor: shape=(10, 1), dtype=float32, numpy=\narray([[ 0.37403315],\n       [-1.423271  ],\n       [-0.60986364],\n       [ 0.94153786],\n       [ 2.247231  ],\n       [ 2.799852  ],\n       [ 2.8013554 ],\n       [ 1.9703895 ],\n       [ 0.6884947 ],\n       [-0.47107112]], dtype=float32)>\n```\n\n#### Parameters Without Varz\n\nAlthough the package is integrated with [Varz](http://github.com/wesselb/varz)\nto make parameter management as painless as possible, you are not forced to use\nVarz.\nIf you do not want to use Varz, you should give the appropriate parameters \nwhen you call `model` to instantiate it; these parameters which will then be\npassed to `__prior__`.\nHere's how `GPModel` could be modified to work in this way:\n\n```python\n...\n\nclass GPModel(Model):\n    @cast\n    def __prior__(self, variance, length_scale, noise):\n        \"\"\"Construct the prior of the model.\"\"\"\n        self.f = GP(variance * EQ().stretch(length_scale))\n        self.noise = noise\n    \n    ...\n```\n\nNote that specifying the initial values of the parameters in the constructor is\nnot necessary anymore, because all parameter values are given to `__prior__`\nupon instantiation.\n\n```python\n>>> model = GPModel()\n\n>>> instance = model(1, 1, 0.1)\n\n>>> instance.f\nGP(0, EQ() > 1)\n\n>>> instance.noise\n0.1\n```\n\n\n#### Details of Model Instantiation\n\nWhen `model` is instantiated by calling it as `model(*args, **kw_args)`,\nthe following happens:\n\n1. First of all, the model is _copied_ to safely allow mutation of the copy: \n\n    ```python\n    instance = copy.copy(model)\n    ```\n   \n    This copy is a _shallow copy_.\n    If a shallow copy is not appropriate, then you should implement\n   `instance.__copy__`.\n    \n2. If the first argument to `model` was a variable container of type `varz.Vars`\n   or a parameter struct of type `varz.spec.Struct`, `instance.ps` (short for\n   parameters) is set to extract parameters from it.\n   If no such argument was given, `instance.ps` will extract parameters from\n   `model.vs`, if `model.vs` exists.\n   If also `model.vs` does not exist, `instance.ps` will remain unavailable.\n   Whatever case happens, `instance.dtype` will reflect the data type\n   of the parameters or arguments with which `model` was instantiated (`args`\n   and `kw_args`).\n\n3. The prior is constructed:\n\n    ```python\n    instance.__prior__(*args, **kw_args)\n    ```\n\n    The arguments `args` and keyword arguments `kw_args` are those given\n    to the model to instantiate it: `model(*args, **kw_args)`.\n    Calling `instance.__prior__()` mutates `instance`, but that's fine, because\n    `instance` is a copy of the original, so no harm done.\n    The implementation of `instance.__prior__` can access learnable parameters\n    through `instance.ps`.\n    \n\n4. For every previous `model = model.condition(x, y)` or\n   `model = model.noiseless` call, the corresponding operations are performed\n   on `instance` in the same order:\n   \n    ```python\n    instance.__condition__(x, y)\n   \n    instance.__noiseless__()\n    ```\n   \n5. We're done! The result `instance` is returned. `instance` is populated with\n   parameters, has constructed its prior, and has done any potential\n   conditioning, so it is ready to be used e.g. for sampling:\n   `instance.sample(x)`.\n\n\n#### Automatic Model Instantiation: `@instancemethod`\n\nFrom what we've seen so far, you can create a model and sample from it in the\nfollowing way:\n\n```python\n# Create a model.\nmodel = GPModel(1, 1, 1e-2)\n\n# Sample from it at inputs `x`.\nparameters = Vars(tf.float32)\ninstance = model(parameters)\nsample = instance.sample(x)\n```\n\nThis pattern is slightly suboptimal in two ways:\n\n1. You need to constantly carry around a variable container `parameters`.\n\n2. You need to not forget to instantiate the model (calling `model(parameters)`)\n    before doing an operation like sampling.\n   \nThe decorator `@instancemethod` is designed to help with these issues.\nIf you decorate a method with `@instancemethod`, then that indicates that\nthat method can only be called on _instances of models_ rather than _models_.\nIf you call an `@instancemethod` without instantiating `model`, then\nthe decorator will automatically instantiate the model with the variable\ncontainer `model.vs`, assuming that it is available.\nThat is, if `model.sample` is an `@instancemethod`, then `model.sample(x)`\nautomatically translates to `model(model.vs).sample(x)`.\n`model.vs` does not automatically contain a variable container: \nyou will need to assign it one.\n\n```python\n# Create a model.\nmodel = GPModel(1, 1, 1e-2)\n\n# Assign a variable container.\nmodel.vs = Vars(tf.float32)\n\n# Sample from the model.\nsample = model.sample(x)\n```\n\n#### Description of Models\n\nThe `Model` class offers the following properties:\n\n| Property             | Description |\n| --                   | -- |\n| `model.vs`           |  A variable container which will be used to automatically instantiate the model when an `@instancemethod` is called uninstantiated. You need to explicitly assign a variable container to `model.vs`. |\n| `model.ps`           | Once the model is instantiated, `model.ps` (or `self.ps` from within the class) can be used to initialise constrained variables. `model.ps` is not available for uninstantiated models. As an example, after instantiation, `self.ps.parameter_group.matrix.orthogonal(shape=(5, 5))` returns a randomly initialised orthogonal matrix of shape `(5, 5)` named `parameter_group.matrix`. `ps` behaves like a nested struct, dictionary, or list. See [Varz](https://github.com/wesselb/varz#structlike-specification) for more details. |\n| `model.instantiated` | `True` if `model` is instantiated and `False` otherwise. |\n| `model.prior`        | `True` if `model` _is not_ conditioned. Throws an exception if `model` is not instantiated. |\n| `model.posterior`    | `True` if `model` _is_ conditioned. Throws an exception if `model` is not instantiated. |\n| `model.dtype`        | If the model is instantiated, this return the data type of `model.ps`. If the model is not instantiated, this attempts to returns the data type of `model.vs`. If neither `model.ps` nor `model.vs` is available, the data type is automatically determined from the arguments to `model.__prior__`. |\n| `model.num_outputs`  | A convenience property which can be set to the number of outputs of the model. |\n\nWhen you subclass `Model`, you can implement the following methods:\n\n| Method                              | Description |\n| --                                  | -- |\n| `__prior__(self, *args, *kw_args)`  | Construct the prior of the model. |\n| `__condition__(self, x, y)`         | The prior was previously constructed. Update the model by conditioning on `(x, y)`. You may want to use `@convert`. You can either return the conditioned model or mutate the current model and return nothing.  |\n| `__noiseless__(self)`               | Remove noise from the current model. You can either return the noiseless model or mutate the current model and return nothing. |\n| `logpdf(self, x, y)`                | Compute the logpdf for `(x, y)`. This needs to be an `@instancemethod` and you may want to use `@convert`. |\n| `sample(self, x)`                   | Sample at inputs `x`. This needs to be an `@instancemethod` and you may want to use `@convert`. |\n| `predict(self)`                     | Predict at inputs `x`. The default implementation samples and computes the mean and variance of these samples, but you can override this implementation. This needs to be an `@instancemethod` and you may want to use `@convert`. |\n\nFor reference, we again show the implementation of `GPModel` here:\n\n```python\nfrom stheno import EQ, GP\n\nfrom probmods import Model, instancemethod, cast\n\n\nclass GPModel(Model):\n    def __init__(self, init_variance, init_length_scale, init_noise):\n        self.init_variance = init_variance\n        self.init_length_scale = init_length_scale\n        self.init_noise = init_noise\n\n    def __prior__(self):\n        \"\"\"Construct the prior of the model.\"\"\"\n        variance = self.ps.variance.positive(self.init_variance)\n        length_scale = self.ps.length_scale.positive(self.init_length_scale)\n        self.f = GP(variance * EQ().stretch(length_scale))\n        self.noise = self.ps.noise.positive(self.init_noise)\n\n    def __noiseless__(self):\n        \"\"\"Transform the model into a noiseless one.\"\"\"\n        self.noise = 0\n\n    @cast\n    def __condition__(self, x, y):\n        \"\"\"Condition the model on data.\"\"\"\n        self.f = self.f | (self.f(x, self.noise), y)\n\n    @instancemethod\n    @cast\n    def logpdf(self, x, y):\n        \"\"\"Compute the log-pdf.\"\"\"\n        return self.f(x).logpdf(y)\n\n    @instancemethod\n    @cast\n    def predict(self, x):\n        \"\"\"Make predictions at new input locations.\"\"\"\n        return self.f(x, self.noise).marginals()\n\n    @instancemethod\n    @cast\n    def sample(self, x):\n        \"\"\"Sample at new input locations.\"\"\"\n        return self.f(x, self.noise).sample()\n```\n\n#### Prior and Posterior Methods: `@priormethod` and `@posteriormethod`\n\nIt might be that the implementation of an operation, like sampling, is\ndifferent for the prior and posterior. \nYou can use the decorators `@priormethod` and `@posteriormethod` to provide\ndifferent implementations for the prior and posterior.\nThese decorators will also automatically instantiate the model, so there is\nno need for an additional `@instancemethod`.\n\nExample:\n\n```python\nfrom probmods import Model, priormethod, posteriormethod\n\nclass MyModel(Model):\n    def __prior__(self):\n        pass\n    \n    def __condition__(self):\n        pass\n    \n    @priormethod\n    def sample(self):\n        return \"sample from the prior\"\n    \n    @posteriormethod\n    def sample(self):\n        return \"sample from the posterior\"\n```\n\n```python\n>>> model = MyModel()\n\n>>> model.sample()\n'sample from the prior'\n\n>>> model.condition().sample()\n'sample from the posterior'\n```\n\n**Important note:**\nThe decorators `@priormethod` and `@posteriormethod` should always be the\n_outermost_ ones.\n\n### `Transformed`\n\nThe package offers an implementation of one model: `Transformed`.\n`Transformed` takes an existing model and transforms the output of the model,\ne.g., to deal with positive data or to normalise data.\n\nExample:\n\n```python\nmodel = Transformed(\n    tf.float32,\n    GPModel(1, 1, 1e-2),\n    transform=\"normalise+positive\",\n)\n```\n\nThe first argument `tf.float32` indicates the data type of the parameters\nthat you would like to use. \n`Transformed` then automatically creates a variable container and assigns\nit to `model.vs`.\nThe second and third arguments are the model to transform and the specification\nof the transform.\nThe following transformations are possible:\n\n| Transformation | Description |\n| :- | :- |\n| `\"normalise\"` | Subtract the mean and divide by the standard deviation. The mean to subtract and the standard deviation to divide by are computed from the data to which the transform is first applied; these values are then remembered. |\n| `\"positive\"` | Perform a log-transform. This is handy for positive data. |\n| `\"squishing\"` | Perform a transform which suppresses tails. This is handy for heavy-tailed data. |\n\nYou can combine transforms by joining the strings with a `,` or `+`.\nFor example, `\"normalise+positive\"` first applies a log-transform and then\nnormalises the data.\nFor a more detailed description of, please see\n`probmods.bijection.parse`.\n\nFinally, the optional keyword argument `learn_transform` can be set to `True`\nor `False` (default) which specifies whether the parameters of the data\ntransform should be learned.\n\n### Model Fitting\n\nTo fit a model, you can just call `model.fit(x, y)`.\nThe default implementation simply maximises `model.logpdf(x, y)`.\nSee `probmods.model.fit` for a description of the arguments to `fit`.\n\nIf you want to provide a custom fitting procedure for your model,\nthen you can implement a method for `fit`:\n\n```python\nfrom probmods import fit\n\n@fit.dispatch\ndef fit(model: GPModel, x, y):\n    ...  # Custom fitting procedure.\n```\n\nNote that this will only apply to `model`s which are of the type `GPModel`.\nFor example, this will not apply to `Transformed(dtype, GPModel(...))`.\nTo implement a fitting procedure for a transformed version of `GPModel`, the\nfollowing is possible:\n\n```python\nfrom probmods import fit, Transformed\n\n@fit.dispatch\ndef fit(model: Transformed[GPModel], x, y):\n    ...  # Custom fitting procedure.\n```\n\n### Automatic Model Tests\n\nThe function `probmods.test.check_model` can be used to perform some basic\nassertions on a model.\nSee the documentation for more details.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/wesselb/probmods",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "probmods",
+    "package_url": "https://pypi.org/project/probmods/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/probmods/",
+    "project_urls": {
+      "Homepage": "https://github.com/wesselb/probmods"
+    },
+    "release_url": "https://pypi.org/project/probmods/0.4.1/",
+    "requires_dist": [
+      "numpy (>=1.16)",
+      "plum-dispatch (>=2)",
+      "backends",
+      "backends-matrix",
+      "varz"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "An interface to facilitate rapid development and deployment of probabilistic models",
+    "version": "0.4.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17187572,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3fd001802129ad4adffa87d614d8d5995926f73e04cd77347277395edc0a225a",
+          "md5": "8a306b7a2e75860299a369da6a8e7c17",
+          "sha256": "ec41b5ac9a4cc5d2f368c6963b8ab1bce9819c8c0404cc8b1b7ee204251a186b"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8a306b7a2e75860299a369da6a8e7c17",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7193,
+        "upload_time": "2021-07-04T22:15:25",
+        "upload_time_iso_8601": "2021-07-04T22:15:25.582076Z",
+        "url": "https://files.pythonhosted.org/packages/3f/d0/01802129ad4adffa87d614d8d5995926f73e04cd77347277395edc0a225a/probmods-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "497c41722f1cc2ee920312b45f59967ce16f42c0e5a43b77e9ef660073983ab2",
+          "md5": "fed03f8560b4444d03e0ce9a406738d4",
+          "sha256": "6281c33f95e995cb869e691904c33c3a1f3c963a986a2611728911f9a04f51f4"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fed03f8560b4444d03e0ce9a406738d4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7198,
+        "upload_time": "2021-07-15T11:11:42",
+        "upload_time_iso_8601": "2021-07-15T11:11:42.425991Z",
+        "url": "https://files.pythonhosted.org/packages/49/7c/41722f1cc2ee920312b45f59967ce16f42c0e5a43b77e9ef660073983ab2/probmods-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0127912472ecbc0d0cad1f91d976a93487514109ca45e65b750a53be6ffaf445",
+          "md5": "d933da8f9cb70dd61284efed88a62954",
+          "sha256": "c5c37e6b930166f4162ee591e9f20c772b7fa482f8eace1c1d079f3c6dd54b06"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d933da8f9cb70dd61284efed88a62954",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 26135,
+        "upload_time": "2021-08-15T13:30:31",
+        "upload_time_iso_8601": "2021-08-15T13:30:31.353428Z",
+        "url": "https://files.pythonhosted.org/packages/01/27/912472ecbc0d0cad1f91d976a93487514109ca45e65b750a53be6ffaf445/probmods-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db8a090a624515d90fa3484d277d3be4a20780c50fbe07b0b27c7c4e269da4a5",
+          "md5": "289688f27b716ca5a170388ab6621237",
+          "sha256": "8f9326bc2a252a111afd6a8f108eb1287efaced55ddbe295580cf217394a1136"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "289688f27b716ca5a170388ab6621237",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30912,
+        "upload_time": "2021-08-28T15:08:07",
+        "upload_time_iso_8601": "2021-08-28T15:08:07.856418Z",
+        "url": "https://files.pythonhosted.org/packages/db/8a/090a624515d90fa3484d277d3be4a20780c50fbe07b0b27c7c4e269da4a5/probmods-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f27767c60d70e4669e1b638850d2432b629d593250132c072d3453bfa9d03aa",
+          "md5": "d028a3bbbd5ad6974939835b9b86fe4a",
+          "sha256": "0c9da0fa5856e3db0cf5c02f629eb03161a8c6703e8eaef06b0ecf7043356dd5"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d028a3bbbd5ad6974939835b9b86fe4a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 33974,
+        "upload_time": "2021-09-01T18:44:16",
+        "upload_time_iso_8601": "2021-09-01T18:44:16.999205Z",
+        "url": "https://files.pythonhosted.org/packages/8f/27/767c60d70e4669e1b638850d2432b629d593250132c072d3453bfa9d03aa/probmods-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c1fddaa4c259e6cc5c3f836f14cc7a8e72530889c4cde3ffe1298c74f780b87c",
+          "md5": "7f64033ca28b318304979c4c5914b572",
+          "sha256": "c84a7d69235a07a4553dc4999be26ac643a3bc82b636e1c6ee95dddb6359a6e6"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7f64033ca28b318304979c4c5914b572",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35443,
+        "upload_time": "2022-01-12T14:02:35",
+        "upload_time_iso_8601": "2022-01-12T14:02:35.383828Z",
+        "url": "https://files.pythonhosted.org/packages/c1/fd/daa4c259e6cc5c3f836f14cc7a8e72530889c4cde3ffe1298c74f780b87c/probmods-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f85b68304bacb7cb5b94a0357259eefa50fe5e632b4eaa4c9d4a44b71d657fbe",
+          "md5": "2fbe36f1c1020036f45bb7d40e686af7",
+          "sha256": "74cca95bf535d46b2fefbfaa6e2467c9c3f4fdee1d7ec3d9a57751b1be7ad045"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2fbe36f1c1020036f45bb7d40e686af7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 25684,
+        "upload_time": "2023-03-06T18:00:44",
+        "upload_time_iso_8601": "2023-03-06T18:00:44.711240Z",
+        "url": "https://files.pythonhosted.org/packages/f8/5b/68304bacb7cb5b94a0357259eefa50fe5e632b4eaa4c9d4a44b71d657fbe/probmods-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6851638ebbeeea8eaded5bae69bc6fb7161a91a5f86cc391379ad40aed96e0be",
+          "md5": "a28728cf1792a7f16206dbc82f2f6a4c",
+          "sha256": "04cb559745c35d38009a375f82cc2de164ba50d949e1ef1150fcf73f1af124ff"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a28728cf1792a7f16206dbc82f2f6a4c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35559,
+        "upload_time": "2023-03-06T18:00:46",
+        "upload_time_iso_8601": "2023-03-06T18:00:46.606500Z",
+        "url": "https://files.pythonhosted.org/packages/68/51/638ebbeeea8eaded5bae69bc6fb7161a91a5f86cc391379ad40aed96e0be/probmods-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2049e1b5c3a2f357f412de973e6d8d8f1d64729c094638e7682526964060d840",
+          "md5": "fcfd2370ee1f8fac12aa0385004e10d6",
+          "sha256": "3465762ef34d153f1551fd59d9025b1db74d5087c1fd35a4937adee9da898acf"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fcfd2370ee1f8fac12aa0385004e10d6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 25680,
+        "upload_time": "2023-03-07T07:59:46",
+        "upload_time_iso_8601": "2023-03-07T07:59:46.515471Z",
+        "url": "https://files.pythonhosted.org/packages/20/49/e1b5c3a2f357f412de973e6d8d8f1d64729c094638e7682526964060d840/probmods-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6424ec4ee65fcdec7eaab0879fc69c71adec21119cfb4ce03e8a22ef97e53dcf",
+          "md5": "1eb8f40cc8989831d6cf119fea04fd63",
+          "sha256": "1e4aba5d8b5eacbe00aa6a9c719c21eea3a52762db575a0ef84e69bc61b723cf"
+        },
+        "downloads": -1,
+        "filename": "probmods-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1eb8f40cc8989831d6cf119fea04fd63",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35560,
+        "upload_time": "2023-03-07T07:59:48",
+        "upload_time_iso_8601": "2023-03-07T07:59:48.882320Z",
+        "url": "https://files.pythonhosted.org/packages/64/24/ec4ee65fcdec7eaab0879fc69c71adec21119cfb4ce03e8a22ef97e53dcf/probmods-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2049e1b5c3a2f357f412de973e6d8d8f1d64729c094638e7682526964060d840",
+        "md5": "fcfd2370ee1f8fac12aa0385004e10d6",
+        "sha256": "3465762ef34d153f1551fd59d9025b1db74d5087c1fd35a4937adee9da898acf"
+      },
+      "downloads": -1,
+      "filename": "probmods-0.4.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "fcfd2370ee1f8fac12aa0385004e10d6",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 25680,
+      "upload_time": "2023-03-07T07:59:46",
+      "upload_time_iso_8601": "2023-03-07T07:59:46.515471Z",
+      "url": "https://files.pythonhosted.org/packages/20/49/e1b5c3a2f357f412de973e6d8d8f1d64729c094638e7682526964060d840/probmods-0.4.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6424ec4ee65fcdec7eaab0879fc69c71adec21119cfb4ce03e8a22ef97e53dcf",
+        "md5": "1eb8f40cc8989831d6cf119fea04fd63",
+        "sha256": "1e4aba5d8b5eacbe00aa6a9c719c21eea3a52762db575a0ef84e69bc61b723cf"
+      },
+      "downloads": -1,
+      "filename": "probmods-0.4.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1eb8f40cc8989831d6cf119fea04fd63",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 35560,
+      "upload_time": "2023-03-07T07:59:48",
+      "upload_time_iso_8601": "2023-03-07T07:59:48.882320Z",
+      "url": "https://files.pythonhosted.org/packages/64/24/ec4ee65fcdec7eaab0879fc69c71adec21119cfb4ce03e8a22ef97e53dcf/probmods-0.4.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

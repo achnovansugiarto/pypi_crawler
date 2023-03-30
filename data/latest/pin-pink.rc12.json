@@ -1,0 +1,633 @@
+{
+  "info": {
+    "author": null,
+    "author_email": "Stéphane Caron <stephane.caron@normalesup.org>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Framework :: Robot Framework :: Library",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering"
+    ],
+    "description": "# Pink\n\n<img src=\"https://user-images.githubusercontent.com/1189580/172797197-9aa46561-cfaa-4046-bd60-f681d85b055d.png\" align=\"right\" height=140>\n\n[![Build](https://img.shields.io/github/actions/workflow/status/tasts-robots/pink/main.yml?branch=master)](https://github.com/tasts-robots/pink/actions)\n[![Coverage](https://coveralls.io/repos/github/tasts-robots/pink/badge.svg?branch=master)](https://coveralls.io/github/tasts-robots/pink?branch=master)\n[![Documentation](https://img.shields.io/badge/docs-online-brightgreen?style=flat)](https://tasts-robots.org/doc/pink/)\n[![PyPI version](https://img.shields.io/pypi/v/pin-pink)](https://pypi.org/project/pin-pink/)\n\n**P**ython **in**verse **k**inematics for articulated robot models, based on [Pinocchio](https://github.com/stack-of-tasks/pinocchio).\n\n## Installation\n\n```console\npip install pin-pink\n```\n\nOn Raspberry Pi, you will need to install [from source](https://tasts-robots.org/doc/pink/installation.html#from-source).\n\n## Usage\n\nPink solves differential inverse kinematics by [weighted tasks](https://scaron.info/robot-locomotion/inverse-kinematics.html). A task is defined by a *residual* function $e(q)$ of the robot configuration $q \\in \\mathcal{C}$ to be driven to zero. For instance, putting a foot position $p_{foot}(q)$ at a given target $p_{foot}^{\\star}$ can be described by the position residual:\n\n$$\ne(q) = p_{foot}^{\\star} - p_{foot}(q)\n$$\n\nIn differential inverse kinematics, we compute a velocity $v \\in \\mathfrak{c}$ that satisfies the first-order differential equation:\n\n$$\nJ_e(q) v = \\dot{e}(q) = -\\alpha e(q)\n$$\n\nwhere $J\\_e(q) := \\frac{\\partial e}{\\partial q}$ is the [task Jacobian](https://scaron.info/robotics/jacobian-of-a-kinematic-task-and-derivatives-on-manifolds.html). We can define multiple tasks, but some of them will come into conflict if they can't be all fully achieved at the same time. Conflicts are resolved by casting all objectives to a common unit, and weighing these normalized objectives relative to each other. We also include configuration and velocity limits, making our overall optimization problem a quadratic program:\n\n$$\n\\begin{align}\n\\underset{v \\in \\mathfrak{c}}{\\text{minimize}} \\ & \\sum_{\\text{task } e} \\Vert J_e(q) v + \\alpha e(q) \\Vert^2_{W_e} \\\\\n\\text{subject to} \\ & v_{\\text{min}}(q) \\leq v \\leq v_{\\text{max}}(q)\n\\end{align}\n$$\n\nPink provides an API to describe the problem as tasks with targets, and automatically build and solve the underlying quadratic program.\n\n### Task costs\n\nHere is the example of a biped robot that controls the position and orientation of its base, left and right contact frames. A fourth \"posture\" task, giving a preferred angle for each joint, is added for regularization:\n\n```python\nfrom pink.tasks import BodyTask, PostureTask\n\ntasks = {\n    \"base\": BodyTask(\n        \"base\",\n        position_cost=1.0,              # [cost] / [m]\n        orientation_cost=1.0,           # [cost] / [rad]\n    ),\n    \"left_contact\": BodyTask(\n        \"left_contact\",\n        position_cost=[0.1, 0.0, 0.1],  # [cost] / [m]\n        orientation_cost=0.0,           # [cost] / [rad]\n    ),\n    \"right_contact\": BodyTask(\n        \"right_contact\",\n        position_cost=[0.1, 0.0, 0.1],  # [cost] / [m]\n        orientation_cost=0.0,           # [cost] / [rad]\n    ),\n    \"posture\": PostureTask(\n        cost=1e-3,                      # [cost] / [rad]\n    ),\n}\n```\n\nOrientation (similarly position) costs can be scalars or 3D vectors. They specify how much each radian of angular error \"costs\" in the overall normalized objective. When using 3D vectors, components are weighted anisotropically along each axis of the body frame.\n\n### Task targets\n\nAside from their costs, most tasks take a second set of parameters called *target*. For example, a body task aims for a target transform, while a posture task aims for a target configuration vector. Targets are set by the `set_target` function:\n\n```python\n    tasks[\"posture\"].set_target(\n        [1.0, 0.0, 0.0, 0.0] +           # floating base quaternion\n        [0.0, 0.0, 0.0] +                # floating base position\n        [0.0, 0.2, 0.0, 0.0, -0.2, 0.0]  # joint angles\n    )\n```\n\nBody tasks can be initialized, for example, from the robot's neutral configuration:\n\n```python\nimport pink\nfrom robot_descriptions.loaders.pinocchio import load_robot_description\n\nrobot = load_robot_description(\"upkie_description\")\nconfiguration = pink.Configuration(robot.model, robot.data, robot.q0)\nfor body, task in tasks.items():\n    if type(task) is BodyTask:\n        task.set_target(configuration.get_transform_body_to_world(body))\n```\n\nA task can be added to the inverse kinematics once both its cost and target (if applicable) are defined.\n\n### Differential inverse kinematics\n\nPink solves differential inverse kinematics, meaning it outputs a velocity that steers the robot towards achieving all tasks at best. If we keep integrating that velocity, and task targets don't change over time, we will converge to a stationary configuration:\n\n```python\ndt = 6e-3  # [s]\nfor t in np.arange(0.0, 42.0, dt):\n    velocity = solve_ik(configuration, tasks.values(), dt, solver=\"quadprog\")\n    configuration.integrate_inplace(velocity, dt)\n    time.sleep(dt)\n```\n\nIf task targets are continuously updated, there will be no stationary solution to converge to, but the model will keep on tracking each target at best. Note that [`solve_ik`](https://scaron.info/doc/pink/inverse-kinematics.html#pink.solve_ik.solve_ik) will take care of both configuration and velocity limits read from the robot model.\n\n## Examples\n\nBasic examples to get started:\n\n* [Double pendulum](https://github.com/tasts-robots/pink/blob/master/examples/double_pendulum.py)\n* [Loading a custom URDF](https://github.com/tasts-robots/pink/blob/master/examples/load_custom_urdf.py)\n* [Visualization in MeshCat](https://github.com/tasts-robots/pink/blob/master/examples/visualize_in_meshcat.py)\n* [Visualization in yourdfpy](https://github.com/tasts-robots/pink/blob/master/examples/visualize_in_yourdfpy.py)\n\nPink works with all kinds of robot morphologies:\n\n* Arms: [Kinova Gen2](https://github.com/tasts-robots/pink/blob/master/examples/arm_kinova_gen2.py), [UR3](https://github.com/tasts-robots/pink/blob/master/examples/arm_ur3.py)\n* Humanoids: [JVRC-1](https://github.com/tasts-robots/pink/blob/master/examples/humanoid_jvrc.py), [SigmaBan](https://github.com/tasts-robots/pink/blob/master/examples/humanoid_sigmaban.py)\n* Wheeled biped: [Upkie](https://github.com/tasts-robots/pink/blob/master/examples/wheeled_biped_upkie.py)\n* Wheeled: [Omnidirectional robot](https://github.com/tasts-robots/pink/blob/master/examples/omnidirectional_wheeled_robot.py)\n\nCheck out the [examples](https://github.com/tasts-robots/pink/tree/master/examples) folder for more.\n\n## How can I help?\n\nInstall the library and use it! Report bugs in the [issue tracker](https://github.com/tasts-robots/pink/issues). If you are a developer with some robotics experience looking to hack on open source, check out the [contribution guidelines](CONTRIBUTING.md).\n\n## See also\n\nSoftware:\n\n- [Jink.jl](https://github.com/adubredu/Jink.jl): Julia package for differential multi-task inverse kinematics.\n- [pymanoid](https://github.com/stephane-caron/pymanoid): precursor to Pink based on OpenRAVE.\n\nTechnical notes:\n\n- [Inverse kinematics](https://scaron.info/robotics/inverse-kinematics.html): a general introduction to differential inverse kinematics.\n- [Jacobian of a kinematic task and derivatives on manifolds](https://scaron.info/robotics/jacobian-of-a-kinematic-task-and-derivatives-on-manifolds.html).\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": null,
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": null,
+    "keywords": "inverse,kinematics,pinocchio",
+    "license": null,
+    "maintainer": null,
+    "maintainer_email": "Stéphane Caron <stephane.caron@normalesup.org>",
+    "name": "pin-pink",
+    "package_url": "https://pypi.org/project/pin-pink/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pin-pink/",
+    "project_urls": {
+      "Changelog": "https://github.com/tasts-robots/pink/blob/master/CHANGELOG.md",
+      "Documentation": "https://tasts-robots.org/doc/pink/",
+      "Source": "https://github.com/tasts-robots/pink",
+      "Tracker": "https://github.com/tasts-robots/pink/issues"
+    },
+    "release_url": "https://pypi.org/project/pin-pink/0.9.0/",
+    "requires_dist": [
+      "loop-rate-limiters >=0.1.0",
+      "numpy >=1.20.0",
+      "pin >=2.6.3",
+      "qpsolvers >=2.5.0",
+      "quadprog >=0.1.11"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Python inverse kinematics for your robot model based on Pinocchio.",
+    "version": "0.9.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17305166,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b76d731575dfc18ed7415e47e0c38cd9cfe3c58d90c381e7635d288220749388",
+          "md5": "59f7c7debb8346ad16469fa669da4fa3",
+          "sha256": "b5f31bc9ea7773ce7c56e4f5f09cb3c445f7a19fc0ef00aa35da4bbe4d6a455f"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "59f7c7debb8346ad16469fa669da4fa3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 5239,
+        "upload_time": "2022-02-06T10:15:11",
+        "upload_time_iso_8601": "2022-02-06T10:15:11.623795Z",
+        "url": "https://files.pythonhosted.org/packages/b7/6d/731575dfc18ed7415e47e0c38cd9cfe3c58d90c381e7635d288220749388/pin_pink-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79997b03201778131715ac8e5eecff022f1e879b7ed2b0b4f31d07de3fdd8760",
+          "md5": "034e2580f2ea457144f7172b591e80c4",
+          "sha256": "dd040d6de045c409ddc89b8c46a18018fe6b5012addac2b9806edb90691edc80"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "034e2580f2ea457144f7172b591e80c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10309,
+        "upload_time": "2022-02-06T10:15:13",
+        "upload_time_iso_8601": "2022-02-06T10:15:13.444838Z",
+        "url": "https://files.pythonhosted.org/packages/79/99/7b03201778131715ac8e5eecff022f1e879b7ed2b0b4f31d07de3fdd8760/pin-pink-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "44be08665c7db281ae5fd1cc300136c170f5a37d62935e30bcc28a54d8cffea9",
+          "md5": "a4e193750e97674fe1e99ff67fee975f",
+          "sha256": "3ebda69d74fd52a00075a364397704805eae1b27524cc9c786ba431a5ab6e50d"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a4e193750e97674fe1e99ff67fee975f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 743759,
+        "upload_time": "2022-03-16T19:32:43",
+        "upload_time_iso_8601": "2022-03-16T19:32:43.957626Z",
+        "url": "https://files.pythonhosted.org/packages/44/be/08665c7db281ae5fd1cc300136c170f5a37d62935e30bcc28a54d8cffea9/pin_pink-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "cf9bff656e76c25fbb285e89859bfa1b3e4c0d036dd4cbbbe78aab8996f0c5fe",
+          "md5": "567b244f342835af822f2cb9914dbd6e",
+          "sha256": "7c5ba4e19f80834641cd54047f5e387921bfb7f21691452f9dd5de6d77950852"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "567b244f342835af822f2cb9914dbd6e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 684791,
+        "upload_time": "2022-03-16T19:32:47",
+        "upload_time_iso_8601": "2022-03-16T19:32:47.050455Z",
+        "url": "https://files.pythonhosted.org/packages/cf/9b/ff656e76c25fbb285e89859bfa1b3e4c0d036dd4cbbbe78aab8996f0c5fe/pin-pink-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "ff832f8a3949405b3f1dda48413d6d26420a0931c57db0fd2a821afc14f1b607",
+          "md5": "17714ed17b62a9e1402ef067aa3254e5",
+          "sha256": "9af338e317d31e8ece886d37ec47d8b1c7f09228a18f92ac1ad8dc8d94e74254"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "17714ed17b62a9e1402ef067aa3254e5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 747344,
+        "upload_time": "2022-03-17T16:19:36",
+        "upload_time_iso_8601": "2022-03-17T16:19:36.383447Z",
+        "url": "https://files.pythonhosted.org/packages/ff/83/2f8a3949405b3f1dda48413d6d26420a0931c57db0fd2a821afc14f1b607/pin_pink-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "47d4560b2137c6e78a6a36db22d434463a572a63ab1a172b233a4f8650bbef90",
+          "md5": "746b04de625edddaff11363bba5a7c7f",
+          "sha256": "dc958f3a40bba6c74321f44919125ac3ff82e77c60e0ae30ec7477a4c5a9e706"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "746b04de625edddaff11363bba5a7c7f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 689726,
+        "upload_time": "2022-03-17T16:19:39",
+        "upload_time_iso_8601": "2022-03-17T16:19:39.437985Z",
+        "url": "https://files.pythonhosted.org/packages/47/d4/560b2137c6e78a6a36db22d434463a572a63ab1a172b233a4f8650bbef90/pin-pink-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2bd3e2304125b0e6f02381a43fa1502c2e5e884ac387e1e987e3c2f9d9603e72",
+          "md5": "75dce19321785e001778d3d7b8cd3107",
+          "sha256": "b9ec62be6d3fc0cc05a76a0c7b4149af6e9b5e282f6c7bb624ffe84e1b627b9b"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.1.0rc1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "75dce19321785e001778d3d7b8cd3107",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13440,
+        "upload_time": "2022-02-17T14:27:58",
+        "upload_time_iso_8601": "2022-02-17T14:27:58.553485Z",
+        "url": "https://files.pythonhosted.org/packages/2b/d3/e2304125b0e6f02381a43fa1502c2e5e884ac387e1e987e3c2f9d9603e72/pin_pink-0.1.0rc1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f9f50e584df8916cde73451956e1d9f044408eaccc9ca5e850635ed94896c85",
+          "md5": "99544c35161d08049adbf302501146f1",
+          "sha256": "4e84d4f6d562a4fafadbb73e0bd9a0bd4c3042af1f4ee5a09b88bcd9f065959b"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.1.0rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "99544c35161d08049adbf302501146f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 681916,
+        "upload_time": "2022-02-17T14:28:03",
+        "upload_time_iso_8601": "2022-02-17T14:28:03.759418Z",
+        "url": "https://files.pythonhosted.org/packages/9f/9f/50e584df8916cde73451956e1d9f044408eaccc9ca5e850635ed94896c85/pin-pink-0.1.0rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "0964e338fced92b74309214406dd4ac685612d4390bb56243120b74d703a2750",
+          "md5": "deffea65cb8336ea398d19f6424ae70e",
+          "sha256": "112174217c01423ad0891081d001d7d23e436c104134c4da9b3687fa7c50fe81"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "deffea65cb8336ea398d19f6424ae70e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 26232,
+        "upload_time": "2022-03-29T17:15:20",
+        "upload_time_iso_8601": "2022-03-29T17:15:20.286358Z",
+        "url": "https://files.pythonhosted.org/packages/09/64/e338fced92b74309214406dd4ac685612d4390bb56243120b74d703a2750/pin_pink-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "0e88e7a5816cbff6ac59856ee1776d60751c8894e3cf04bc4987145e462a47bb",
+          "md5": "d0d0fe07432a0c03f3b46bfaf26fd350",
+          "sha256": "f6adc4a70df5e09dff5184c7f9675234c1d9c88b62e82b9235d84cedfc2616f3"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d0d0fe07432a0c03f3b46bfaf26fd350",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6233432,
+        "upload_time": "2022-03-29T17:15:26",
+        "upload_time_iso_8601": "2022-03-29T17:15:26.285547Z",
+        "url": "https://files.pythonhosted.org/packages/0e/88/e7a5816cbff6ac59856ee1776d60751c8894e3cf04bc4987145e462a47bb/pin-pink-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "097aff2b44b935c61cb9acf50b7121647e827f3977e44c62c5f241643b1d2e2c",
+          "md5": "35027a49f93e7bfc184ceb091f8f4c05",
+          "sha256": "f2ca1e511a68d7ffb30ed257761f5268a73854a4a87212e188fd4719d572774d"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "35027a49f93e7bfc184ceb091f8f4c05",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 25980,
+        "upload_time": "2022-03-30T18:55:41",
+        "upload_time_iso_8601": "2022-03-30T18:55:41.778287Z",
+        "url": "https://files.pythonhosted.org/packages/09/7a/ff2b44b935c61cb9acf50b7121647e827f3977e44c62c5f241643b1d2e2c/pin_pink-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "78582a746c576824721c235758d947da78ac5a638c357608a1b1db47d09bc583",
+          "md5": "f5af8c4ea3e389ecd090c9dcb85d2527",
+          "sha256": "6e2c0b52ab82354d81d9c943e145f4b2d343e27581d301f785d7bcad26258d60"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f5af8c4ea3e389ecd090c9dcb85d2527",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6234142,
+        "upload_time": "2022-03-30T18:55:47",
+        "upload_time_iso_8601": "2022-03-30T18:55:47.046299Z",
+        "url": "https://files.pythonhosted.org/packages/78/58/2a746c576824721c235758d947da78ac5a638c357608a1b1db47d09bc583/pin-pink-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "ee9e7aabbd7d2633d39f5890fcd4b15bcc0e376cd9c050abc784f716fd9c8565",
+          "md5": "a5d4bcf5ceaaf0b4f5f6ce420dadd484",
+          "sha256": "432bd585caaf04bbffd40660f58c095ed8454d6bbd31fca7968a6d5c13424afe"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a5d4bcf5ceaaf0b4f5f6ce420dadd484",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 28576,
+        "upload_time": "2022-06-21T17:10:53",
+        "upload_time_iso_8601": "2022-06-21T17:10:53.437285Z",
+        "url": "https://files.pythonhosted.org/packages/ee/9e/7aabbd7d2633d39f5890fcd4b15bcc0e376cd9c050abc784f716fd9c8565/pin_pink-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "048b0ee5dc7b41dc6d8c08fd052d6f55723f57fee6577cc51a1a3811e9643634",
+          "md5": "f3a839b4dfcf31efaf75bdb056b362b0",
+          "sha256": "b4fe8fb83b3d78132201b7d1171f7dc69e5366846c5af07c04f0f0d4a43b204f"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f3a839b4dfcf31efaf75bdb056b362b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 72919,
+        "upload_time": "2022-06-21T17:10:56",
+        "upload_time_iso_8601": "2022-06-21T17:10:56.230780Z",
+        "url": "https://files.pythonhosted.org/packages/04/8b/0ee5dc7b41dc6d8c08fd052d6f55723f57fee6577cc51a1a3811e9643634/pin-pink-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "10885a27a32834d49bbb352991cc83b73dc2d10da11fa1b517946ac0e9b0279a",
+          "md5": "2910f47439f6c3427dcd2a80b5316210",
+          "sha256": "6b15d64d86bf139cee8fd49706e208142707f1d1f86196738b98fa9cfa8ea239"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2910f47439f6c3427dcd2a80b5316210",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 28171,
+        "upload_time": "2022-09-26T15:08:08",
+        "upload_time_iso_8601": "2022-09-26T15:08:08.566742Z",
+        "url": "https://files.pythonhosted.org/packages/10/88/5a27a32834d49bbb352991cc83b73dc2d10da11fa1b517946ac0e9b0279a/pin_pink-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "072df673522e6dc19f48b393567fe6da0a283cfcda55d4f1ccd7420189fe7484",
+          "md5": "e09667db19d3bbd0d5ae8035c0920ed8",
+          "sha256": "89ebebf45985298034e58c0d0abcbf876e55adc1eb794b2d2c9894884803c1b4"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e09667db19d3bbd0d5ae8035c0920ed8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 78584,
+        "upload_time": "2022-09-26T15:08:12",
+        "upload_time_iso_8601": "2022-09-26T15:08:12.019943Z",
+        "url": "https://files.pythonhosted.org/packages/07/2d/f673522e6dc19f48b393567fe6da0a283cfcda55d4f1ccd7420189fe7484/pin-pink-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "49e556051120a604a1b443cba6081e5c6e0a5887e5a636ee46366393d5194471",
+          "md5": "9dbee715096fc13537137dbda2397d14",
+          "sha256": "13d070fb334c1b9545013d233d2af1d9b86c9914b2de9e7d48afe3e4eda0eb64"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9dbee715096fc13537137dbda2397d14",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 28151,
+        "upload_time": "2022-12-01T14:13:42",
+        "upload_time_iso_8601": "2022-12-01T14:13:42.199545Z",
+        "url": "https://files.pythonhosted.org/packages/49/e5/56051120a604a1b443cba6081e5c6e0a5887e5a636ee46366393d5194471/pin_pink-0.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "33df4a053ad8ba9786c32bec18753ba26147291dac6cf3f161a2fb8d5473a950",
+          "md5": "c7657fb3443b1439650df1a7d6cb2db0",
+          "sha256": "f8157be4e6afb326e7ec276ecc70cfca2a37eb9e1072d7fe17430e7f32427f18"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c7657fb3443b1439650df1a7d6cb2db0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 77946,
+        "upload_time": "2022-12-01T14:13:47",
+        "upload_time_iso_8601": "2022-12-01T14:13:47.534465Z",
+        "url": "https://files.pythonhosted.org/packages/33/df/4a053ad8ba9786c32bec18753ba26147291dac6cf3f161a2fb8d5473a950/pin-pink-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "b1de8da6153b67eb0875524dd57eea82a973aebe5c43010c4568984befcc238c",
+          "md5": "fc28ecb57b3d769a57a4a78f0eb97c12",
+          "sha256": "b8eec137c524d96a47d2ff8b792efa4a09f01d72663d9ea09a3c49523a94d21b"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fc28ecb57b3d769a57a4a78f0eb97c12",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 28740,
+        "upload_time": "2023-01-16T16:49:16",
+        "upload_time_iso_8601": "2023-01-16T16:49:16.710483Z",
+        "url": "https://files.pythonhosted.org/packages/b1/de/8da6153b67eb0875524dd57eea82a973aebe5c43010c4568984befcc238c/pin_pink-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "e35ca2bcef53fd6c111a1bcc60a69bc0d3445def79cd0259bc2b7726ed33f87c",
+          "md5": "0a9563c97c8dd98327bf671eeb8e08da",
+          "sha256": "580f7e7e881739478669fc6bf23659c8cc4552a78e0564a34b3160ab9e96c1c0"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0a9563c97c8dd98327bf671eeb8e08da",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 78977,
+        "upload_time": "2023-01-16T16:49:22",
+        "upload_time_iso_8601": "2023-01-16T16:49:22.997279Z",
+        "url": "https://files.pythonhosted.org/packages/e3/5c/a2bcef53fd6c111a1bcc60a69bc0d3445def79cd0259bc2b7726ed33f87c/pin-pink-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "cbe000495926d376a603519cff42d5a9eb4bb44a0f8ec88ed102056e171cfcba",
+          "md5": "929a3d63c93a2319ca29a96dfaa87c91",
+          "sha256": "b8a77dab109f6628139f300869fc656589d0580f62001cd46f93ad9ed416a26e"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "929a3d63c93a2319ca29a96dfaa87c91",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 29659,
+        "upload_time": "2023-02-09T18:44:46",
+        "upload_time_iso_8601": "2023-02-09T18:44:46.071010Z",
+        "url": "https://files.pythonhosted.org/packages/cb/e0/00495926d376a603519cff42d5a9eb4bb44a0f8ec88ed102056e171cfcba/pin_pink-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "0c186f943bb290d040938911317e61a7ff0bbd7103cb769bf84d9023211d2ce8",
+          "md5": "339c86074c4793e4335359876c4b82c9",
+          "sha256": "865fb60bb0f009b3a3e6161896e00ed2ab259d27483bf342c53914a9b87844c4"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "339c86074c4793e4335359876c4b82c9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 81788,
+        "upload_time": "2023-02-09T18:44:49",
+        "upload_time_iso_8601": "2023-02-09T18:44:49.778221Z",
+        "url": "https://files.pythonhosted.org/packages/0c/18/6f943bb290d040938911317e61a7ff0bbd7103cb769bf84d9023211d2ce8/pin-pink-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "36b0a8047b07477f75b028e619749397d73f050f9fb5e27aa53c08c4681baac5",
+          "md5": "e16a96976238ae37679709c7b92e99d4",
+          "sha256": "f897f994f07958e15f9a0e4adfa1186035c9bcdc1814cca08c88f6735576cf47"
+        },
+        "downloads": -1,
+        "filename": "pin_pink-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e16a96976238ae37679709c7b92e99d4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 33482,
+        "upload_time": "2023-03-15T15:18:44",
+        "upload_time_iso_8601": "2023-03-15T15:18:44.012353Z",
+        "url": "https://files.pythonhosted.org/packages/36/b0/a8047b07477f75b028e619749397d73f050f9fb5e27aa53c08c4681baac5/pin_pink-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": null,
+        "digests": {
+          "blake2b_256": "70f58d4f0c1d5a141353d2036c44995ca301a44c8e9c0ee836090321ffe43669",
+          "md5": "17bde7f4f0335fed39ba4d49b808bfad",
+          "sha256": "7f854761508ce3dedc8ce21ebcf92492039946769957882fcaa64672b1e59ed6"
+        },
+        "downloads": -1,
+        "filename": "pin-pink-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "17bde7f4f0335fed39ba4d49b808bfad",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 84944,
+        "upload_time": "2023-03-15T15:18:47",
+        "upload_time_iso_8601": "2023-03-15T15:18:47.341897Z",
+        "url": "https://files.pythonhosted.org/packages/70/f5/8d4f0c1d5a141353d2036c44995ca301a44c8e9c0ee836090321ffe43669/pin-pink-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": null,
+      "digests": {
+        "blake2b_256": "36b0a8047b07477f75b028e619749397d73f050f9fb5e27aa53c08c4681baac5",
+        "md5": "e16a96976238ae37679709c7b92e99d4",
+        "sha256": "f897f994f07958e15f9a0e4adfa1186035c9bcdc1814cca08c88f6735576cf47"
+      },
+      "downloads": -1,
+      "filename": "pin_pink-0.9.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e16a96976238ae37679709c7b92e99d4",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 33482,
+      "upload_time": "2023-03-15T15:18:44",
+      "upload_time_iso_8601": "2023-03-15T15:18:44.012353Z",
+      "url": "https://files.pythonhosted.org/packages/36/b0/a8047b07477f75b028e619749397d73f050f9fb5e27aa53c08c4681baac5/pin_pink-0.9.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": null,
+      "digests": {
+        "blake2b_256": "70f58d4f0c1d5a141353d2036c44995ca301a44c8e9c0ee836090321ffe43669",
+        "md5": "17bde7f4f0335fed39ba4d49b808bfad",
+        "sha256": "7f854761508ce3dedc8ce21ebcf92492039946769957882fcaa64672b1e59ed6"
+      },
+      "downloads": -1,
+      "filename": "pin-pink-0.9.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "17bde7f4f0335fed39ba4d49b808bfad",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 84944,
+      "upload_time": "2023-03-15T15:18:47",
+      "upload_time_iso_8601": "2023-03-15T15:18:47.341897Z",
+      "url": "https://files.pythonhosted.org/packages/70/f5/8d4f0c1d5a141353d2036c44995ca301a44c8e9c0ee836090321ffe43669/pin-pink-0.9.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

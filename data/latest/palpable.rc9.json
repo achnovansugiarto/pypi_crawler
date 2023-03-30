@@ -1,0 +1,492 @@
+{
+  "info": {
+    "author": "Xiao",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Palpable\n\n## Introduction\n\nPalpable is a producer-consumer type of task server that uses multiprocessing to do parallel computing. If you need a\nsmall asynchronous task server and would not like to go through the complication of setting up rabbitmq and Celery,\nPalpable is the choice.\n\nPalpable uses Clients to submit Tasks to a Server which manages several Workers. A Task is constructed given a Procedure\nwhich defines what should be done in a task. Each Task has a unique task_id for querying.\n\n## Install\n\n```shell\npip install palpable\n```\n\n## ATTENTION Before Start Using\n\n### Palpable do not offer on disk persistence\nPalpable Server's data are all in memory. Once the server is shutdown, all data are lost.\n\n### Palpable run each task in its own process\nThis ensures isolated environment for each task and multi-cpu usages. However, it adds overhead. Therefore,if each task \nis easy, running these tasks will be way slower than directly run them in one process.\n\n### Python's `print` `multiprocessing` deadlock\nDo not use `print` in the code send to the Palpable server. Doing so may cause palpable Workers to deadlock without\nnotice. Palpable is trying to catch the `print` statement in the code sent to the server, and change it to `log.info`, \nbut this is not guaranteed to work well. If you are not sure whether `print` will be sent to your Palpable server, use \n`python -u` to start your Server, or set `PYTHONUNBUFFERED=1` as an environment variable, when starting your Server.\n\n## Basic Usage\n\n### Setup Customized Server and Client\n\n```python\n\n# configurations\nSERVER_ADDRESS = (\"127.0.0.1\", 8089)\nSERVER_FAMILY = \"AF_INET\"\nSECRET = b\"29r8in389rhd\"\nNUM_OF_WORKERS: int = 8\nTASK_TIMEOUT_SECONDS: float = 3600 * 3\nRESULT_RETENTION_CAPACITY: int = 100000\nRESULT_RETENTION_SECONDS: float = 600\n\nfrom palpable.servants.server import Server\nfrom palpable.units.client import Client\nimport tempfile, shutil\n\n\nclass ExampleServer(Server):\n    def __init__(self):\n        super(ExampleServer, self).__init__(\n            logging_folder=tempfile.mkdtemp(),\n            address=SERVER_ADDRESS,\n            family=SERVER_FAMILY,\n            authkey=SECRET,\n            num_workers=NUM_OF_WORKERS,\n            task_timeout_seconds=TASK_TIMEOUT_SECONDS,\n            result_retention_capacity=RESULT_RETENTION_CAPACITY,\n            result_retention_seconds=RESULT_RETENTION_SECONDS,\n        )\n\n    def close(self):\n        super(ExampleServer, self).close()\n        shutil.rmtree(self._logging_folder)\n\n\nclass ExampleClient(Client):\n    def __init__(self):\n        super(ExampleClient, self).__init__(\n            address=SERVER_ADDRESS,\n            family=SERVER_FAMILY,\n            authkey=SECRET\n        )\n\n```\n\n### Define a Function\n\nSuppose the following code is in the file `utils.py`\n\n```python\nfrom time import sleep\n\n\ndef square(x):\n    sleep(1)\n    return x * x\n\n```\n\n### Use Palpable to Map a Function or Call a Function\n\n```python\nfrom time import sleep\nfrom utils import square\n\nif __name__ == \"__main__\":\n    with ExampleServer() as server:\n        client = ExampleClient()\n\n        result = client.map(square, range(1000))  # map function `square` with parameters [0, 1, ..., 999]\n        print(result)\n        result = client.run(square, 4)  # run function `square` with parameter `4`\n        print(result)\n```\n\nNOICE: it is important to put the `square` function in a different module, otherwise imported function, like `sleep`,\nmay not be pickled correctly.\n\nIn this example, the `with` clause is used to start and stop the server. To do it without `with`:\n\n```python\nserver = ExampleServer()\n\n# start the server\nserver.start()\n\n# signal the server to stop\nserver.stop()\n\n# wait for all processes and threads to end\nserver.join()\n\n# close the server\nserver.close()\n```\n\n## Advanced Usage\n\n### Define a Customized Procedure\n\nSubclass the Procedure class and implement the run method. The run method will be called by the Workers to do the job.\n\n```python\n\nclass Procedure(Immutable):\n\n    def run(self, messenger):\n        \"\"\"\n        This method will be called by the Worker to execute in a process.\n\n        Override this method.\n        Use __init__ to set any params needed for this call\n        The messenger parameter is a Messenger instance\n\n        Use messenger.debug/info/warning/error to send logs\n        Use messenger.submit_tasks to submit sub tasks to the server\n        Use messenger.query_results to query for results of the submitted sub tasks\n\n        If you call predefined functions in this method, to catch possible `print` in the function, do:\n            predefined_function.__globals__[\"print\"] = messenger.print  # inject messenger.print as print\n        See the RunFunction procedure as an example\n\n        ATTENTION: do not use multiprocessing in this method.\n\n        :param messenger: Messenger\n        :return: The data if the task is successful. The data will be constructed to a successful\n            TaskResult by the TaskWorker.\n        :raise raise TaskFailed exception with the failed data if the task is unsuccessful. e.g.\n            raise TaskFailed(\"ID not found\"). The \"ID not found\" will be constructed to a failed TaskResult.\n            Other exceptions will be caught by the Worker and be constructed to a unsuccessful TaskResult using\n            the Exception instance as data\n        \"\"\"\n        raise NotImplementedError\n```\n\nIn the run method, you can submit more tasks or run procedures using the messenger. You can also submit blocking tasks\n(that means you wait for the results of these tasks before moving on) in the run method. Palpable will handle and run\nthe blocking tasks to get the results, even when all the workers are blocked and waiting for results.\n\nExample:\n\n```python\n\nfrom palpable.units.task import Task\nfrom palpable.procedures.procedure import Procedure\n\n\ndef double(x):\n    print(f\"processing {x}\")\n    return 2 * x\n\n\nclass CheckIfOdd(Procedure):\n    def __init__(self, nums):\n        \"\"\"\n        Check if all the nums are odd numbers\n        \"\"\"\n        self.nums = nums\n\n    def run(self, messenger):\n        for n in self.nums:\n            if n % 2 == 0:\n                return False\n        return True\n\n\nclass DoubleOddNumberProc(Procedure):\n    def __init__(self, nums):\n        \"\"\"\n        Check if the nums are all odd, if so double the value of the nums\n        :param nums: odd numbers\n        \"\"\"\n        self.nums = nums\n\n    def run(self, messenger):\n        double.__globals__[\"print\"] = messenger.print  # inject messenger.print as print\n\n        messenger.info(\"check if the numbers are all odd numbers\")\n        # submit new CheckIfOdd procedure and wait for results\n        check_if_odd_task_result = messenger.run_procedure(CheckIfOdd(self.nums))\n\n        if not check_if_odd_task_result:\n            raise Exception(\"Error: the given numbers are not all odd\")\n\n        res = [double(x) for x in self.nums]\n\n        return res\n\n\n```\n\n### Run the Customized Procedure with parameters\n\n```python\nif __name__ == \"__main__\":\n    with ExampleServer() as server:\n        client = ExampleClient()\n\n        # this task will succeed\n        task_result = client.run_procedure(DoubleOddNumberProc(range(1, 10, 2)))\n        print(task_result.is_successful, task_result.data)\n\n        # this task will fail\n        task_result = client.run_procedure(DoubleOddNumberProc(range(2, 10, 2)))\n        print(task_result.is_successful, task_result.data)\n```\n\n### More Usage\n\nCheck the source codes, test codes, and examples for more usage\nhttps://github.com/XiaoMutt/palpable\n\n## Mechanism\n\n### How it works\n\nHere is how it works at a high level:\n\n- you start a Palpable Server with n workers\n- you submit a Procedure through Client to the Server for the workers to finish\n- the Procedure will be wrapped into a Task with a unique task id, and the Task is put into the TaskQueue\n- you receive a task ID for future reference\n- if any worker is available, it will run the task and put the TaskResult into the ResultCache\n- you can query the result cache at any time, using a task ID, to asking for the result of a Task\n    - if there is no such Task with the task ID, None will be returned\n    - if the task is still running, then you will get a TaskResult whose is_successful attribute is None\n    - if the task finished and the result is ready, you will get a TaskResult that has the following attributes:\n        - task_id: the task ID\n        - is_successful: a boolean to indicate whether the task is successful\n        - data: the result data if the task is successful, else the error message\n        - followup_task_ids: the task may initiate new tasks. This is a list of task_ids initiated by this task to\n          followup. Attention: this TaskResult will then be removed from the ResultCache.\n\n### Architecture\n\nThere are three classes that do the heavy lifting: Server, Manager, and Worker. Each of them has a main thread loop that\ndo some jobs:\n\n- Server: the main thread listens incoming commands and starts a new short-lived thread to handle every received\n  commands\n- Manager: the main thread periodically prunes the ResultCache\n- Worker: the main thread periodically checks for available Tasks to run, if so start the Task in a different Process\n  and monitors it\n\nThe three classes have the following ownership Server --> Manager --> Worker (TaskQueue & Lock / ResultCache & Lock)\n\n- The Server owns Manager & its thread lock: the threads spawned by the Server use the lock to access the Manager\n  concurrently\n- The Manager owns several Workers, TaskQueue & its thread lock, ResultCache & its thread lock. The Manager shares the\n  TaskQueue & its thread lock and ResultCache & its thread lock with the Workers. Workers and the Manager communicate\n  through the TaskQueue and ResultCache\n    \n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/XiaoMutt/palpable",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "palpable",
+    "package_url": "https://pypi.org/project/palpable/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/palpable/",
+    "project_urls": {
+      "Homepage": "https://github.com/XiaoMutt/palpable"
+    },
+    "release_url": "https://pypi.org/project/palpable/0.0.11/",
+    "requires_dist": [
+      "dill",
+      "sortedcontainers",
+      "psutil"
+    ],
+    "requires_python": "",
+    "summary": "A multiprocessing task server",
+    "version": "0.0.11",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12757808,
+  "releases": {
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "354133edf5798d505e97837ee90a42163b2210f71dd1e51ebf2643b21b7dda24",
+          "md5": "e43067a90207d1e2c5ee357f24dc514c",
+          "sha256": "8dd72a2d70acb936ba26f73a6df9f9bfca599e4d81ad44ed5428b2de6c912bbc"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e43067a90207d1e2c5ee357f24dc514c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23535,
+        "upload_time": "2022-01-28T07:05:06",
+        "upload_time_iso_8601": "2022-01-28T07:05:06.842838Z",
+        "url": "https://files.pythonhosted.org/packages/35/41/33edf5798d505e97837ee90a42163b2210f71dd1e51ebf2643b21b7dda24/palpable-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e4095350efc8acf355f1f08ff0fab768fdb16a2e91e9e353160792f48ab27cd",
+          "md5": "a148ceddc41e3bfef5003ba638e4b9b6",
+          "sha256": "65aafcfc140532182b266b0845f30ee1654822c3c8fa449dd7d5042a117d373e"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a148ceddc41e3bfef5003ba638e4b9b6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20327,
+        "upload_time": "2022-01-28T07:05:08",
+        "upload_time_iso_8601": "2022-01-28T07:05:08.440502Z",
+        "url": "https://files.pythonhosted.org/packages/3e/40/95350efc8acf355f1f08ff0fab768fdb16a2e91e9e353160792f48ab27cd/palpable-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ae2db9851870b0d28e3a14e0d5d218047b6459b91e17f07687b44451a5a96e7",
+          "md5": "5e48541bb9019400c25c6d5b91ff40db",
+          "sha256": "291aef8c404af1a5a10bb891accb47dd369009bae4662f90288674861248cdaa"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5e48541bb9019400c25c6d5b91ff40db",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23726,
+        "upload_time": "2022-02-01T18:51:13",
+        "upload_time_iso_8601": "2022-02-01T18:51:13.849743Z",
+        "url": "https://files.pythonhosted.org/packages/2a/e2/db9851870b0d28e3a14e0d5d218047b6459b91e17f07687b44451a5a96e7/palpable-0.0.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "89b5af9c466a2e54b4b47f4968d0828e086ba5eec8f6a683b81ab6524c674274",
+          "md5": "35b1c05d0a23e447c37bb3c4a01fc87c",
+          "sha256": "fa03765f756e9ddd24ba1dbd4ea81ec32c3ed2e95f1658d71e15960cbef6298e"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "35b1c05d0a23e447c37bb3c4a01fc87c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20779,
+        "upload_time": "2022-02-01T18:51:15",
+        "upload_time_iso_8601": "2022-02-01T18:51:15.327618Z",
+        "url": "https://files.pythonhosted.org/packages/89/b5/af9c466a2e54b4b47f4968d0828e086ba5eec8f6a683b81ab6524c674274/palpable-0.0.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee5b2209c848a957f5de3dea011766b4adc9f6995c3ab70090393262db983940",
+          "md5": "8256640b74745434777a8d787d931599",
+          "sha256": "4b16c3f31860adaca9abd10b3be6c6dda28a486b10403a578895c836e419839e"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8256640b74745434777a8d787d931599",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21641,
+        "upload_time": "2021-12-09T23:07:02",
+        "upload_time_iso_8601": "2021-12-09T23:07:02.499136Z",
+        "url": "https://files.pythonhosted.org/packages/ee/5b/2209c848a957f5de3dea011766b4adc9f6995c3ab70090393262db983940/palpable-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ffddb10ce34e4bcaf54b1fa52e135ccea13fe9f61e0d812c7eccef442e699a74",
+          "md5": "1d070b04b271550c2ad8886adc2e1b61",
+          "sha256": "929523ef5d379f9a93d507e5a30befce420afa434aacb9dc1c43d3b53d284cd4"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1d070b04b271550c2ad8886adc2e1b61",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18599,
+        "upload_time": "2021-12-09T23:07:04",
+        "upload_time_iso_8601": "2021-12-09T23:07:04.317111Z",
+        "url": "https://files.pythonhosted.org/packages/ff/dd/b10ce34e4bcaf54b1fa52e135ccea13fe9f61e0d812c7eccef442e699a74/palpable-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45362b8600f79a63237f7cfa3756acd3402668f19006d2d6a59a97cccf4ec411",
+          "md5": "afdf72ebffe2aebe88ff0806d5c4af59",
+          "sha256": "eecad592e53345c7c7ca900a600175ecaac68d429ed6e3494525430bafff12cb"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "afdf72ebffe2aebe88ff0806d5c4af59",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21634,
+        "upload_time": "2021-12-09T23:32:59",
+        "upload_time_iso_8601": "2021-12-09T23:32:59.797812Z",
+        "url": "https://files.pythonhosted.org/packages/45/36/2b8600f79a63237f7cfa3756acd3402668f19006d2d6a59a97cccf4ec411/palpable-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "af0f5f847b416d5954b2d2d8780da3594c1c2ebf8f1bafb6bf634e60c91ff35a",
+          "md5": "580f474b0337df52ed1fea3bb5ba21b9",
+          "sha256": "d3228f4f232144dc40f96ea7d85f8e69318d03b19c32b1d4e0d9adbfa0462e9c"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "580f474b0337df52ed1fea3bb5ba21b9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18719,
+        "upload_time": "2021-12-09T23:33:01",
+        "upload_time_iso_8601": "2021-12-09T23:33:01.322417Z",
+        "url": "https://files.pythonhosted.org/packages/af/0f/5f847b416d5954b2d2d8780da3594c1c2ebf8f1bafb6bf634e60c91ff35a/palpable-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9262337d36b34d6f89cf9ee968a8efd18d9f22f0da29fff0bd420b538f20efac",
+          "md5": "cea43adb52cb5b11b745aab4fdb72478",
+          "sha256": "ea8b4c26224767238c292375ce8aa605ef46b47e5b79848795f006cbcad1e887"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cea43adb52cb5b11b745aab4fdb72478",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 22931,
+        "upload_time": "2021-12-10T03:18:32",
+        "upload_time_iso_8601": "2021-12-10T03:18:32.310297Z",
+        "url": "https://files.pythonhosted.org/packages/92/62/337d36b34d6f89cf9ee968a8efd18d9f22f0da29fff0bd420b538f20efac/palpable-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c88858815eeeba6b37ea71e5bb8ccf5ed8a66e11d438bb0d34430886154ec76",
+          "md5": "f5c2f7c0f801c72c4744737ada85b746",
+          "sha256": "6d136e2d3e986f3de186e7a7e7e0cd758f5e7687e25885250c91324f7fe2d476"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f5c2f7c0f801c72c4744737ada85b746",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19859,
+        "upload_time": "2021-12-10T03:18:34",
+        "upload_time_iso_8601": "2021-12-10T03:18:34.437169Z",
+        "url": "https://files.pythonhosted.org/packages/6c/88/858815eeeba6b37ea71e5bb8ccf5ed8a66e11d438bb0d34430886154ec76/palpable-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93acd0be3e8cc075aa52958aa8dc5642ddd624928259cc535dbf48e396b7396d",
+          "md5": "cb55631108c3df5f3b6946dcb27fbcdd",
+          "sha256": "5b22c828f7f983a095314b008309e5280fff62d6d42c6edc44058b9ca7bfbea2"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cb55631108c3df5f3b6946dcb27fbcdd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23103,
+        "upload_time": "2021-12-10T21:03:42",
+        "upload_time_iso_8601": "2021-12-10T21:03:42.211852Z",
+        "url": "https://files.pythonhosted.org/packages/93/ac/d0be3e8cc075aa52958aa8dc5642ddd624928259cc535dbf48e396b7396d/palpable-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb49db57dd403fc59b7d304354a7459c2a8d0fd3b95e4f5e04861506ecb3d40c",
+          "md5": "9289a296b97de62ccfa02d47d40fb33c",
+          "sha256": "318e9b5a68c5818213e42a7c1840a9fb0e5cdd681f1b4272a631dcb29da9b3be"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9289a296b97de62ccfa02d47d40fb33c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19933,
+        "upload_time": "2021-12-10T21:03:43",
+        "upload_time_iso_8601": "2021-12-10T21:03:43.781460Z",
+        "url": "https://files.pythonhosted.org/packages/eb/49/db57dd403fc59b7d304354a7459c2a8d0fd3b95e4f5e04861506ecb3d40c/palpable-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "228180410f051be3941a3471b6c47b915b383f4bcc0396271714787720b287ef",
+          "md5": "a2e50b63afc739b98568e5adf0998311",
+          "sha256": "b6c699f5a9f942f7778c2c91ec4a5e67a9c2b8675b5b7e4a4446b1ef4a06d697"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a2e50b63afc739b98568e5adf0998311",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23283,
+        "upload_time": "2021-12-10T21:18:41",
+        "upload_time_iso_8601": "2021-12-10T21:18:41.000711Z",
+        "url": "https://files.pythonhosted.org/packages/22/81/80410f051be3941a3471b6c47b915b383f4bcc0396271714787720b287ef/palpable-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f82597d824875c51db7ef3e84436f1ec09a626cb64dfe0d3a402cd262fd9d97",
+          "md5": "4ead0dfaa8541e45715ee2de0d5b4883",
+          "sha256": "78dd10d4dcfad2ea9746b865b90993dd4a49167eac9c7890947b7e65ca783e85"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4ead0dfaa8541e45715ee2de0d5b4883",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20136,
+        "upload_time": "2021-12-10T21:18:42",
+        "upload_time_iso_8601": "2021-12-10T21:18:42.856781Z",
+        "url": "https://files.pythonhosted.org/packages/0f/82/597d824875c51db7ef3e84436f1ec09a626cb64dfe0d3a402cd262fd9d97/palpable-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06079d246df07795ced8470bf951d2b8907db037b8371f68ee687cb3ff90541f",
+          "md5": "ffd17ac607adba1525cf28810aed6464",
+          "sha256": "edc78d3dacb4ee7450a6bc53d2c63cd92206ef75131a8bf416bf63886d0318da"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ffd17ac607adba1525cf28810aed6464",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23314,
+        "upload_time": "2021-12-17T02:00:08",
+        "upload_time_iso_8601": "2021-12-17T02:00:08.824891Z",
+        "url": "https://files.pythonhosted.org/packages/06/07/9d246df07795ced8470bf951d2b8907db037b8371f68ee687cb3ff90541f/palpable-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4c3de92e37190be2296f70503ba183c93b8ce2dc19f29629bd539ae493217f1",
+          "md5": "1dfa883b98ac28f71a16bc54a76e165f",
+          "sha256": "376c6e8ab9bb23592a5d8b0b47b0113bd298bb5ee824feea7f39f6f236344d9c"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1dfa883b98ac28f71a16bc54a76e165f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20097,
+        "upload_time": "2021-12-17T02:00:10",
+        "upload_time_iso_8601": "2021-12-17T02:00:10.971993Z",
+        "url": "https://files.pythonhosted.org/packages/c4/c3/de92e37190be2296f70503ba183c93b8ce2dc19f29629bd539ae493217f1/palpable-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b3322850a8a869337ddc8070620ea86888453e2e5ede4c77606d37af8c34b050",
+          "md5": "8a03dd98a962c319a7f9546a15527264",
+          "sha256": "4cf1b69abfb753e654b2bace299ccdf553a28aad5209edcdbf4ac21148ed1cde"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8a03dd98a962c319a7f9546a15527264",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23476,
+        "upload_time": "2022-01-28T02:37:25",
+        "upload_time_iso_8601": "2022-01-28T02:37:25.773050Z",
+        "url": "https://files.pythonhosted.org/packages/b3/32/2850a8a869337ddc8070620ea86888453e2e5ede4c77606d37af8c34b050/palpable-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5aee5330c57c2a7b99dad94c11079445ff421253e2f455183a76a8bcc461adef",
+          "md5": "0bb1f97008f9aeeff81bdf9202256ec0",
+          "sha256": "140c1eb49c5011b3571f217cae40c1d54706320696337007baff12383f72382d"
+        },
+        "downloads": -1,
+        "filename": "palpable-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0bb1f97008f9aeeff81bdf9202256ec0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20251,
+        "upload_time": "2022-01-28T02:37:27",
+        "upload_time_iso_8601": "2022-01-28T02:37:27.781110Z",
+        "url": "https://files.pythonhosted.org/packages/5a/ee/5330c57c2a7b99dad94c11079445ff421253e2f455183a76a8bcc461adef/palpable-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2ae2db9851870b0d28e3a14e0d5d218047b6459b91e17f07687b44451a5a96e7",
+        "md5": "5e48541bb9019400c25c6d5b91ff40db",
+        "sha256": "291aef8c404af1a5a10bb891accb47dd369009bae4662f90288674861248cdaa"
+      },
+      "downloads": -1,
+      "filename": "palpable-0.0.11-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5e48541bb9019400c25c6d5b91ff40db",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 23726,
+      "upload_time": "2022-02-01T18:51:13",
+      "upload_time_iso_8601": "2022-02-01T18:51:13.849743Z",
+      "url": "https://files.pythonhosted.org/packages/2a/e2/db9851870b0d28e3a14e0d5d218047b6459b91e17f07687b44451a5a96e7/palpable-0.0.11-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "89b5af9c466a2e54b4b47f4968d0828e086ba5eec8f6a683b81ab6524c674274",
+        "md5": "35b1c05d0a23e447c37bb3c4a01fc87c",
+        "sha256": "fa03765f756e9ddd24ba1dbd4ea81ec32c3ed2e95f1658d71e15960cbef6298e"
+      },
+      "downloads": -1,
+      "filename": "palpable-0.0.11.tar.gz",
+      "has_sig": false,
+      "md5_digest": "35b1c05d0a23e447c37bb3c4a01fc87c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 20779,
+      "upload_time": "2022-02-01T18:51:15",
+      "upload_time_iso_8601": "2022-02-01T18:51:15.327618Z",
+      "url": "https://files.pythonhosted.org/packages/89/b5/af9c466a2e54b4b47f4968d0828e086ba5eec8f6a683b81ab6524c674274/palpable-0.0.11.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

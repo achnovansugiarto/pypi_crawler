@@ -1,0 +1,400 @@
+{
+  "info": {
+    "author": "Victor Klapholz",
+    "author_email": "victor.klapholz@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# A Domain-Driven Design (DDD) Framework for Python Developers\n\n## What is this library good for?\nThis is a lightweight framework that provides a quick and simple setup for\n[Domain-Driven](https://en.wikipedia.org/wiki/Domain-driven_design) designed apps\nthat are a pleasure to maintain and easy to unit test.\n\nThese are the main features that are supported by the framework:\n1. **Unit of Work** with a **commit** and **rollback** mechanism for application layer handlers\n2. Definition of **Domain Commands** in the domain layer and their **Command Handlers** in the application layer\n3. Definition of **Domain Events** in the domain layer and their **Event Handlers** in the application layer\n4. **Event-Driven Architecture** based on **Domain Events**\n\nThis library has no external dependencies and hence should be easy to add to any project that can benefit from \nDDD.\n\nSupports [asyncio](https://docs.python.org/3/library/asyncio.html).\n\n## Installation\n\n```shell\npip install py-ddd-framework\n```\n\n## Import\n\n```python\nimport asyncio\n\nimport ddd\n\ndef main():\n    bootstrapper = ddd.Bootstrapper()\n    command = SaveUserCommand()\n    # regular usage\n    result = bootstrapper.handle_command(command)\n    # async usage\n    result = asyncio.run(bootstrapper.async_handle_command(command))\n```\n\n## How to implement it?\n\nA sample implementation is provided within the [demo](https://github.com/vklap/py_ddd_framework/tree/main/demo) folder\nin the source code (both for async and regular usage). \n\nTo run the demo, please `cd` into the root folder and execute the following command:\n```shell\npython run_demo.py\n```\n\nThe below explanation is based on this sample implementation.\n\n## Sample Implementation\n\nLet's imagine a simplified background job for saving a user's details that consists \nof the following steps within a unit of work:\n\n1. Get the new user's data from a **PubSub message broker** (such as Amazon SQS, RabbitMQ, etc.) \n   and transform it into a **command** object that can be handled by the **application layer**\n2. Perform basic validations on the **command**'s data\n3. Get the existing **user entity** data from the database, via a **repository**\n4. Update the **user entity** with the data stored in the **command** object\n5. **Save** the updated user entity **in the repository**\n6. Either **commit** (and store the new data in the database) \n   or **rollback** (and thus discard the changes recorded in the previous steps)\n\nSteps 2 (command validation) and 6 (commit or rollback) are triggered by the framework.\n\n### How the code looks like?\n\n#### Domain Layer\n\n##### User Entity\n\n```python\nfrom __future__ import annotations\n\nimport ddd\nfrom demo.domain.command_model.email_set_event import EmailSetEvent\n\n\nclass User(ddd.AbstractEntity):\n    def __init__(self, email: str | None = None, id_: str | None = None):\n        super().__init__()\n        self._id = id_\n        self._email = email\n\n    def get_id(self) -> str:\n        return self._id\n\n    def set_id(self, value: str) -> None:\n        self._id = value\n\n    @property\n    def email(self) -> str:\n        return self._email\n\n    def set_email(self, value: str) -> None:\n        if value and self._email != value:\n            self.add_event(EmailSetEvent(user_id=self._id, new_email=value, old_email=self._email))\n        self._email = value\n\n    def __repr__(self) -> str:\n        return f'<{type(self).__name__}(id={self._id}, email={self._email})>'\n```\n\n##### SaveUserCommand\n\n```python\nfrom __future__ import annotations\n\nimport dataclasses\n\nimport ddd\n\n\n@dataclasses.dataclass\nclass SaveUserCommand(ddd.AbstractCommand):\n    user_id: str | None = None\n    email: str | None = None\n\n    @property\n    def name(self) -> str:\n        return type(self).__name__\n\n    def validate(self) -> None:\n        if not self.user_id:\n            raise ddd.BoundedContextError(ddd.BAD_REQUEST, 'Missing user_id')\n        if not self.email:\n            raise ddd.BoundedContextError(ddd.BAD_REQUEST, 'Missing email')\n```\n\n##### Repository\n\nPlease note that we're using an in memory repository for demo purposes \n(and also for the [unit tests](https://github.com/vklap/py_ddd_framework/tree/main/tests))\n\n```python\nfrom __future__ import annotations\n\nimport abc\n\nimport ddd\nfrom demo.domain.command_model.user import User\n\n\nclass AbstractUserRepository(ddd.RollbackCommitter, abc.ABC):\n    def get_by_id(self, id_: str) -> User:\n        return self._get_by_id(id_)\n\n    def save(self, user: User) -> None:\n        self._save(user)\n\n    @abc.abstractmethod\n    def _get_by_id(self, id_: str) -> User:\n        raise NotImplementedError\n\n    @abc.abstractmethod\n    def _save(self, user: User) -> None:\n        raise NotImplementedError\n\n\nclass InMemoryUserRepository(AbstractUserRepository):\n    def __init__(self):\n        super().__init__()\n        self.users_by_id: dict[str, User] = {}\n        self._saved_users: list[User] = []\n        self.commit_called = False\n        self.rollback_called = False\n        self.commit_should_fail = False\n        self.rollback_should_fail = False\n\n    def _get_by_id(self, id_: str) -> User:\n        result = self.users_by_id.get(id_)\n        if not result:\n            raise ddd.BoundedContextError(ddd.NOT_FOUND, f'User with ID \"{id_}\" does not exist')\n        return result\n\n    def _save(self, user: User) -> None:\n        self._saved_users.append(user)\n\n    def commit(self) -> None:\n        self.commit_called = True\n        if self.commit_should_fail:\n            raise Exception('commit failed')\n        for user in self._saved_users:\n            self.users_by_id[user.get_id()] = user\n\n    def rollback(self) -> None:\n        self.rollback_called = True\n        if self.rollback_should_fail:\n            raise Exception('rollback failed')\n        self._saved_users.clear()\n```\n\n##### SaveUserCommandHandler\n\nThis is the application layer flow that is triggered by the framework's unit of work - \nin order to either commit or rollback the changes. \n\nThis handler is registered to the above defined `SaveUserCommand` - so that whenever this command is received, \nthen this handler will be executed. The registration is handled by the `Bootstrapper` which will be shown later.\n\n```python\nfrom __future__ import annotations\n\nimport ddd\nfrom demo.adapters.repositories.user_repository import AbstractUserRepository\nfrom demo.domain.command_model.save_user_command import SaveUserCommand\n\n\nclass SaveUserCommandHandler(ddd.AbstractCommandHandler[SaveUserCommand, str]):\n    def __init__(self, user_repository: AbstractUserRepository):\n        super().__init__()\n        self._user_repository = user_repository\n        self._events: list[ddd.AbstractEvent] = []\n\n    def handle(self, command: ddd.TCommand) -> ddd.THandleCommandResult:\n        user = self._user_repository.get_by_id(command.user_id)\n        user.set_email(command.email)\n        self._events.extend(user.events)\n        return user.get_id()\n\n    @property\n    def events(self) -> list[ddd.AbstractEvent]:\n        return list(self._events)\n\n    def commit(self) -> None:\n        self._user_repository.commit()\n\n    def rollback(self) -> None:\n        self._user_repository.rollback()\n```\n\n##### Registration of the SaveUserCommand with its handler: SaveUserCommandHandler\nThis happens within the bootstrapper, like so:\n\n```python\nfrom __future__ import annotations\n\nimport ddd\n\nfrom demo.adapters.clients.pubsub_client import InMemoryPubSubClient\nfrom demo.adapters.repositories.user_repository import InMemoryUserRepository\nfrom demo.domain.command_model.save_user_command import SaveUserCommand\nfrom demo.service_layer.command_handlers.save_user_command_handler import SaveUserCommandHandler\n\n\nclass DemoBootstrapper(ddd.Bootstrapper):\n    def __init__(self):\n        super().__init__()\n        self.user_repository = InMemoryUserRepository()\n        self.pubsub_client = InMemoryPubSubClient()\n        self.register_command_handler_factory(SaveUserCommand().name, self.create_save_user_command_handler)\n        \n    def create_save_user_command_handler(self) -> ddd.AbstractCommandHandler:\n        \"\"\"\n        Made public for the framework's unit test.\n        In realworld usage, this method should best be private.\n        \"\"\"\n        return SaveUserCommandHandler(self.user_repository)\n```\n\n##### Handling the SaveUserCommand by the framework\n\nBased on the above created bootstrapper instance, \nthis is how the command should be propagated into the framework: \n```python\nbootstrapper = DemoBootstrapper()\n\ncommand = SaveUserCommand(user_id='1', email='eli.cohen@mossad.gov.il')\n\nbootstrapper.handle_command(command)\n```\n\n### But wait, isn't this code over-engineered?\n\nBasically, if this is all the code should do, then this code is arguably too complex.\nYet, what happens when the requirements grow, and you need to handle other tasks, such as:\n1. Trigger a verification email to validate the provided email?\n2. Notify a KPI Service about the changes - for further analysis\n3. Handle other changes, as in a real world scenario the user entity should have much more properties - \n   where each property change might require triggering other actions (a.k.a. `Domain Events`)\n\n\nThe code might quickly look like this:\n```python\n\n    def handle(self, command: ddd.TCommand) -> ddd.THandleCommandResult:\n        user = self._user_repository.get_by_id(command.user_id)\n        user.set_email(command.email)\n        # Side effect...\n        if user.changed_email:\n            self._pubsub_client.notify_email_changed(...)\n            self._pubsub_client.notify_kpi_service(...)\n        # Side effect...\n        if user.phone_number_changed:\n            self._pubsub_client.notify_phone_number_changed(...)\n            self._pubsub_client.notify_kpi_service(...)\n        return user.get_id()\n```\n\nThe above code will contain lots side effects, and will defeat the SRP (Single Responsibility Principle) \nfor which it was created - which is to save the new user details.\nEven worse, it will sooner than later become spaghetti code - that will be a nightmare to maintain and unit test. \n\n### Event-Driven Architecture with EventHandlers to the Rescue\nAll the above side effects should best be extracted out of the above code, and handled within other handlers. \nThese handlers will be handled in the same way as the command handler, \ni.e. within units of work of their own - and may trigger other events which will be handled by the framework.\n\nHere are 2 sample event handlers:\n\n#### EmailSetEventHandler that will trigger a KPIEvent that will be handled by the KPIEventHandler\n```python\nfrom __future__ import annotations\n\nimport ddd\nfrom demo.adapters.clients.pubsub_client import AbstractPubSubClient\nfrom demo.domain.command_model.email_set_event import EmailSetEvent\nfrom demo.domain.command_model.kpi_event import KpiEvent\n\n\nclass EmailSetEventHandler(ddd.AbstractEventHandler[EmailSetEvent]):\n    def __init__(self, email_client: AbstractPubSubClient):\n        super().__init__()\n        self._email_client = email_client\n        self._events: list[ddd.AbstractEvent] = []\n\n    def handle(self, event: ddd.TEvent) -> None:\n        self._email_client.notify_email_changed(event.user_id, event.new_email, event.old_email)\n        self._events.append(\n            KpiEvent(action=event.name, data=f'{event!r}')\n        )\n\n    @property\n    def events(self) -> list[ddd.AbstractEvent]:\n        return list(self._events)\n\n    def commit(self) -> None:\n        self._email_client.commit()\n\n    def rollback(self) -> None:\n        self._email_client.rollback()\n```\n\n##### KpiEventHandler\n```python\nfrom __future__ import annotations\n\nimport ddd\nfrom demo.adapters.clients.pubsub_client import AbstractPubSubClient\nfrom demo.domain.command_model.kpi_event import KpiEvent\n\n\nclass KpiEventHandler(ddd.AbstractEventHandler[KpiEvent]):\n    def __init__(self, pubsub_client: AbstractPubSubClient):\n        super().__init__()\n        self._pubsub_client = pubsub_client\n        self._events: list[ddd.AbstractEvent] = []\n\n    def handle(self, event: ddd.TEvent) -> None:\n        self._pubsub_client.notify_kpi_service(event)\n\n    @property\n    def events(self) -> list[ddd.AbstractEvent]:\n        return list(self._events)\n\n    def commit(self) -> None:\n        self._pubsub_client.commit()\n\n    def rollback(self) -> None:\n        self._pubsub_client.rollback()\n```\n\n### Advantages of applying the above-mentioned Domain-Driven Design Tactical Patterns\n\n- A clear separation of concerns between the business rules (which reside solely inside the domain layer), \n  the application flows (which reside in the service layer) and the IO related operations - \n  such as communication with databases/web services/file system (which reside in the adapters layer)\n\n- This separation of concerns make this kind of code very suitable for unit & integration tests - \n  the service & domain layers can be fully unit tested and the adapter layer can easily \n  be integration tested (without being concerned with any business logic leaking from the other layers - \n  so that the integration tests can remain simple)\n  \n- A common code base structure makes it much easier for other developers, \n  who are aware of this structure, to get into the code.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/vklap/py_ddd_framework",
+    "keywords": "DDD Domain Driven Design Framework Domain-Driven",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "py-ddd-framework",
+    "package_url": "https://pypi.org/project/py-ddd-framework/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/py-ddd-framework/",
+    "project_urls": {
+      "Homepage": "https://github.com/vklap/py_ddd_framework"
+    },
+    "release_url": "https://pypi.org/project/py-ddd-framework/0.1.0/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Python Domain-Driven Design (DDD) Framework",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16363304,
+  "releases": {
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb3baf7905dc98fa3dc2165e11e2fdd2b895e80b46ed71fed5999c10d975fbbf",
+          "md5": "836fae77b83236824a5fe64b0ac9a346",
+          "sha256": "308a984e17311afa490de941e29d74789a635603919c3ddfc812773962996230"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "836fae77b83236824a5fe64b0ac9a346",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7852,
+        "upload_time": "2023-01-07T11:56:55",
+        "upload_time_iso_8601": "2023-01-07T11:56:55.077467Z",
+        "url": "https://files.pythonhosted.org/packages/fb/3b/af7905dc98fa3dc2165e11e2fdd2b895e80b46ed71fed5999c10d975fbbf/py_ddd_framework-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5248c3361ad28a8bb56d7a1427570d879da84d38a87606de745bc140c6009195",
+          "md5": "effbcd159b13f8e5b66ce3b24aa7d7ea",
+          "sha256": "db55b8c9f4bcd7ce7490b6859d2f47db7fed909cb230864348ec53dd7af3944a"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "effbcd159b13f8e5b66ce3b24aa7d7ea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6308,
+        "upload_time": "2023-01-07T11:56:56",
+        "upload_time_iso_8601": "2023-01-07T11:56:56.087691Z",
+        "url": "https://files.pythonhosted.org/packages/52/48/c3361ad28a8bb56d7a1427570d879da84d38a87606de745bc140c6009195/py_ddd_framework-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e1965cec47ae894afb6f696976b0d598eec71325a00de9f22372f67d102b994",
+          "md5": "5b18fb00404bf7a54c8bfb49e205b4f5",
+          "sha256": "a64b36c9c49f762c61ea2060b482ee71005e3c567ba6129e559d78b4dd755a4b"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5b18fb00404bf7a54c8bfb49e205b4f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7836,
+        "upload_time": "2023-01-07T12:13:11",
+        "upload_time_iso_8601": "2023-01-07T12:13:11.174138Z",
+        "url": "https://files.pythonhosted.org/packages/0e/19/65cec47ae894afb6f696976b0d598eec71325a00de9f22372f67d102b994/py_ddd_framework-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b4923907f21ce7c40d947aa8df1c7ead5b061889e9e6d67abed82850a22b2772",
+          "md5": "cef5643fc4dac9941fcf3776c42a3892",
+          "sha256": "401e83f7ce2e5f589d9166ad993588714007513f1cc93230db7afd41b94a70e3"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cef5643fc4dac9941fcf3776c42a3892",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6310,
+        "upload_time": "2023-01-07T12:13:12",
+        "upload_time_iso_8601": "2023-01-07T12:13:12.334762Z",
+        "url": "https://files.pythonhosted.org/packages/b4/92/3907f21ce7c40d947aa8df1c7ead5b061889e9e6d67abed82850a22b2772/py_ddd_framework-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40da9474251aaac10294eb0343fb1c687d265cd777274237942c06c454b4d9bd",
+          "md5": "ab073d2a87e3f8c9f0d8c9da74bd1c6c",
+          "sha256": "0e5304c13e3530366d77c394f66563b3384350ff62f81d7c328231cde1a5ad4f"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ab073d2a87e3f8c9f0d8c9da74bd1c6c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7836,
+        "upload_time": "2023-01-07T12:24:54",
+        "upload_time_iso_8601": "2023-01-07T12:24:54.122395Z",
+        "url": "https://files.pythonhosted.org/packages/40/da/9474251aaac10294eb0343fb1c687d265cd777274237942c06c454b4d9bd/py_ddd_framework-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cba07906c28c0dd83703ffd2d0148fc77bc7a2ba9c9aa0d0edd6f4c9a22087a3",
+          "md5": "c1b48421ef95788c3d1ab90a30461936",
+          "sha256": "cca67c7381185d076611f8ee983c20a2e0e65e37cc64e6281fd6e4b2e1e43707"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c1b48421ef95788c3d1ab90a30461936",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6319,
+        "upload_time": "2023-01-07T12:24:55",
+        "upload_time_iso_8601": "2023-01-07T12:24:55.147032Z",
+        "url": "https://files.pythonhosted.org/packages/cb/a0/7906c28c0dd83703ffd2d0148fc77bc7a2ba9c9aa0d0edd6f4c9a22087a3/py_ddd_framework-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0db04a99b32a8725b68e14df6496b1795c905b48592a0f2fc265ec61db5d8467",
+          "md5": "76ea2817761185f051ae034c18438717",
+          "sha256": "6f1a95291bc02da02afec49ac7d11c2b174766898bb05cf747faa4e611e58a55"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76ea2817761185f051ae034c18438717",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11075,
+        "upload_time": "2023-01-09T17:00:19",
+        "upload_time_iso_8601": "2023-01-09T17:00:19.808668Z",
+        "url": "https://files.pythonhosted.org/packages/0d/b0/4a99b32a8725b68e14df6496b1795c905b48592a0f2fc265ec61db5d8467/py_ddd_framework-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88c4330bc56d939e1fa11afc6812c6013acda48f7c589473bdf72463bb333036",
+          "md5": "6c0e6701934d5b970aa32b2defa7549f",
+          "sha256": "06314e3f5a734ba57be3340ed5352e4d5c8fb06565cf51964b45e4bc9e072399"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6c0e6701934d5b970aa32b2defa7549f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13144,
+        "upload_time": "2023-01-09T17:00:21",
+        "upload_time_iso_8601": "2023-01-09T17:00:21.231491Z",
+        "url": "https://files.pythonhosted.org/packages/88/c4/330bc56d939e1fa11afc6812c6013acda48f7c589473bdf72463bb333036/py_ddd_framework-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33f745debb893c82b6d57c32ce16953732ff330d899a530e141dab730c5cd1eb",
+          "md5": "2e75e80328fa237f7e682ac0a6bc8ce0",
+          "sha256": "f9d8ba25ec7922512dc8790abe4c44e2178dbc456dd156b73ddc69c7a8577f4c"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e75e80328fa237f7e682ac0a6bc8ce0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10991,
+        "upload_time": "2023-01-09T17:14:14",
+        "upload_time_iso_8601": "2023-01-09T17:14:14.987556Z",
+        "url": "https://files.pythonhosted.org/packages/33/f7/45debb893c82b6d57c32ce16953732ff330d899a530e141dab730c5cd1eb/py_ddd_framework-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b472c735236355fccf290b549f020af8ed8984dde83aa56f52d1e91273d2b451",
+          "md5": "5a8c3a0643ae578c378fbd3711e1d138",
+          "sha256": "75eff319a710e75238890f6d224dac037988ce2f2b7eb5f480b6eb46bf4908a9"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5a8c3a0643ae578c378fbd3711e1d138",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12967,
+        "upload_time": "2023-01-09T17:14:19",
+        "upload_time_iso_8601": "2023-01-09T17:14:19.859745Z",
+        "url": "https://files.pythonhosted.org/packages/b4/72/c735236355fccf290b549f020af8ed8984dde83aa56f52d1e91273d2b451/py_ddd_framework-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "567bc1bc9ccd6041ff3bc715f77db4e587bd07c0aeb5521aea21d2b088777bd2",
+          "md5": "813da623c416a61f3f08dfbc72fe827b",
+          "sha256": "5c3a1793f8d86c4b39e38f696d4a8f43eea9407c44ab5558ba3c0a2be4d88e9d"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "813da623c416a61f3f08dfbc72fe827b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10982,
+        "upload_time": "2023-01-09T17:30:58",
+        "upload_time_iso_8601": "2023-01-09T17:30:58.606069Z",
+        "url": "https://files.pythonhosted.org/packages/56/7b/c1bc9ccd6041ff3bc715f77db4e587bd07c0aeb5521aea21d2b088777bd2/py_ddd_framework-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "049d678aad32becfc3e66c87dc338da792c6ec4a738ee5ac40b2d7dad584f969",
+          "md5": "3851c4a84a1b3c8b1da989417f7f778c",
+          "sha256": "078e086aab97c45706b1af81ab7ea6e3e6f0d5eed9e2c13176e11a0475824b72"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3851c4a84a1b3c8b1da989417f7f778c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12948,
+        "upload_time": "2023-01-09T17:30:59",
+        "upload_time_iso_8601": "2023-01-09T17:30:59.875076Z",
+        "url": "https://files.pythonhosted.org/packages/04/9d/678aad32becfc3e66c87dc338da792c6ec4a738ee5ac40b2d7dad584f969/py_ddd_framework-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c9e73b5ed7843b3920c6e96b9bf77390ee10ef9674dd03a1311fccd5e57e0cdc",
+          "md5": "e8327a85708454fd7fe30a75273e5346",
+          "sha256": "6ed2831eaf0d8edf220d999efdd8b3818bd99450cac9e50a90e63bc73d669ff2"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e8327a85708454fd7fe30a75273e5346",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10921,
+        "upload_time": "2023-01-09T17:48:06",
+        "upload_time_iso_8601": "2023-01-09T17:48:06.752027Z",
+        "url": "https://files.pythonhosted.org/packages/c9/e7/3b5ed7843b3920c6e96b9bf77390ee10ef9674dd03a1311fccd5e57e0cdc/py_ddd_framework-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b17b22f6c421ae2325d7cddc6b48ea0309237abf190dcc44145725d54f6caae2",
+          "md5": "66e67a8fab24db7c325f63bbbc7b26a8",
+          "sha256": "0a23e4ad14f56e5fec2d6d6973bbf74dfce904b38d90e80c07f39fe6ac443511"
+        },
+        "downloads": -1,
+        "filename": "py_ddd_framework-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "66e67a8fab24db7c325f63bbbc7b26a8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12778,
+        "upload_time": "2023-01-09T17:48:08",
+        "upload_time_iso_8601": "2023-01-09T17:48:08.166771Z",
+        "url": "https://files.pythonhosted.org/packages/b1/7b/22f6c421ae2325d7cddc6b48ea0309237abf190dcc44145725d54f6caae2/py_ddd_framework-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c9e73b5ed7843b3920c6e96b9bf77390ee10ef9674dd03a1311fccd5e57e0cdc",
+        "md5": "e8327a85708454fd7fe30a75273e5346",
+        "sha256": "6ed2831eaf0d8edf220d999efdd8b3818bd99450cac9e50a90e63bc73d669ff2"
+      },
+      "downloads": -1,
+      "filename": "py_ddd_framework-0.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e8327a85708454fd7fe30a75273e5346",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 10921,
+      "upload_time": "2023-01-09T17:48:06",
+      "upload_time_iso_8601": "2023-01-09T17:48:06.752027Z",
+      "url": "https://files.pythonhosted.org/packages/c9/e7/3b5ed7843b3920c6e96b9bf77390ee10ef9674dd03a1311fccd5e57e0cdc/py_ddd_framework-0.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b17b22f6c421ae2325d7cddc6b48ea0309237abf190dcc44145725d54f6caae2",
+        "md5": "66e67a8fab24db7c325f63bbbc7b26a8",
+        "sha256": "0a23e4ad14f56e5fec2d6d6973bbf74dfce904b38d90e80c07f39fe6ac443511"
+      },
+      "downloads": -1,
+      "filename": "py_ddd_framework-0.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "66e67a8fab24db7c325f63bbbc7b26a8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 12778,
+      "upload_time": "2023-01-09T17:48:08",
+      "upload_time_iso_8601": "2023-01-09T17:48:08.166771Z",
+      "url": "https://files.pythonhosted.org/packages/b1/7b/22f6c421ae2325d7cddc6b48ea0309237abf190dcc44145725d54f6caae2/py_ddd_framework-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

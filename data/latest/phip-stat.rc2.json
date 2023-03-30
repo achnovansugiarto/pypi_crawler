@@ -1,0 +1,182 @@
+{
+  "info": {
+    "author": "Laserson Lab",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 2.6",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# phip-stat: tools for analyzing PhIP-seq data\n\n**NOTE**: This project is no longer being maintained. Please see the phippery, phip-flow, and related projects maintained by Erick Matsen's group:\nhttps://github.com/matsengrp/phippery\nhttps://github.com/matsengrp/phip-flow\n\n\nThe PhIP-seq assay was first described in [Larman et.\nal.](https://dx.doi.org/10.1038/nbt.1856). This repo contains code for\nprocessing raw PhIP-seq data into analysis-ready enrichment scores.\n\nThis code also implements multiple statistical models for processing PhIP-seq\ndata, including the model described in the original Larman et al paper\n(`generalized-poisson-model`).  We currently recommend using one of the newer\nmodels implemented here (e.g., `gamma-poisson-model`).\n\nPlease submit [issues](https://github.com/lasersonlab/phip-stat/issues) to\nreport any problems.\n\n\n## Installation\n\nphip-stat runs on Python 3.6+ and minimally depends on click, tqdm, numpy, scipy,\nand pandas. The matrix factorization model also requires tensorflow.\n\n```bash\npip install phip-stat\n```\n\nor to install the latest development version from GitHub\n\n```bash\npip install git+https://github.com/lasersonlab/phip-stat.git\n```\n\n\n## Usage\n\nThe overall flow of the pipeline is\n\n1. align — for each sample count the number of reads derived from each\n   possible library member\n\n2. merge — combine the count values from all samples into a single count\n   matrix\n\n3. model — normalize counts and train a model to compute enrichment\n   scores/hits\n\nAn entire NextSeq run with 500M reads can be processed in <30 min on a 4-core\nlaptop (if aligning with a tool like kallisto).\n\n### Command-line interface\n\nAll the pipeline tools are accessed through the `phip` executable. All\n(sub)command usage/options can be obtained by passing `-h`.\n\n```\n$ phip -h\nUsage: phip [OPTIONS] COMMAND [ARGS]...\n\n  phip -- PhIP-seq analysis tools\n\nOptions:\n  -h, --help  Show this message and exit.\n\nCommands:\n  align-parts     align fastq files to peptide reference\n  compute-counts  compute counts from aligned bam file\n  compute-pvals   compute p-values from counts\n  groupby-sample  group alignments by sample\n  join-barcodes   annotate Illumina reads with barcodes Some...\n  merge-columns   merge tab-delim files\n  split-fastq     split fastq files into smaller chunks\n```\n\n### Example pipeline 1: kallisto alignment followed by Gamma-Poisson model\n\nThis pipeline will use kallisto to pseudoalign the reads to the reference.\nBecause the output of each alignment step is a directory, the merge step uses a\nCLI tool designed for this directory structure. The counts are also\npre-normalized.\n\n```bash\n# 1. align\nkallisto quant --single --plaintext --fr-stranded -l 75 -s 0.1 -t 4 \\\n    -i reference.idx -o sample_counts/sample1 sample1.fastq.gz\n# ...\nkallisto quant --single --plaintext --fr-stranded -l 75 -s 0.1 -t 4 \\\n    -i reference.idx -o sample_counts/sampleN sampleN.fastq.gz\n\n# 2. merge\nphip merge-kallisto-tpm -i sample_counts -o cpm.tsv\n\n# 3. model\nphip gamma-poisson-model -t 99.9 -i cpm.tsv -o gamma-poisson\n```\n\n### Example pipeline 2: exact-matching reads followed by matrix factorization\n\nThis pipeline will match each read to the reference exactly (or a chosen subset\nof the read) followed by merging into a single matrix. The matrix is then\nfactored with a low-rank approximation (allowing for clipping) and \"hits\" are\ncalled with a heuristic.\n\n```bash\n# 1. align\nphip count-exact-matches -r reference.fasta -l 75 -o sample_counts/sample1.counts.tsv sample1.fastq.gz\n# ...\nphip count-exact-matches -r reference.fasta -l 75 -o sample_counts/sampleN.counts.tsv sampleN.fastq.gz\n\n# 2. merge\nphip merge-columns -m iter -i sample_counts -o counts.tsv\n\n# 3. model\nphip clipped-factorization-model --rank 2 -i counts.tsv -o residuals.tsv\nphip call-hits -i residuals.tsv -o hits.tsv --beads-regex \".*BEADS_ONLY.*\"\n```\n\n### Example pipeline 3: bowtie2 alignment followed by normalization and Gamma-Poisson\n\nThis example uses bowtie2, which should give the maximum sensitivity at the\nexpense of speed. The main bowtie2 command accomplishes the following: align\nreads to reference, sort and convert to BAM, compute coverage depth at each\nposition of each clone, for each clone take only the largest number observed,\nfinally sort by clone identifier.\n\n```bash\n# 1. align\necho \"id\\tsample1\" > sample_counts/sample1.tsv\nbowtie2 -p 4 -x reference_index -U sample1.fastq.gz \\\n    | samtools sort -O BAM \\\n    | samtools depth -aa -m 100000000 - \\\n    | awk 'BEGIN {OFS=\"\\t\"} {counts[$1] = ($3 < counts[$1]) ? counts[$1] : $3} END {for (c in counts) {print c, counts[c]}}' \\\n    | sort -k 1 \\\n    >> sample_counts/sample1.tsv\n# ...\necho \"id\\tsampleN\" > sample_counts/sampleN.tsv\nbowtie2 -p 4 -x reference_index -U sampleN.fastq.gz \\\n    | samtools sort -O BAM \\\n    | samtools depth -aa -m 100000000 - \\\n    | awk 'BEGIN {OFS=\"\\t\"} {counts[$1] = ($3 < counts[$1]) ? counts[$1] : $3} END {for (c in counts) {print c, counts[c]}}' \\\n    | sort -k 1 \\\n    >> sample_counts/sampleN.tsv\n\n# 2. merge -- NOTE: this performs a pandas outer join and loads all counts into memory\nphip merge-columns -m outer -i sample_counts -o counts.tsv\n\n# 3. model\nphip normalize-counts -m size-factors -i counts.tsv -o normalized_counts.tsv\nphip gamma-poisson-model -t 99.9 -i normalized_counts.tsv -o gamma-poisson\n```\n\n### Snakemake recipes\n\nWe include several example Snakemake recipes for easily processing large sets of\nsamples at once, e.g.,\n`workflows/example-kallisto-GamPois-factorization.snakefile`. In general the\nconfiguration section must be edited to specify the location of the raw\nsequencing data.\n\n\n## Running unit tests\nUnit tests use the `nose` package and can be run with:\n\n```\n$ pip install nose  # if not already installed\n$ nosetests -sv test/\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/lasersonlab/phip-stat",
+    "keywords": "",
+    "license": "Apache License, Version 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "phip-stat",
+    "package_url": "https://pypi.org/project/phip-stat/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/phip-stat/",
+    "project_urls": {
+      "Homepage": "https://github.com/lasersonlab/phip-stat"
+    },
+    "release_url": "https://pypi.org/project/phip-stat/0.5.1/",
+    "requires_dist": [
+      "click",
+      "tqdm",
+      "numpy",
+      "scipy",
+      "pandas"
+    ],
+    "requires_python": "",
+    "summary": "PhIP-seq analysis tools",
+    "version": "0.5.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12215775,
+  "releases": {
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fefe40366b6cb2f29774135c77ff0ac28e378dfe7a4feb14e8ee104779413447",
+          "md5": "3da6d47e73ff9a7021e35f4c63453345",
+          "sha256": "ae641cf9cda25fbfb2798a681e957b9b3bac9f2fd0b8b7c63078cbd5e13fb006"
+        },
+        "downloads": -1,
+        "filename": "phip_stat-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3da6d47e73ff9a7021e35f4c63453345",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 14670,
+        "upload_time": "2017-02-17T18:32:33",
+        "upload_time_iso_8601": "2017-02-17T18:32:33.004935Z",
+        "url": "https://files.pythonhosted.org/packages/fe/fe/40366b6cb2f29774135c77ff0ac28e378dfe7a4feb14e8ee104779413447/phip_stat-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab88630164f8fbae84fc40b86569c4048d4301235ff6f80bf04f17d07bcab81b",
+          "md5": "bb499353be92c6bb85211597774023eb",
+          "sha256": "e40275fee05a7e2222340b55a96b514255ed6d7b22aebe8ef5995b7b8652a26b"
+        },
+        "downloads": -1,
+        "filename": "phip-stat-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bb499353be92c6bb85211597774023eb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9078,
+        "upload_time": "2017-02-17T18:32:34",
+        "upload_time_iso_8601": "2017-02-17T18:32:34.376762Z",
+        "url": "https://files.pythonhosted.org/packages/ab/88/630164f8fbae84fc40b86569c4048d4301235ff6f80bf04f17d07bcab81b/phip-stat-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11a4fc0e5e42a48c7bc25186a45ea540b348dca69c54692410b33f291b052bc0",
+          "md5": "a3a998603c0cc6acd60635cbebb50848",
+          "sha256": "257502939ea7884659a66f27165cabd1cc0fe44f4651eb1b904989819efeae7b"
+        },
+        "downloads": -1,
+        "filename": "phip_stat-0.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a3a998603c0cc6acd60635cbebb50848",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 30247,
+        "upload_time": "2021-12-05T17:10:00",
+        "upload_time_iso_8601": "2021-12-05T17:10:00.113485Z",
+        "url": "https://files.pythonhosted.org/packages/11/a4/fc0e5e42a48c7bc25186a45ea540b348dca69c54692410b33f291b052bc0/phip_stat-0.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "301067885e116322b1859ab20a34076581b55b929bee338f0bda24d8f4187125",
+          "md5": "c8c74b4b646755cc3fe857626398d9bf",
+          "sha256": "ebf405bbede636f34a26e9d4cf0201a2d4603ca504492338078d43a3cd62c2fc"
+        },
+        "downloads": -1,
+        "filename": "phip-stat-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c8c74b4b646755cc3fe857626398d9bf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 31404,
+        "upload_time": "2021-12-05T17:10:01",
+        "upload_time_iso_8601": "2021-12-05T17:10:01.608173Z",
+        "url": "https://files.pythonhosted.org/packages/30/10/67885e116322b1859ab20a34076581b55b929bee338f0bda24d8f4187125/phip-stat-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "11a4fc0e5e42a48c7bc25186a45ea540b348dca69c54692410b33f291b052bc0",
+        "md5": "a3a998603c0cc6acd60635cbebb50848",
+        "sha256": "257502939ea7884659a66f27165cabd1cc0fe44f4651eb1b904989819efeae7b"
+      },
+      "downloads": -1,
+      "filename": "phip_stat-0.5.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a3a998603c0cc6acd60635cbebb50848",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 30247,
+      "upload_time": "2021-12-05T17:10:00",
+      "upload_time_iso_8601": "2021-12-05T17:10:00.113485Z",
+      "url": "https://files.pythonhosted.org/packages/11/a4/fc0e5e42a48c7bc25186a45ea540b348dca69c54692410b33f291b052bc0/phip_stat-0.5.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "301067885e116322b1859ab20a34076581b55b929bee338f0bda24d8f4187125",
+        "md5": "c8c74b4b646755cc3fe857626398d9bf",
+        "sha256": "ebf405bbede636f34a26e9d4cf0201a2d4603ca504492338078d43a3cd62c2fc"
+      },
+      "downloads": -1,
+      "filename": "phip-stat-0.5.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c8c74b4b646755cc3fe857626398d9bf",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 31404,
+      "upload_time": "2021-12-05T17:10:01",
+      "upload_time_iso_8601": "2021-12-05T17:10:01.608173Z",
+      "url": "https://files.pythonhosted.org/packages/30/10/67885e116322b1859ab20a34076581b55b929bee338f0bda24d8f4187125/phip-stat-0.5.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

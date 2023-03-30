@@ -1,0 +1,95 @@
+{
+  "info": {
+    "author": "Akbir Khan",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: MacOS",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Games/Entertainment",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence"
+    ],
+    "description": "<h1 align=\"center\">\n  <a href=\"https://github.com/akbir/pax/blob/main/docs/imgs/logo.png\">\n    <img src=\"https://github.com/akbir/pax/blob/main/docs/imgs/logo.png?raw=true\" width=\"215\" /></a><br>\n  <b> Pax: Meta|Multi Agent Learning in JAX </b><br>\n</h1>\n<p align=\"center\">\n      <a href=\"https://pypi.python.org/pypi/gymnax\">\n        <img src=\"https://img.shields.io/badge/python-3.9-blue.svg\" /></a>\n       <a href= \"https://github.com/akbir/pax/blob/main/LICENSE.md\">\n        <img src=\"https://img.shields.io/badge/license-Apache2.0-blue.svg\" /></a>\n       <a href= \"https://codecov.io/gh/akbir/pax\">\n        <img src=\"https://codecov.io/gh/akbir/gymnax/branch/main/graph/badge.svg?token=OKKPDRIQJR\" /></a>\n       <a href= \"https://github.com/psf/black\">\n        <img src=\"https://img.shields.io/badge/code%20style-black-000000.svg\" /></a>\n</p>\n\n\nPax is an experiment runner for multi and meta agent research built on top of JAX. It supports \"other agent shaping\", \"multi agent RL\" and \"single agent RL\" experiments. It supports evolutionary and RL-based optimisation. \n\n> *Pax (noun) - a period of peace that has been forced on a large area, such as an empire or even the whole world*\n\nPax is composed of 3 components: Environments, Agents and Runners.\n\n### Environments\nEnvironments are similar to [gymnax](https://github.com/RobertTLange/gymnax).\n\n```python\nfrom pax.envs.iterated_matrix_game import (\n    IteratedMatrixGame,\n    EnvParams,\n)\n\nenv = IteratedMatrixGame(num_inner_steps=5)\nenv_params = EnvParams(payoff_matrix=payoff)\n\n# 0 = Defect, 1 = Cooperate\nactions = (jnp.ones(()), jnp.ones(()))\nobs, env_state = env.reset(rng, env_params)\ndone = False\n\nwhile not done:\n    obs, env_state, rewards, done, info = env.step(\n        rng, env_state, actions, env_params\n    )\n```\nWe can compose these with JAX built-in functins `jit`, `vmap`, `pmap` and `lax.scan`.\n\n```python\nimport IteratedMatrixGame, EnvParams\nimport jax.numpy as jnp\n\n# batch over env initalisations\nnum_envs = 2\npayoff = [[2, 2], [0, 3], [3, 0], [1, 1]]\nrollout_length = 50\n\nrng = jnp.concatenate(\n    [jax.random.PRNGKey(0), jax.random.PRNGKey(1)]\n).reshape(num_envs, -1)\n\nenv = IteratedMatrixGame(num_inner_steps=rollout_length)\nenv_params = EnvParams(payoff_matrix=payoff)\n\naction = jnp.ones((num_envs,), dtype=jnp.float32)\n\n# we want to batch over rngs, actions\nenv.step = jax.vmap(\n    env.step,\n    in_axes=(0, None, 0, None),\n    out_axes=(0, None, 0, 0, 0),\n)\n\nobs, env_state = env.reset(rng, env_params)\n\n# lets scan the rollout for speed\ndef rollout(carry, unused):\n    carry = (_, env_state, env_rng)\n    actions = (action, action)\n    obs, env_state, rewards, done, info = env.step(\n        env_rng, env_state, actions, env_params\n    )\n\n    return (obs, env_state, env_rng), (\n        obs,\n        actions,\n        rewards,\n        done,\n    )\n\n\nfinal_state, trajectory = jax.lax.scan(\n    rollout, (obs, env_state, rng), rollout_length\n)\n```\n\n### Agents\nThe agent interface is as follows:\n\n```python\nimport jax.numpy as jnp\nimport Agent\n\nargs = {\"hidden\": 16, \"observation_spec\": 5}\nrng = jax.random.PRNGKey(0)\nbs = 1\ninit_hidden = jnp.zeros((bs, args.hidden))\nobs = jnp.ones((bs, 5))\n\nagent = Agent(args)\nstate, memory = agent.make_initial_state(rng, init_hidden)\naction, state, mem = agent.policy(rng, obs, mem)\n\nstate, memory, stats = agent.update(\n    traj_batch, obs, state, mem\n)\n\nmem = agent.reset_memory(mem, False)\n```\n\nNote that `make_initial_state`, `policy`, `update` and `reset_memory` all support `jit`, `vmap` and `lax.scan`. Allowing you to compile more of your experiment to [XLA](https://www.tensorflow.org/xla).\n\n\n```python\n# batch MemoryState not TrainingState\nagent.batch_reset = jax.jit(\n    jax.vmap(agent.reset_memory, (0, None), 0),\n    static_argnums=1,\n)\n\nagent.batch_policy = jax.jit(\n    jax.vmap(agent._policy, (None, 0, 0), (0, None, 0))\n)\nagent1.batch_init = jax.vmap(\n    agent.make_initial_state,\n    (None, 0),\n    (None, 0),\n)\n```\n\n### Runners\nWe can finally combine all the above into our runner code. This is where you'd expect to write most custom logic for your own experimental set up,\n\n```python\ndef _rollout(carry, unused):\n    \"\"\"Runner for inner episode\"\"\"\n    (\n        rngs,\n        obs,\n        a_state,\n        a_mem,\n        env_state,\n        env_params,\n    ) = carry\n\n    # unpack rngs\n    rngs = self.split(rngs, 4)\n    action, a_state, new_a_mem = agent1.batch_policy(\n        a_state,\n        obs[0],\n        a_mem,\n    )\n\n    next_obs, env_state, rewards, done, info = env.step(\n        rngs,\n        env_state,\n        (action, action),\n        env_params,\n    )\n\n    traj = Sample(\n        obs1,\n        action,\n        rewards[0],\n        new_a1_mem.extras[\"log_probs\"],\n        new_a1_mem.extras[\"values\"],\n        done,\n        a1_mem.hidden,\n    )\n\n    return (\n        rngs,\n        next_obs,\n        a1_state,\n        new_a1_mem,\n        env_state,\n        env_params,\n    ), (\n        traj1,\n        traj2,\n    )\n\n\nagent = Agent(args)\nstate, memory = agent.make_initial_state(rng, init_hidden)\n\nfor _ in range(num_updates):\n    final_timestep, batch_trajectory = jax.lax.scan(\n        _rollout,\n        ((obs, env_state, rng), rollout_length),\n        10,\n    )\n\n    _, obs, rewards, a1_state, a1_mem, _, _ = final_timestep\n\n    state, memory, stats = agent.update(\n        batch_trajectory, obs[0], state, memory\n    )\n```\n\nNote this isn't even a fully optimised example - we could jit the outer loop!\n\n\n# Installation\nPax is written in pure Python, but depends on C++ code via JAX.\n\nBecause JAX installation is different depending on your CUDA version, Haiku does not list JAX as a dependency in requirements.txt.\n\nFirst, follow these instructions to install JAX with the relevant accelerator support.\n\n## General Information\nThe project entrypoint is `pax/experiment.py`. The simplest command to run a game would be: \n\n```bash\npython -m pax.experiment\n```\n\nWe currently use [WandB](https://wandb.ai/) for logging and [Hydra](https://hydra.cc/docs) for configs. Hyperparameters are stored `/conf/experiment` as `.yaml` files. Depending on your needs, you can specify hyperparameters through the CLI or by changing the `.yaml` files directly. \n\n```bash\npython -m pax.experiment +total_timesteps=1_000_000 +num_envs=10\n```\n\nWe currently support two major environments: `MatrixGames` and `CoinGame`.\n```\n\nFor `MatrixGames`, we support the ability to specify your own payoff matrix either through the CLI or the `yaml` files. For example the common Iterated Prisoners Dilemma is:\n```bash \npython -m pax.experiment +experiment/ipd=ppo ++payoff=\"[[-2,-2], [0,-3], [-3,0], [-1,-1]]\" ++wandb.group=\"testing\"\n```\n\n## Experiments\n```bash \npython -m pax.experiment +experiment/ipd=yaml ++wandb.group=\"testing\" \n``` \n\nWe store previous experiments as parity tests. We use [Hydra](https://hydra.cc/docs) to store these configs and keep track of good hyper-paremters. As a rule for development, we try retain backwards compatability and allow all previous results to be replicated. These can be run easily by `python -m pax.experiment +experiment=NAME`. We also provide a  list of our existing experiments and expected result [here](docs/experiments.md).\n\n## Loading and Saving \n1. All models trained using Pax by default are saved to the `exp` folder. \n2a. If you have the model saved locally, specify `model_path = exp/...`. By default, Player 1 will be loaded with the parameters.  \n2b. If you do not have the weights saved locally, specify the wandb run `run_path={wandb-group}{wandb-project}{}` and `model_path = exp/...` player 1 will be loaded with the parameters. \n3. In order to run evaluation, specify `eval: True` and evaluation for `num_seeds` iterations. \n\n\n## Citation\n\nIf you use Pax in any of your work, please cite:\n\n```\n@misc{pax,\n    author = {Khan, Akbir and Willi, Timon and Kwan, Newton, and Samvelyan, Mikayel and Lu, Chris},\n    title = {Pax: Multi-Agent Learning in JAX},\n    year = {2022},\n    publisher = {GitHub},\n    journal = {GitHub repository},\n    howpublished = {\\url{https://github.com/akbir/pax}},\n}\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/akbir/pax",
+    "keywords": "",
+    "license": "Apache License, Version 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pax-rl",
+    "package_url": "https://pypi.org/project/pax-rl/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pax-rl/",
+    "project_urls": {
+      "Homepage": "https://github.com/akbir/pax"
+    },
+    "release_url": "https://pypi.org/project/pax-rl/0.1.0b0/",
+    "requires_dist": null,
+    "requires_python": ">=3.9",
+    "summary": "Pax: Environment for ...",
+    "version": "0.1.0b0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15843199,
+  "releases": {
+    "0.1.0b0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "345b23b090e31248b7956b5e90ae0b35b85b0e52d142180f71204fb1a5c4bd46",
+          "md5": "b7dc412a389c02da87fde1c60ff20342",
+          "sha256": "54aa1d006716660fad4dbae066aa8f0610137697dcf548a714139d39373d8fda"
+        },
+        "downloads": -1,
+        "filename": "pax-rl-0.1.0b0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b7dc412a389c02da87fde1c60ff20342",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 29661,
+        "upload_time": "2022-11-21T17:06:04",
+        "upload_time_iso_8601": "2022-11-21T17:06:04.870986Z",
+        "url": "https://files.pythonhosted.org/packages/34/5b/23b090e31248b7956b5e90ae0b35b85b0e52d142180f71204fb1a5c4bd46/pax-rl-0.1.0b0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "345b23b090e31248b7956b5e90ae0b35b85b0e52d142180f71204fb1a5c4bd46",
+        "md5": "b7dc412a389c02da87fde1c60ff20342",
+        "sha256": "54aa1d006716660fad4dbae066aa8f0610137697dcf548a714139d39373d8fda"
+      },
+      "downloads": -1,
+      "filename": "pax-rl-0.1.0b0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b7dc412a389c02da87fde1c60ff20342",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9",
+      "size": 29661,
+      "upload_time": "2022-11-21T17:06:04",
+      "upload_time_iso_8601": "2022-11-21T17:06:04.870986Z",
+      "url": "https://files.pythonhosted.org/packages/34/5b/23b090e31248b7956b5e90ae0b35b85b0e52d142180f71204fb1a5c4bd46/pax-rl-0.1.0b0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

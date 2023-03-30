@@ -1,0 +1,292 @@
+{
+  "info": {
+    "author": "QuantCo, Inc.",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Programming Language :: SQL",
+      "Topic :: Database"
+    ],
+    "description": "# pydiverse.pipedag\n\n[![CI](https://github.com/pydiverse/pydiverse.pipedag/actions/workflows/ci.yml/badge.svg)](https://github.com/pydiverse/pydiverse.pipedag/actions/workflows/ci.yml)\n\nA pipeline orchestration library executing tasks within one python session. It takes care of SQL table\n(de)materialization, caching and cache invalidation. Blob storage is supported as well for example\nfor storing model files.\n\nThis is an early stage version 0.x which lacks documentation. Please contact\nhttps://github.com/orgs/pydiverse/teams/code-owners if you like to become an early adopter\nor to contribute early stage usage examples.\n\n## Usage\n\npydiverse.pipedag can either be installed via pypi with `pip install pydiverse-pipedag` or via conda-forge\nwith `conda install pydiverse-pipedag -c conda-forge`.\n\n## Example\n\nA flow can look like this (i.e. put this in a file named `run_pipeline.py`):\n\n```python\nfrom pydiverse.pipedag import materialize, Table, Flow, Stage\nimport sqlalchemy as sa\nimport pandas as pd\n\nfrom pydiverse.pipedag.context import StageLockContext, RunContext\nfrom pydiverse.pipedag.util import setup_structlog\n\n\n@materialize(lazy=True)\ndef lazy_task_1():\n    return sa.select([sa.literal(1).label(\"x\"), sa.literal(2).label(\"y\")])\n\n\n@materialize(lazy=True, input_type=sa.Table)\ndef lazy_task_2(input1: sa.Table, input2: sa.Table):\n    query = sa.select([(input1.c.x * 5).label(\"x5\"), input2.c.a]).select_from(\n        input1.outerjoin(input2, input2.c.x == input1.c.x)\n    )\n    return Table(query, name=\"task_2_out\", primary_key=[\"a\"])\n\n\n@materialize(lazy=True, input_type=sa.Table)\ndef lazy_task_3(input: sa.Table, my_stage: Stage):\n    return sa.text(f\"SELECT * FROM {my_stage.transaction_name}.{input.name}\")\n\n\n@materialize(lazy=True, input_type=sa.Table)\ndef lazy_task_4(input: sa.Table, prev_stage: Stage):\n    return sa.text(f\"SELECT * FROM {prev_stage.name}.{input.name}\")\n\n\n@materialize(nout=2, version=\"1.0.0\")\ndef eager_inputs():\n    dfA = pd.DataFrame(\n        {\n            \"a\": [0, 1, 2, 4],\n            \"b\": [9, 8, 7, 6],\n        }\n    )\n    dfB = pd.DataFrame(\n        {\n            \"a\": [2, 1, 0, 1],\n            \"x\": [1, 1, 2, 2],\n        }\n    )\n    return Table(dfA, \"dfA\"), Table(dfB, \"dfB_%%\")\n\n\n@materialize(version=\"1.0.0\", input_type=pd.DataFrame)\ndef eager_task(tbl1: pd.DataFrame, tbl2: pd.DataFrame):\n    return tbl1.merge(tbl2, on=\"x\")\n\n\ndef main():\n    with Flow() as f:\n        with Stage(\"stage_1\"):\n            lazy_1 = lazy_task_1()\n            a, b = eager_inputs()\n\n        with Stage(\"stage_2\") as stage2:\n            lazy_2 = lazy_task_2(lazy_1, b)\n            lazy_3 = lazy_task_3(lazy_2, stage2)\n            eager = eager_task(lazy_1, b)\n\n        with Stage(\"stage_3\"):\n            lazy_4 = lazy_task_4(lazy_2, stage2)\n        _ = lazy_3, lazy_4, eager  # unused terminal output tables\n\n    # Run flow\n    result = f.run()\n    assert result.successful\n\n    # Run in a different way for testing\n    with StageLockContext():\n        result = f.run()\n        assert result.successful\n        assert result.get(lazy_1, as_type=pd.DataFrame)[\"x\"][0] == 1\n\n\nif __name__ == \"__main__\":\n    # initialize logging\n    setup_structlog()\n    main()\n```\n\nCreate a file called `pipedag.yaml` in the same directory:\n\n```yaml\nname: pipedag_tests\ntable_store_connections:\n  postgres:\n    # Postgres: this can be used after running `docker-compose up`\n    url: \"postgresql://{$POSTGRES_USERNAME}:{$POSTGRES_PASSWORD}@127.0.0.1:6543/{instance_id}\"\n\ninstances:\n  __any__:\n    # listen-interface for pipedag context server which synchronizes some task state during DAG execution\n    network_interface: \"127.0.0.1\"\n    # classes to be materialized to table store even without pipedag Table wrapper (we have loose coupling between\n    # pipedag and pydiverse.transform, so consider adding 'pydiverse.transform.Table' in your config)\n    auto_table: [\"pandas.DataFrame\", \"sqlalchemy.sql.elements.TextClause\", \"sqlalchemy.sql.selectable.Selectable\"]\n    fail_fast: true\n\n    instance_id: pipedag_default\n    table_store:\n      class: \"pydiverse.pipedag.backend.table.SQLTableStore\"\n\n      # Postgres: this can be used after running `docker-compose up`\n      table_store_connection: postgres\n      create_database_if_not_exists: True\n\n      # print select statements before being encapsualted in materialize expressions and tables before writing to\n      # database\n      print_materialize: true\n      # print final sql statements\n      print_sql: true\n\n    blob_store:\n      class: \"pydiverse.pipedag.backend.blob.FileBlobStore\"\n      base_path: \"/tmp/pipedag/blobs\"\n\n    lock_manager:\n      class: \"pydiverse.pipedag.backend.lock.ZooKeeperLockManager\"\n      hosts: \"localhost:2181\"\n\n    orchestration:\n      class: \"pydiverse.pipedag.engine.SequentialEngine\"\n```\n\nIf you don't have a postgres, Microsoft SQL Server, or IBM DB2 database at hand, you can\nstart a postgres database with the following `docker-compose.yaml` file:\n\n```yaml\nversion: \"3.9\"\nservices:\n  postgres:\n    image: postgres\n    environment:\n      POSTGRES_USER: sa\n      POSTGRES_PASSWORD: Pydiverse23\n      POSTGRES_PORT: 6543\n    ports:\n      - 6543:5432\n  zoo:\n    image: zookeeper\n    environment:\n      ZOO_4LW_COMMANDS_WHITELIST: ruok\n    ports:\n      - 2181:2181\n```\n\nRun `docker-compose up` in the directory of your `docker-compose.yaml` and then execute\nthe flow script as follows with a shell like `bash` and a python environment that\nincludes `pydiverse-pipedag`, `pandas`, and `sqlalchemy`:\n\n```bash\nexport POSTGRES_USERNAME=sa\nexport POSTGRES_PASSWORD=Pydiverse23\npython run_pipeline.py\n```\n\nFinally, you may connect to your localhost postgres database `pipedag_default` and\nlook at tables in schemas `stage_1`..`stage_3`.\n\nIf you don't have a SQL UI at hand, you may use `psql` command line tool inside the docker container.\nCheck out the `NAMES` column in `docker ps` output. If the name of your postgres container is\n`example_postgres_1`, then you can look at output tables like this:\n\n```bash\ndocker exec example_postgres_1 psql --username=sa --dbname=pipedag_default -c 'select * from stage_1.dfa;'\n```\n\nOr more interactively:\n\n```bash\ndocker exec -t -i example_postgres_1 bash\npsql --username=sa --dbname=pipedag_default\n\\dt stage_*.*\nselect * from stage_2.task_2_out;\n```\n\n## Troubleshooting\n\n### Installing mssql odbc driver for linux\n\nInstalling with\ninstructions [here](https://docs.microsoft.com/en-us/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server?view=sql-server-ver16#suse18)\nworked.\nBut `odbcinst -j` revealed that it installed the configuration in `/etc/unixODBC/*`. But conda installed pyodbc brings\nits own `odbcinst` executable and that shows odbc config files are expected in `/etc/*`. Symlinks were enough to fix the\nproblem. Try `python -c 'import pyodbc;print(pyodbc.drivers())'` and see whether you get more than an empty list.\nFurthermore, make sure you use 127.0.0.1 instead of localhost. It seems that /etc/hosts is ignored.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pydiverse-pipedag",
+    "package_url": "https://pypi.org/project/pydiverse-pipedag/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/pydiverse-pipedag/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/pydiverse-pipedag/0.2.1/",
+    "requires_dist": [
+      "pandas (>=1.4.3,<2.0.0)",
+      "SQLAlchemy (>=1.4.39,<2.0.0)",
+      "typing-extensions (>=4.1.0,<5)",
+      "networkx (>=2.8)",
+      "attrs (>=22.1.0)",
+      "structlog (>=22.1.0)",
+      "tomli (>=2.0.1)",
+      "pynng (>=0.7.1)",
+      "msgpack (>=1.0.4)",
+      "packaging (>=21.3)",
+      "python-box (>=6.1.0)",
+      "filelock (>=3.7.1) ; extra == \"filelock\"",
+      "kazoo (>=2.8.0) ; extra == \"zookeeper\"",
+      "Sphinx (>=5.1.1) ; extra == \"docs\"",
+      "sphinx-rtd-theme (>=1.0.0) ; extra == \"docs\"",
+      "sphinxcontrib-apidoc (>=0.3.0) ; extra == \"docs\"",
+      "pyodbc (>=4.0.35) ; extra == \"mssql\"",
+      "pytsql (>=1.1.4) ; extra == \"mssql\"",
+      "ibm-db (>=3.1.4) ; extra == \"ibm-db2\"",
+      "ibm-db-sa (>=0.3.8) ; extra == \"ibm-db2\"",
+      "prefect (>=1.3,<2) ; extra == \"prefect\""
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "A pipeline orchestration library executing tasks within one python session. It takes care of SQL table (de)materialization, caching and cache invalidation. Blob storage is supported as well for example for storing model files.",
+    "version": "0.2.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16435683,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "669d32fdf2e417c8926fe70cfa942724c0f020270e2ba34b537d7e03ce6fdb27",
+          "md5": "241bf34dacbe1b7668e8ad0dde8f21b3",
+          "sha256": "3aed35d563f9a9cd12398cf197c06a3823694f2bb78bae1b9896c5de93659408"
+        },
+        "downloads": -1,
+        "filename": "pydiverse.pipedag-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "241bf34dacbe1b7668e8ad0dde8f21b3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 2789,
+        "upload_time": "2022-06-17T20:40:21",
+        "upload_time_iso_8601": "2022-06-17T20:40:21.994045Z",
+        "url": "https://files.pythonhosted.org/packages/66/9d/32fdf2e417c8926fe70cfa942724c0f020270e2ba34b537d7e03ce6fdb27/pydiverse.pipedag-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4af28ab860d539fa27b27045b98172e3a46e9ac99d06d653edbf1b90beac0542",
+          "md5": "f384861e0a82bd51424750af6c1028db",
+          "sha256": "cfa6504a913110719cdb83d14fe3f9bda70ce9ceeed95d4cdd61f00839b430b3"
+        },
+        "downloads": -1,
+        "filename": "pydiverse.pipedag-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f384861e0a82bd51424750af6c1028db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 8831,
+        "upload_time": "2022-06-17T20:40:24",
+        "upload_time_iso_8601": "2022-06-17T20:40:24.290238Z",
+        "url": "https://files.pythonhosted.org/packages/4a/f2/8ab860d539fa27b27045b98172e3a46e9ac99d06d653edbf1b90beac0542/pydiverse.pipedag-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "67f3b5ca5f24ee26a7bd456fba2b31fd9aeb4e4b5851acd9f598edd37ff66602",
+          "md5": "e9a7f052a1f270f8ca932d4ab86ade7c",
+          "sha256": "26f2e6ac561f94cb23cd14a488be833f8155e0fa7bb613ad39994a0cb28f0c9f"
+        },
+        "downloads": -1,
+        "filename": "pydiverse_pipedag-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e9a7f052a1f270f8ca932d4ab86ade7c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 53623,
+        "upload_time": "2022-09-02T13:27:01",
+        "upload_time_iso_8601": "2022-09-02T13:27:01.743970Z",
+        "url": "https://files.pythonhosted.org/packages/67/f3/b5ca5f24ee26a7bd456fba2b31fd9aeb4e4b5851acd9f598edd37ff66602/pydiverse_pipedag-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7db874989b024ad62f664a7111212a83f31385abcb8baabec1ee3e79d1e1746a",
+          "md5": "8093a595ca69165dc65a339ea82d09aa",
+          "sha256": "49de85120743ee31ade0f1f1df477b626388efbc7aeefb197ee703a6c7adda7d"
+        },
+        "downloads": -1,
+        "filename": "pydiverse-pipedag-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8093a595ca69165dc65a339ea82d09aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 41079,
+        "upload_time": "2022-09-03T14:30:22",
+        "upload_time_iso_8601": "2022-09-03T14:30:22.482204Z",
+        "url": "https://files.pythonhosted.org/packages/7d/b8/74989b024ad62f664a7111212a83f31385abcb8baabec1ee3e79d1e1746a/pydiverse-pipedag-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "214d3c61cbc3cd745caea15bc8628a65555d9bdacbcd56bfb5cba9d702fe4950",
+          "md5": "89ead457f0a048e9c8fb4cdbfe2e7569",
+          "sha256": "93132be2aa017e94823219eb5843d86e1a17c1175346130194f141e3258c0dfa"
+        },
+        "downloads": -1,
+        "filename": "pydiverse_pipedag-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "89ead457f0a048e9c8fb4cdbfe2e7569",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 81625,
+        "upload_time": "2023-01-14T15:52:39",
+        "upload_time_iso_8601": "2023-01-14T15:52:39.699369Z",
+        "url": "https://files.pythonhosted.org/packages/21/4d/3c61cbc3cd745caea15bc8628a65555d9bdacbcd56bfb5cba9d702fe4950/pydiverse_pipedag-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7734df020372af7e759ac180baa44306f698b26f3367e218b7ff26747cd912a8",
+          "md5": "0af481b510fc21b7b74eb2950d105b42",
+          "sha256": "39f87717eb2ec373e0c09d0b0c38a08be1aa5a2da572ec5e109a98fa39723e76"
+        },
+        "downloads": -1,
+        "filename": "pydiverse_pipedag-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0af481b510fc21b7b74eb2950d105b42",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 69248,
+        "upload_time": "2023-01-14T15:52:41",
+        "upload_time_iso_8601": "2023-01-14T15:52:41.554603Z",
+        "url": "https://files.pythonhosted.org/packages/77/34/df020372af7e759ac180baa44306f698b26f3367e218b7ff26747cd912a8/pydiverse_pipedag-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb30bdfac906f0cb472758f6b8084d9f4f586cb4823fd537efee95466539da23",
+          "md5": "0ce95865752b7bcf79063726754ea1ad",
+          "sha256": "441c109b1bd8c4acbf40ecad78a4119cd348d7d9362986461e42afa5939c46a6"
+        },
+        "downloads": -1,
+        "filename": "pydiverse_pipedag-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0ce95865752b7bcf79063726754ea1ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 81623,
+        "upload_time": "2023-01-15T14:29:09",
+        "upload_time_iso_8601": "2023-01-15T14:29:09.583530Z",
+        "url": "https://files.pythonhosted.org/packages/bb/30/bdfac906f0cb472758f6b8084d9f4f586cb4823fd537efee95466539da23/pydiverse_pipedag-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "851df3145f5c295961716cf9beb37e7a695c84a57cc2fd444f0c7257c8511aed",
+          "md5": "1273d986c00aba87f0430aebc3b44692",
+          "sha256": "f6456570522aac2c69267a0acf6f03ac8c63c78d4ab91ba143ef6b2f2e294291"
+        },
+        "downloads": -1,
+        "filename": "pydiverse_pipedag-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1273d986c00aba87f0430aebc3b44692",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 69244,
+        "upload_time": "2023-01-15T14:29:11",
+        "upload_time_iso_8601": "2023-01-15T14:29:11.128463Z",
+        "url": "https://files.pythonhosted.org/packages/85/1d/f3145f5c295961716cf9beb37e7a695c84a57cc2fd444f0c7257c8511aed/pydiverse_pipedag-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bb30bdfac906f0cb472758f6b8084d9f4f586cb4823fd537efee95466539da23",
+        "md5": "0ce95865752b7bcf79063726754ea1ad",
+        "sha256": "441c109b1bd8c4acbf40ecad78a4119cd348d7d9362986461e42afa5939c46a6"
+      },
+      "downloads": -1,
+      "filename": "pydiverse_pipedag-0.2.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "0ce95865752b7bcf79063726754ea1ad",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 81623,
+      "upload_time": "2023-01-15T14:29:09",
+      "upload_time_iso_8601": "2023-01-15T14:29:09.583530Z",
+      "url": "https://files.pythonhosted.org/packages/bb/30/bdfac906f0cb472758f6b8084d9f4f586cb4823fd537efee95466539da23/pydiverse_pipedag-0.2.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "851df3145f5c295961716cf9beb37e7a695c84a57cc2fd444f0c7257c8511aed",
+        "md5": "1273d986c00aba87f0430aebc3b44692",
+        "sha256": "f6456570522aac2c69267a0acf6f03ac8c63c78d4ab91ba143ef6b2f2e294291"
+      },
+      "downloads": -1,
+      "filename": "pydiverse_pipedag-0.2.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1273d986c00aba87f0430aebc3b44692",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 69244,
+      "upload_time": "2023-01-15T14:29:11",
+      "upload_time_iso_8601": "2023-01-15T14:29:11.128463Z",
+      "url": "https://files.pythonhosted.org/packages/85/1d/f3145f5c295961716cf9beb37e7a695c84a57cc2fd444f0c7257c8511aed/pydiverse_pipedag-0.2.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

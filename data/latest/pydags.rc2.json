@@ -1,0 +1,183 @@
+{
+  "info": {
+    "author": "David Torpey",
+    "author_email": "torpey.david93@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# pydags\n\n**pydags** is a Python package to facilitate the creation and running of\nlightweight DAG-based workloads locally. Whereas technologies like Airflow,\nKubeflow, and Luigi are more heavyweight, enterprise-level workflow managers,\n**pydags** is instead an extensible, simple, lightweight alternative tailored\nfor local development and execution. There are no dependencies on Docker,\nKubernetes, or any other such technologies, and it is use-case agnostic (unlike\nKubeflow/Luigi).\n\n## Terminology\n\n### Stage\n\nA *Stage* is synonymous to a node in a DAG.\n\n### Pipeline\n\nA *Pipeline* is synonymous to a DAG, and is comprised of 1 or more *Stages* in\na DAG-like structure.\n\n## Get Started\n\n### External Dependencies\n\n**pydags** requires multiple non-Python dependencies in order to function properly.\nThese include Redis (for internal operation) and GraphViz (for visualization). To install these, run the following command in terminal:\n\n```bash\nsudo apt-get install redis graphviz\n```\n\nInstalling redis with this command on most *nix systems will result in the\nRedis server starting automatically. You can verify this by running the\n`redis-server` command, which should result in an `Address already in use`\nmessage, or similar.\n\n### Python Dependencies\n\nThe requirements for the SDK are defined in the `requirements.txt` file, and\ncan be installed with the following command:\n\n```bash\npip install -r requirements.txt\n```\n\n### Install pydags\n\nCurrently, pydags needs to be installed from source. Simply run the following command:\n\n```bash\npython3 setup.py install\n```\n\nYou may require `sudo` permissions to run this command. If you do not have\n`sudo` permissions on your system, then you can point to a different\ninstallation directory using the `--home /path/to/folder/` flag and point it\nto a folder you have write permissions to. Ensure that the `build/libs`\ndirectory  that gets created is in your `PYTHONPATH` environment variable.\n\n## Example Usage\n\n### Expressing a DAG\n\nBelow is a simple example that aims to simply demonstrate how to specify DAGs\nin **pydags**. In this case, each stage of the pipeline is a Python function\ndecorated with the `@stage` decorator.\n\n```python\nfrom pydags.pipeline import Pipeline\nfrom pydags.stage import stage\n\n\n@stage\ndef stage_1():\n    print('Running stage 1')\n\n@stage\ndef stage_2():\n    print('Running stage 2')\n\n@stage\ndef stage_3():\n    print('Running stage 3')\n\n@stage\ndef stage_4():\n    print('Running stage 4')\n\n@stage\ndef stage_5():\n    print('Running stage 5')\n\n@stage\ndef stage_6():\n    print('Running stage 6')\n\ndef build_pipeline():\n    stage1 = stage_1()\n    stage2 = stage_2()\n    stage3 = stage_3().after(stage2)\n    stage4 = stage_4().after(stage2)\n    stage5 = stage_5().after(stage1)\n    stage6 = stage_6().after(stage3).after(stage4).after(stage5)\n\n    pipeline = Pipeline()\n\n    pipeline.add_stages([\n        stage1, stage2, stage3,\n        stage4, stage5, stage6\n    ])\n\n    return pipeline\n\n\npipeline = build_pipeline()\n\npipeline.visualize()\n\npipeline.start()\n```\n\nStages of the pipeline that can be run in parallel (in the above case, stages 1\nand 2, and stages 3, 4, 5) will only be run in parallel is you set the\n`num_cores` argument of the `.start()` method to a positive integer\n(representing the number of cores to distribute computation across). For\nexample, if you want to parallelize the execution of such nodes that can be run\nin parallel, then simply replace `pipeline.start()` with\n`pipeline.start(num_cores=8)` (to use 8 cores).\n\n### A Simple ML Pipeline\n\nBelow is an example of a simple ML pipeline consisting of 3 stages: 1) data\ndownload, 2) preprocessing, 3) model training. All 3 stages are subclasses of\n`RedisStage`, and thus inherit the functionality to read from and write to a\nRedis server. The data is thus passed between the stages using Redis. You may\nsubclass DiskCacheStage, or implement your own cache/storage backend, if Redis\nis not suited to your use case.\n\nPlease note that you will need to install the additional `scikit-learn`\ndependency to run this example.\n\n```python\nimport redis\nfrom sklearn.datasets import load_wine\nfrom sklearn.ensemble import RandomForestClassifier\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.preprocessing import MinMaxScaler\n\nfrom pydags.pipeline import Pipeline\nfrom pydags.stage import RedisStage\n\n\nclass DataIngestor(RedisStage):\n    @staticmethod\n    def download_data():\n        data = load_wine()\n        features = data['data']\n        targets = data['target']\n        return features, targets\n\n    def run(self, *args, **kwargs):\n        features, targets = self.download_data()\n        self.write('features', features)\n        self.write('targets', targets)\n\n\nclass DataPreprocessor(RedisStage):\n    @staticmethod\n    def normalize(features):\n        return MinMaxScaler().fit_transform(features)\n\n    @staticmethod\n    def split(features, targets):\n        return train_test_split(features, targets, test_size=0.2)\n\n    def run(self, *args, **kwargs):\n        features = self.read('features')\n        targets = self.read('targets')\n\n        xtr, xte, ytr, yte = self.split(features, targets)\n\n        xtr = self.normalize(xtr)\n        xte = self.normalize(xte)\n\n        data = {\n            'xtr': xtr, 'xte': xte,\n            'ytr': ytr, 'yte': yte\n        }\n\n        self.write('preprocessed_data', data)\n\n\nclass ModelTrainer(RedisStage):\n    def __init__(self, *args, **kwargs):\n        super(ModelTrainer, self).__init__(*args, **kwargs)\n\n        self.model = None\n\n    def train_model(self, xtr, ytr):\n        self.model = RandomForestClassifier().fit(xtr, ytr)\n\n    def test_model(self, xte, yte):\n        acc = self.model.score(xte, yte)\n        return acc\n\n    def run(self, *args, **kwargs):\n        preprocessed_data = self.read('preprocessed_data')\n\n        xtr = preprocessed_data['xtr']\n        xte = preprocessed_data['xte']\n        ytr = preprocessed_data['ytr']\n        yte = preprocessed_data['yte']\n\n        self.train_model(xtr, ytr)\n\n        acc = self.test_model(xte, yte)\n\n        print('Accuracy:', acc)\n\n\ndef build_pipeline():\n    redis_instance = redis.Redis(host='localhost', port=6379, db=0)\n\n    data_ingestor = DataIngestor(redis_instance=redis_instance)\n\n    data_preprocessor = DataPreprocessor(redis_instance=redis_instance).after(data_ingestor)\n\n    model_trainer = ModelTrainer(redis_instance=redis_instance).after(data_preprocessor)\n\n    pipeline = Pipeline()\n    pipeline.add_stages([data_ingestor, data_preprocessor, model_trainer])\n\n    return pipeline\n\n\np = build_pipeline()\n\np.visualize()\n\np.start()\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/DavidTorpey/pydags",
+    "keywords": "",
+    "license": "GPLv3",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "pydags",
+    "package_url": "https://pypi.org/project/pydags/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/pydags/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/DavidTorpey/pydags/issues",
+      "Homepage": "https://github.com/DavidTorpey/pydags"
+    },
+    "release_url": "https://pypi.org/project/pydags/0.1.1/",
+    "requires_dist": [
+      "cloudpickle (==1.6.0)",
+      "dill (==0.3.3)",
+      "diskcache (==5.2.1)",
+      "matplotlib (==3.3.3)",
+      "networkx (==2.5)",
+      "pydot (==1.4.2)",
+      "redis (==3.5.3)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A simple, lightweight, extensible DAG framework for Python",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10243307,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "813a802ca0bb1f3faae27a19d79ce5f53f786a5cec91136278724ed194f7d7ee",
+          "md5": "9690880a912f89fcc755b993c417e749",
+          "sha256": "8476f36131ee9b246b7edbd7c30d52525263dcc300c772caf40c5ff3dbe7f9c7"
+        },
+        "downloads": -1,
+        "filename": "pydags-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9690880a912f89fcc755b993c417e749",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 23486,
+        "upload_time": "2021-05-03T13:49:52",
+        "upload_time_iso_8601": "2021-05-03T13:49:52.776164Z",
+        "url": "https://files.pythonhosted.org/packages/81/3a/802ca0bb1f3faae27a19d79ce5f53f786a5cec91136278724ed194f7d7ee/pydags-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30c9865146bcb23a7f702398220e8071be846b82f087ff20f4eac6f0e4ecc826",
+          "md5": "35af4f642cc35beb57fb3088da2ae716",
+          "sha256": "b552a27139e9cd63b525077325a2b8022c734f3c0500a32664676ac9690ad03d"
+        },
+        "downloads": -1,
+        "filename": "pydags-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "35af4f642cc35beb57fb3088da2ae716",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25904,
+        "upload_time": "2021-05-03T13:49:54",
+        "upload_time_iso_8601": "2021-05-03T13:49:54.358864Z",
+        "url": "https://files.pythonhosted.org/packages/30/c9/865146bcb23a7f702398220e8071be846b82f087ff20f4eac6f0e4ecc826/pydags-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d245e7a36d02236c694100a568eb592abfe553422dca4b526a3f51e783412a79",
+          "md5": "8ed3eea454849ad4aa688acd318c2a52",
+          "sha256": "0c302af245c614340aafd387024194cbd5ba18701b77b1f7d8fa72e969ce4046"
+        },
+        "downloads": -1,
+        "filename": "pydags-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ed3eea454849ad4aa688acd318c2a52",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 23574,
+        "upload_time": "2021-05-03T19:21:15",
+        "upload_time_iso_8601": "2021-05-03T19:21:15.950429Z",
+        "url": "https://files.pythonhosted.org/packages/d2/45/e7a36d02236c694100a568eb592abfe553422dca4b526a3f51e783412a79/pydags-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "967c9f88065cd7da15fd7770dde37b68c73bdadb9cca28fc3e22965766fd3b28",
+          "md5": "3c8edc06094065904bfcb086e5687195",
+          "sha256": "1c8b328ef163a25cc6ad385a1fd7ba4f0d75d5545e48c2ea1a85949bfb0f097b"
+        },
+        "downloads": -1,
+        "filename": "pydags-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3c8edc06094065904bfcb086e5687195",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 26025,
+        "upload_time": "2021-05-03T19:21:17",
+        "upload_time_iso_8601": "2021-05-03T19:21:17.268397Z",
+        "url": "https://files.pythonhosted.org/packages/96/7c/9f88065cd7da15fd7770dde37b68c73bdadb9cca28fc3e22965766fd3b28/pydags-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d245e7a36d02236c694100a568eb592abfe553422dca4b526a3f51e783412a79",
+        "md5": "8ed3eea454849ad4aa688acd318c2a52",
+        "sha256": "0c302af245c614340aafd387024194cbd5ba18701b77b1f7d8fa72e969ce4046"
+      },
+      "downloads": -1,
+      "filename": "pydags-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8ed3eea454849ad4aa688acd318c2a52",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 23574,
+      "upload_time": "2021-05-03T19:21:15",
+      "upload_time_iso_8601": "2021-05-03T19:21:15.950429Z",
+      "url": "https://files.pythonhosted.org/packages/d2/45/e7a36d02236c694100a568eb592abfe553422dca4b526a3f51e783412a79/pydags-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "967c9f88065cd7da15fd7770dde37b68c73bdadb9cca28fc3e22965766fd3b28",
+        "md5": "3c8edc06094065904bfcb086e5687195",
+        "sha256": "1c8b328ef163a25cc6ad385a1fd7ba4f0d75d5545e48c2ea1a85949bfb0f097b"
+      },
+      "downloads": -1,
+      "filename": "pydags-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3c8edc06094065904bfcb086e5687195",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 26025,
+      "upload_time": "2021-05-03T19:21:17",
+      "upload_time_iso_8601": "2021-05-03T19:21:17.268397Z",
+      "url": "https://files.pythonhosted.org/packages/96/7c/9f88065cd7da15fd7770dde37b68c73bdadb9cca28fc3e22965766fd3b28/pydags-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
