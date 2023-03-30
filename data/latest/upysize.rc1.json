@@ -1,0 +1,137 @@
+{
+  "info": {
+    "author": "SatoshiLabs",
+    "author_email": "info@satoshilabs.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Decreasing micropython code size\n\nHaving smaller code is always a good thing. Sometimes it is a necessity, for example when running on a micro-controller with limited flash space. Smaller code should also be quicker to execute, due to less instructions.\n\nThis is a collection of tips and tricks to reduce the compiled size of the `micropython` code.\n\nMajority of these strategies are also automated into this tool, so one does not need to search for them manually.\n\nOne of the very few resources on this topic is [micropython docs](https://docs.micropython.org/en/latest/reference/speed_python.html#micropython-code-improvements) - even though it mainly concerns speed, some tips are common for code size efficiency.\n\nAll the examples below are real, coming from `micropython` codebase of [Trezor firmware](https://github.com/trezor/trezor-firmware) repository.\n\n(Want to measure how big is the code in the final binary? Try out [size analysis tool](https://github.com/grdddj/binsize))\n\n\n## Tool basic usage\n\nInstalling this package creates `upysize` command, which takes the file/directory as an argument.\n\n```bash\n$ upysize .\n$ upysize src/apps/bitcoin/sign_tx/bitcoin.py\n$ upysize src/apps\n```\n\nResult will be printed into terminal, suggesting some changes in specific files, together with estimated decrease of binary size.\n\n## Strategies\n\nOverall, strategies have one thing in common - reducing the amount of instructions/bytecode that need to be compiled into the final binary/executable.\n\nTo sum up some of the lessons learned:\n\n```\nAccessing global symbols from functions is expensive.\nAccessing symbol attributes is expensive.\n```\n\nwhich leads to a saying\n\n```\nCache is our friend.\n```\n\nList below shows the strategies (in no particular order).\n\n### 1. Delete unused code\n\nProbably the easiest way to reduce the size of the code is to delete all the unused stuff (imports, functions, classes, variables... ) - or at least delete it from the resulting binary. How to search for it? Apart from doing it manually, what helps are two things:\n- code editor (at least `VS Code`) highlights unused symbols - they become greyed out\n- tools like [Vulture](https://pypi.org/project/vulture/) can analyze whole `python` codebase and report all possibly unused symbols\n\n---\n\n### 2. Import only what is needed for the code execution\n\nStatic type hints in modern `python` are a fantastic thing, but they are not without some drawbacks. When type-hinting with object from another module, this object needs to be imported - and therefore, normally, will generate some runtime and compiled overhead.\n\nTo combat this (and also to combat circular dependencies), it is possible to use `typing.TYPE_CHECKING` flag. This flag is `False` at runtime, but `True` when type-checking the code. The imports inside `if TYPE_CHECKING:` are not executed at runtime (not included into binary at compile time).\n\n##### Before\n```python\nfrom my_module import MyObject\n\ndef my_func(obj: MyObject) -> None:\n    ...\n```\n\n##### After\n```python\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from my_module import MyObject\n\ndef my_func(obj: MyObject) -> None:\n    ...\n```\n\n#### Benefits\n\nSize cost of one global import is around **8 bytes**.\n\n---\n\n### 3. Inline short one-time helper functions\n\nHaving a lot of small and well-documented helper functions is generally a good practice. However, each function has significant size overhead in the resulting binary.\n\nWhen a function is used only once, it can be beneficial to inline it. This is especially true for short functions, which are not used anywhere else.\n\n##### Before\n\n```python\ndef derive_shelley_address(parameters: Params) -> bytes:\n    header = _create_header(parameters.address_type, network_id)\n    ...\n\ndef _create_header(address_type: AddressType, network_id: int) -> bytes:\n    header = address_type << 4 | network_id\n    return header.to_bytes(1, \"little\")\n```\n\n##### After\n\n```python\ndef derive_shelley_address(parameters: Params) -> bytes:\n    # _create_header\n    header_int = parameters.address_type << 4 | network_id\n    header = header_int.to_bytes(1, \"little\")\n    ...\n```\n\n#### Benefits\n\nSize benefit of inlining one-time function is around **50 bytes**. It depends on the amount of function arguments - the more, the bigger the size decrease. Also, those two functions can now share one local scope, which is beneficial for caching purposes (see next strategies).\n\n#### Drawbacks\n\nIt can decrease the readability of the code. It is also then impossible to test that helper function in isolation. What would solve both these issues is compile-time magic doing the \"inlining\" automatically.\n\n---\n\n### 4. Create functions of repeating patterns\n\nIt may be a contradiction of the point above, to create more functions, but when the same logic is used many times, it can be (not only space-wise) beneficial to group it into a function.\n\n##### Before\n\n```python\nself.prevouts = HashWriter(blake2b(outlen=32, personal=b\"ZTxIdPrevoutHash\"))\nself.amounts = HashWriter(blake2b(outlen=32, personal=b\"ZTxTrAmountsHash\"))\n...\nself.outputs = HashWriter(blake2b(outlen=32, personal=b\"ZTxIdOutputsHash\"))\n```\n\n##### After\n\n```python\ndef blake_hash_writer_32(personal: bytes) -> HashWriter:\n    return HashWriter(blake2b(outlen=32, personal=personal))\n\nself.prevouts = blake_hash_writer_32(b\"ZTxIdPrevoutHash\")\nself.amounts = blake_hash_writer_32(b\"ZTxTrAmountsHash\")\n...\nself.outputs = blake_hash_writer_32(b\"ZTxIdOutputsHash\")\n```\n\n#### Benefits\n\nThe more expensive the operation is, the bigger the size benefit. Also it is more apparent that all the steps are really the same in all places.\n\n---\n\n### 5. Replace series of calls with a loop\n\nWhen there is an uninterrupted sequence of the same calls, just with different arguments, it can be beneficial to replace it with a loop.\n\n##### Before\n\n```python\nwrite_uint32_le(w, tx.version | OVERWINTERED)  # nVersion | fOverwintered\nwrite_uint32_le(w, tx.version_group_id)  # nVersionGroupId\nwrite_uint32_le(w, tx.branch_id)  # nConsensusBranchId\nwrite_uint32_le(w, tx.lock_time)  # lock_time\nwrite_uint32_le(w, tx.expiry)  # expiryHeight\n```\n\n##### After\n\n```python\nfor num in (\n    tx.version | _OVERWINTERED,  # nVersion | fOverwintered\n    tx.version_group_id,  # nVersionGroupId\n    tx.branch_id,  # nConsensusBranchId\n    tx.lock_time,  # lock_time\n    tx.expiry,  # expiryHeight\n):\n    write_uint32_le(w, num)\n```\n\n---\n\n### 6. Not setting values through if-elif-else\n\nIf applicable (when always comparing the same thing), a `dict` may be more efficient than a long `if-elif-else` chain.\n\n##### Before\n\n```python\nif rotation == 0:\n    label = \"north\"\nelif rotation == 90:\n    label = \"east\"\nelif rotation == 180:\n    label = \"south\"\nelif rotation == 270:\n    label = \"west\"\nelse:\n    raise wire.DataError(\"Unsupported display rotation\")\n```\n\n##### After\n\n```python\nlabel = {\n    0: \"north\",\n    90: \"east\",\n    180: \"south\",\n    270: \"west\",\n}.get(rotation)\nif label is None:\n    raise DataError(\"Unsupported display rotation\")\n```\n\nIn very simple cases, ternary operator can be even more space-efficient:\n\n```python\nif msg.fee.change > 0:\n    action = \"increase\"\nelse:\n    action = \"decrease\"\n```\n\nvs\n\n```python\naction = \"increase\" if msg.fee.change > 0 else \"decrease\"\n```\n\n---\n\n### 7. Cache any frequent attribute access\n\nAttribute access is expensive, so when we do it repeatedly, we could cache the result into one variable.\n\n##### Before\n(focus on `msg.address_n`)\n\n```python\nasync def get_address(ctx: Context, msg: GetAddress) -> Address:\n    await validate(ctx, msg.address_n)\n    node = derive(msg.address_n)\n    address = to_str(msg.address_n)\n    return Address(address=address)\n```\n\n##### After\n\n```python\nasync def get_address(ctx: Context, msg: GetAddress) -> Address:\n    address_n = msg.address_n  # cache\n\n    await validate(ctx, address_n)\n    node = derive(address_n)\n    address = to_str(address_n)\n    return Address(address=address)\n```\n\nIt works well even with methods:\n\n```python\nmy_list = []\n\nmy_list.append(...)\n...\nmy_list.append(...)\n```\n\nvs\n\n```python\nmy_list = []\nmy_list_append = my_list.append  # cache\n\nmy_list_append(...)\n...\nmy_list_append(...)\n```\n\n#### Benefits\n\nThe more the attribute lookup was used, the bigger the saving. It saves around  **2 bytes** per one replaced lookup (when replacing 4 or more usages).\n\n#### Drawbacks\n\nFor caching methods, it worsens their readability in code editor (`my_list.append` has object and method differentiated by color, while `my_list_append` is only a variable).\n\n---\n\n### 8. Cache frequently accessed global symbol locally\n\nAccessing global symbols (imported modules or top-level functions) is expensive. When we use it many times inside one function, it could be beneficial to store the reference in a local variable.\n\n##### Before\n\n```python\nfrom trezor.messages import MessageType\n\ndef boot() -> None:\n    register(MessageType.GetAddress, get_address)\n    register(MessageType.GetPublicKey, get_public_key)\n    ...\n    register(MessageType.Ping, ping)\n```\n\n##### After\n\n```python\nfrom trezor.messages import MessageType\n\ndef boot() -> None:\n    MT = MessageType  # cache\n\n    register(MT.GetAddress, get_address)\n    register(MT.GetPublicKey, get_public_key)\n    ...\n    register(MT.Ping, ping)\n```\n\n\"Double win\" is storing a local reference to a global attribute lookup:\n\n```python\nfrom trezor import wire\n\ndef validate(msg: Message) -> None:\n    if msg.high_fee:\n        raise wire.DataError(\"high_fee\")\n    if msg.low_fee:\n        raise wire.DataError(\"low_fee\")\n    ...\n```\n\nvs\n\n```python\nfrom trezor import wire\n\ndef validate(msg: Message) -> None:\n    DataError = wire.DataError  # cache\n\n    if msg.high_fee:\n        raise DataError(\"high_fee\")\n    if msg.low_fee:\n        raise DataError(\"low_fee\")\n    ...\n```\n\n#### Benefits\n\nThe more global usages are replaced, the bigger benefit. It is roughly **1 byte** per replacement when replacing 5 or more usages.\n\n---\n\n### 9. Import symbols only in the one function where it is used\n\nWhen some imported symbol is used only in one function from the module, it is beneficial to import it locally just in that single function instead of creating a global import.\n\n##### Before\n\n```python\nfrom trezor.crypto.hashlib import sha256\n\ndef get_tx_hash(w: HashWriter) -> bytes:\n     d = w.get_digest()\n     return sha256(sha256(d).digest()).digest()\n```\n\n##### After\n\n```python\ndef get_tx_hash(w: HashWriter) -> bytes:\n    from trezor.crypto.hashlib import sha256\n\n    d = w.get_digest()\n    return sha256(sha256(d).digest()).digest()\n```\n\n#### Benefits\n\nThe more times the symbol is used in that function, the more space-beneficial it is to import it just there (as it creates a local symbol, not a global one).  For each usage of local import, around **2-3 bytes** are saved.\n\n#### Drawbacks\n\nThis way not all the imports are on the top and it is therefore harder to see all the dependencies of the module. Also when later adding another function using this symbol, we need to decide whether to import it also locally there, or do it globally.\n\n---\n\n### 10. Use `const` for global constants\n\nCreating a constant is more costly than to define a normal number, but it saves a lot in places which use this constant.\n\n##### Before\n\n```python\nHASH_LENGTH = 32\nSLIP_44_ID = 123\nLOCAL_ONLY = 456\n```\n\n##### After\n\n```python\nfrom micropython import const\n\nHASH_LENGTH = const(32)\nSLIP_44_ID = const(123)\n_LOCAL_ONLY = const(456)\n```\n\nOne extra benefit of using `const()` is when the variable is used only in module where it is defined. In that case, prepending a variable name with `_` will tell `micropython` that it does not need to be included in the public module dictionary. This saves around **4 bytes**.  More details in [micropython docs](https://docs.micropython.org/en/v1.9.3/wipy/reference/constrained.html#execution-phase).\n\n---\n\n### 11. Import frequently used symbols directly\n\nTo avoid the need of attribute lookups on imported modules, importing the used symbols directly can be beneficial when that symbol is used many times in more than one function.\n\n##### Before\n\n```python\nfrom trezor import wire\nimport trezorui2\n\ndef show_group_share_success():\n    ...\n    if result is not trezorui2.CONFIRMED:\n        raise wire.ActionCancelled\n\ndef continue_recovery():\n    ...\n    if result is not trezorui2.CONFIRMED:\n        raise wire.ActionCancelled\n```\n\n##### After\n\n```python\nfrom trezor.wire import ActionCancelled\nfrom trezorui2 import CONFIRMED\n\n# CONFIRMED = trezorui2.CONFIRMED  # cache  # second option\n\ndef show_group_share_success():\n    ...\n    if result is not CONFIRMED:\n        raise ActionCancelled\n\ndef continue_recovery():\n    ...\n    if result is not CONFIRMED:\n        raise ActionCancelled\n```\n\n### 12. Do not use keyword arguments\n\nCalling functions with keyword arguments is nice (hello `Rust`), but it turns out it costs more space than with positional arguments.\n\n##### Before\n\n```python\nmosaic = MosaicLevy(\n    type=Mosaic.ABC,\n    fee=10,\n    namespace=\"dim\",\n    mosaic=\"coin\",\n)\n```\n\n##### After\n\n```python\nmosaic = MosaicLevy(  # levy\n    Mosaic.ABC,  # type\n    10,  # fee\n    \"dim\",  # namespace\n    \"coin\",  # mosaic\n)\n```\n\n#### Benefits\n\nIt saves **3 bytes** per one kwarg pair.\n\n#### Drawbacks\n\nIt can decrease readability of what each argument means, especially when there are many of them. It can be therefore good to include comments with the names of the arguments.\n\n---\n\n### 13. Do not use small classes to hold data for a short time\n\nWhen data have only short-term duration (are not passed to other modules, etc.), the class may be replaced by a tuple holding just the raw data.\n\nDefining class and creating an instance are both quite costly, so avoiding it saves space. Tuples do not have this cost.\n\n##### Before\n\n```python\nclass RippleField:\n    def __init__(self, type: int, key: int) -> None:\n        self.type: int = type\n        self.key: int = key\n\nFIELDS: list[RippleField] = [\n    RippleField(type=FIELD_TYPE_ACCOUNT, key=1),\n    RippleField(type=FIELD_TYPE_ACCOUNT, key=3),\n    ...\n    RippleField(type=FIELD_TYPE_INT32, key=27),\n]\n\ndef serialize(w: Writer):\n    for field in FIELDS:\n        write(w, field)\n\ndef write(w: Writer, field: RippleField) -> None:\n    type = field.type\n    key = field.key\n    ...\n```\n\n##### After\n\n```python\nif TYPE_CHECKING:\n    RippleField = tuple[int, int]\n\nFIELDS: list[RippleField] = [\n    (FIELD_TYPE_ACCOUNT, 1),\n    (FIELD_TYPE_ACCOUNT, 3),\n    ...\n    (FIELD_TYPE_INT32, 27),\n]\n\ndef serialize(w: Writer):\n    for field in FIELDS:\n        write(w, field)\n\ndef write(w: Writer, field: RippleField) -> None:\n    type = field[0]\n    key = field[1]\n    ...\n```\n\n#### Drawbacks\n\nIt worsens the readability/reliability due the need of using number subscripting (`field[0]`) to access the data. It can be therefore good to define a type alias for the tuple to have a static analysis.\n\n---\n\n### 14. Effectively store bigger data\n\nIn memory-constrained environments we sometimes need to work with data-sets that cannot even fit RAM in their entirety. For those cases the data need to be stored in flash and accessed sequentially, which can cost a lot of space.\n\nYielding iterators of tuples turned out to be the most effective way. Some higher function will loop through them and can do something on each element.\n\n(Using tuples is more efficient than classes, as already discussed above. Class can be constructed by the higher function.)\n\n##### Before\n\n```python\nclass TokenInfo:\n    def __init__(self, symbol: str, decimals: int) -> None:\n        self.symbol = symbol\n        self.decimals = decimals\n\ndef token_by_chain_address(address: bytes) -> TokenInfo:\n    if address == b\"\\x4e\\x84...\":\n        return TokenInfo(\"$FFC\", 18)\n    if address == b\"\\x7d\\xd7...\":\n        return TokenInfo(\"$TEAK\", 18)\n    ...\n```\n\n##### After\n\n```python\ndef token_by_chain_address(address: bytes) -> TokenInfo:\n    for t in _token_iterator():\n        if address == t[0]:\n            return TokenInfo(t[1], t[2])\n\ndef _token_iterator() -> Iterator[tuple[bytes, str, int]]:\n    yield (  # address, symbol, decimals\n        b\"\\x4e\\x84...\",\n        \"$FFC\",\n        18,\n    )\n    yield (  # address, symbol, decimals\n        b\"\\x7d\\xd7..\",\n        \"$TEAK\",\n        18,\n    )\n    ...\n```\n\n## Conclusion\n\nUsing the strategies above, it was possible to shrink the compiled size of [Trezor firmware](https://github.com/trezor/trezor-firmware)'s `micropython` code by around **10 %**.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/grdddj/upysize",
+    "keywords": "micropython,code size",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "upysize",
+    "package_url": "https://pypi.org/project/upysize/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/upysize/",
+    "project_urls": {
+      "Homepage": "https://github.com/grdddj/upysize",
+      "Repository": "https://github.com/grdddj/upysize"
+    },
+    "release_url": "https://pypi.org/project/upysize/0.1.0/",
+    "requires_dist": [
+      "click (>=8.1.3,<9.0.0)",
+      "typing-extensions"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "Tool to help decrease compiled size of micropython code",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15304319,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "552e320255ae140750b0c6218d6165883c0e8e27337c7d9508c2a67245fa4c40",
+          "md5": "602b57767289eaa00cebc60fb3f18223",
+          "sha256": "6d7b448c93d14f8ef417ded254b91bda8a84341b1f95424c94e1344b7d967253"
+        },
+        "downloads": -1,
+        "filename": "upysize-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "602b57767289eaa00cebc60fb3f18223",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 22899,
+        "upload_time": "2022-10-04T16:34:01",
+        "upload_time_iso_8601": "2022-10-04T16:34:01.053592Z",
+        "url": "https://files.pythonhosted.org/packages/55/2e/320255ae140750b0c6218d6165883c0e8e27337c7d9508c2a67245fa4c40/upysize-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49ad04b34adb73be76ddf475b8fd01484d1ee1245cba145c17ca50572b9726bb",
+          "md5": "b240b9a516ecad9857ec8a9b06fe3cb7",
+          "sha256": "23c8c758038284783b07e289bb385d1f24422f1ee343d89fd9e7d67336963241"
+        },
+        "downloads": -1,
+        "filename": "upysize-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b240b9a516ecad9857ec8a9b06fe3cb7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 23244,
+        "upload_time": "2022-10-04T16:34:03",
+        "upload_time_iso_8601": "2022-10-04T16:34:03.204889Z",
+        "url": "https://files.pythonhosted.org/packages/49/ad/04b34adb73be76ddf475b8fd01484d1ee1245cba145c17ca50572b9726bb/upysize-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "552e320255ae140750b0c6218d6165883c0e8e27337c7d9508c2a67245fa4c40",
+        "md5": "602b57767289eaa00cebc60fb3f18223",
+        "sha256": "6d7b448c93d14f8ef417ded254b91bda8a84341b1f95424c94e1344b7d967253"
+      },
+      "downloads": -1,
+      "filename": "upysize-0.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "602b57767289eaa00cebc60fb3f18223",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 22899,
+      "upload_time": "2022-10-04T16:34:01",
+      "upload_time_iso_8601": "2022-10-04T16:34:01.053592Z",
+      "url": "https://files.pythonhosted.org/packages/55/2e/320255ae140750b0c6218d6165883c0e8e27337c7d9508c2a67245fa4c40/upysize-0.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "49ad04b34adb73be76ddf475b8fd01484d1ee1245cba145c17ca50572b9726bb",
+        "md5": "b240b9a516ecad9857ec8a9b06fe3cb7",
+        "sha256": "23c8c758038284783b07e289bb385d1f24422f1ee343d89fd9e7d67336963241"
+      },
+      "downloads": -1,
+      "filename": "upysize-0.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b240b9a516ecad9857ec8a9b06fe3cb7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 23244,
+      "upload_time": "2022-10-04T16:34:03",
+      "upload_time_iso_8601": "2022-10-04T16:34:03.204889Z",
+      "url": "https://files.pythonhosted.org/packages/49/ad/04b34adb73be76ddf475b8fd01484d1ee1245cba145c17ca50572b9726bb/upysize-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
