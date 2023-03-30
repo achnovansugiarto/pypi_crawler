@@ -1,0 +1,315 @@
+{
+  "info": {
+    "author": "Dmitry Novikov",
+    "author_email": "avigmati@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# About\nThis package provides services for django applications. The servitin service is an asynchronous standalone application.\n\n\n# Installation\n```shell\npip install servitin\n```\n\n# Howto\nAdd ```servitin``` to ```settings.INSTALLED_APPS```\n\nMake sure you have ```LOGGING``` settings in your project - servitin needs this.\n\nLet's say you have a django app ```myapp```.\n\nMake ```myapp``` a servitin service by adding the line ```is_servitin = True``` in ```myapp/apps.py```:\n```python\nfrom django.apps import AppConfig\n\nclass MyappConfig(AppConfig):\n    default_auto_field = 'django.db.models.BigAutoField'\n    name = 'myapp'\n    is_servitin = True\n```\n\nCreate file ```myapp/servitin.py```:\n\n```python\nfrom servitin.base import BaseService\n\nclass Service(BaseService):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.log.info(f\"Myapp service ready.\")\n```\n\n(Not necessary) Give the version ```myapp```, write in the file ```myapp/__init__.py```:\n```python\n__version__ = '1.0'\n```\n\nStart service:\n```shell\n./manage.py run_servitin\n```\n\nIf all is ok you will see in the log ```Myapp service ready.```\n\n# Logging\nTo configure the built-in logger for each service, Servitin looks for a logger named ```servitin_myservice_logger``` for the ```myservice``` app, \nsimilarly for the ```my_other_service``` app it will look for ```servitin_my_other_service_logger```.\n\nBuil-in logger is used like this:\n```python\nself.log.info(f\"Myapp service ready.\")\n```\nin the example above\n\n# Request handling\nEdit ```myapp/servitin.py``` to make the service as the ZeroMQ server:\n\n```python\nfrom servitin.base import BaseService\nfrom servitin.lib.zmq.server import ZMQServer\n\nclass Service(ZMQServer, BaseService):\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.log.info(f\"Myapp service ready.\")\n```\n\nCreate ```myapp/settings.py```:\n\n```python\nfrom django.conf import settings\n\nsettings.SERVITIN_MYAPP_ZMQ = getattr(settings, 'SERVITIN_MYAPP_ZMQ', {\n    'BIND_ADDRESS': 'tcp://*:5555',\n    'CONNECT_ADDRESS': 'tcp://127.0.0.1:5555',\n    'SECRET': ''\n})\n```\n\nCreate file ```myapp/zmq.py```:\n\n```python\nimport asyncio\nfrom servitin.lib.zmq.server import zmq, Response\nfrom asgiref.sync import sync_to_async\nfrom django.core import serializers\nfrom django.contrib.auth.models import User\nfrom servitin.utils import serializable\n\n@zmq\nasync def get_users(request):\n    order_by = request.data['order_by']\n    # use built-in logger\n    request.log.info(f'request order: {order_by}', name='@get_users')\n\n    def get_data():\n        # data with datetime objects, so it no serializable\n        data = serializers.serialize('python', User.objects.all().order_by(order_by), fields=('username', 'date_joined'))\n        # so make it serializable (you can use your own serializer) \n        return serializable(data)\n    \n    return Response(request, await sync_to_async(get_data)())\n\n\n@zmq\nasync def heavy_task(request):\n    \"\"\" emulate heavy task endpoint for timeout test \"\"\"\n\n    await asyncio.sleep(5)\n    request.log.info(f'data: {request.data}', id=request.request_id, name='@heavy_task')\n    return Response(request, f'complete: {request.data}')\n```\n\nHere we have created two endpoints: ```get_users```, ```heavy_task```.\nThe service is ready to handle requests, let's test it.\n\nCreate django management command ```myapp/management/commands/test_myapp_service.py```:\n\n```python\nimport asyncio\nfrom django.core.management import BaseCommand\nfrom servitin.lib.zmq.client import Servitin\nimport myapp.settings  # import our service settings\n\n\nclass Command(BaseCommand):\n    def handle(self, *args, **options):\n\n        async def do():\n            async with Servitin('myapp').connect() as my_service:\n                print(await my_service.get_users({'order_by': 'username'}))\n\n        asyncio.run(do())\n\n```\nIn this example servitin client configured via ```myapp/settings.py```.\n\nRun it:\n```shell\n./manage.py test_myapp_service\n```\n\n# Calls\n\nIt is also possible to use the servitin client outside of django.\n\nCreate file ```test_calls.py```:\n\n```python\nfrom servitin.lib.zmq.client import Servitin\nimport asyncio\n\n\nloop = asyncio.get_event_loop()\nparams = {'connect': 'tcp://127.0.0.1:5555', 'secret': ''}\n\n\n# ASYNC CALLS\n\nasync def do():\n    # manual close connection\n    my_service = Servitin(**params)\n    results = await asyncio.gather(*[\n        my_service.get_users({'order_by': 'username'}),\n        my_service.get_users({'order_by': 'id'})\n    ])\n    print(results)\n    my_service.close()  # close connection\n\n    # auto close connection via context manager\n    async with Servitin(**params).connect() as my_service:\n        print(await my_service.get_users({'order_by': 'username'}))\n\n    # timeout\n    # you can specify timeout by passing it to Servitin():\n    # async with Servitin(connect='tcp://127.0.0.1:5555', secret='', timeout=1).connect() as my_service:\n    async with Servitin(**params).connect() as my_service:\n        try:\n            # or pass it directly in call\n            print(await my_service.heavy_task({'data': 'context manager, timeout call'}, timeout=1))\n        except asyncio.TimeoutError as e:\n            print(e.__repr__())\n\n\nloop.run_until_complete(do())\n\n\n# SYNC CALLS\n\nparams = {'connect': 'tcp://127.0.0.1:5555', 'secret': '', 'async_mode': False}\n\n# manual\nmy_service = Servitin(**params)\nprint(my_service.get_users({'order_by': 'username'}))\nmy_service.close()\n\n# via context manager\nwith Servitin(**params).sync_connect() as my_service:\n    print(my_service.get_users({'order_by': 'username'}))\n\n\nloop.close()\n\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/avigmati/servitin",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "servitin",
+    "package_url": "https://pypi.org/project/servitin/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/servitin/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/avigmati/servitin/issues",
+      "Homepage": "https://github.com/avigmati/servitin"
+    },
+    "release_url": "https://pypi.org/project/servitin/1.0.4/",
+    "requires_dist": [
+      "aiozmq (>=0.9.0)",
+      "async-timeout (>=3.0.1)",
+      "msgpack (>=1.0.2)",
+      "pydantic (>=1.8.2)",
+      "python-jose (>=3.3.0)"
+    ],
+    "requires_python": ">=3.9",
+    "summary": "Django services app",
+    "version": "1.0.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11809863,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0169da82700dc319ca9534ff32decd62e0be82cbd2edb6ebedfc48f97ab916b5",
+          "md5": "d1ae454c1cc1daa8e596b0b61309f1bb",
+          "sha256": "c9d63e9f08c722b5eeaa7cd69bf01a49ad30f420b5afd5e957e4258b0265457a"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d1ae454c1cc1daa8e596b0b61309f1bb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14131,
+        "upload_time": "2021-09-07T07:55:50",
+        "upload_time_iso_8601": "2021-09-07T07:55:50.128490Z",
+        "url": "https://files.pythonhosted.org/packages/01/69/da82700dc319ca9534ff32decd62e0be82cbd2edb6ebedfc48f97ab916b5/servitin-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd5639aa0421e890c3033c0bd5415a861ddb7409f0f346f1d3fef47dc1264664",
+          "md5": "5f91463374f5d1a7cf5470079a1c94fe",
+          "sha256": "237e6969786b18e10adc1cd2837813a3ab11c875c9970a7dec1f2d96498e8773"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5f91463374f5d1a7cf5470079a1c94fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 12228,
+        "upload_time": "2021-09-07T07:55:53",
+        "upload_time_iso_8601": "2021-09-07T07:55:53.523454Z",
+        "url": "https://files.pythonhosted.org/packages/dd/56/39aa0421e890c3033c0bd5415a861ddb7409f0f346f1d3fef47dc1264664/servitin-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "58c59f2f5a1cad531e169a5c3c7ea8533fdf5ad9c4d5f24095f661d9223bbc91",
+          "md5": "0a7b3cca5b40cda7de80273913e5d8c4",
+          "sha256": "1880dbd2526440d410eadaed97b76ef8b3f3e2fa5cc581c2531d2626e925f91e"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0a7b3cca5b40cda7de80273913e5d8c4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14225,
+        "upload_time": "2021-09-16T10:22:39",
+        "upload_time_iso_8601": "2021-09-16T10:22:39.792523Z",
+        "url": "https://files.pythonhosted.org/packages/58/c5/9f2f5a1cad531e169a5c3c7ea8533fdf5ad9c4d5f24095f661d9223bbc91/servitin-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9988fef01c9a3ef1e96a4db313b223c1df72a5f7735c3e07d1f7d9dd767bf870",
+          "md5": "e88eab5ea2ac1548d30c4aadbe24844b",
+          "sha256": "d07ae81bf155f32029c19ec7390e473d28975928e6f85b6794109c780998bc58"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e88eab5ea2ac1548d30c4aadbe24844b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 12424,
+        "upload_time": "2021-09-16T10:22:42",
+        "upload_time_iso_8601": "2021-09-16T10:22:42.508685Z",
+        "url": "https://files.pythonhosted.org/packages/99/88/fef01c9a3ef1e96a4db313b223c1df72a5f7735c3e07d1f7d9dd767bf870/servitin-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45100b56b29af8763adfb7cd56b0f5b9595093e0f51366f7fa74274db3e8213f",
+          "md5": "2f5fc063622348eb69cb1f6b7d6bb89b",
+          "sha256": "7bd5c623b6a1863b59ea08efdce9498ec31649dbc1f4cd8520f815b1a80be2b0"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f5fc063622348eb69cb1f6b7d6bb89b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14121,
+        "upload_time": "2021-09-16T10:24:39",
+        "upload_time_iso_8601": "2021-09-16T10:24:39.029218Z",
+        "url": "https://files.pythonhosted.org/packages/45/10/0b56b29af8763adfb7cd56b0f5b9595093e0f51366f7fa74274db3e8213f/servitin-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa57a3d18cb5a5ee69b59906aa7a4c155d346f715a031430d04ee0350c656324",
+          "md5": "7ff9c50b2fed233ad0b2dbf14bd4aa57",
+          "sha256": "f9e00ab1edfc5ae80d783a31b5103d19e5091adbfe4bbecf08c76b4e8add80e3"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7ff9c50b2fed233ad0b2dbf14bd4aa57",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 12203,
+        "upload_time": "2021-09-16T10:24:42",
+        "upload_time_iso_8601": "2021-09-16T10:24:42.814789Z",
+        "url": "https://files.pythonhosted.org/packages/aa/57/a3d18cb5a5ee69b59906aa7a4c155d346f715a031430d04ee0350c656324/servitin-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "507549dea44325e244b6fbeb1d80a1f32ba1a05d77233a0f2cac0daa5db383c5",
+          "md5": "3396c198ab0fac22b93bc60caf914249",
+          "sha256": "16db45ffe2a8829bc44d48e241fc719b91acd63134813fa770fc0556e39043bb"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3396c198ab0fac22b93bc60caf914249",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14802,
+        "upload_time": "2021-09-29T11:18:04",
+        "upload_time_iso_8601": "2021-09-29T11:18:04.241467Z",
+        "url": "https://files.pythonhosted.org/packages/50/75/49dea44325e244b6fbeb1d80a1f32ba1a05d77233a0f2cac0daa5db383c5/servitin-1.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b7826b4bdc36ffdac1614cfa87eca4bf2bd7f7a6ffe70fc00743aa8949ee55ec",
+          "md5": "da796f352b16c83778a4c2ab36dfa968",
+          "sha256": "28284cea48475e7b0e22858be420b69943e6c523f0080cab1dd48b9c6fc1bd2f"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "da796f352b16c83778a4c2ab36dfa968",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 13364,
+        "upload_time": "2021-09-29T11:18:06",
+        "upload_time_iso_8601": "2021-09-29T11:18:06.404882Z",
+        "url": "https://files.pythonhosted.org/packages/b7/82/6b4bdc36ffdac1614cfa87eca4bf2bd7f7a6ffe70fc00743aa8949ee55ec/servitin-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ed1c859c0f6c43c9bfe1de21dbfd5782f485c27e15be671d9c023676cda7b42e",
+          "md5": "7e939241f9b2616deabf0548814ba16a",
+          "sha256": "f2f15605f2230483542dabbd0660129ea833c183be32748868071a152b240bb6"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7e939241f9b2616deabf0548814ba16a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14304,
+        "upload_time": "2021-10-23T06:23:34",
+        "upload_time_iso_8601": "2021-10-23T06:23:34.180882Z",
+        "url": "https://files.pythonhosted.org/packages/ed/1c/859c0f6c43c9bfe1de21dbfd5782f485c27e15be671d9c023676cda7b42e/servitin-1.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f6ea6f96e73f439f6aab7933e748c63ad8a16ac294604c47603e8c68ebf36c21",
+          "md5": "f0a9131487563f6e92331cd256d4c386",
+          "sha256": "b0e4cc757d217ffe86a01f22cc3e079ecf556e7d263045fdf18b51ba76106dcb"
+        },
+        "downloads": -1,
+        "filename": "servitin-1.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f0a9131487563f6e92331cd256d4c386",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 13040,
+        "upload_time": "2021-10-23T06:23:37",
+        "upload_time_iso_8601": "2021-10-23T06:23:37.529039Z",
+        "url": "https://files.pythonhosted.org/packages/f6/ea/6f96e73f439f6aab7933e748c63ad8a16ac294604c47603e8c68ebf36c21/servitin-1.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ed1c859c0f6c43c9bfe1de21dbfd5782f485c27e15be671d9c023676cda7b42e",
+        "md5": "7e939241f9b2616deabf0548814ba16a",
+        "sha256": "f2f15605f2230483542dabbd0660129ea833c183be32748868071a152b240bb6"
+      },
+      "downloads": -1,
+      "filename": "servitin-1.0.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7e939241f9b2616deabf0548814ba16a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9",
+      "size": 14304,
+      "upload_time": "2021-10-23T06:23:34",
+      "upload_time_iso_8601": "2021-10-23T06:23:34.180882Z",
+      "url": "https://files.pythonhosted.org/packages/ed/1c/859c0f6c43c9bfe1de21dbfd5782f485c27e15be671d9c023676cda7b42e/servitin-1.0.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f6ea6f96e73f439f6aab7933e748c63ad8a16ac294604c47603e8c68ebf36c21",
+        "md5": "f0a9131487563f6e92331cd256d4c386",
+        "sha256": "b0e4cc757d217ffe86a01f22cc3e079ecf556e7d263045fdf18b51ba76106dcb"
+      },
+      "downloads": -1,
+      "filename": "servitin-1.0.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f0a9131487563f6e92331cd256d4c386",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9",
+      "size": 13040,
+      "upload_time": "2021-10-23T06:23:37",
+      "upload_time_iso_8601": "2021-10-23T06:23:37.529039Z",
+      "url": "https://files.pythonhosted.org/packages/f6/ea/6f96e73f439f6aab7933e748c63ad8a16ac294604c47603e8c68ebf36c21/servitin-1.0.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

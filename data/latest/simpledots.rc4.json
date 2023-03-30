@@ -1,0 +1,272 @@
+{
+  "info": {
+    "author": "Lincoln Ombelets",
+    "author_email": "lombelets@caltech.edu",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Simpledots image analysis\n\nDot detection and file management for seqFISH-type experiments.\n\nBy Lincoln Ombelets, 2019-2020\n\nDistributed under the MIT license.\n\n# Classes\n\n## WBImage\nThis is a simple container class for gracefully dealing with multidimensional images in a standardized way. \n\nIn our research, we commonly encounter 2, 3, or 4 dimensional images. The first 2 dimensions are just the horizontal and vertical dimensions, and each 2D image is a single snap from the microscope camera. But many snaps are often bundled together with changes in either Z (depth) position or fluorescent channel. Finally, rarely you may have multiple time points or \"frames\", representing a fifth dimension. \n\n`WBImage` facilitates dealing with any dimensionality image in roughly the same way, by expanding any image to 5D, adding length 1 dimensions that are missing. \n\nThe only thing you have to specify is the order of the dimensions of the raw image. You can ascertain this by loading in the image (for example, with `skimage.io.imread()`) and checking the `shape`:\n\n```python\nim = skimage.io.imread('C:\\path\\to\\image.tif')\nprint(im.shape)\n```\n\nGenerally, this will print out something like (depending on the type of experiment and the software that produced the image) `(10, 2048, 2048, 4)`. You know your own experiments best, so from this information you can usually determine the way Python is naively reading the image. In this case, the order would be Z slices - X - Y - Fluorescent channels. We would specify this with the single-letter shorthand `zxyc`, which is supplied to the constructor:\n\n```python\nwb_im = WBImage(im, order='zxyc')\nprint(wb_im.shape)\n> (4, 10, 1, 2048, 2048)\n```\n\nThe WBImage constructor reordered the axes and inserted a length-1 `frames` axis to bring the image to the final standard shape `czfxy`.\nNote that if you do not specify an order, WBImage assumes the image is already in the final standard shape.\n\n`WBImage` instances can be indexed for reading similarly to `ndarray`s:\n\n```python    \nwb_im[1, 4].shape # this is the same as wb_im[1, 4, 0]\n> (2048, 2048)\n```\n\nThis would give the second channel, fifth Z slice image.\n\nThe image itself is stored as a reshaped `ndarray` in `wb_im.image`.\n\nThey can also be iterated as if they were flat arrays of `c*z*f` 2D images, but supply a `dict` with channel, slice and frame information:\n```python\nfor a in wb_im:\n    print(a.keys())\n```\n\nThe keys of the iterator are `channel`, `slice`, `frame`, and `image` containing the 2D `x*y` image.\n\nFinally, the `apply` method loops through the stack in this manner and applies a given function (with optional keyword arguments) to each 2D image, either returning a new `WBImage` instance or modifying the current one in place.\n\n```python\ndef filter_wbimage(im, sigmas):\n    return skimage.filters.gaussian(im['image'], sigma=sigmas[im['channel']])\n\nwb_im_filtered = wb_im.apply(filter_wbimage, inplace=False, sigmas=[4, 2, 1, 1])\n```\n\nThe above code would apply a different width Gaussian filter to each channel. The applied function receives the same `dict` as any iterator, so you can use the channel, slice and frame information in your function.\n\n\n## DotImage\n\nThis is the main class for dealing with smFISH-like images. Its main functions at present are to perform background subtraction, registration to a reference image, and find and quantify dots. All stages of the image processing are stored as `WBImage`s.\n\n### Constructor\n\nSimilar to `WBImage`, the only required arguments to the constructor are an image (filename or preloaded `ndarray`) and a string indicating the axes order of the raw image. However, the full constructor looks like this:\n\n```python\n    def __init__(self, \n                 source,\n                 order,\n                 desc='',\n                 exclude_channels=None, \n                 hybcycle=0,\n                 position=0,\n                 ref_image=None,\n                 z_use=[0],\n                 ):\n```\n\n`source` and `order` are the required arguments. `desc`, `hybcycle`, `position` are metadata that you can add optionally.\n`exclude_channels` lets you indicate which channels *not* to process with background subtraction, dot finding etc. Typically the final channel in our images is DAPI, a nuclear stain. You can supply a single integer or a list of integers to exclude them from the analysis.\nTo exclude DAPI, assuming it's the final channel, you would supply `exclude_channels=-1`.\n\n`z_use` allows you to change how Z slices are handled.\n\n`z_use = 0` or `z_use = [1, 5, 7]` only keeps the specified Z slices in the analysis.\n\n`z_use = 'max'` takes a maximum projection along the Z slices, collapsing the image to a single slice. This can greatly speed up the analysis by reducing the number of 2D images to process, so long as 3D information is not needed.\n\nLeaving `z_use` empty includes all Z slices in the analysis.\n\nAfter calling the constructor, the *raw* image - with all channels and slices - is found in `im.raw_image`, and the *working* image, without excluded channels and after Z processing, is in `im.image`. `im.shape`, `im.channels`, `im.slices`, `im.frames` refer to the *working* image's shape.\n\n### Processing methods\n\n#### dapi_align\n```python\ndef dapi_align(self, ref_image, channel=-1, z_slice=None, inter=0):\n```\n\nThis function performs 2D image alignment between the current object and a given `DotImage`, `ref_image`. The channel to perform cross-correlation on is given as -1 by default, because that is typically the DAPI channel - note that this `channel` argument refers to the `raw_image`, containing channels that were excluded in the constructor.\n\n `z_slice` allows you to specify which slices to use - it can be a tuple in case they are different between the current image and the reference image, or a single integer. If not supplied, the *middle z slice* of each image is used, by reasoning that this may be most likely to have in focus signal. \n\n The `inter` argument allows you to specify the order of interpolation performed in the shift operation. By default it is 0, which is equivalent to pixel-resolution alignment - no subpixel shift is possible without higher order. Higher orders allow finer shifts, but potentially alter the dot intensities.\n\n\n After running this method, the `align_shift` attribute contains a tuple of the shifts in each direction, and `ref_dapi` contains the 2D DAPI image used as a reference.\n\n#### subtract_background\n\n```python\ndef subtract_background(self, radius=3, bg_image=None):\n```\n\nThis method performs a Gaussian blur on each 2D subimage, then subtracts the blurred image from the original. `radius` specifies the sigma of the Gaussian filter applied - a larger radius retains more lower frequency features while keeping the signal higher, while a smaller radius discards more features at the expense of some real signal intensity. Typically, a radius of a little bigger than the expected size of real dots is used to selectively retain real features.\n\nAlternatively, if an actual background image is available, it can be supplied as a `WBImage` which must have the same shape as the current image. Each 2D image of this will be subtracted from the corresponding image in the current object.\n\n\nAfter running this method, the `image_nobg` attribute contains the background-subtracted `WBImage`, and `image_bg` contains an array of *standard deviations* of each background (blurred) image. The standard deviation of the background image is used in `find_local_maxes` as a basis for relative thresholding of dots.\n\nNote that the convolutions (actually forward and inverse Fourier Transforms with multiplications) needed for computing this function are expensive for high-dimensional images (such as those with many Z slices). Typically this method runs much longer than `find_local_maxes`. `find_local_maxes` can run on raw, non-background subtracted images as well if desired; thresholding is somewhat tougher and must be optimized manually. In the future, a faster routine that either averages along Z or only computes the blur periodically could be implemented to reduce the number of convolutions. \n\n#### find_local_maxes\n```python\ndef find_local_maxes(self, \n                    thresh_abs=0,\n                    thresh_coeff=3,\n                    mask=None,\n                    verbose=False):\n```\n\nThis method identifies local maxima pixels in each 2D subimage of the current object. The most important parameters to optimize are the thresholds. `thresh_abs`, if supplied, *takes precedence* over `thresh_coeff.`, and specifies the minimum absolute pixel value to call a local maximum. `thresh_coeff`, which is used by default, is the multiplier applied to one of two measures of 'background':\n\n1. If background subtraction has been performed, each subimage is thresholded on `thresh_coeff` times the *standard deviation of its background image*\n2. If no background subtraction was performed, each subimage is thresholded on `thresh_coeff` times the *minimum value of the raw image* (though will likely change this to a quantile-based measure).\n\nFor both of these, a single number can be supplied, *or a list of numbers*, one for each channel. This is useful for channels that have different typical backgrounds. \n\n`mask` is a binary 2D image of the same XY dimensions as the current image that can be used to specify where to look or not to look for dots.\n\nIf `verbose` is `True`, messages about the thresholds applied and number of dots identified in each subimage are printed.\n\n\nThe outputs of `find_local_maxes` are:\n\n1. A *binary* `WBImage` called `local_max_image` where identified local maxima are `True` and all other pixels are `False`\n2. A `DataFrame` called `dots_df` containing the information about every dot identified. This can be quite a long DataFrame. Its columns are:\n    1. `Coords`: A length-2 list with the X and Y pixel location\n    2. `Label`: An integer label that is unique to each dot\n    3. `Area`: Area in pixels of the local maximum, should always be 1\n    4. `Intensity`: Pixel intensity of the dot *from the non-background subtracted image*\n    5. `Channel`: Channel dot was found in.\n    6. `Slice`: Z slice dot was found in\n    7. `Frame`: Time frame dot was found in\n    8. `HybCycle`: `hybcycle` attribute of current image\n    9. `Position`: `position` attribute of current image\n\nThus, `dots_df` contains all of the information needed to quantify intensity, position (in 3D) and channel of all identified local maxima. \n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.com/lincdog/simpledots",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "simpledots",
+    "package_url": "https://pypi.org/project/simpledots/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/simpledots/",
+    "project_urls": {
+      "Homepage": "https://gitlab.com/lincdog/simpledots"
+    },
+    "release_url": "https://pypi.org/project/simpledots/0.0.7/",
+    "requires_dist": [
+      "numpy",
+      "scipy",
+      "pandas",
+      "scikit-image (>=0.16.0)",
+      "xarray",
+      "bokeh"
+    ],
+    "requires_python": ">=3.5",
+    "summary": "Analysis package for smFISH and puncta-like images, focused on simplicity and ease of use.",
+    "version": "0.0.7",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7858349,
+  "releases": {
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "948088db3d5710c8097448d291cd6b99fddf40d56592b6fc03a92dfe05348b7f",
+          "md5": "63a543b71c8f659725cad6d6e8995cbd",
+          "sha256": "4214e6da1d15c95c453734f74185c90ac34f95520af2bdbc0deb8d76ef8ce435"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "63a543b71c8f659725cad6d6e8995cbd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 16591,
+        "upload_time": "2020-07-23T03:00:52",
+        "upload_time_iso_8601": "2020-07-23T03:00:52.817737Z",
+        "url": "https://files.pythonhosted.org/packages/94/80/88db3d5710c8097448d291cd6b99fddf40d56592b6fc03a92dfe05348b7f/simpledots-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de69aacac9b0b31f4068ad139444bb9954d37c2328d33ad20cb50e72237b1abb",
+          "md5": "ff3076b454caae16075637b05da1038a",
+          "sha256": "dd18b99978550cf387cde1bdb08c9629c217b0f218ae75e656580f31d8499fe4"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ff3076b454caae16075637b05da1038a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 18907,
+        "upload_time": "2020-07-23T03:00:54",
+        "upload_time_iso_8601": "2020-07-23T03:00:54.082985Z",
+        "url": "https://files.pythonhosted.org/packages/de/69/aacac9b0b31f4068ad139444bb9954d37c2328d33ad20cb50e72237b1abb/simpledots-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b772011d7f3e11510cf2e7ebaad694cbf19cbf2a3940c4dd9d47b9833e79a8a",
+          "md5": "bc17278ed131213f52a7e953bdb91c73",
+          "sha256": "cc1e6da9b10829125e9dea106069265c8d6f67036186eccc8e16ea38ad358290"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc17278ed131213f52a7e953bdb91c73",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 16185,
+        "upload_time": "2020-07-30T04:30:58",
+        "upload_time_iso_8601": "2020-07-30T04:30:58.456366Z",
+        "url": "https://files.pythonhosted.org/packages/9b/77/2011d7f3e11510cf2e7ebaad694cbf19cbf2a3940c4dd9d47b9833e79a8a/simpledots-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f5fa7f79346a40cea40a0e33a368053527b20ff8af746e94d8ef45f0e541937",
+          "md5": "e28d82d7422cf1c6049ee76f8dab6b69",
+          "sha256": "533e3bb16b2ce03f1fcf573d197e91208eb0cb045db643ede9a3daee79a96b9a"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e28d82d7422cf1c6049ee76f8dab6b69",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 18729,
+        "upload_time": "2020-07-30T04:30:59",
+        "upload_time_iso_8601": "2020-07-30T04:30:59.662784Z",
+        "url": "https://files.pythonhosted.org/packages/2f/5f/a7f79346a40cea40a0e33a368053527b20ff8af746e94d8ef45f0e541937/simpledots-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d94ec0b54be8f99113f7d21cded4b945fac648dd89ccdda50ec2656704308a5b",
+          "md5": "aa596f30c745099a04db8aa514c280b9",
+          "sha256": "4d8dee486ab117a49129c75156e8a1051239da6bfad260b59d36a5ff823cb0f6"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aa596f30c745099a04db8aa514c280b9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 19947,
+        "upload_time": "2020-07-30T18:36:20",
+        "upload_time_iso_8601": "2020-07-30T18:36:20.652193Z",
+        "url": "https://files.pythonhosted.org/packages/d9/4e/c0b54be8f99113f7d21cded4b945fac648dd89ccdda50ec2656704308a5b/simpledots-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f39e7ed172a791506320eb3e6401309ae7b2a71a09a1362ddb34801246c6fec",
+          "md5": "3164f4d56fc327ab741070301f0c9f19",
+          "sha256": "cad63887771f8bb3008a92e63fd60e146f9ae75a5a0bf5f7984ee9da31dd2083"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3164f4d56fc327ab741070301f0c9f19",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 21708,
+        "upload_time": "2020-07-30T18:36:22",
+        "upload_time_iso_8601": "2020-07-30T18:36:22.059813Z",
+        "url": "https://files.pythonhosted.org/packages/8f/39/e7ed172a791506320eb3e6401309ae7b2a71a09a1362ddb34801246c6fec/simpledots-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd3702eba784b9768b5e5366d385c74fd9670655bf4d5502a1a6d2785799616d",
+          "md5": "d23b60da0988d11dfe8df88f05be2864",
+          "sha256": "5282ec0a5e11a021fed6ae97a00f3d75d4047d0bde4e697881d313dfea476526"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d23b60da0988d11dfe8df88f05be2864",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 19965,
+        "upload_time": "2020-07-31T22:09:15",
+        "upload_time_iso_8601": "2020-07-31T22:09:15.214746Z",
+        "url": "https://files.pythonhosted.org/packages/dd/37/02eba784b9768b5e5366d385c74fd9670655bf4d5502a1a6d2785799616d/simpledots-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4836edb0f4298bb074c7a5fe44e8cf6f7878aa467cd1150b0d2bfd80d0f16145",
+          "md5": "4908a232e7c3ab964e3435acc829c738",
+          "sha256": "e30cef13bad140ce975e995b7457127d18bc957bb3228e3a89d34907772c7f12"
+        },
+        "downloads": -1,
+        "filename": "simpledots-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4908a232e7c3ab964e3435acc829c738",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 21731,
+        "upload_time": "2020-07-31T22:09:16",
+        "upload_time_iso_8601": "2020-07-31T22:09:16.171447Z",
+        "url": "https://files.pythonhosted.org/packages/48/36/edb0f4298bb074c7a5fe44e8cf6f7878aa467cd1150b0d2bfd80d0f16145/simpledots-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "dd3702eba784b9768b5e5366d385c74fd9670655bf4d5502a1a6d2785799616d",
+        "md5": "d23b60da0988d11dfe8df88f05be2864",
+        "sha256": "5282ec0a5e11a021fed6ae97a00f3d75d4047d0bde4e697881d313dfea476526"
+      },
+      "downloads": -1,
+      "filename": "simpledots-0.0.7-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d23b60da0988d11dfe8df88f05be2864",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.5",
+      "size": 19965,
+      "upload_time": "2020-07-31T22:09:15",
+      "upload_time_iso_8601": "2020-07-31T22:09:15.214746Z",
+      "url": "https://files.pythonhosted.org/packages/dd/37/02eba784b9768b5e5366d385c74fd9670655bf4d5502a1a6d2785799616d/simpledots-0.0.7-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4836edb0f4298bb074c7a5fe44e8cf6f7878aa467cd1150b0d2bfd80d0f16145",
+        "md5": "4908a232e7c3ab964e3435acc829c738",
+        "sha256": "e30cef13bad140ce975e995b7457127d18bc957bb3228e3a89d34907772c7f12"
+      },
+      "downloads": -1,
+      "filename": "simpledots-0.0.7.tar.gz",
+      "has_sig": false,
+      "md5_digest": "4908a232e7c3ab964e3435acc829c738",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.5",
+      "size": 21731,
+      "upload_time": "2020-07-31T22:09:16",
+      "upload_time_iso_8601": "2020-07-31T22:09:16.171447Z",
+      "url": "https://files.pythonhosted.org/packages/48/36/edb0f4298bb074c7a5fe44e8cf6f7878aa467cd1150b0d2bfd80d0f16145/simpledots-0.0.7.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

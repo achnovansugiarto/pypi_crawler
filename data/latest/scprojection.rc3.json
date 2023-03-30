@@ -1,0 +1,225 @@
+{
+  "info": {
+    "author": "Nelson Johansen, Gerald Quon",
+    "author_email": "njjohansen@ucdavis.edu, gquon@ucdavis.edu",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Tutorial: Deconvolution of CellBench human lung adenocarcinoma cell line mixtures.\n\nThis tutorial provides a guided deconvolutions of CellBench mixtures sequenced with CEL-Seq2 or SORT-Seq using a matching single cell RNA dataset sequenced with CEL-Seq.\n\n## Setup Python (compatible with cluster environment)\n\nFirst we must set up a python virtual environment. Move to the directory where you want to set up the environment, then use virtualenv command. **All of the following commands in this section are performed on the command line:**\n\n<pre><code> virtualenv -p /usr/bin/python3 environment_name\n</code></pre>\n\nNow you can freely install any packages using pip install in the activated virtual environment.\n\n<pre><code> pip install package_name\n</code></pre>\n\nAfter setting up the environment, you need to activate it. Remember to activate the relevant environment every time you work on the project.\n\n<pre><code> source environment_name/bin/activate\n</code></pre>\n\nOnce you are in the virtual environment, install tensorflow version 1.15 and some other pre-reqs:\n\n<pre><code>pip3 install tensorflow==1.15rc2\npip3 install tfp-nightly\npip3 install sklearn\n</code></pre>\n\nNow we need to install the deconvolution package:\n<pre><code> pip3 install /share/quonlab/software/deconvolution/deconv\n</code></pre>\n\nThe remaining sections of this tutorial will be in R.\n\n## Deconvolution goals\nThe following is a walkthrough of `<NAME>` and has been designed to provide an overview of data preprocessing, deconvolution and visualization of standard outputs. Here, our primary goals include:\n\n1. Preprocess both the single cell dataset and mixture dataset in `R`.  \n2. Train `<NAME>` with and without marker genes.\n3. Visualize cell type proportions and cell type-specific expression profiles for each mixture profile.\n\n## Data preprocessing\nThe data matrices for this tutorial can be found at `/share/quonlab/wkdir/njjohans/public/cellbench/`.\n\nFirst, we perform standard scRNA preprocessing steps using the `Seurat` package. After preprocessing we reduce to the top 2,000 highly variable genes and identify marker genes for the cell types in our single cell data.\n\n```R\nlibrary(Seurat)\noptions(stringsAsFactors=F)\n\nworking.dir = '/share/quonlab/wkdir/njjohans/public/cellbench/'\n\nload(paste0(working.dir, 'raw_data/sincell_with_class.RData'))\nload(paste0(working.dir, 'raw_data/mRNAmix_qc.RData'))\n\n## Mixture data\ncolnames(sce2_qc) = paste0(\"CELMix-\", colnames(sce2_qc))\ncolnames(sce8_qc) = paste0(\"SORTMix-\", colnames(sce8_qc))\n\n## Individual data\ncolnames(sce_sc_CELseq2_qc) = paste0(\"CEL-\", colnames(sce_sc_CELseq2_qc))\n\n## Reduce to the common genes (rows)\ncommon.genes = Reduce(intersect, list(rownames(counts(sce2_qc)),\n                                        rownames(counts(sce8_qc)),\n                                        rownames(sce_sc_CELseq2_qc)))\n\n## Combine data (this is optional). Single cell and mixture data can also be normalized separately.\ncellbench_data = cbind(counts(sce2_qc)[common.genes,],\n                       counts(sce8_qc)[common.genes,],     \n                       counts(sce_sc_CELseq2_qc)[common.genes,])\n\n################################################################################\n## Seurat combined normalization\n################################################################################\ncellbenchSeuratObj <- CreateSeuratObject(counts = cellbench_data, project = \"DECONV\", min.cells = 1)\n## Batch annotation\ncellbenchSeuratObj@meta.data$platform  = as.factor(c(rep('CELMix-seq', ncol(counts(sce2_qc))),\n                                                     rep('SORTMix-seq', ncol(counts(sce8_qc))),\n                                                     rep('CEL-seq', ncol(counts(sce_sc_CELseq2_qc)))))\n## Cell type annotation\ncellbenchSeuratObj@meta.data$cell.type = as.factor(c(sce2_qc@colData$mix,\n                                                     sce8_qc@colData$mix,\n                                                     sce_sc_CELseq2_qc@colData$cell_line))\n## Important that log transformation is not performed during this step.\ncellbenchSeuratObj <- NormalizeData(cellbenchSeuratObj, normalization.method=\"RC\", scale.factor=1e4)\ncellbenchSeuratObj <- ScaleData(cellbenchSeuratObj, do.scale=T, do.center=T, display.progress = T)\ncellbenchSeuratObj <- FindVariableFeatures(cellbenchSeuratObj, nfeatures=2000)\n```\n\n## Marker gene selection\nSpecification of marker genes is essential for successful deconvolution. Marker gene lists from external sources such as previous studies on the tissue of interest or methods including CIBERSORTx are typically the best starting point. Otherwise, use packages such as Seurat to identify marker genes from single cell data.\n\n```R\n################################################################################\n## Marker genes\n################################################################################\nmarker.genes = read.table('/share/quonlab/wkdir/njjohans/public/cellbench/CEL_signature_genes.txt', sep=\"\\t\", header=T, stringsAsFactors=F)[,1]\n\n## Combine variable features and marker genes.\nVariableFeatures(cellbenchSeuratObj) = union(marker.genes, VariableFeatures(cellbenchSeuratObj))\n\n## Create a binary mask for the position of markers in the gene list (optional input to our method).\nmarker_gene_mask = rep(0, length(VariableFeatures(cellbenchSeuratObj)))\nmarker_gene_mask[which(VariableFeatures(cellbenchSeuratObj) %in% marker.genes)]=1\n```\n\n## Input overview\nNow that we have both preprocessed scRNA and mixture data, here is a look at standard inputs:\n1.  Single cell RNAseq data **(cells x genes)**.\n2.  Mixture RNAseq data     **(cellx x genes)**.\n3.  Single cell data, cell type labels **(cells x 1)**. A vector of cell type names, with no white spaces.\n\nand optionally:\n\n4.  Marker gene mask **(genes x 1)**. A binary vector where 1's indicate the position of a marker gene.\n\n## Deconvolve mixture profiles with `<NAME>`!\n\n```R\nlibrary(reticulate)\ndeconv = import(\"deconv\")\nsource('/share/quonlab/software/deconvolution/deconvR/nnDeconvClass.R')\n\n## cells x genes\ncomponent_data = GetAssayData(cellbenchSeuratObj, 'scale.data')[,which(cellbenchSeuratObj[[\"platform\"]] == 'CEL-seq')]\ncomponent_data = t(component_data[VariableFeatures(cellbenchSeuratObj),])\n## cell ids for component_data, should be strings!\ncomponent_label = as.character(cellbenchSeuratObj[[\"cell.type\"]][which(cellbenchSeuratObj[[\"platform\"]] == 'CEL-seq'),1])\n## cells x genes\nmixture_data = GetAssayData(cellbenchSeuratObj, 'scale.data')[,which(cellbenchSeuratObj[[\"platform\"]] != 'CEL-seq')]\nmixture_data = t(mixture_data[VariableFeatures(cellbenchSeuratObj),])\n\n## Because we are calling Python from R we must be careful about variable type:\n##    as.matrix() to ensure data matrices are passed as type matrix\n##    as.array()  to ensure lists/vectors are passed as type array\n##    Integers must be followed by 'L', i.e. 100L.\n\n## First we create the deconvolution model:\ndeconvModel = deconv$deconvModel(component_data   = as.matrix(component_data),\n                                 component_label  = as.array(as.character(component_label)),\n                                 mixture_data     = as.matrix(mixture_data))\n\n## Now we define the network architecture and run deconvolution!\ndeconvModel$deconvolve(max_steps_component = 100L,\n                       num_latent_dims     = 64L,\n                       num_layers          = 3L,\n                       hidden_unit_2power  = 9L,\n                       batch_norm_layers   = 'True')\n\n## Convert the python class to an R S4 class. check: str(deconvResults)\ndeconvResults = convertDeconv(deconvModel)\n```\n\n## Output overview\nThe following are standard outputs stored in `deconvModel$deconvResults`:\n\n1.  `proportions` **(cells x celltypes)**. Each row contains the relative proportion of cell types in the corresponding mixture profile.\n2.  `weights`     **(cellx x celltypes)**. Unnormalized (softmax) proportions.\n3.  `deconv_data$component` **(cells x genes)**. Reconstructions of the single cell data per cell type.\n4.  `deconv_data$purified` **(cells x genes)**. Mixture profiles purified to expression consistent with a specific cell type.\n5.  The remaining outputs are diagnostics from training/testing used for model evaluation/selection.\n\n## Visualize the results of deconvolution\n\n```R\nlibrary(ComplexHeatmap)\nlibrary(circlize)\n\n## In the case of CellBench we have labels on the mixture data!\nmixture.labels = as.character(cellbenchSeuratObj[[\"cell.type\"]][which(cellbenchSeuratObj[[\"platform\"]] != 'CEL-seq'),1])\n\n## Extract the estimated proportions from the final training step and name the cell type columns\nproportions = deconvResults@proportions$`10000`\n\n## Create an annotation for our heatmap\nrow_anno = HeatmapAnnotation(\n    mixture.type = factor(mixture.labels, levels=1:max(mixture.labels)),\n    which=\"row\")\n\n## Another way to define annotations\ncolors = c(\"blue\", \"green\", \"purple\"); names(colors) = colnames(proportions);\ncol_anno = HeatmapAnnotation(\n    cell.type = colnames(proportions),\n    col = list(cell.type = colors),\n    which=\"column\")\n\n## Plot results\npng(paste0(\"~/proportion_heatmap.png\"), width=16, height=16, units='in', res=300)\nheatmap = Heatmap(proportions,\n                  top_annotation = col_anno,\n                  col = colorRamp2(c(0, 1), c('white', 'red')),\n                  cluster_rows = T,\n                  cluster_columns = T,\n                  show_row_names = F,\n                  show_column_names = T,\n                  show_row_dend = T,\n                  show_column_dend = F,\n                  column_title = \"Cell type proportions\",\n                  row_title = \"Mixture profiles\",\n                  na_col = 'white',\n                  column_names_gp = gpar(fontsize = 24),\n                  column_title_gp = gpar(fontsize = 24),\n                  row_title_gp = gpar(fontsize = 24),\n                  column_names_max_height = unit(20, \"cm\"),\n                  row_dend_width = unit(3, \"cm\"),\n                  row_km=4,\n                  show_heatmap_legend=T,\n                  border=T) + row_anno\ndraw(heatmap)\ndev.off()\n```\n![Proportions](https://github.com/ucdavis/quonlab/blob/master/development/deconvRelease/figures/proportion_heatmap.png)\n\n## Masking to marker genes improves deconvolution\n\nNow lets tell the deconvolution aspect of `<NAME>` to only utilize marker genes.\n\n```R\n## Now we define the network architecture and run deconvolution!\ndeconvModel$deconvolve(marker_gene_mask    = marker_gene_mask,\n                       max_steps_component = 100L,\n                       num_latent_dims     = 64L,\n                       num_layers          = 3L,\n                       hidden_unit_2power  = 9L,\n                       batch_norm_layers   = 'True')\n\n## Convert the python class to an R S4 class. check: str(deconvResults)\ndeconvResults = convertDeconv(deconvModel)\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ucdavis/quonlab/tree/master/development/deconvAllen",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "scProjection",
+    "package_url": "https://pypi.org/project/scProjection/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/scProjection/",
+    "project_urls": {
+      "Homepage": "https://github.com/ucdavis/quonlab/tree/master/development/deconvAllen"
+    },
+    "release_url": "https://pypi.org/project/scProjection/0.22/",
+    "requires_dist": [
+      "tensorflow",
+      "tensorflow-probability",
+      "sklearn",
+      "numpy"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Projection and Deconvolution using deep heirarchical and generative neural network.",
+    "version": "0.22",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13897541,
+  "releases": {
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "164bfce58d16ec1a548bd55c0785e741a9e555e4dc479a3a675dd9c609223b33",
+          "md5": "ebffbe8580f1d0550137b8528b6c2e97",
+          "sha256": "4c9b3c00f1fe08e67366f814f3165668cd26aed01c145d41c28e4f1a350b14f4"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ebffbe8580f1d0550137b8528b6c2e97",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29817,
+        "upload_time": "2022-05-23T03:27:40",
+        "upload_time_iso_8601": "2022-05-23T03:27:40.315016Z",
+        "url": "https://files.pythonhosted.org/packages/16/4b/fce58d16ec1a548bd55c0785e741a9e555e4dc479a3a675dd9c609223b33/scProjection-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f5559cf066447808dd895c08e9e95b56db21b693c879368c12ca423200c2bee",
+          "md5": "57c5d2590ed97f6fcd8cce1053e5df51",
+          "sha256": "5e102bceb4d80ccbd48089f6c485aa88fbb13f7ca8471a5a3c14c617acd772c4"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "57c5d2590ed97f6fcd8cce1053e5df51",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29213,
+        "upload_time": "2022-05-23T03:27:42",
+        "upload_time_iso_8601": "2022-05-23T03:27:42.707045Z",
+        "url": "https://files.pythonhosted.org/packages/5f/55/59cf066447808dd895c08e9e95b56db21b693c879368c12ca423200c2bee/scProjection-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8c9b33b676e3089b51b904864729178724b209fb2bf872278c02fa145966cdb5",
+          "md5": "5decd528d325459a27059107d59cddeb",
+          "sha256": "092bfeeac0739df3d4974ad17c7c1ac81d79161756376c5a83dd4c77c0cd8694"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5decd528d325459a27059107d59cddeb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29875,
+        "upload_time": "2022-05-23T03:38:56",
+        "upload_time_iso_8601": "2022-05-23T03:38:56.635306Z",
+        "url": "https://files.pythonhosted.org/packages/8c/9b/33b676e3089b51b904864729178724b209fb2bf872278c02fa145966cdb5/scProjection-0.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40cbca48552b6e172077310ef401842067aca95c93665b09d931fb436bcd73d2",
+          "md5": "598cfb6331e1df5c489cbb913e5075ab",
+          "sha256": "759ea5357b89d35e35ddf5e8e89c14483800ac68f7e4b47ddc26f0b2e43a6cf1"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.21.tar.gz",
+        "has_sig": false,
+        "md5_digest": "598cfb6331e1df5c489cbb913e5075ab",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29361,
+        "upload_time": "2022-05-23T03:38:59",
+        "upload_time_iso_8601": "2022-05-23T03:38:59.822563Z",
+        "url": "https://files.pythonhosted.org/packages/40/cb/ca48552b6e172077310ef401842067aca95c93665b09d931fb436bcd73d2/scProjection-0.21.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f19b844770bc64a356fa5d544e0392a7da3987d6bf1735e1f12f33e1bd3e9ff5",
+          "md5": "11964de8ca0264d35109957d94867822",
+          "sha256": "6eac73f0fd7426dc4c3d97f550247ae7397a697892d8fc7d007de73abfd6b28a"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "11964de8ca0264d35109957d94867822",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29842,
+        "upload_time": "2022-05-23T03:40:37",
+        "upload_time_iso_8601": "2022-05-23T03:40:37.336270Z",
+        "url": "https://files.pythonhosted.org/packages/f1/9b/844770bc64a356fa5d544e0392a7da3987d6bf1735e1f12f33e1bd3e9ff5/scProjection-0.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e064bf3936cda96f290b7d61ed1fde3b43a50c45c9e54f1b7552fef176c9da7",
+          "md5": "7565881d367a1502d542e123783d0406",
+          "sha256": "a6d6ada0458d60d27bb191437182e1aaca247c04dad02af347e1ddb60723d4ea"
+        },
+        "downloads": -1,
+        "filename": "scProjection-0.22.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7565881d367a1502d542e123783d0406",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29301,
+        "upload_time": "2022-05-23T03:40:41",
+        "upload_time_iso_8601": "2022-05-23T03:40:41.332186Z",
+        "url": "https://files.pythonhosted.org/packages/1e/06/4bf3936cda96f290b7d61ed1fde3b43a50c45c9e54f1b7552fef176c9da7/scProjection-0.22.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f19b844770bc64a356fa5d544e0392a7da3987d6bf1735e1f12f33e1bd3e9ff5",
+        "md5": "11964de8ca0264d35109957d94867822",
+        "sha256": "6eac73f0fd7426dc4c3d97f550247ae7397a697892d8fc7d007de73abfd6b28a"
+      },
+      "downloads": -1,
+      "filename": "scProjection-0.22-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "11964de8ca0264d35109957d94867822",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 29842,
+      "upload_time": "2022-05-23T03:40:37",
+      "upload_time_iso_8601": "2022-05-23T03:40:37.336270Z",
+      "url": "https://files.pythonhosted.org/packages/f1/9b/844770bc64a356fa5d544e0392a7da3987d6bf1735e1f12f33e1bd3e9ff5/scProjection-0.22-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1e064bf3936cda96f290b7d61ed1fde3b43a50c45c9e54f1b7552fef176c9da7",
+        "md5": "7565881d367a1502d542e123783d0406",
+        "sha256": "a6d6ada0458d60d27bb191437182e1aaca247c04dad02af347e1ddb60723d4ea"
+      },
+      "downloads": -1,
+      "filename": "scProjection-0.22.tar.gz",
+      "has_sig": false,
+      "md5_digest": "7565881d367a1502d542e123783d0406",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 29301,
+      "upload_time": "2022-05-23T03:40:41",
+      "upload_time_iso_8601": "2022-05-23T03:40:41.332186Z",
+      "url": "https://files.pythonhosted.org/packages/1e/06/4bf3936cda96f290b7d61ed1fde3b43a50c45c9e54f1b7552fef176c9da7/scProjection-0.22.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

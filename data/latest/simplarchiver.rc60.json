@@ -1,0 +1,1468 @@
+{
+  "info": {
+    "author": "yindaheng98",
+    "author_email": "yindaheng98@163.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# simplarchiver\n\n一个简单的可扩展异步下载器框架（Python协程小练习）\n\n针对的问题：定时爬虫\n* 我需要使用几种不同的方法获取下载链接\n* 我所获取到的下载链接包含很多不同方面的内容，每个下载链接都需要使用几种不同的方法进行下载\n* 不同的网站有各自的限制，获取下载链接和下载过程都需要限制并发数\n* 我需要以指定的时间间隔执行爬虫过程\n\n我想自定义的东西：\n* 获取下载链接的方式\n* 下载过程\n\n我想让框架帮我管理哪些东西：\n* 限制并发数\n* 将下载链接传给下载器\n* 出错时自动重试\n* 以指定时间间隔运行\n\n## 基本思想\n\n名词解释：\n\n| 名词           | 释义                                                                         |\n| -------------- | ---------------------------------------------------------------------------- |\n| **Item**       | 每一个Item描述了一个待下载的项目，可以看作是下载链接                         |\n| **Feeder**     | Item生产者，定义获取下载链接的过程，产生Item以供下载                         |\n| **Downloader** | Item消费者，定义获取下载过程，获取Item并依据其内容执行下载过程               |\n| **Pair**       | Feeder和Downloader所组成的集合，表示这些Feeder生产的Item要传给这些Downloader |\n\n系统的基本运行过程：\n\n在每个Pair内，将所有Feeder产生的所有Item交给所有Downloader进行下载\n* 不同Feeder所产生的Item一视同仁\n* 每个Downloader都会收到相同的Item序列\n\n```\nFeeder──┐        ┌──Downloader\nFeeder──┼──Pair──┼──Downloader\nFeeder──┘        └──Downloader\n```\n\n## 基本结构\n\nItem、Feeder、Downloader、Pair具体到代码中是四个类：\n\n| 名词           | 代码中的体现                                                                                        | 使用方法                                                                                                                             |\n| -------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |\n| **Item**       | `simplarchiver.Feeder.get_feeds`函数的迭代输出以及`simplarchiver.Downloader.download`函数的输入参数 | 完全由用户自定义，`simplarchiver`只会将其简单的从Feeder搬运到Downloader，不会对其进行操作                                            |\n| **Feeder**     | 一个抽象类`simplarchiver.Feeder`                                                                    | 用户继承此类构造自己的子类，从而自定义如何获取Item                                                                                   |\n| **Downloader** | 一个抽象类`simplarchiver.Downloader`                                                                | 用户继承此类构造自己的子类，从而自定义如何下载Item                                                                                   |\n| **Pair**       | `simplarchiver.Pair`，其构造函数的包含`simplarchiver.Feeder`和`simplarchiver.Downloader`的列表      | 用户以自己定义的`simplarchiver.Feeder`和`simplarchiver.Downloader`子类列表为输入，调用构造函数构造其实例，调用其协程函数执行下载过程 |\n\n### Feeder抽象类`simplarchiver.Feeder`\n\n`simplarchiver.Feeder`是包含一个异步迭代器函数`get_feeds`的抽象类，其迭代输出一个个的Item。\n\n```python\nimport abc\nclass Feeder(metaclass=abc.ABCMeta):\n    @abc.abstractmethod\n    async def get_feeds(self):\n        yield\n```\n\n继承此类，实现`get_feeds`函数，就能自定义产生什么样的Item。\n\n例如，一个只会睡觉的[`simplarchiver.example.SleepFeeder`](simplarchiver/example/sleep.py)，睡醒了就返回一个字符串作为Item：\n\n```python\nclass SleepFeeder(Feeder):\n    \"\"\"一个只会睡觉的Feeder\"\"\"\n    running: int = 0\n\n    def __init__(self, i=uuid.uuid4(), n=10, seconds=None, rand_max=1):\n        \"\"\"\n        i表示Feeder的编号\n        n表示总共要返回多少个item\n        如果指定了seconds，每次就睡眠seconds秒\n        如果没有指定seconds，那就睡眠最大rand_max秒的随机时长\n        \"\"\"\n        self.seconds = seconds\n        self.rand_max = rand_max\n        self.n = n\n        self.id = i\n        self.log('Initialized: seconds=%s, rand_max=%s, n=%s' % (seconds, rand_max, n))\n\n    def log(self, msg):\n        logging.info('SleepFeeder     %s | %s' % (self.id, msg))\n\n    async def get_feeds(self):\n        for i in range(0, self.n):\n            t = random.random() * self.rand_max if self.seconds is None else self.seconds\n            SleepFeeder.running += 1\n            self.log('Now there are %d SleepFeeder awaiting including me, I will sleep %f seconds' % (SleepFeeder.running, t))\n            item = await asyncio.sleep(delay=t, result='item(i=%s,t=%s)' % (i, t))\n            self.log('I have slept %f seconds, time to wake up and return an item %s' % (t, item))\n            SleepFeeder.running -= 1\n            self.log('I wake up, Now there are %d SleepFeeder awaiting' % SleepFeeder.running)\n            yield item\n\n```\n\n更多案例：\n* [`simplarchiver.example.RandomFeeder`](simplarchiver/example/random.py)：不sleep，不知疲倦地返回随机数的Feeder\n* [`simplarchiver.example.RSSHubFeeder`](simplarchiver/example/rss.py)：从RSSHub中爬取Feed Item。获取到的item是RSSHub返回的每个RSS Item中的link标签里的内容和pubDate值，如果有enclosure还会返回enclosure值\n* [`simplarchiver.example.RSSHubMultiPageFeeder`](simplarchiver/example/rss.py)：从多个页面的RSSHub中爬取Feed Item，内容同上\n* [`simplarchiver.example.TTRSSCatFeeder`](simplarchiver/example/rss.py)：通过TTRSS API从TTRSS的Category中爬取Feed。返回指定的Category中的所有订阅链接和最新的内容链接\n\n### Downloader抽象类`simplarchiver.Downloader`\n\n`simplarchiver.Downloader`是包含一个以Item为输入的协程函数`download`的抽象类。\n\n```python\nimport abc\nclass Downloader(metaclass=abc.ABCMeta):\n    @abc.abstractmethod\n    async def download(self, item):\n        pass\n```\n\n继承此类，实现`download`函数，就能自定义对Item执行什么样的下载过程。\n\n例如，一个只会睡觉的[`simplarchiver.example.SleepDownloader`](simplarchiver/example/sleep.py)，收到Item之后先睡一觉然后起床把Item以字符串的方式输出到命令行：\n\n```python\nclass SleepDownloader(Downloader):\n    \"\"\"一个只会睡觉的Downloader\"\"\"\n    running: int = 0\n\n    def __init__(self, i=uuid.uuid4(), seconds=None, rand_max=5):\n        \"\"\"\n        i表示Feeder的编号\n        如果指定了seconds，每次就睡眠seconds秒\n        如果没有指定seconds，那就睡眠最大rand_max秒的随机时长\n        \"\"\"\n        self.seconds = seconds\n        self.rand_max = rand_max\n        self.id = i\n        self.log('Initialized: seconds=%s, rand_max=%s' % (seconds, rand_max))\n\n    def log(self, msg):\n        logging.info('SleepDownloader %s | %s' % (self.id, msg))\n\n    async def download(self, item):\n        self.log('I get an item! %s' % item)\n        t = random.random() % self.rand_max if self.seconds is None else self.seconds\n        SleepDownloader.running += 1\n        self.log('Now there are %d SleepDownloader awaiting including me, I will sleep %f seconds' % (SleepDownloader.running, t))\n        item = await asyncio.sleep(delay=t, result=item)\n        self.log('I have slept %f seconds for the item %s, time to wake up' % (t, item))\n        SleepDownloader.running -= 1\n        self.log('I wake up, Now there are %d SleepDownloader awaiting' % SleepDownloader.running)\n```\n\n更多案例：\n* [`simplarchiver.example.JustDownloader`](simplarchiver/example/just.py)：不sleep，不知疲倦地输出收到的Item的Downloader\n* [`simplarchiver.example.SubprocessDownloader`](simplarchiver/example/subprocess.py)：根据Item开子进程执行系统调用的Downloader\n\n### Pair类`simplarchiver.Pair`\n\n`simplarchiver.Pair`包含了整个系统的`simplarchiver`核心逻辑。\n\n```python\nclass Pair:\n    def __init__(self,\n                 feeders: List[Feeder] = [],\n                 downloaders: List[Downloader] = [],\n                 start_deny: timedelta = timedelta(seconds=4),\n                 interval: timedelta = timedelta(minutes=30),\n                 feeder_concurrency: int = 3,\n                 downloader_concurrency: int = 3):\n        ...\n    ...\n    async def coroutine_once(self):\n        ...\n    async def coroutine_forever(self):\n        ...\n```\n\n其中，构造函数输入为：\n\n| 形参                     | 含义                                                                           |\n| ------------------------ | ------------------------------------------------------------------------------ |\n| `feeders`                | 由`simplarchiver.Feeder`构成的列表，用户在此处输入自己定义的Feeder             |\n| `downloaders`            | 由`simplarchiver.Downloader`构成的列表，用户在此处输入自己定义的Downloader     |\n| `start_deny`             | sleep多长时间后启动第一轮下载 |\n| `interval`               | 在`coroutine_forever`函数中当一轮下载全部完成后，sleep多长时间再开始下一轮下载 |\n| `feeder_concurrency`     | `feeders`所输入的`Feeder`最多可以同时运行多少个   |\n| `downloader_concurrency` | `downloaders`所输入的`Downloader`最多可以同时运行多少个            |\n\n注意：一个`Downloader`实例的`simplarchiver.Downloader.download()`不会被并行调用，所以如果设置了`downloader_concurrency`大于`downloaders`列表的长度，同一时刻最多也只会有`len(downloaders)`个`simplarchiver.Downloader.download()`并行调用，每个`Downloader`实例最多有一个`simplarchiver.Downloader.download()`在运行\n\nTODO：未来可能会改变`downloader_concurrency`的实现方式，让一个`Downloader`实例可以并行运行多个`simplarchiver.Downloader.download()`过程，使`downloader_concurrency`控制同一时刻最多可以并发运行多少个`simplarchiver.Downloader.download()`\n\n两个主要协程的运行过程为：\n\n`coroutine_once`，运行一次：\n1. 为`downloaders`里的Downloader创建下载队列，启动所有Downloader等待下载\n2. 启动`feeders`里的所有Feeder获取要下载的items\n3. 对于Feeder输出的每个item，在每个Downloader下载队列里面都push一个\n4. Feeder输出结束之后向每个Downloader下载队列发送`None`作为停止信号\n5. Downloader运行完所有的下载任务后收到最后的停止信号就退出\n6. 等待所有Downloader退出\n\n`coroutine_forever`，永久运行：\n1. 运行`coroutine_once`协程并等待其完成\n2. 如果`coroutine_once`抛出了错误，则忽略错误并立即回到步骤1\n3. 如果`coroutine_once`正常退出，则等待`interval`时长后再回到步骤1\n\n除了构造函数之外，协程开始前还可以使用这些方法修改设置：\n\n```python\nclass Pair:\n    ...\n    def add_feeder(self, feeder: Feeder):\n        ...\n\n    def add_feeders(self, feeders: List[Feeder]):\n        ...\n\n    def add_downloader(self, downloader: Downloader):\n        ...\n\n    def add_downloaders(self, downloaders: List[Downloader]):\n        ...\n\n    def set_timedelta(self, timedelta: timedelta):\n        ...\n\n    def set_feeder_concurrency(self, n: int):\n        ...\n\n    def set_downloader_concurrency(self, n: int):\n        ...\n    ...\n```\n\n例如，使用上面定义的`SleepFeeder`和`SleepDownloader`构造一个包含4个Feeder和4个Downloader、以5秒为间隔运行的、Feeder和Downloader并发数分别为3和4的`simplarchiver.Pair`（位于[test_Sleep.py](test_Sleep.py)）：：\n\n```python\nfrom simplarchiver import Pair\nfrom simplarchiver.example import SleepFeeder, SleepDownloader\nfrom datetime import timedelta\n\npair = Pair([SleepFeeder(0)], [SleepDownloader(0)], timedelta(seconds=1), timedelta(seconds=5), 3, 4)\nfor i in range(1, 4):\n    pair.add_feeder(SleepFeeder(i))\nfor i in range(1, 4):\n    pair.add_downloader(SleepDownloader(i))\n```\n\n要启动运行，只需要使用`asyncio.run`运行`simplarchiver.Pair`的协程即可（位于[test_Sleep.py](test_Sleep.py)）：\n\n```python\nimport logging\nimport asyncio\n\nlogging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')\n\n\ndef log(msg):\n    logging.info('test_Pair | %s' % msg)\n\nlog(\"pair.coroutine_once()\")\nasyncio.run(pair.coroutine_once()) # 运行一次\nlog(\"pair.coroutine_forever()\")\nasyncio.run(pair.coroutine_forever()) # 永远运行\n```\n\n## 扩展：`simplarchiver.Controller`\n\n进一步的需求：并行运行多个`simplarchiver.Pair`\n* 在好几个项目里面都用到了这个框架，现在有一堆`simplarchiver.Pair`需要运行\n* 不想给每个`simplarchiver.Pair`都弄一个进程，想把它们放在一个事件循环里运行，节约资源\n\n实现：用`asyncio.gather`运行多个`simplarchiver.Pair.coroutine_forever()`就好了，这个过程封装为[`simplarchiver.Controller`](simplarchiver/controller.py)：\n\n```python\nfrom .pair import *\nfrom typing import List\n\n\nclass Controller:\n    def __init__(self, pairs: List[Pair] = []):\n        \"\"\"\n        feeder-downloader对列表，键为id值为Pair\n        每个Pair都是独立运行的\n        \"\"\"\n        self.__pairs = []\n        self.add_pairs(pairs)\n\n    async def coroutine(self):\n        await asyncio.gather(*[pair.coroutine_forever() for pair in self.__pairs])\n```\n\n并发运行Pair轻而易举：\n```python\nfrom simplarchiver import Controller, Pair\nfrom simplarchiver.example import RandomFeeder, JustDownloader\n\ncontroller = Controller()\nfor i in range(1, 4):\n    controller.add_pair(\n        Pair([RandomFeeder('(%d,%d)' % (i, j)) for j in range(1, 4)],\n             [JustDownloader('(%d,%d)' % (i, j)) for j in range(1, 4)],\n             timedelta(seconds=i * 1), timedelta(seconds=i * 5), i, i))\nasyncio.run(controller.coroutine())\n```\n\n## 扩展：过滤\n\n进一步的需求：\n* 有些Item，我想处理或筛选一下再传给Downloader去下载\n* 有些Item的处理我想放在Feeder输出之后，让修改和筛选传给到所有的Downloader\n* 有些Item的处理我想放在Downloader输入之前，让修改和筛选只传给一个Downloader\n\n### 实现Feeder的Item后处理：Feed过滤器[`simplarchiver.FilterFeeder`](simplarchiver/abc.py)\n\n* 一个带有过滤函数`filter`的抽象类\n* 继承自`simplarchiver.Feeder`\n* 内部存储一个`simplarchiver.Feeder`作为基础Feeder\n* 在其`get_feeds`中先调用基础Feeder的`get_feeds`，再调用`filter`过滤之\n\n```python\nclass FilterFeeder(Feeder):\n    \"\"\"带过滤功能的Feeder\"\"\"\n\n    def __init__(self, base_feeder: Feeder):\n        \"\"\"从一个基本的Feeder生成带过滤的Feeder\"\"\"\n        self.__base_feeder = base_feeder\n\n    @abc.abstractmethod\n    async def filter(self, item):\n        \"\"\"\n        如果过滤器返回了None，则会被过滤掉，不会被yield\n        过滤器内可以修改item\n        \"\"\"\n        return item\n\n    async def get_feeds(self):\n        \"\"\"带过滤的Feeder的Feed过程\"\"\"\n        async for item in self.__base_feeder.get_feeds():\n            item = await self.filter(item)\n            if item is not None:  # 如果过滤器返回了None，则会被过滤掉，不会被yield\n                yield item\n```\n\n于是，用户可以继承此类，定义自己的过滤方案，然后在构造时将需要过滤的Feeder封装进去即可。例如，一个随机删除一半Item的Feed过滤器[`simplarchiver.example.RandomFilterFeeder`](simplarchiver/example/random.py)：\n\n```python\nclass RandomFilterFeeder(FilterFeeder):\n    \"\"\"一个随机过滤item的Feeder\"\"\"\n\n    def __init__(self, base_feeder: Feeder,\n                 logger: logging.Logger = logging.getLogger(\"RandomFilterFeeder\")):\n        super().__init__(base_feeder)\n        self.__logger = logger\n\n    async def filter(self, item):\n        r = random.random()\n        self.__logger.info(\n            \"RandomFilterFeeder rand  a number %f and item %s, \" % (r, item) + (\n                \"keep the item\" if r > 0.5 else \"drop the item\"))\n        return item if r > 0.5 else None\n```\n\n在构造时将要过滤的Feeder封装进去即可：\n```python\npair = Pair([\n    RandomFilterFeeder(\n        SleepFeeder(0)\n    )\n], [SleepDownloader(0)], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n因为Feed过滤器也是继承自`simplarchiver.Feeder`，所以它天生就是可以嵌套的。例如我要随机删除某个Feeder四分之三的输出Item，那就嵌套一下：\n```python\npair = Pair([\n    RandomFilterFeeder(\n        RandomFilterFeeder(\n            SleepFeeder(0)\n        )\n    )\n], [SleepDownloader(0)], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n更多案例：\n* [`simplarchiver.example.TTRSSHubLinkFeeder`](simplarchiver/example/rss.py)：用于封装`simplarchiver.example.TTRSSCatFeeder`，`TTRSSCatFeeder`返回的`item['link']`字段是RSS订阅链接，`TTRSSHubLinkFeeder.filter`将根据此RSS订阅链接获取原网页地址替换到`item['link']`中。\n\n### 实现Downloader的Item预处理：Download过滤器[`simplarchiver.FilterDownloader`](simplarchiver/abc.py)\n\n和[`simplarchiver.FilterFeeder`](simplarchiver/abc.py)类似，只不过`simplarchiver.FilterFeeder`的`filter`函数在`get_feeds`的`yield`之后调用，`simplarchiver.FilterDownloader`的`filter`函数在`download`之前调用：\n\n```python\nclass FilterDownloader(Downloader):\n    \"\"\"带过滤功能的Downloader\"\"\"\n\n    def __init__(self, base_downloader: Downloader):\n        \"\"\"从一个基本的Downloader生成带过滤的Downloader\"\"\"\n        self.__base_downloader = base_downloader\n\n    @abc.abstractmethod\n    async def filter(self, item):\n        \"\"\"\n        如果过滤器返回了None，则会被过滤掉，不会被Download\n        过滤器内可以修改item\n        \"\"\"\n        return item\n\n    async def download(self, item):\n        \"\"\"带过滤的Downloader的Download过程\"\"\"\n        item = await self.filter(item)\n        if item is not None:  # 如果过滤器返回了None，则会被过滤掉，不会被Download\n            return await self.__base_downloader.download(item)\n```\n\n于是，用户可以继承此类，定义自己的过滤方案，然后在构造时将需要过滤的Downloader封装进去即可。例如，一个随机删除一半Item的Download过滤器[`simplarchiver.example.RandomFilterDownloader`](simplarchiver/example/random.py)：\n\n```python\nclass RandomFilterDownloader(FilterDownloader):\n    \"\"\"一个随机过滤item的Downloader\"\"\"\n\n    def __init__(self, base_downloader: Downloader,\n                 logger: logging.Logger = logging.getLogger(\"RandomFilterDownloader\")):\n        super().__init__(base_downloader)\n        self.__logger = logger\n\n    async def filter(self, item):\n        r = random.random()\n        self.__logger.info(\n            \"RandomFilterDownloader rand a number %f and item %s, \" % (r, item) + (\n                \"keep the item\" if r > 0.5 else \"drop the item\"))\n        return item if r > 0.5 else None\n```\n\n在构造时将要过滤的Downloader封装进去即可：\n```python\npair = Pair([SleepFeeder(0)], [\n    RandomFilterDownloader(\n        SleepDownloader(0)\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n同样，Download过滤器也是可以嵌套的。和上面的Feed过滤器的嵌套案例一样，我要让某个Downloader随机跳过四分之三的输入Item，那就嵌套一下：\n```python\npair = Pair([SleepFeeder(0)], [\n    RandomFilterDownloader(\n        RandomFilterDownloader(\n            SleepDownloader(0)\n        )\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n更多案例：\n* [`simplarchiver.example.EnclosureOnlyDownloader`](simplarchiver/example/rss.py)：筛选出包含`enclosure`字段的Item\n* [`simplarchiver.example.EnclosureExceptDownloader`](simplarchiver/example/rss.py)：筛选出不包含`enclosure`字段的Item\n\n## 扩展：放大\n\n首先明确“放大”的概念：\n* 有些Feeder输出的item可用作为其他Feeder生成时的输入\n* 一个item放进另一个Feeder里会得到多个item\n* 对于一个Feeder输出的每个item，都可以放进另一个Feeder里生成多个item\n* 于是，item变多了，就叫做“放大”\n\n以RSS订阅为例，要获取所有的订阅详情，需要使用[`simplarchiver.example.TTRSSCatFeeder`](simplarchiver/example/rss.py)从TTRSS上获取所有RSS订阅的链接，再使用[`simplarchiver.example.RSSHubFeeder`](simplarchiver/example/rss.py)访问这些RSS订阅链接，从中读取所有的RSS item。\n\nTTRSS上的订阅链接是`simplarchiver.example.TTRSSCatFeeder`的输出，也是`simplarchiver.example.RSSHubFeeder`的输入；`simplarchiver.example.RSSHubFeeder`对于每个订阅链接都生成多个订阅项。\n\n基于这个需求，可以构造如下的Feeder放大器类：\n```python\nclass AmplifierFeeder(Feeder):\n    \"\"\"基于一个Feeder生成的item生成多个Feeder进而生成多个item\"\"\"\n\n    def __init__(self, base_feeder: Feeder, ampl_feeder_gen: Callable[[Any], Feeder]):\n        \"\"\"从一个基本的Feeder和一个放大器Feeder生成器生成带过滤的Feeder\"\"\"\n        self.__base_feeder = base_feeder\n        self.__ampl_feeder_gen = ampl_feeder_gen\n\n    async def get_feeds(self):\n        async for item in self.__base_feeder.get_feeds():  # 获取基本Feeder里的item\n            sub_feeder = self.__ampl_feeder_gen(item)  # 生成放大器Feeder\n            if sub_feeder is not None:\n                async for sub_item in sub_feeder.get_feeds():  # 获取放大器Feeder里的item\n                    yield sub_item\n```\n很简单，就是输入一个基本Feeder和一个放大器Feeder生成函数，对基本Feeder输出的每个item都调用放大器Feeder生成函数生成放大器Feeder，再从放大器Feeder里读item。\n\n## 扩展：Download回调\n\n进一步的需求：\n\n* 一个`Downloader.download`退出了，我想看看是下载完成了还是下载失败了\n* 在下载完成后，我还想根据下载完成或是失败的信息进行进一步的操作\n* 我定义了好几个不同的Downloader，它们的返回信息都差不多，进一步的操作的差不多，我不想在每个`Downloader.download`末尾都写一遍一样的代码\n\n实现：回调机制\n\n* 一个带有回调函数`callback`的抽象类\n* 继承自`simplarchiver.Downloader`\n* 内部存储一个`simplarchiver.Downloader`作为基础Downloader\n* 在其`download`中先调用基础Feeder的`download`，再将其返回值和Item作为`callback`的输入\n\n```python\nclass CallbackDownloader(Downloader):\n    \"\"\"具有回调功能的Downloader\"\"\"\n\n    def __init__(self, base_downloader: Downloader):\n        \"\"\"从一个基本的Downloader生成具有回调功能Downloader\"\"\"\n        self.__base_downloader = base_downloader\n\n    @abc.abstractmethod\n    async def callback(self, item, return_code):\n        \"\"\"\n        回调函数接受两个参数，一个是item，一个是被封装的基本Downloader的返回值\n        \"\"\"\n        pass\n\n    async def download(self, item):\n        return await self.callback(item, await self.__base_downloader.download(item))\n```\n\n于是，用户可以继承此类，定义自己的回调，然后在构造时将需要回调的Downloader封装进去即可。例如，一个输出`download`函数返回值的回调[`simplarchiver.example.JustLogCallbackDownloader`](simplarchiver/example/just.py)：\n\n```python\nclass JustLogCallbackDownloader(CallbackDownloader):\n    \"\"\"只是把Callback的内容输出到log而已\"\"\"\n\n    def __init__(self, base_downloader: Downloader,\n                 logger: logging.Logger = logging.getLogger(\"JustLogCallbackDownloader\")):\n        super(JustLogCallbackDownloader, self).__init__(base_downloader)\n        self.__logger = logger\n\n    async def callback(self, item, return_code):\n        self.__logger.info(\n            \"JustLogCallbackDownloader run its callback, return_code: %s, item: %s\" % (return_code, item))\n```\n\n在构造时将要过滤的Downloader封装进去即可：\n```python\npair = Pair([SleepFeeder(0)], [\n    JustLogCallbackDownloader(\n        SleepDownloader(0)\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\nDownload回调自然也是可以嵌套的：\n```python\npair = Pair([SleepFeeder(0)], [\n    JustLogCallbackDownloader(\n        JustLogCallbackDownloader(\n            SleepDownloader(0)\n        )\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n但要注意，嵌套之后，外层的回调函数获取到的`return_code`值来自于内层回调函数的返回值，而获取到的Item来自于外层的输入。\n\n## 扩展：同时使用Downloader过滤和回调\n\n同时使用了过滤和回调时，显然回调不会影响过滤函数的输入Item，进而也不会影响过滤过程；但反过来，过滤函数会影响到回调函数的输入参数。请看下例。\n\n过滤器在外、回调函数在内时，回调的`download`在过滤器的`download`内调用，因此`callback`收到的就是已经过滤过的Item，没有什么异常：\n\n```python\npair = Pair([SleepFeeder(0)], [\n    RandomFilterDownloader(\n        JustLogCallbackDownloader(\n            SleepDownloader(0)\n        )\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n回调函数在外、过滤器在内时，过滤器的`download`在回调的`download`内调用，因此`callback`收到的是没有经过过滤的Item，且由于过滤器的`download`在要被过滤的Item处是直接退出的，所以在被过滤的Item处，`callback`收到的`return_code`值为`None`：\n\n```python\npair = Pair([SleepFeeder(0)], [\n    JustLogCallbackDownloader(\n        RandomFilterDownloader(\n            SleepDownloader(0)\n        )\n    )\n], timedelta(seconds=1), timedelta(seconds=5), 4, 4)\n```\n\n从逻辑上看，我们不需要对一个没有经过下载的Item调用回调，其`return_code`值也没有意义，在此系统中还容易和正常退出的`return_code`混淆。所以过滤器在外，回调函数在内的用法才是逻辑上正确的用法。\n\n为了避免同时使用过滤和回调的嵌套问题，索性定义了一个杂交类[`simplarchiver.FilterCallbackDownloader`](simplarchiver/abc.py)：\n\n```python\nclass FilterCallbackDownloader(Downloader):\n    \"\"\"同时具有过滤和回调功能的Downloader\"\"\"\n\n    def __init__(self, base_downloader: Downloader):\n        \"\"\"从一个基本的Downloader生成具有过滤和回调功能Downloader\"\"\"\n        self.__base_downloader = base_downloader\n\n    @abc.abstractmethod\n    async def callback(self, item, return_code):\n        \"\"\"\n        回调函数接受两个参数，一个是item，一个是被封装的基本Downloader的返回值\n        \"\"\"\n        pass\n\n    @abc.abstractmethod\n    async def filter(self, item):\n        \"\"\"\n        如果过滤器返回了None，则会被过滤掉，不会被Download\n        过滤器内可以修改item\n        \"\"\"\n        return item\n\n    async def download(self, item):\n        \"\"\"过滤+回调\"\"\"\n        item = await self.filter(item)\n        if item is not None:  # 如果过滤器返回了None，则会被过滤掉，不会被Download\n            return_code = await self.__base_downloader.download(item)\n            await self.callback(item, return_code)\n            return return_code  # 调用了回调之后将return_code继续向下一级返回\n```\n\n这个类就相当于一个过滤器在外、回调函数在内的嵌套。有了这个类，就没必要用过滤和回调实现既有过滤又有回调的Downloader了。尽量避免系统设计触及到已有系统的缺陷，不要为了图方便而用愚蠢的实现，在学习框架时好好从思想开始积累，在看到新框架时多多思考作者为什么要设计这样的框架、框架的基本思想是什么、使用者应该有一种什么样的共识、什么样的用法是好的、什么样的用法能解决问题但是不好、它不好在何处？是因为行为怪异难以捉摸而准备废弃？是因为开发时的疏忽而引入的不符合整体思想的实现？解决问题的方法千千万万，如果总是只采用查到的第一个方案作为解决方案而不经过对多种方案的思考和比较，那永远只能做代码的熟练搬运工，技术上永远不会有质的提升。不断追问解决方法背后的逻辑可以让人不由自主地去搜寻多种解决方案，即使有一个人云亦云的明显方案摆在眼前；在这样不断的在这种“无意义”的搜索上“浪费时间”的过程中，既有系统的核心思想和逻辑会逐渐地清晰，自己的对既有系统的直觉上的把握也会越来越接近作者的思维，解决问题的方式也会从“用网上搜到的解决方案”到“网上搜到的解决方案不太符合原作者的想法”到“自己思考解决方案”最后到“像原作者一样解决问题”。在不断的进步中你会逐渐发现搬运式编程的危害。一个优秀的系统可以让不同水平的使用者对一个相同的需求都写出大差不离的代码，这样即使不写注释其他人也能很容易地明白程序的意思，节约参与者的时间是开源项目大火的重要因素，如果一个开源项目目标明确，且只需要几分钟就能弄懂结构并按照自己的意愿添加功能，那只要它能解决某方面的需求，必定能成为优秀的开源项目。但这样优秀的系统难得一见，大部分情况下，大家都是用着“约定大于配置”的思想：程序这么写不是唯一的方法，也不一定是最好的方法，但我们在开发文档里约定大家就要这么写，不要自由发挥，那会让其他人在理解代码上浪费时间。大部分有名有姓的开源项目都是这么做的，因为这样可以极大地节约每个参与者的时间，更容易团结力量做大事。而搬运式编程则不符合这种套路。搬运式编程虽然能解决问题，但解决问题的方法都是一定条件下的产物，在计算机软件这一无比复杂的领域基本上不会有一种方法适用于多种情况。搬运式编程是“心中只有自己”甚至是心中只有“现在的自己”，连“未来维护程序时的自己”都没有，是一种目光短浅的做法。这种编程方式能极大地提升初期的开发效率，但遗患无穷。正确的方法是，不要搜索不到一个小时找到一个解决方案就欣喜若狂然后进入下一步，多搜索一些解决方案，多看看别人是的用法，读一读文档，体会一下作者的思想，看看自己站在作者的立场会做出什么样的东西，在回头看看作者是怎么解决问题的，最后再回头看看自己遇到的问题，这个问题为什么产生？原作者为什么没有在框架里直接解决问题？我的开发方法符合作者的思路吗？在不断的思考解决问题的过程中，自己的开发手法会逐渐熟练，知道哪些问题是可以避免的，框架在哪些情况不应该使用，更重要的是，你会发现网上能找到的大多数方案都是“愚蠢”的，贸然使用真的会带来更多的问题，从你发现这一情况的时刻开始，你解决问题的手法将发生质的变化，对所见方案的合理怀疑将成为你的本能，鉴别“愚蠢”方案将成为你的直觉，这种对“愚蠢”方案的抗拒将迫使你所用的一切框架和软件都倾尽所能进行深入挖掘，而越是深入，对网上那些方案的甄别能力就越强，更多似是而非的方案将浮出水面，强烈的违和感更加迫使你进行深入学习。这是一个正循环，当越过了那座山峰，接下来的进步自然而然。我自己是什么时候越过那座峰的？可能是在大一和几位志同道合的好友合作课设的时候，可能是在大二接触开源项目的时候，可能是在大三一个课设参加了好几个比赛的时候，也可能是在大四疫情在家一个人孤独地做毕设的时候。当我回过神来的时候，我发现自己hack开源项目越来越顺畅，阅读多人合作的开源代码就像读书一样自然，但写程序时的做法已经和身边的人越来越远，总觉得它们的程序虽然可以运行但无法交流，无法“读书”。困扰至此，反正这个垃圾项目也没有人看，随便乱写写。\n\n## TODO\n\n* 或许可以在不影响上层应用的情况下将过滤和回调改成接口类\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/yindaheng98/simplarchiver",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "simplarchiver",
+    "package_url": "https://pypi.org/project/simplarchiver/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/simplarchiver/",
+    "project_urls": {
+      "Homepage": "https://github.com/yindaheng98/simplarchiver"
+    },
+    "release_url": "https://pypi.org/project/simplarchiver/2.1.3/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "一个简单的可扩展聚合异步下载器框架",
+    "version": "2.1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14326360,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9e34a30c0474cc0a38f807238b18b92fb9e5756ea8149f7cf5fe7180efa956c",
+          "md5": "8852cce18813d27a3e19d2bae6292aad",
+          "sha256": "e0517838e3b69819932a5372415442465d734a3a15111988803faf0cb1c5f375"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-0.1.1-py3.9.egg",
+        "has_sig": false,
+        "md5_digest": "8852cce18813d27a3e19d2bae6292aad",
+        "packagetype": "bdist_egg",
+        "python_version": "0.1.1",
+        "requires_python": null,
+        "size": 8731,
+        "upload_time": "2021-08-20T02:20:18",
+        "upload_time_iso_8601": "2021-08-20T02:20:18.107854Z",
+        "url": "https://files.pythonhosted.org/packages/e9/e3/4a30c0474cc0a38f807238b18b92fb9e5756ea8149f7cf5fe7180efa956c/simplarchiver-0.1.1-py3.9.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c6f20a1e52e6dd9c773ec769de65a9592bb3e7b9a4246d512c4e5535ad51ab02",
+          "md5": "51485ba87c9083f1fc145cc09a3dcbae",
+          "sha256": "d5cd9f0d1ce257a57e8959f178c6919b216066dcc2cb21a9b20c93be6b27e0d2"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "51485ba87c9083f1fc145cc09a3dcbae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4628,
+        "upload_time": "2021-08-20T02:20:19",
+        "upload_time_iso_8601": "2021-08-20T02:20:19.850466Z",
+        "url": "https://files.pythonhosted.org/packages/c6/f2/0a1e52e6dd9c773ec769de65a9592bb3e7b9a4246d512c4e5535ad51ab02/simplarchiver-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e91e230158060d91e62fb71e71c5d38f54f7f27c4cd2aa4ba71dc59e21ab169",
+          "md5": "d59872f148df5249adbcee80e899abf6",
+          "sha256": "468bb4967114fd7f573f6f147bb292bbdd757a0e152c01c7446abd0fe73709e6"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d59872f148df5249adbcee80e899abf6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4653,
+        "upload_time": "2021-08-20T02:43:40",
+        "upload_time_iso_8601": "2021-08-20T02:43:40.997171Z",
+        "url": "https://files.pythonhosted.org/packages/7e/91/e230158060d91e62fb71e71c5d38f54f7f27c4cd2aa4ba71dc59e21ab169/simplarchiver-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0db997b000285f83e9cec0637ed3790c53c2e851f85197ef22d01a4a36bbb377",
+          "md5": "580399f451604995e32aa86fe7fd9703",
+          "sha256": "a6764b28ff6bf1f522ea05b76740e2584d087a55b40d49ad347729d8fec30e03"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "580399f451604995e32aa86fe7fd9703",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5069,
+        "upload_time": "2021-08-20T08:30:35",
+        "upload_time_iso_8601": "2021-08-20T08:30:35.480331Z",
+        "url": "https://files.pythonhosted.org/packages/0d/b9/97b000285f83e9cec0637ed3790c53c2e851f85197ef22d01a4a36bbb377/simplarchiver-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b4e9bc23bbaf6723bfac63e3c7244b432488ab8b174a0a1916f0455a8098e55",
+          "md5": "dde0327e8e718b5147aa10ecfb568f48",
+          "sha256": "3838be23dce32c8de7ef6a12396871326f7068e4ffb630492b2dd5fdfb429c80"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dde0327e8e718b5147aa10ecfb568f48",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5175,
+        "upload_time": "2021-08-20T09:42:48",
+        "upload_time_iso_8601": "2021-08-20T09:42:48.035473Z",
+        "url": "https://files.pythonhosted.org/packages/9b/4e/9bc23bbaf6723bfac63e3c7244b432488ab8b174a0a1916f0455a8098e55/simplarchiver-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79b2cf6be25f4fef7ad0dfdde12a4ec97de9d2b9ae449fb6fe92577ba4e0c5e2",
+          "md5": "1a2d9ce7ac0b1ff7ae70a8d40f4e9df4",
+          "sha256": "be5e0d2d12582d1c81ecce414926051ba688289df24a271a236a46588c5be426"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a2d9ce7ac0b1ff7ae70a8d40f4e9df4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5177,
+        "upload_time": "2021-08-20T13:38:51",
+        "upload_time_iso_8601": "2021-08-20T13:38:51.342043Z",
+        "url": "https://files.pythonhosted.org/packages/79/b2/cf6be25f4fef7ad0dfdde12a4ec97de9d2b9ae449fb6fe92577ba4e0c5e2/simplarchiver-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a4832af84840b589a2902d93dbfbedb5fa04f8bf7c4ea546218d81a0c3026c9",
+          "md5": "61b3a8b4f91dc74af1d42db669ef5add",
+          "sha256": "4f8abb975921bcb2f60cbab86ec6f4b0a928ea62cc47f750c65144763f535429"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "61b3a8b4f91dc74af1d42db669ef5add",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5178,
+        "upload_time": "2021-08-20T14:15:46",
+        "upload_time_iso_8601": "2021-08-20T14:15:46.595039Z",
+        "url": "https://files.pythonhosted.org/packages/5a/48/32af84840b589a2902d93dbfbedb5fa04f8bf7c4ea546218d81a0c3026c9/simplarchiver-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4b345e6a47a7180feb51377a7bae4345b1ebffaa5f24ae6324d87cf62aa3b08",
+          "md5": "3041c3dbed3e5754eeb49fdfd8df8daf",
+          "sha256": "9f11bf33bcc0db5cb5266e8e342ee7d4f819f08fd0f7c04046106ecf8bf1a788"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3041c3dbed3e5754eeb49fdfd8df8daf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5176,
+        "upload_time": "2021-08-20T14:23:42",
+        "upload_time_iso_8601": "2021-08-20T14:23:42.390442Z",
+        "url": "https://files.pythonhosted.org/packages/d4/b3/45e6a47a7180feb51377a7bae4345b1ebffaa5f24ae6324d87cf62aa3b08/simplarchiver-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "26cff2fc80d962ea9ba0b68cabcc6d418a36cb3b8a9767207c76d08ab89ca415",
+          "md5": "ac0fe204bf1185e12fb7027d904dfa29",
+          "sha256": "15675da6f639f0c09fe51fbc5e39c0e4d8ac3f2de8fd998a8e4d20bf246c99ab"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ac0fe204bf1185e12fb7027d904dfa29",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11568,
+        "upload_time": "2021-08-21T03:06:35",
+        "upload_time_iso_8601": "2021-08-21T03:06:35.096916Z",
+        "url": "https://files.pythonhosted.org/packages/26/cf/f2fc80d962ea9ba0b68cabcc6d418a36cb3b8a9767207c76d08ab89ca415/simplarchiver-1.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "27be4ea2f20352aa4d9564838b7004e7ddd61a47982db7238215eba99e47764e",
+          "md5": "f19cee25e5ed7dc7404a2935a4f4d5fe",
+          "sha256": "4fb593608a372655ac50434b433a072c4fd8daa5b1b90e73dcb6b3a1843137a8"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f19cee25e5ed7dc7404a2935a4f4d5fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11515,
+        "upload_time": "2021-08-21T07:54:18",
+        "upload_time_iso_8601": "2021-08-21T07:54:18.641671Z",
+        "url": "https://files.pythonhosted.org/packages/27/be/4ea2f20352aa4d9564838b7004e7ddd61a47982db7238215eba99e47764e/simplarchiver-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ab1d1c24418b86b5579bc3c72a6aadae57c1b4c1d8a148f1340f44c7f4a775d",
+          "md5": "15b345b082826bddeb801dfaa72696a7",
+          "sha256": "b710574f91f825e2158e5930694db0547fedc3e0ea9c1636f8d55e86f2314123"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "15b345b082826bddeb801dfaa72696a7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11511,
+        "upload_time": "2021-08-21T08:25:22",
+        "upload_time_iso_8601": "2021-08-21T08:25:22.990036Z",
+        "url": "https://files.pythonhosted.org/packages/5a/b1/d1c24418b86b5579bc3c72a6aadae57c1b4c1d8a148f1340f44c7f4a775d/simplarchiver-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.10.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b980ecdc2ad1e2796eea9f536fa8f7d35e96f9e092a6de019f05ecb8f6b1e2de",
+          "md5": "8625f2c77cbb11440ab2b00159df43ed",
+          "sha256": "1eac8a0c21332fce27929146c810760e3a0d82a29d887af11b0a5dff1a9ee747"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.10.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8625f2c77cbb11440ab2b00159df43ed",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38948,
+        "upload_time": "2021-11-11T08:00:30",
+        "upload_time_iso_8601": "2021-11-11T08:00:30.905194Z",
+        "url": "https://files.pythonhosted.org/packages/b9/80/ecdc2ad1e2796eea9f536fa8f7d35e96f9e092a6de019f05ecb8f6b1e2de/simplarchiver-1.10.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.10.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e83c00c2395ec96511b801041ad2c1860c8592caaa3b7d990e82562b180f751",
+          "md5": "d7ab9f2e4c6aafb48673f97201cf858a",
+          "sha256": "8160e1292ccf641d980e03921aee155db55600c9e88d9bca79ee7406c99ca149"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.10.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d7ab9f2e4c6aafb48673f97201cf858a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38950,
+        "upload_time": "2021-11-11T12:55:16",
+        "upload_time_iso_8601": "2021-11-11T12:55:16.623086Z",
+        "url": "https://files.pythonhosted.org/packages/4e/83/c00c2395ec96511b801041ad2c1860c8592caaa3b7d990e82562b180f751/simplarchiver-1.10.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.10.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b7314c14ea3033306f1afbd1ad894aab6d65587be05c76ef98ed654ddf3c24f",
+          "md5": "22993dfb25cb138619fb5c91d6f64776",
+          "sha256": "d89d7ea179128129f1e9bee7b29ebd7524d28450ed9ed53222e7f20b53c2dcf0"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.10.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22993dfb25cb138619fb5c91d6f64776",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38937,
+        "upload_time": "2021-11-13T11:15:59",
+        "upload_time_iso_8601": "2021-11-13T11:15:59.053038Z",
+        "url": "https://files.pythonhosted.org/packages/5b/73/14c14ea3033306f1afbd1ad894aab6d65587be05c76ef98ed654ddf3c24f/simplarchiver-1.10.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.11.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f8c2fce428f37f2c0effa26325cae908397f6da5892f63ab7ccb75a1999a87a",
+          "md5": "ffb00fd5956ab33696e695cc1005925d",
+          "sha256": "ad8f07efb492f3af660ee3ee620575d2e2f2ebb78a4a1f1c1f83eee941bb147a"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.11.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ffb00fd5956ab33696e695cc1005925d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 39420,
+        "upload_time": "2021-12-14T12:40:16",
+        "upload_time_iso_8601": "2021-12-14T12:40:16.016689Z",
+        "url": "https://files.pythonhosted.org/packages/8f/8c/2fce428f37f2c0effa26325cae908397f6da5892f63ab7ccb75a1999a87a/simplarchiver-1.11.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.11.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "730643f161d683ce50ad332503a3fa3107d4d914fdf1c114b1b33e2e6dbb5c4b",
+          "md5": "70cf12c38e53c87cc6540e3adb00ace3",
+          "sha256": "4215fe0f7e0cfb3e1b2e2105090a43e8425b89d912e0550640f6e886ff0e88fe"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.11.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "70cf12c38e53c87cc6540e3adb00ace3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 39433,
+        "upload_time": "2021-12-15T02:22:22",
+        "upload_time_iso_8601": "2021-12-15T02:22:22.688345Z",
+        "url": "https://files.pythonhosted.org/packages/73/06/43f161d683ce50ad332503a3fa3107d4d914fdf1c114b1b33e2e6dbb5c4b/simplarchiver-1.11.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2067236401efca9c11bf3d2d4698eada9b8adbd5afb33e7cca12add45998b53",
+          "md5": "1ad046695529853d1aecc08ba7795cea",
+          "sha256": "ed5a23247fd13d276b3064cac48fedfff180eafc6e1526b7c9b3df7cd9072268"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ad046695529853d1aecc08ba7795cea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40132,
+        "upload_time": "2022-02-15T15:11:40",
+        "upload_time_iso_8601": "2022-02-15T15:11:40.237139Z",
+        "url": "https://files.pythonhosted.org/packages/e2/06/7236401efca9c11bf3d2d4698eada9b8adbd5afb33e7cca12add45998b53/simplarchiver-1.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd94d22747eb78c1d6205ec8ba99df35b0076d0169b45bba75225d8353e9c6a5",
+          "md5": "ee124a5c0bad5680412595bd2cb0236a",
+          "sha256": "6a58015748663abd532f567f8c358664f9f3926db07d93d0592a4126bfabcf05"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ee124a5c0bad5680412595bd2cb0236a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40456,
+        "upload_time": "2022-02-24T09:09:34",
+        "upload_time_iso_8601": "2022-02-24T09:09:34.042374Z",
+        "url": "https://files.pythonhosted.org/packages/cd/94/d22747eb78c1d6205ec8ba99df35b0076d0169b45bba75225d8353e9c6a5/simplarchiver-1.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d4622f304432eedbad8fe0218629200ee36e8b8b1a2ede092a2783acf72a1a6",
+          "md5": "3e6d581c5e5ecbf9930a55c80cbb2000",
+          "sha256": "fb2a44ff4e1bbc19ef91e82fb6b3de92aa320e57ef5c3049ee7a80d61579adce"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3e6d581c5e5ecbf9930a55c80cbb2000",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40489,
+        "upload_time": "2022-02-27T11:18:47",
+        "upload_time_iso_8601": "2022-02-27T11:18:47.476875Z",
+        "url": "https://files.pythonhosted.org/packages/4d/46/22f304432eedbad8fe0218629200ee36e8b8b1a2ede092a2783acf72a1a6/simplarchiver-1.13.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d7aa2e6c08fb1138f2e7393e597a7b422cb37d94acf111115b70d396419c3899",
+          "md5": "44bbdf8e592643c7086ac03c5679b895",
+          "sha256": "e2e44b15af60a50a48a696d1045652bb952cb8c5c2af172c41168f59e8b29d57"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "44bbdf8e592643c7086ac03c5679b895",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40482,
+        "upload_time": "2022-03-17T13:52:35",
+        "upload_time_iso_8601": "2022-03-17T13:52:35.573128Z",
+        "url": "https://files.pythonhosted.org/packages/d7/aa/2e6c08fb1138f2e7393e597a7b422cb37d94acf111115b70d396419c3899/simplarchiver-1.13.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02ea90e6c01874e0a1cb6fc2a2f702246bd71e1ddf52b3203218517c63d36352",
+          "md5": "ebc6ae60a7fd2a746c0bac3899c296e0",
+          "sha256": "ea541ba053b4f3e85bf110915dfad9d701df13b54e845ed61eb15a3994d95e04"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ebc6ae60a7fd2a746c0bac3899c296e0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40485,
+        "upload_time": "2022-03-18T03:24:12",
+        "upload_time_iso_8601": "2022-03-18T03:24:12.579364Z",
+        "url": "https://files.pythonhosted.org/packages/02/ea/90e6c01874e0a1cb6fc2a2f702246bd71e1ddf52b3203218517c63d36352/simplarchiver-1.13.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e554ae28ded2a5bd158e8bb55dbbc9816217529707ce99589f4ff1c31b6ddba6",
+          "md5": "107c0d0e6fc2fbf81ad05a07b39d936b",
+          "sha256": "4bf241970d71e3abab3347a3ccca520a4eda1e365c48baeb5df616d46cc507a2"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "107c0d0e6fc2fbf81ad05a07b39d936b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40502,
+        "upload_time": "2022-03-18T03:51:36",
+        "upload_time_iso_8601": "2022-03-18T03:51:36.671230Z",
+        "url": "https://files.pythonhosted.org/packages/e5/54/ae28ded2a5bd158e8bb55dbbc9816217529707ce99589f4ff1c31b6ddba6/simplarchiver-1.13.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2fd1df856ad52e3155929f56041dbb6033146532472e54c9ba0c448bf549e39b",
+          "md5": "a78cfbf6d656ee3850c18ccec85d9b2f",
+          "sha256": "d3aac5427e00f4b2de729ddce42ce0ffa5fa546255e7e04eca1a137e761e7100"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a78cfbf6d656ee3850c18ccec85d9b2f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40526,
+        "upload_time": "2022-03-20T11:42:38",
+        "upload_time_iso_8601": "2022-03-20T11:42:38.216788Z",
+        "url": "https://files.pythonhosted.org/packages/2f/d1/df856ad52e3155929f56041dbb6033146532472e54c9ba0c448bf549e39b/simplarchiver-1.13.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b3faeb8fbafb6e261e92f4e898fa13e897a273faa42f8b0ff8c5877e9d5fc46",
+          "md5": "790e60606d9ecc0d7d4b76419b88c7fd",
+          "sha256": "8aaf39b5370d192fc63ec2fa1955ca3c56e5cb1e7b95b2806d87469e63534e9c"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "790e60606d9ecc0d7d4b76419b88c7fd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40525,
+        "upload_time": "2022-03-20T14:28:32",
+        "upload_time_iso_8601": "2022-03-20T14:28:32.562812Z",
+        "url": "https://files.pythonhosted.org/packages/9b/3f/aeb8fbafb6e261e92f4e898fa13e897a273faa42f8b0ff8c5877e9d5fc46/simplarchiver-1.13.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "424f306cc9831501799c92f9f05620e080e7e4d5908801c98a57d061e2261563",
+          "md5": "b75ecf6d3de3077e806a3eadcb88739b",
+          "sha256": "81622e88e631c40bdfa0c050aa5db209de7205ffd435e72cec41c449c3969b55"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b75ecf6d3de3077e806a3eadcb88739b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40543,
+        "upload_time": "2022-03-21T05:58:36",
+        "upload_time_iso_8601": "2022-03-21T05:58:36.338841Z",
+        "url": "https://files.pythonhosted.org/packages/42/4f/306cc9831501799c92f9f05620e080e7e4d5908801c98a57d061e2261563/simplarchiver-1.13.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c715dfaa91572c6470a3bcc1cd7826936a0c5176a8519882e8ef89e130d19d97",
+          "md5": "6247607a10d6ee4e8c5f8593b4a98bc4",
+          "sha256": "c798fbd87b57cd0e3f289cce7da1c3ea671a5f00bd682bff04d2e2552e298616"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6247607a10d6ee4e8c5f8593b4a98bc4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40541,
+        "upload_time": "2022-03-21T06:01:16",
+        "upload_time_iso_8601": "2022-03-21T06:01:16.791052Z",
+        "url": "https://files.pythonhosted.org/packages/c7/15/dfaa91572c6470a3bcc1cd7826936a0c5176a8519882e8ef89e130d19d97/simplarchiver-1.13.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.13.4.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c559773c5a21fbc477c835b5a89f7a23a12cde3a1080c72f6d189233115a6872",
+          "md5": "af73d386689ac0b5a29a659b3b084eb9",
+          "sha256": "7184da7c2063095a3975e58ca91c5b012b6fa2494d2c800b57d25372930f971b"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.13.4.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af73d386689ac0b5a29a659b3b084eb9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40598,
+        "upload_time": "2022-04-02T03:39:05",
+        "upload_time_iso_8601": "2022-04-02T03:39:05.844683Z",
+        "url": "https://files.pythonhosted.org/packages/c5/59/773c5a21fbc477c835b5a89f7a23a12cde3a1080c72f6d189233115a6872/simplarchiver-1.13.4.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b61e8c23dc5d97ee93518beacda50292152f69b75056c04d0ed308a52fe3f2e2",
+          "md5": "b63c21de420516fbfc885dff81749a6e",
+          "sha256": "6f40803d8d5d8390c11373b397099b3060033d9cfcae82e5920865a26d351b2f"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b63c21de420516fbfc885dff81749a6e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11562,
+        "upload_time": "2021-08-21T09:05:03",
+        "upload_time_iso_8601": "2021-08-21T09:05:03.369795Z",
+        "url": "https://files.pythonhosted.org/packages/b6/1e/8c23dc5d97ee93518beacda50292152f69b75056c04d0ed308a52fe3f2e2/simplarchiver-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03895e9d37ead6f360767ad80e3efc6a01e1921f29fb6963892e9f1715b5fab5",
+          "md5": "6776c927b29211cd153b14a088c70c22",
+          "sha256": "c12d64fa328d82184fe15658d2b2745d65e3e207d9377952bd20c9def5eab1bc"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6776c927b29211cd153b14a088c70c22",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32303,
+        "upload_time": "2021-08-22T10:13:08",
+        "upload_time_iso_8601": "2021-08-22T10:13:08.756797Z",
+        "url": "https://files.pythonhosted.org/packages/03/89/5e9d37ead6f360767ad80e3efc6a01e1921f29fb6963892e9f1715b5fab5/simplarchiver-1.2.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df5eb516857db9b716ee9d47e995bd0349340338b8e19a7f3f8ab99c01850cb2",
+          "md5": "90c5c8165c7109dd462abae0f9d4b179",
+          "sha256": "c86ef7f90589916a17e60d63b3e074f13953e5d4a97b8117c74c938d2f122ec1"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "90c5c8165c7109dd462abae0f9d4b179",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32926,
+        "upload_time": "2021-08-22T12:40:35",
+        "upload_time_iso_8601": "2021-08-22T12:40:35.582063Z",
+        "url": "https://files.pythonhosted.org/packages/df/5e/b516857db9b716ee9d47e995bd0349340338b8e19a7f3f8ab99c01850cb2/simplarchiver-1.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb1d30a166dd7a067c7e2330256e83241ef26f10966c29b758b24627ad5a832d",
+          "md5": "fef77350b8734b10f2481bab3854caa6",
+          "sha256": "8fd973ec1c99538c37ff759e4613f63e5f7c8e91b1053d5d177b51a59b31b773"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fef77350b8734b10f2481bab3854caa6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33251,
+        "upload_time": "2021-08-22T14:22:43",
+        "upload_time_iso_8601": "2021-08-22T14:22:43.045968Z",
+        "url": "https://files.pythonhosted.org/packages/fb/1d/30a166dd7a067c7e2330256e83241ef26f10966c29b758b24627ad5a832d/simplarchiver-1.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "23aa47cb32413b1bc88b6dbfbbfb40e66eec3bd73c420a722f976302f63806e2",
+          "md5": "3c64009f3eb14e2769b8d5c96687bdd7",
+          "sha256": "2e0feb0d18486ab415dd43ddb0f6a14c8cc64ee3a3354c7b8f06ebcc057c4673"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3c64009f3eb14e2769b8d5c96687bdd7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28818,
+        "upload_time": "2021-08-29T09:58:06",
+        "upload_time_iso_8601": "2021-08-29T09:58:06.599801Z",
+        "url": "https://files.pythonhosted.org/packages/23/aa/47cb32413b1bc88b6dbfbbfb40e66eec3bd73c420a722f976302f63806e2/simplarchiver-1.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6115f31d29b1874b186e5ca2897978c2051ecc6f62e7b438da227c4eee3f20f0",
+          "md5": "2f0f585935f641d010b6af4ea945c901",
+          "sha256": "c15cdbd3bac81fa6faff75bd905b4d2757d311aac0d055adee3fe084a43579b0"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f0f585935f641d010b6af4ea945c901",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28973,
+        "upload_time": "2021-08-29T09:59:40",
+        "upload_time_iso_8601": "2021-08-29T09:59:40.812544Z",
+        "url": "https://files.pythonhosted.org/packages/61/15/f31d29b1874b186e5ca2897978c2051ecc6f62e7b438da227c4eee3f20f0/simplarchiver-1.2.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fedce8be3d4b8250fe620499a6d37539fa7d9c326bd4991476cbc532d4b91aac",
+          "md5": "8dc9d4cd8f2b63f21709e739b2e99480",
+          "sha256": "411685d4d0959450dbc3191d79da9dde8222a67e6fcd110fd314a164a7d6f9b2"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8dc9d4cd8f2b63f21709e739b2e99480",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33500,
+        "upload_time": "2021-08-29T10:19:19",
+        "upload_time_iso_8601": "2021-08-29T10:19:19.458775Z",
+        "url": "https://files.pythonhosted.org/packages/fe/dc/e8be3d4b8250fe620499a6d37539fa7d9c326bd4991476cbc532d4b91aac/simplarchiver-1.2.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03fa67803db3137f9ef7b6fbde7984574f3e9f4ba12c7c4ffdf7756921417eee",
+          "md5": "f9192934ad374e965337a048d85663f3",
+          "sha256": "a57645f96f15a97e4e74518b0fb85d6569366accdbb8d46a07ccec6da39b199e"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f9192934ad374e965337a048d85663f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33559,
+        "upload_time": "2021-08-29T12:58:27",
+        "upload_time_iso_8601": "2021-08-29T12:58:27.282663Z",
+        "url": "https://files.pythonhosted.org/packages/03/fa/67803db3137f9ef7b6fbde7984574f3e9f4ba12c7c4ffdf7756921417eee/simplarchiver-1.2.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da0a652a31a30cc6eceb201f595afd902d75dd7b89f3e3100224dd4bce711c12",
+          "md5": "dde233bf0618061e3eb22ab7137cfbd5",
+          "sha256": "ad4d6cd834e2a8205b405373a1f814d1e61eb4def742e438ff36daa64803a5d4"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dde233bf0618061e3eb22ab7137cfbd5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33529,
+        "upload_time": "2021-08-30T03:38:35",
+        "upload_time_iso_8601": "2021-08-30T03:38:35.537214Z",
+        "url": "https://files.pythonhosted.org/packages/da/0a/652a31a30cc6eceb201f595afd902d75dd7b89f3e3100224dd4bce711c12/simplarchiver-1.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c21a106a9e9652328d1cbe5c3d98f4c8f403f3fb69fdc3cf7475740a875c5b42",
+          "md5": "9699c183060d6dc2f111caca93ef3391",
+          "sha256": "5f8c7951524625c77d029beacd9b0f2c6372c755dfc15f7b17c13a9eee7dea7f"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9699c183060d6dc2f111caca93ef3391",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33535,
+        "upload_time": "2021-08-30T03:55:20",
+        "upload_time_iso_8601": "2021-08-30T03:55:20.187910Z",
+        "url": "https://files.pythonhosted.org/packages/c2/1a/106a9e9652328d1cbe5c3d98f4c8f403f3fb69fdc3cf7475740a875c5b42/simplarchiver-1.2.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b8d83c672905aa9cc7efb2056af7fdcbb9a86cc76ec657526f08eb6c2610997",
+          "md5": "1f7e12e1cafcc8b200e70c9d1100fa8f",
+          "sha256": "8cfa920a8ac56966a030e8f9da2f4d8adc334a59654b38e1647ee3f847a196e4"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1f7e12e1cafcc8b200e70c9d1100fa8f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33549,
+        "upload_time": "2021-08-30T05:04:54",
+        "upload_time_iso_8601": "2021-08-30T05:04:54.824086Z",
+        "url": "https://files.pythonhosted.org/packages/3b/8d/83c672905aa9cc7efb2056af7fdcbb9a86cc76ec657526f08eb6c2610997/simplarchiver-1.2.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3675c55a33360e0a20e49285b4197a24dfe209fe2e78be4b3d77bceaef1ca74",
+          "md5": "deff8d9a0cf424a70aa5ba30aaddf74b",
+          "sha256": "1f1349d888d53b41406cf53f33bd53c1d319b71537278c889202b6b70cb5d443"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "deff8d9a0cf424a70aa5ba30aaddf74b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33568,
+        "upload_time": "2021-08-31T08:16:38",
+        "upload_time_iso_8601": "2021-08-31T08:16:38.219603Z",
+        "url": "https://files.pythonhosted.org/packages/a3/67/5c55a33360e0a20e49285b4197a24dfe209fe2e78be4b3d77bceaef1ca74/simplarchiver-1.2.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5c650b77dea872878f99fe29266713d57456c55beeeb4e3d3a752ac0f9344e5",
+          "md5": "5c943e7119ff96af514eab89f1ec3991",
+          "sha256": "c897c202396a3f5e6147f04c438740d813f2e1196c6205cb8653ad81ab9ee73e"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.5.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5c943e7119ff96af514eab89f1ec3991",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28269,
+        "upload_time": "2021-09-27T01:06:54",
+        "upload_time_iso_8601": "2021-09-27T01:06:54.982515Z",
+        "url": "https://files.pythonhosted.org/packages/e5/c6/50b77dea872878f99fe29266713d57456c55beeeb4e3d3a752ac0f9344e5/simplarchiver-1.2.5.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cd57f43041b5ff1ba0d1c0aad73cc640a2a467fc81d6d9942cd3f87e607a13f",
+          "md5": "74d973dfa504cc3ae39e659011f6cb55",
+          "sha256": "5c189f1b3de5636684c2302e1edb65546cbb01d23bfb99e8af2a8625aca53552"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "74d973dfa504cc3ae39e659011f6cb55",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28272,
+        "upload_time": "2021-09-28T02:06:00",
+        "upload_time_iso_8601": "2021-09-28T02:06:00.618068Z",
+        "url": "https://files.pythonhosted.org/packages/3c/d5/7f43041b5ff1ba0d1c0aad73cc640a2a467fc81d6d9942cd3f87e607a13f/simplarchiver-1.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e5f86a15db2301118c6b97201d032d7e6c9b635a9eb982b94078420d6f9534a",
+          "md5": "0aa570f3609fa7bccf81840b293a92c9",
+          "sha256": "e5ebcb681a8981ef920e10abeb4aae222883ee57e894effb671da6a8dc38d13d"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0aa570f3609fa7bccf81840b293a92c9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28259,
+        "upload_time": "2021-09-30T03:11:24",
+        "upload_time_iso_8601": "2021-09-30T03:11:24.583147Z",
+        "url": "https://files.pythonhosted.org/packages/9e/5f/86a15db2301118c6b97201d032d7e6c9b635a9eb982b94078420d6f9534a/simplarchiver-1.2.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f086f8a793e82e081475675d71dc749e709ee0e23d3f4543c435dbea711e79a",
+          "md5": "328736b05f0cc2e1483b7a1c84805639",
+          "sha256": "012472a7e44ba07eb0491ab5a9cbf664b051db0bdeef7cc134184b065a6d66fa"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "328736b05f0cc2e1483b7a1c84805639",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28636,
+        "upload_time": "2021-09-30T08:10:30",
+        "upload_time_iso_8601": "2021-09-30T08:10:30.380981Z",
+        "url": "https://files.pythonhosted.org/packages/0f/08/6f8a793e82e081475675d71dc749e709ee0e23d3f4543c435dbea711e79a/simplarchiver-1.2.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "703f7a57d4d6181cd58002bf3c287d205c79b120adb9175d02249af5e7755594",
+          "md5": "1a68b9d9ccf188235b6188532b098ed0",
+          "sha256": "c213d3a8358f0f222bf101ea3eafd2d5ea17b2eb4fc33609f1eeab78388bf604"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a68b9d9ccf188235b6188532b098ed0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28896,
+        "upload_time": "2021-10-06T12:33:26",
+        "upload_time_iso_8601": "2021-10-06T12:33:26.790639Z",
+        "url": "https://files.pythonhosted.org/packages/70/3f/7a57d4d6181cd58002bf3c287d205c79b120adb9175d02249af5e7755594/simplarchiver-1.2.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b2d8a572c570e229314b64c11a55635bc72a5ab5a55649905e071234ea413a1",
+          "md5": "94185af28c1fe04f474f0c5744d080d6",
+          "sha256": "d19b4d90423473caae1dce10a32d2c4574e76b3b0c842bfe0160b4efa0291613"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.2.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "94185af28c1fe04f474f0c5744d080d6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28870,
+        "upload_time": "2021-10-06T12:56:21",
+        "upload_time_iso_8601": "2021-10-06T12:56:21.199026Z",
+        "url": "https://files.pythonhosted.org/packages/4b/2d/8a572c570e229314b64c11a55635bc72a5ab5a55649905e071234ea413a1/simplarchiver-1.2.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9e1d5f1f098337d6eb85f170aca2ff0ddcb6b18dbbafdbafc9fb98c73799460",
+          "md5": "0444e366a5615ad068f03f045abb60ed",
+          "sha256": "ea717f2bc38c47129c7fb418989c889b3554cb9b2306837f5a38400068e7f058"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0444e366a5615ad068f03f045abb60ed",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29004,
+        "upload_time": "2021-10-06T13:37:52",
+        "upload_time_iso_8601": "2021-10-06T13:37:52.528891Z",
+        "url": "https://files.pythonhosted.org/packages/e9/e1/d5f1f098337d6eb85f170aca2ff0ddcb6b18dbbafdbafc9fb98c73799460/simplarchiver-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "102ea04f78122d69e08bcef6f90dfa39fd2b95f33b3a4c77e6aa98c80ba0b565",
+          "md5": "440a0bbf44062e6b57b2623c6251c882",
+          "sha256": "222a6238288ad60c9cc8bfa9ef329fd646a6a3e420c270ffebb9c9fcc2d7bc53"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "440a0bbf44062e6b57b2623c6251c882",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29089,
+        "upload_time": "2021-10-07T02:54:54",
+        "upload_time_iso_8601": "2021-10-07T02:54:54.263154Z",
+        "url": "https://files.pythonhosted.org/packages/10/2e/a04f78122d69e08bcef6f90dfa39fd2b95f33b3a4c77e6aa98c80ba0b565/simplarchiver-1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e473fbab2664047a6e30e8b060dbddf77164bf432cac6555431546a0a244c99",
+          "md5": "f43a996250bf52f7079a2c4c7409e4f1",
+          "sha256": "5823ef814ba8484c454a480491730dc068f4ec5846db900f2f6931fba4066324"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f43a996250bf52f7079a2c4c7409e4f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29117,
+        "upload_time": "2021-10-07T04:26:30",
+        "upload_time_iso_8601": "2021-10-07T04:26:30.278378Z",
+        "url": "https://files.pythonhosted.org/packages/5e/47/3fbab2664047a6e30e8b060dbddf77164bf432cac6555431546a0a244c99/simplarchiver-1.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c033634d8486e6ec9197f87f0de756d6f8722842a331b7ddbcd13ad84e3cf30d",
+          "md5": "308310b59441f7018d8d48396c67797c",
+          "sha256": "929eedc54477557104c4c84525f34b7a9c50f54f035e10204f4f7b8f970ad718"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "308310b59441f7018d8d48396c67797c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29342,
+        "upload_time": "2021-10-07T07:54:52",
+        "upload_time_iso_8601": "2021-10-07T07:54:52.122693Z",
+        "url": "https://files.pythonhosted.org/packages/c0/33/634d8486e6ec9197f87f0de756d6f8722842a331b7ddbcd13ad84e3cf30d/simplarchiver-1.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33055b732569e6e1c58460bf3b90d66239e676301eb168ef5ed7dec6e558f9ba",
+          "md5": "19112ff9696203b063a8a71d7e2a5c09",
+          "sha256": "af1ec5d7209039b5ecf8a6deddd12137a168f0e54fecbb151c883248af010bee"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "19112ff9696203b063a8a71d7e2a5c09",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29548,
+        "upload_time": "2021-10-07T08:39:37",
+        "upload_time_iso_8601": "2021-10-07T08:39:37.807602Z",
+        "url": "https://files.pythonhosted.org/packages/33/05/5b732569e6e1c58460bf3b90d66239e676301eb168ef5ed7dec6e558f9ba/simplarchiver-1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "446eba3c0d2ddde6f998905208e7432f37df5aa30bd311f933f21a0cdddd7296",
+          "md5": "305632631b7b7c7fd6845042f858e939",
+          "sha256": "316f2df2066a45d9196ac583a142089d3400724bde04eb1455b88d2bad0cd55f"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.4.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "305632631b7b7c7fd6845042f858e939",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29580,
+        "upload_time": "2021-10-07T09:16:07",
+        "upload_time_iso_8601": "2021-10-07T09:16:07.000578Z",
+        "url": "https://files.pythonhosted.org/packages/44/6e/ba3c0d2ddde6f998905208e7432f37df5aa30bd311f933f21a0cdddd7296/simplarchiver-1.4.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87cc0997ce03cb0e7da831f69e1011749f1f5945c6dd1ad653f6c9cb3f2e373c",
+          "md5": "ecb6ca637738001b252a6de5367fb67e",
+          "sha256": "2bc7537b751ed67115238f9f4ab660b8e156889ffb14c49a391dc93f45de5f30"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ecb6ca637738001b252a6de5367fb67e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38147,
+        "upload_time": "2021-10-07T11:45:33",
+        "upload_time_iso_8601": "2021-10-07T11:45:33.393933Z",
+        "url": "https://files.pythonhosted.org/packages/87/cc/0997ce03cb0e7da831f69e1011749f1f5945c6dd1ad653f6c9cb3f2e373c/simplarchiver-1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d3d00e90bf014e7501bd48067ef44aaed461a5cad27ca42103b144a56e52882",
+          "md5": "7fe06780ff2e131959575db5951c8f07",
+          "sha256": "bc55b8d4a18422133cd5153d9d2cb3bfeaf042a03dfdc9684b73a0cd8cb24841"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.5.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7fe06780ff2e131959575db5951c8f07",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38164,
+        "upload_time": "2021-10-07T11:47:06",
+        "upload_time_iso_8601": "2021-10-07T11:47:06.037746Z",
+        "url": "https://files.pythonhosted.org/packages/8d/3d/00e90bf014e7501bd48067ef44aaed461a5cad27ca42103b144a56e52882/simplarchiver-1.5.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5041e05b292cff6f3a450a978923e39255c213f46a391287e27a0f59d8b67976",
+          "md5": "027e2cb5963e42a8cbc9649b31254088",
+          "sha256": "37dff0280b743195255f4f6b61eaba4180897e193f960873993ce9e726bf47b0"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "027e2cb5963e42a8cbc9649b31254088",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38611,
+        "upload_time": "2021-11-04T06:50:31",
+        "upload_time_iso_8601": "2021-11-04T06:50:31.892437Z",
+        "url": "https://files.pythonhosted.org/packages/50/41/e05b292cff6f3a450a978923e39255c213f46a391287e27a0f59d8b67976/simplarchiver-1.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.9.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8f72dd5da714e4428ed66cb97a7e651c81666d2e62f359eb060e677d04235df",
+          "md5": "fa34309f30bbd01a7e3f24e16488b1d5",
+          "sha256": "ea92e288663467fea29438ad984e4c9697b2a34aab8fd9769d98f4985c943712"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-1.9.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fa34309f30bbd01a7e3f24e16488b1d5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38626,
+        "upload_time": "2021-11-10T15:02:00",
+        "upload_time_iso_8601": "2021-11-10T15:02:00.963483Z",
+        "url": "https://files.pythonhosted.org/packages/a8/f7/2dd5da714e4428ed66cb97a7e651c81666d2e62f359eb060e677d04235df/simplarchiver-1.9.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fc067b3b1b0db0c0f86d3819a83b8ba93e71c840e81d5a51d737edc7f738268",
+          "md5": "9a8060f930deb5b6076973495a153315",
+          "sha256": "594207fce6b0a4664f280e9d1433f919d7e6d7a9c064804b8a114ecf0359b3f9"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9a8060f930deb5b6076973495a153315",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 40800,
+        "upload_time": "2022-07-02T08:33:23",
+        "upload_time_iso_8601": "2022-07-02T08:33:23.331049Z",
+        "url": "https://files.pythonhosted.org/packages/8f/c0/67b3b1b0db0c0f86d3819a83b8ba93e71c840e81d5a51d737edc7f738268/simplarchiver-2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a99027d029cc1a54843590f4021f53e8ab426a6ed718af05a8f6115fa64f71f6",
+          "md5": "abaa57328b5a6fd465eab7eb98bc2e8a",
+          "sha256": "7ec8ad7ab0219ac139c4fd7ea8f183b3af3f50ce90766610797f5419c6723e78"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "abaa57328b5a6fd465eab7eb98bc2e8a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 41057,
+        "upload_time": "2022-07-02T12:07:38",
+        "upload_time_iso_8601": "2022-07-02T12:07:38.835705Z",
+        "url": "https://files.pythonhosted.org/packages/a9/90/27d029cc1a54843590f4021f53e8ab426a6ed718af05a8f6115fa64f71f6/simplarchiver-2.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94a042abadcbb7a1044d84c9c5036d128c3d94cd7499a06afbbb49df470e582c",
+          "md5": "81488f90b39dca2856948e5cbe4680fb",
+          "sha256": "4cf5f557942bf80e1d011f510947e5f3655a01783e526ec820a86712a58725f3"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81488f90b39dca2856948e5cbe4680fb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42447,
+        "upload_time": "2022-07-02T15:23:56",
+        "upload_time_iso_8601": "2022-07-02T15:23:56.358007Z",
+        "url": "https://files.pythonhosted.org/packages/94/a0/42abadcbb7a1044d84c9c5036d128c3d94cd7499a06afbbb49df470e582c/simplarchiver-2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5707e3edeb501d768105db4c0ce39988f4132b78ce1b504bb860abe188ef7d78",
+          "md5": "badcb1c805f564a2e042cee7524fe701",
+          "sha256": "66751df19cb33452f4b8b92d9abc83c49dfdc8da94e6049ff49c6a4c67482665"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "badcb1c805f564a2e042cee7524fe701",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42630,
+        "upload_time": "2022-07-03T12:04:37",
+        "upload_time_iso_8601": "2022-07-03T12:04:37.261727Z",
+        "url": "https://files.pythonhosted.org/packages/57/07/e3edeb501d768105db4c0ce39988f4132b78ce1b504bb860abe188ef7d78/simplarchiver-2.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "280b058e2e74f961a887e6950540f9e652be238c97627c729313645ce81f540a",
+          "md5": "f3b94d2b3535435e2d39cac166df7dcf",
+          "sha256": "635a7d6cf4d811875d51925c75e61c5681975bbc4b82bf7669e7fb5a1f204812"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f3b94d2b3535435e2d39cac166df7dcf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42699,
+        "upload_time": "2022-07-04T03:15:17",
+        "upload_time_iso_8601": "2022-07-04T03:15:17.351902Z",
+        "url": "https://files.pythonhosted.org/packages/28/0b/058e2e74f961a887e6950540f9e652be238c97627c729313645ce81f540a/simplarchiver-2.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "271251ebf14f6da82607ec6bdfe1a85e8ecdecc77f9c3101596a99b50d776bc9",
+          "md5": "6d110bd654c0cf0c19860102abc4ed7f",
+          "sha256": "b99d6666a42f0a470d61dc9cc4a2ab43903ffe9b76205529f057361e2c124cb1"
+        },
+        "downloads": -1,
+        "filename": "simplarchiver-2.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6d110bd654c0cf0c19860102abc4ed7f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42701,
+        "upload_time": "2022-07-04T03:33:10",
+        "upload_time_iso_8601": "2022-07-04T03:33:10.909789Z",
+        "url": "https://files.pythonhosted.org/packages/27/12/51ebf14f6da82607ec6bdfe1a85e8ecdecc77f9c3101596a99b50d776bc9/simplarchiver-2.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "271251ebf14f6da82607ec6bdfe1a85e8ecdecc77f9c3101596a99b50d776bc9",
+        "md5": "6d110bd654c0cf0c19860102abc4ed7f",
+        "sha256": "b99d6666a42f0a470d61dc9cc4a2ab43903ffe9b76205529f057361e2c124cb1"
+      },
+      "downloads": -1,
+      "filename": "simplarchiver-2.1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6d110bd654c0cf0c19860102abc4ed7f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 42701,
+      "upload_time": "2022-07-04T03:33:10",
+      "upload_time_iso_8601": "2022-07-04T03:33:10.909789Z",
+      "url": "https://files.pythonhosted.org/packages/27/12/51ebf14f6da82607ec6bdfe1a85e8ecdecc77f9c3101596a99b50d776bc9/simplarchiver-2.1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

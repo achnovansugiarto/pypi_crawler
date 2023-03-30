@@ -1,0 +1,629 @@
+{
+  "info": {
+    "author": "Matthew Hamilton",
+    "author_email": "mwhamilton6@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "Install this package with `pip install simple_redshift_upload`\n\n## Testing\n### Set up environment\nWay 1 (Assumes you have a set up environment)\n1. Clone this repository\n2. `cd` into the directory\n3. Using the file `aws_account_creds_template.json`, fill in the data and rename the file `aws_account_creds.json`\n4. Run the file `gen_redshift_environment.py --start`\n5. Run the tests\n6. To remove the Redshift environment after testing, run `gen_redshift_environment.py --end`\n\nWay 2 (Blank Slate test environment)\n1. Clone this repository\n2. `cd` into the directory\n3. Run the command `python ./gen_environment/main.py`. This script does the following:\n    1. Runs `aws cloudformation deploy --template-file ./gen_environment/template.yaml --stack-name test`\n    2. Generates access key pairs with access to the S3 bucket\n    3. Creates temporary accounts in Redshift\n    4. Creates a creds.json with the associated credentials.\n4. Run the tests\n5. To remove the Redshift environment after testing, run `python ./gen_environment/main.py --destroy`\n\n### Run tests\nNote: Due to the relatively slow nature of these tests, it's suggested you install `pip install pytest-xdist` in order to run these tests in parallel.\n\n1. To run tests, just run `pytest` or `pytest -n auto --dist loadfile` (2nd is only available if you have pytest-xdist installed). The `--dist loadfile` is important. The tests in each file all target the same table and you will experience failures when multiple tests manipulate the same table.\n2. To test mypy, run the command `mypy -p redshift_upload`\n    1. There should be 10 errors about Optional Dictionaries not being indexable in upload.py. Those are ignorable.\n3. To run the performance test, just run `python ./tests/performance/base.py`\n\n## High Level Process\nThis package follows the following steps to upload your data to Redshift.\n\n1. Gets the data and makes it into a pandas.DataFrame\n2. Using locally defined columns, remote columns (if the table exists and isn't going to be dropped) and type checking, serializes the columns.\n3. Checks the remote to add any columns that are in the remote, but not local. If there are varchar columns that are too small to fit the new data, the program attempts to expand the varchar column\n4. If the table is going to be dropped, looks for dependent views. It saves the dependent views locally and metadata like the view's dependencies\n5. Loads the data to s3. If load_in_parallel > 1, it splits it into groups to speed up upload.\n6. Deletes/Truncates the table if specified .\n7. Copies the data from s3 to Redshift\n8. Grants access to the specified individuals/groups\n9. If necessary, re-instantiates the dependent views, using toposort to generate the topological ordering of the dependencies\n10. If a records table has been specified, records basic information about the upload\n11. Cleans up the S3 files, if specified\n12. Returns the interface object, in case you want to see more data or use the connection to the db to continue querying\n![Library Workflow](https://github.com/douglassimonsen/redshift_upload/blob/main/documentation/process_flow.png)\n## Example\n```python3\ndf = pandas.DataFrame([{\"a\": \"hi\"}, {\"a\": \"hi\"}])\naws_creds = {\n    \"redshift_username\": \"\",\n    \"redshift_password\": \"\",\n    \"access_key\": \"\",\n    \"secret_key\": \"\",\n    \"bucket\": \"\",\n    \"host\": \"\",\n    \"dbname\": \"\",\n    \"port\": \"\"\n}\n\n\nupload.upload(\n    source=df,\n    schema_name=\"public\",\n    table_name=\"unit_test_column_expansion\",\n    upload_options={\"drop_table\": True},\n)\n```\n\n# Performance Comparison\nGiven that there are other, simpler ways to upload data to Redshift, we should compare the various methods. Using a simple table with a single varchar column, we upload using the following methods:\n\n__Naive Insert__ \n```python\ndef naive_insert(data, table_name):\n    insert_query = f'''\n    insert into public.{table_name} (a)\n    values (%(a)s)\n    '''\n    with get_conn() as conn:\n        cursor = conn.cursor()\n        cursor.executemany(insert_query, data)\n        conn.commit()\n```\n\n__Batch Insert__\n```python\ndef batch_insert(data, table_name):\n    insert_query = f'''\n    insert into public.{table_name} (a)\n    values (%(a)s)\n    '''\n    with get_conn() as conn:\n        cursor = conn.cursor()\n        psycopg2.extras.execute_batch(cursor, insert_query, data)\n```\n\n__Library__\n```python\ndef library(data, table_name):\n    upload(\n        source=data,\n        schema_name=\"public\",\n        table_name=table_name,\n        upload_options={\n            \"skip_checks\": True,\n            'default_logging': False,\n        },\n        aws_info=aws_creds\n    )\n```\n\n![Performance Comparison](https://github.com/douglassimonsen/redshift_upload/blob/main/documentation/comparison.png)\n\n# Credential Store\n\nOne of the common issues when connecting to databases is handling credentials. Although we'd ideally always store secrets in [AWS KMS](https://aws.amazon.com/kms/), often what happens is that credentials end up hardcoded in programs. Not only is this insecure, but it makes rotating credentials a monumental task.\n\nThe credential store is a middle ground between these two. By utilizing the credential store, the credentials are stored in a single json within the library itself. The credentials are stored in plain text, but it's a single location that won't be included in any git repositories and should be in a part of the filesystem that people rarely visit, making it _kind of_ secure.\n\n## Setting up a Credential Store\n__Note 1__: In case you need to access multiple DBs, the store can handle multiple sets of credentials.\n__Note 2__: The store does basic pattern matching to ensure the data you entered matches the format the library needs.\n```python\nfrom redshift_upload import credential_store\n\nsample_creds = {\n    \"host\": \"cluster.redshift.amazonaws.com\",\n    \"port\": 5439,\n    \"dbname\": \"test\",\n    \"default_schema\": \"public\",\n    \"redshift_username\": \"user\",\n    \"redshift_password\": \"pass\",\n    \"bucket\": \"bucket-name\",\n    \"access_key\": \"AAAAAAAAAA0000000000\",\n    \"secret_key\": \"AAAAAAAAAAAbbbbbbbbb999999999999999999/=\",\n}\ncredential_store.credentials['<name1>'] = sample_creds\ncredential_store.credentials['<name2>'] = sample_creds\n```\n\n## Accessing Credentials\n__Note__: When you enter your first set of credentials, the store designates them as the default credentials. This can \n```python\nfrom redshift_upload import credential_store\ncreds = credential_store.credentials['<name1>']\ncreds = credential_store.credentials()  # returns the default credentials\n```\n\n## Using Store in Upload\n```python\nimport redshift_upload\nredshift_upload.upload(\n    source='tests/full_tests/load_source.csv',\n    table_name=\"test\",\n)  # runs as the default user\n\nredshift_upload.upload(\n    source='tests/full_tests/load_source.csv',\n    table_name=\"test\",\n    aws_info=\"<user1>\",\n)  # runs as the specified user\n```\n\n## Updating Default Credentials\n__Note__: If you try to set the default to a user that doesn't exist, the store will raise a `ValueError`\n```python\nfrom redshift_upload import credential_store\ncredential_store.credentials.default = '<name2>'\n```\n\n## Deleting Credentials\n```python\nfrom redshift_upload import credential_store\ndel credential_store.credentials['<name2>']\n```\n\n## Removing Credential Store\n```python\nfrom redshift_upload import credential_store\ncredential_store.credentials.clear()  # replaces the store with an empty store and saves it to store.json\ncredential_store.credentials.delete()  # deletes store.json. This would mainly be used when you have a temporary credential store. The tests for this library use this function for cleanup, but I can't imagine why this would be used by end users. \n```\n\n## Changing Active Credential Store\n__Note 1__: The default store is named store.json and is set by default\n__Note 2__: If you don't end the store with '.json', it will be automatically added\n```python\nfrom redshift_upload import credential_store\nstore_1 = credential_store.set_store('test')\nstore_2 = credential_store.set_store('test.json')\nassert store_1.file_path == store_2.file_path\n```\n## Required permissions for library\nThe AWS keys for this library should have at least the following permissions\n```json\n{\n    \"Version\": \"2012-10-17\",\n    \"Statement\": [\n        {\n            \"Action\": [\n                \"s3:PutObject\",\n                \"s3:GetObject\",\n                \"s3:ListBucket\",\n                \"s3:DeleteObject\"\n            ],\n            \"Resource\": [\n                \"arn:aws:s3:::<bucket-name>/*\",\n                \"arn:aws:s3:::<bucket-name>\"\n            ],\n            \"Effect\": \"Allow\",\n            \"Sid\": \"basicS3Access\"\n        }\n    ]\n\n```\nThe redshift users must have access to the following system tables:\n1. SVV_TABLE_INFO\n2. STV_LOCKS\n# Contributing\n\n## Setup environment\nThis project uses a [Black](https://black.readthedocs.io/en/stable/) pre-commit hook to ensure consistent styling. To enable this, run `pre-commit install --hook-type pre-commit --hook-type post-commit` in the directory. This project uses flake8 with the following command: `flake8 --ignore E501,E402,E401,W503`\n\n\n## Deploying a new verion to pypi\n1. Update the version in `redshift_upload/__init__.py`\n2. Run `python push.py`\n5. Check [actions](https://github.com/douglassimonsen/redshift_upload/actions) for deployment progress\n\n## Warnings\n1. For the case of `varchar`, this program converts all empty strings to null. This was noticed late in development and probably can't be fixed :(\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://github.com/mwhamilton/redshift_upload/archive/1.2.4.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/mwhamilton/redshift_upload",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "simple-redshift-upload",
+    "package_url": "https://pypi.org/project/simple-redshift-upload/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/simple-redshift-upload/",
+    "project_urls": {
+      "Download": "https://github.com/mwhamilton/redshift_upload/archive/1.2.4.tar.gz",
+      "Homepage": "https://github.com/mwhamilton/redshift_upload"
+    },
+    "release_url": "https://pypi.org/project/simple-redshift-upload/1.2.4/",
+    "requires_dist": [
+      "boto3",
+      "boto3-stubs[s3]",
+      "click",
+      "colorama",
+      "jsonschema",
+      "pandas",
+      "psycopg2",
+      "pytest",
+      "toposort"
+    ],
+    "requires_python": "",
+    "summary": "A package that simplifies uploading data to redshift",
+    "version": "1.2.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13155240,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e76b64c82ac82b9a0e75eaf4e60b66a8ee50ebf32422e71a64dfc9f25683647e",
+          "md5": "d8035c89c1330629ed34a41b60fb33f2",
+          "sha256": "62f47f78a6d06a9c16c32e786c224e223a3cc2045976488be5e6a7821ba24e2e"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d8035c89c1330629ed34a41b60fb33f2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14689,
+        "upload_time": "2020-10-25T22:31:39",
+        "upload_time_iso_8601": "2020-10-25T22:31:39.188996Z",
+        "url": "https://files.pythonhosted.org/packages/e7/6b/64c82ac82b9a0e75eaf4e60b66a8ee50ebf32422e71a64dfc9f25683647e/simple_redshift_upload-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c29113af379391c7f671fd882fd1d2786f85840ade702b1de6695e07171ad66",
+          "md5": "75ccceb156c36a259fd63bd0e8a300ec",
+          "sha256": "7099e818b9d0fedeadafeeb1dc5d44fc54f3210d4fc57302651f892587ee5935"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "75ccceb156c36a259fd63bd0e8a300ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14694,
+        "upload_time": "2020-10-25T22:39:19",
+        "upload_time_iso_8601": "2020-10-25T22:39:19.441410Z",
+        "url": "https://files.pythonhosted.org/packages/4c/29/113af379391c7f671fd882fd1d2786f85840ade702b1de6695e07171ad66/simple_redshift_upload-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cc687faa5243adeb3448ccb363644d04f04e0ca8c77c31502fd7a067144fca8",
+          "md5": "e411c89a9bba1d1f5c3112cf410a6424",
+          "sha256": "242f85ffc0d486dcc632afe03a191bd0cdc2e7d4dbbd81e3704250c83609e320"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e411c89a9bba1d1f5c3112cf410a6424",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16608,
+        "upload_time": "2022-01-13T03:03:58",
+        "upload_time_iso_8601": "2022-01-13T03:03:58.278167Z",
+        "url": "https://files.pythonhosted.org/packages/3c/c6/87faa5243adeb3448ccb363644d04f04e0ca8c77c31502fd7a067144fca8/simple_redshift_upload-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "571ba511ed39f413f93caba12a7c60204164f075115ab69fc27ad70b17518821",
+          "md5": "4ac3925e19ea86358b7bb46b152d0473",
+          "sha256": "92b396ddac30fae529ee7f781fe394d1de6287c50d5dc78407582640a4534b23"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4ac3925e19ea86358b7bb46b152d0473",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21594,
+        "upload_time": "2022-01-13T02:42:12",
+        "upload_time_iso_8601": "2022-01-13T02:42:12.932870Z",
+        "url": "https://files.pythonhosted.org/packages/57/1b/a511ed39f413f93caba12a7c60204164f075115ab69fc27ad70b17518821/simple_redshift_upload-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "61b27e8e0203e9eeb194952f385c42ff3d6381ac7e2a81739794b9f2e328fefe",
+          "md5": "57dc296c5ad27e91243c438811c16b70",
+          "sha256": "47ad4c3748dd04679efb52eaa086bc6a84ac9c30b362c1b1812ef278f4f6358b"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "57dc296c5ad27e91243c438811c16b70",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16608,
+        "upload_time": "2022-01-13T03:07:18",
+        "upload_time_iso_8601": "2022-01-13T03:07:18.640613Z",
+        "url": "https://files.pythonhosted.org/packages/61/b2/7e8e0203e9eeb194952f385c42ff3d6381ac7e2a81739794b9f2e328fefe/simple_redshift_upload-1.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87674ddac5fb74a1df2c2799d766b30182f7fd5335d327c493586b2b0add1fe9",
+          "md5": "2efd798c30bc3765ffb05df53338e951",
+          "sha256": "89a44210f6187a2a011b24a1e12c5cb7498e251a781213ccfa8f619f386e6c0a"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2efd798c30bc3765ffb05df53338e951",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16607,
+        "upload_time": "2022-01-13T03:07:19",
+        "upload_time_iso_8601": "2022-01-13T03:07:19.995236Z",
+        "url": "https://files.pythonhosted.org/packages/87/67/4ddac5fb74a1df2c2799d766b30182f7fd5335d327c493586b2b0add1fe9/simple_redshift_upload-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "857626048220be962336b907268ca456c3b69e4b3426592bf8f77844926367e3",
+          "md5": "f016019d3dfc59b4b31bcab3216be098",
+          "sha256": "e7561a1a657d461a6017783c3f7ae5d687bc9176ac9b1542ae156db8492401c7"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f016019d3dfc59b4b31bcab3216be098",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 36892,
+        "upload_time": "2022-01-14T00:13:51",
+        "upload_time_iso_8601": "2022-01-14T00:13:51.639810Z",
+        "url": "https://files.pythonhosted.org/packages/85/76/26048220be962336b907268ca456c3b69e4b3426592bf8f77844926367e3/simple_redshift_upload-1.1.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c85ba625a887d4a35a1f4b13c6ab1a874739a3da6ba1d54d10c39ceb65920bb8",
+          "md5": "14047543f4077e14cfeb4df9f84ed6a0",
+          "sha256": "8dcbc27b6fe86312d276eef9f6c1211371b09910065dc7c83207eacfaea2b6f9"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14047543f4077e14cfeb4df9f84ed6a0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33188,
+        "upload_time": "2022-01-14T00:13:52",
+        "upload_time_iso_8601": "2022-01-14T00:13:52.927247Z",
+        "url": "https://files.pythonhosted.org/packages/c8/5b/a625a887d4a35a1f4b13c6ab1a874739a3da6ba1d54d10c39ceb65920bb8/simple_redshift_upload-1.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "229480f13b9f2d39cdbeb2790db0631320cd8459006d9ed6be4fa61017032570",
+          "md5": "671c31af27f95cecd40b2495d0b44761",
+          "sha256": "6887bb22359275bf0ded46750b4d67c413e70af37ab66f2f36203650e1f18e4f"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "671c31af27f95cecd40b2495d0b44761",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 32079,
+        "upload_time": "2022-01-13T03:36:06",
+        "upload_time_iso_8601": "2022-01-13T03:36:06.031188Z",
+        "url": "https://files.pythonhosted.org/packages/22/94/80f13b9f2d39cdbeb2790db0631320cd8459006d9ed6be4fa61017032570/simple_redshift_upload-1.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8f57fbf57dbc795d42c16f4bef61dc49cb855fa216d83ada29ac9a9b5331284",
+          "md5": "7058b785177e5aecda5e355263bdd16b",
+          "sha256": "9a77843ace569df5d35da33e31ddbdfac20962b84074a3d8c74579b11c38605c"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7058b785177e5aecda5e355263bdd16b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28071,
+        "upload_time": "2022-01-13T03:36:06",
+        "upload_time_iso_8601": "2022-01-13T03:36:06.978512Z",
+        "url": "https://files.pythonhosted.org/packages/a8/f5/7fbf57dbc795d42c16f4bef61dc49cb855fa216d83ada29ac9a9b5331284/simple_redshift_upload-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68aa619e6763a792dd936d52d1ff4bbc55818043d1fc20a39255d9bfde9d4182",
+          "md5": "35203e3786fa0a572f5128126a5f2122",
+          "sha256": "1aaa0110ed9433536d6d1e61f3dbeebefb0fe13295505a07baed2793221ecba0"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "35203e3786fa0a572f5128126a5f2122",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 33200,
+        "upload_time": "2022-01-13T21:41:24",
+        "upload_time_iso_8601": "2022-01-13T21:41:24.057477Z",
+        "url": "https://files.pythonhosted.org/packages/68/aa/619e6763a792dd936d52d1ff4bbc55818043d1fc20a39255d9bfde9d4182/simple_redshift_upload-1.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "85a4a6f915cd594cffbbca48d2a56878ee018e9108156bfa36f6e134d5db1bdb",
+          "md5": "8f020715eb2d03f8f3721af6c5178528",
+          "sha256": "d7c4dab1078f7dabf60ec2613508dee8136ecc30b653209349fdc85c3ad11267"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8f020715eb2d03f8f3721af6c5178528",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29037,
+        "upload_time": "2022-01-13T21:41:25",
+        "upload_time_iso_8601": "2022-01-13T21:41:25.497405Z",
+        "url": "https://files.pythonhosted.org/packages/85/a4/a6f915cd594cffbbca48d2a56878ee018e9108156bfa36f6e134d5db1bdb/simple_redshift_upload-1.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aac7b93dbee729b556aee1e5b2b824a185145b6c0499bd27df32e4bfca0970db",
+          "md5": "96e696e53763eaf91b30f76da00c6441",
+          "sha256": "899123243a0992867bb593dc0f87593d9b92958c43ca184f8af8ef1986a84173"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "96e696e53763eaf91b30f76da00c6441",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 33200,
+        "upload_time": "2022-01-13T21:49:31",
+        "upload_time_iso_8601": "2022-01-13T21:49:31.882839Z",
+        "url": "https://files.pythonhosted.org/packages/aa/c7/b93dbee729b556aee1e5b2b824a185145b6c0499bd27df32e4bfca0970db/simple_redshift_upload-1.1.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de231581ad5337af6b7adf9a5af6335c958d71a1f2209c881e8a0028d8a000b2",
+          "md5": "be8ab960313be31d55251c5a1745fdc0",
+          "sha256": "e2442635c3ba3bcc42856334320bbb97aaf83a49a586923dc5f2144a6cd5a6f3"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "be8ab960313be31d55251c5a1745fdc0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29031,
+        "upload_time": "2022-01-13T21:49:32",
+        "upload_time_iso_8601": "2022-01-13T21:49:32.742238Z",
+        "url": "https://files.pythonhosted.org/packages/de/23/1581ad5337af6b7adf9a5af6335c958d71a1f2209c881e8a0028d8a000b2/simple_redshift_upload-1.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2bcb9743291caa768db26179dcdc276c44242f46f47e39bc414ce05c22de2454",
+          "md5": "12e222a9c16a9ec9bf8266f20c4d6fcc",
+          "sha256": "c0fd81c8762b291d8b93543dfb9c1abc4de32771e167d21425c98e5f4bbbb676"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "12e222a9c16a9ec9bf8266f20c4d6fcc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 33520,
+        "upload_time": "2022-01-14T00:06:11",
+        "upload_time_iso_8601": "2022-01-14T00:06:11.649237Z",
+        "url": "https://files.pythonhosted.org/packages/2b/cb/9743291caa768db26179dcdc276c44242f46f47e39bc414ce05c22de2454/simple_redshift_upload-1.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d7555872d297279a19ae26136458e05ab4a623a9a112b5db9c2df0325ae00684",
+          "md5": "2a8f53cb15bb063c4f84116c4c4d7d7a",
+          "sha256": "9f3474c736cd55a1eb8f167524dafaeacea3e5b4273fb3b75f0e1a343633b05f"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2a8f53cb15bb063c4f84116c4c4d7d7a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29266,
+        "upload_time": "2022-01-14T00:06:12",
+        "upload_time_iso_8601": "2022-01-14T00:06:12.769783Z",
+        "url": "https://files.pythonhosted.org/packages/d7/55/5872d297279a19ae26136458e05ab4a623a9a112b5db9c2df0325ae00684/simple_redshift_upload-1.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3c2398fb08a3e39b6bd5f73e939331b84a490211737696473e78ea1a002629ff",
+          "md5": "e9a5251c7d62658e6e17acf952e62a58",
+          "sha256": "b290f567b806754916349fc4bfb36eb1677f5594ab109b48090e12d0124c10e0"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e9a5251c7d62658e6e17acf952e62a58",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 36926,
+        "upload_time": "2022-01-14T04:15:50",
+        "upload_time_iso_8601": "2022-01-14T04:15:50.854401Z",
+        "url": "https://files.pythonhosted.org/packages/3c/23/98fb08a3e39b6bd5f73e939331b84a490211737696473e78ea1a002629ff/simple_redshift_upload-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "77ac24c4806f158695b9f84bc8c8a388c00876f285740cf5941e1287597de673",
+          "md5": "041287f5cbdf8cd18ca79f04ff920f38",
+          "sha256": "24061f5c165cb7435c3f419549828834d00ada519f7ec79dbcc18da03fe3eb3c"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "041287f5cbdf8cd18ca79f04ff920f38",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 33230,
+        "upload_time": "2022-01-14T04:15:52",
+        "upload_time_iso_8601": "2022-01-14T04:15:52.434234Z",
+        "url": "https://files.pythonhosted.org/packages/77/ac/24c4806f158695b9f84bc8c8a388c00876f285740cf5941e1287597de673/simple_redshift_upload-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d882cbf106c405ab7cf46fe8d12d98667ed81a93daf186288ad5387602ad6e3f",
+          "md5": "4fc6f48e5832987184aafa66456f560a",
+          "sha256": "1e2188dde5a2bf7265e4112b88bdc4384e1ca3a710aadef83f230ce5ea87576c"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4fc6f48e5832987184aafa66456f560a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39311,
+        "upload_time": "2022-02-10T05:50:50",
+        "upload_time_iso_8601": "2022-02-10T05:50:50.490770Z",
+        "url": "https://files.pythonhosted.org/packages/d8/82/cbf106c405ab7cf46fe8d12d98667ed81a93daf186288ad5387602ad6e3f/simple_redshift_upload-1.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4abfebb1b59b7e65220a9c2a5a55781d69e26beb708a091b757871db2b27870",
+          "md5": "b2dd0aca1e1f20c2a36f5adae95bdf14",
+          "sha256": "94848a1c0f43040b865f233ae775258fc6022a5272df101745776251421f7c0f"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b2dd0aca1e1f20c2a36f5adae95bdf14",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 35422,
+        "upload_time": "2022-02-10T05:50:51",
+        "upload_time_iso_8601": "2022-02-10T05:50:51.998420Z",
+        "url": "https://files.pythonhosted.org/packages/c4/ab/febb1b59b7e65220a9c2a5a55781d69e26beb708a091b757871db2b27870/simple_redshift_upload-1.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "691c9aa28d62a57f070e53791c8958f9baec31f2534ec2848eb57125231706d5",
+          "md5": "dd5f88ed8fd118e3dc6826e9d66c862d",
+          "sha256": "9a30a094e3a14436084962fb09599a675fbba99529a6f2ce7cde29684ded686d"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dd5f88ed8fd118e3dc6826e9d66c862d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39308,
+        "upload_time": "2022-03-12T02:38:32",
+        "upload_time_iso_8601": "2022-03-12T02:38:32.024721Z",
+        "url": "https://files.pythonhosted.org/packages/69/1c/9aa28d62a57f070e53791c8958f9baec31f2534ec2848eb57125231706d5/simple_redshift_upload-1.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cdbb33b9d105a1606891648fb1c62dfd6a37108cf6e74d1f9129cec8718f7c9f",
+          "md5": "879c07c0ab43481de1704c182338e75d",
+          "sha256": "cf1cf185e24a01bcba144fd66672da579b99efe923ebc8757cca4dfad662c515"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "879c07c0ab43481de1704c182338e75d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 35419,
+        "upload_time": "2022-03-12T02:38:33",
+        "upload_time_iso_8601": "2022-03-12T02:38:33.935846Z",
+        "url": "https://files.pythonhosted.org/packages/cd/bb/33b9d105a1606891648fb1c62dfd6a37108cf6e74d1f9129cec8718f7c9f/simple_redshift_upload-1.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ecfc83b5f9279297880499cf5fa20982227f46bf1ac646266b5bed49aab7144",
+          "md5": "e476d58852bda1c2af1eca971d1c1190",
+          "sha256": "ffa4443a6219d8742d338783e6ef75421f437a6fdf4bafadc4dfe3bd35aee21b"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e476d58852bda1c2af1eca971d1c1190",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39378,
+        "upload_time": "2022-03-12T03:50:06",
+        "upload_time_iso_8601": "2022-03-12T03:50:06.473975Z",
+        "url": "https://files.pythonhosted.org/packages/1e/cf/c83b5f9279297880499cf5fa20982227f46bf1ac646266b5bed49aab7144/simple_redshift_upload-1.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a70fd34770b8156eb11c574be3f2b4851a701106298816ab0ddff1aabd14d7ac",
+          "md5": "fd66836781374e24fcc93e234a58dbbb",
+          "sha256": "b4450161caab071cbd2112e3bffd3ab9dbd47afed8e5383e54c911ca96f4c5ca"
+        },
+        "downloads": -1,
+        "filename": "simple_redshift_upload-1.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd66836781374e24fcc93e234a58dbbb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 35499,
+        "upload_time": "2022-03-12T03:50:07",
+        "upload_time_iso_8601": "2022-03-12T03:50:07.983334Z",
+        "url": "https://files.pythonhosted.org/packages/a7/0f/d34770b8156eb11c574be3f2b4851a701106298816ab0ddff1aabd14d7ac/simple_redshift_upload-1.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1ecfc83b5f9279297880499cf5fa20982227f46bf1ac646266b5bed49aab7144",
+        "md5": "e476d58852bda1c2af1eca971d1c1190",
+        "sha256": "ffa4443a6219d8742d338783e6ef75421f437a6fdf4bafadc4dfe3bd35aee21b"
+      },
+      "downloads": -1,
+      "filename": "simple_redshift_upload-1.2.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e476d58852bda1c2af1eca971d1c1190",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 39378,
+      "upload_time": "2022-03-12T03:50:06",
+      "upload_time_iso_8601": "2022-03-12T03:50:06.473975Z",
+      "url": "https://files.pythonhosted.org/packages/1e/cf/c83b5f9279297880499cf5fa20982227f46bf1ac646266b5bed49aab7144/simple_redshift_upload-1.2.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a70fd34770b8156eb11c574be3f2b4851a701106298816ab0ddff1aabd14d7ac",
+        "md5": "fd66836781374e24fcc93e234a58dbbb",
+        "sha256": "b4450161caab071cbd2112e3bffd3ab9dbd47afed8e5383e54c911ca96f4c5ca"
+      },
+      "downloads": -1,
+      "filename": "simple_redshift_upload-1.2.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "fd66836781374e24fcc93e234a58dbbb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 35499,
+      "upload_time": "2022-03-12T03:50:07",
+      "upload_time_iso_8601": "2022-03-12T03:50:07.983334Z",
+      "url": "https://files.pythonhosted.org/packages/a7/0f/d34770b8156eb11c574be3f2b4851a701106298816ab0ddff1aabd14d7ac/simple_redshift_upload-1.2.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

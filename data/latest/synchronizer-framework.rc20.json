@@ -1,0 +1,1220 @@
+{
+  "info": {
+    "author": "Sebastian Spies",
+    "author_email": "s+gitlab@sloc.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Synchronizer Framework\n\nThis framework provides a data synchronization pattern based on a declarative bi-directional definition. The definition\nis a mapping of entity types with identity keys and non-key attributes which support CRUD operations and a\nsynchronization strategy. The data sources may be arbitrarily implemented as long as they inherit from `sync.base.Base`.\nCommon data sources like ORMs (django-orm, sqlalchemy) or REST APIs may be used as long as they support CRUD.\n\nData sources may mixin `sync.base.Timestamped` to apply a last-write wins synchronization strategy based on\nthe `updated_at` field.\n\nThe project targets audiences which have chosen data synchronization as a primary integration method for microservices.\nInspiration has been taken from projects Kubernetes and Chef.\n\nDisclaimer: The demo and README mentions systems like Desire and Daphne. Those are no open source projects, but some\ntarget audience will understand them. The definition is supposed to cover all use-cases of the Desire architecture.\n\n### Features\n\n* Adding missing objects\n* Defer adding objects, which miss required foreign keys, because they do not exist or which are not synchronized yet\n* Linking synchronized objects with each other to track them subsequently\n* Many objects contributing to a single synchronized object on the remote side\n* Updating non-key attributes\n* Last write wins (entity needs to support `sync.base.Timestamped`)\n* Deep-join attribute sourcing\n* Abstract data access to make the pattern work with any CRUD data source (like Microsoft Dynamics, ldap, REST APIs,\n  netconf, gNMI, CSP SDKs)\n    * i.e. AWS SDK Create as `AllocateHostedConnection`, Read as `DescribeConnections`, ...\n    * Data sources need to implement crud operations as defined in `sync.datasource.DataSource`\n* pre-load/include for deep joins\n* Optional deletion based on orphaned entities\n* Possibility to expedite single object synchronization based on an event stream\n    * Celery support\n* SQLAlchemy backend support\n* Redis linking backend support\n* dockerized\n\nMore details about the pattern can be found in the `tests` path.\n\n### Missing/TODO\n\n* Deletion based on intent (with cryptographic verification) \n\n### Known Limitations\n\n1. Cannot synchronize three-way at once.\n\n   *Example:*\n\n   Assume entities `PA` required parent of `A`, `BA` required parent of `B`, `CA` required parent of `C`. Mappings are\n   defined as `M1: A -> B` and `M2: B <- C`. The pattern prevents each `M1` and `M2` to progress independently. For `M1`\n   , information about `PC` is missing and for `M2` information about `PA` is missing. Further, assume `x(e)` to denote\n   an entity `e`\n   transformed to the namespace of `x`.\n\n   *Solution:*\n    * Introduce an intermediary entity `I` which accepts optional parents `I(PA)` and `I(PC)`\n    * remove `M1` and `M2`\n    * create `M3: A -> I`, `M4: I <- C`\n    * create `M5: I -> B`\n\n   The sequence of `M3, M4, M5` leads to a synchronized `B` containing both parents `B(PA)` and `B(PC)`. The order of\n   events always keeps consistent states. For example, `M5` may never progress before `M4` even if it is executed\n   before.\n\n   The solution is *not* limited to uni-directional mappings, but the author chose demonstrating uni-directional\n   mappings for easier understanding of how data flows.\n\n1. The orphan deletion may be counter-intuitive and will be changed in a future version. Refrain from using it, if you\n   do not understand the consequences.\n\n## Define Entities\n\nEntities below resemble the desire and daphne entity hierarchy and deviate to some extent. The intention is to\ndemonstrate the synchronization pattern instead of resembling existing models accurately. The details which are left out\nof consideration seem to be straight-forward to implement.\n\n### Base\n\n\n```python\nclass DemoBase(InMemoryLinks, Hierarchical, InMemoryTimestamp):\n    ...\n```\n\n### Daphne\n\n```python\nclass VlanServiceProvider(DemoBase):\n    def __init__(self, name=None, children=set()):\n        super().__init__()\n        self.name = name\n        self.children = children\n\n\nclass VlanServiceConnection(DemoBase):\n    def __init__(self, name, region, pop):\n        super().__init__()\n        self.name = name\n        self.region = region\n        self.pop = pop\n```\n\n### Desire\n\n```python\nclass CloudServiceProvider(DemoBase):\n    def __init__(self, name=None, children=None):\n        super().__init__()\n        self.name = name\n        self.children = children or set()\n\n\nclass CloudRegion(DemoBase):\n    def __init__(self, name=None, children=None):\n        super().__init__()\n        self.name = name\n        self.children = children or set()\n\n\nclass CloudHandover(DemoBase):\n    def __init__(self, name=None, children=None):\n        super().__init__()\n        self.name = name\n        self.children = children or set()\n\n\nclass NIC(DemoBase):\n    def __init__(self, name=None):\n        super().__init__()\n        self.name = name\n```\n\n## Define Mapping\n\n```python\nmappings = [\n   Mapping(\n      entity_types=(VlanServiceConnection, CloudRegion),\n      modes={Mode.LEFT_TO_RIGHT},\n      keys={\n         AttributeMap(\"region\", \"name\"),\n         AttributeMap(\n            \"parent\", \"parent\", VlanServiceProvider, CloudServiceProvider\n         ),\n      },\n      attributes={AttributeMap(\"externalRef\", \"external_ref\")},\n   ),\n   Mapping(\n      entity_types=(VlanServiceProvider, CloudServiceProvider),\n      modes={Mode.LEFT_TO_RIGHT, Mode.RIGHT_TO_LEFT},\n      keys={AttributeMap(\"name\", \"name\")},\n      attributes={AttributeMap(\"canUpgrade\", \"upgrade_allowed\")},\n   ),\n   Mapping(\n      entity_types=(VlanServiceConnection, CloudHandover),\n      modes={Mode.LEFT_TO_RIGHT},\n      keys={\n         AttributeMap(\"pop\", \"name\"),\n         AttributeMap(\"__self__\", \"parent\", VlanServiceConnection, CloudRegion),\n      },\n      attributes={AttributeMap(\"externalRef\", \"external_ref\")},\n   ),\n   Mapping(\n      entity_types=(VlanServiceConnection, NIC),\n      modes={Mode.RIGHT_TO_LEFT},\n      keys={\n         AttributeMap(\"name\", \"name\"),\n         AttributeMap(\"region\", (\"parent\", \"parent\", \"name\")),\n         AttributeMap(\"pop\", (\"parent\", \"name\")),\n         AttributeMap(\n            \"parent\",\n            (\"parent\", \"parent\", \"parent\"),\n            VlanServiceProvider,\n            CloudServiceProvider,\n         ),\n      },\n      attributes={AttributeMap(\"externalRef\", \"external_ref\")},\n   ),\n   Mapping(\n      entity_types=(VlanServiceConnection, NIC),\n      modes={Mode.LEFT_TO_RIGHT},\n      keys={\n         AttributeMap(\"name\", \"name\"),\n         AttributeMap(\n            \"__self__\", \"parent\", VlanServiceConnection, CloudHandover\n         ),\n      },\n      attributes={AttributeMap(\"externalRef\", \"external_ref\")},\n   ),\n]\n\n```\n\n## Define some objects\n\n```python\ndaphne_db = Db.from_collection(\n    {\n        VlanServiceProvider(\n            name=\"AWS\",\n            children={\n                VlanServiceConnection(\"nic-1\", \"eu-central-1\", \"INX6\"),\n                VlanServiceConnection(\"nic-2\", \"eu-central-1\", \"EqFA5\"),\n                VlanServiceConnection(\"nic-3\", \"eu-west-2\", \"EqFA5\"),\n            },\n        ),\n        VlanServiceProvider(name=\"AZURE\", children=set()),\n    }\n)\n\ndesire_db = Db.from_collection(\n    {\n        CloudServiceProvider(\n            name=\"AWS\",\n            children={\n                CloudRegion(\n                    name=\"eu-central-1\",\n                    children={\n                        CloudHandover(name=\"INX6\", children={NIC(\"nic-1\")}),\n                        CloudHandover(name=\"EqFA5\", children={NIC(\"nic-2a\")}),\n                    },\n                ),\n                CloudRegion(\n                    name=\"eu-west-1\",\n                    children={\n                        CloudHandover(name=\"LON1\", children={NIC(name=\"nic-3a\")})\n                    },\n                ),\n                CloudRegion(\n                    name=\"eu-west-2\",\n                    children={\n                        CloudHandover(\n                            name=\"EqFA5\",\n                            children={NIC(name=\"nic-3\", external_ref=\"nic3-eref\")},\n                        )\n                    },\n                ),\n            },\n        ),\n        CloudServiceProvider(\n            name=\"IBM\",\n            children={\n                CloudRegion(\n                    name=\"EU-Frankfurt\",\n                    children={CloudHandover(name=\"fra03\", children={NIC(\"nic-4\")})},\n                )\n            },\n        ),\n    }\n)\n\n```\n\n## Plug it together\n\n```python\nsync(daphne_db, desire_db, mappings)\n```\n\n## Demo Output\n\n```shell\n$ python src/demo/main.py\n/home/sspies/git/sync-poc/venv/bin/python3 /home/sspies/git/sync-poc/src/demo/main.py\nINFO:root:Initial DB states\nINFO:root:{<class 'demo.desire.CloudServiceProvider'>: [CloudServiceProvider(name=IBM),\n                                              CloudServiceProvider(name=AWS)],\n <class 'demo.desire.CloudRegion'>: [CloudRegion(name=EU-Frankfurt, parent=CloudServiceProvider(name=IBM)),\n                                     CloudRegion(name=eu-west-2, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-west-1, parent=CloudServiceProvider(name=AWS))],\n <class 'demo.desire.CloudHandover'>: [CloudHandover(name=fra03, parent=CloudRegion(name=EU-Frankfurt)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-west-2)),\n                                       CloudHandover(name=INX6, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=LON1, parent=CloudRegion(name=eu-west-1))],\n <class 'demo.desire.NIC'>: [NIC(name=nic-4, parent=CloudHandover(name=fra03)),\n                             NIC(name=nic-3, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-1, parent=CloudHandover(name=INX6)),\n                             NIC(name=nic-2a, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-3a, parent=CloudHandover(name=LON1))]}\nINFO:root:{<class 'demo.daphne.VlanServiceProvider'>: [VlanServiceProvider(name=AZURE),\n                                             VlanServiceProvider(name=AWS)],\n <class 'demo.daphne.VlanServiceConnection'>: [VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6),\n                                               VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)]}\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6).parent. VlanServiceProvider(name=AWS) not in CloudServiceProvider\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5).parent. VlanServiceProvider(name=AWS) not in CloudServiceProvider\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5).parent. VlanServiceProvider(name=AWS) not in CloudServiceProvider\nINFO:root:✨ Adding CloudServiceProvider(name=AZURE)\nINFO:root:✨ Adding VlanServiceProvider(name=IBM)\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6).__self__. VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6) not in CloudRegion\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5).__self__. VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5) not in CloudRegion\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5).__self__. VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5) not in CloudRegion\nINFO:root:✨ Adding VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03)\nINFO:root:✨ Adding VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)\nINFO:root:✨ Adding VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6).__self__. VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6) not in CloudHandover\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5).__self__. VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5) not in CloudHandover\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5).__self__. VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5) not in CloudHandover\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03).__self__. VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03) not in CloudHandover\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5).__self__. VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5) not in CloudHandover\nWARNING:root:Cannot find linked entity of VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1).__self__. VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1) not in CloudHandover\nINFO:root:27 operation(s) made\nINFO:root:Operations: [SkipMissingLink(VlanServiceConnection -> CloudRegion),\n SkipMissingLink(VlanServiceConnection -> CloudRegion),\n SkipMissingLink(VlanServiceConnection -> CloudRegion),\n Addition(CloudServiceProvider(name=AZURE)),\n Linking(frozenset({VlanServiceProvider(name=AZURE), CloudServiceProvider(name=AZURE)})),\n Linking(frozenset({VlanServiceProvider(name=AWS), CloudServiceProvider(name=AWS)})),\n AttributeUpdated(CloudServiceProvider(name=AWS).upgrade_allowed: True -> False from VlanServiceProvider(name=AWS)),\n Addition(VlanServiceProvider(name=IBM)),\n Linking(frozenset({VlanServiceProvider(name=IBM), CloudServiceProvider(name=IBM)})),\n SkipMissingLink(VlanServiceConnection -> CloudHandover),\n SkipMissingLink(VlanServiceConnection -> CloudHandover),\n SkipMissingLink(VlanServiceConnection -> CloudHandover),\n Addition(VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03)),\n Linking(frozenset({NIC(name=nic-4, parent=CloudHandover(name=fra03)), VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03)})),\n Linking(frozenset({NIC(name=nic-3, parent=CloudHandover(name=EqFA5)), VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5)})),\n AttributeUpdated(VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5).externalRef:  -> nic3-eref from NIC(name=nic-3, parent=CloudHandover(name=EqFA5))),\n Linking(frozenset({VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6), NIC(name=nic-1, parent=CloudHandover(name=INX6))})),\n Addition(VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)),\n Linking(frozenset({NIC(name=nic-2a, parent=CloudHandover(name=EqFA5)), VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)})),\n Addition(VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)),\n Linking(frozenset({NIC(name=nic-3a, parent=CloudHandover(name=LON1)), VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)})),\n SkipMissingLink(VlanServiceConnection -> NIC),\n SkipMissingLink(VlanServiceConnection -> NIC),\n SkipMissingLink(VlanServiceConnection -> NIC),\n SkipMissingLink(VlanServiceConnection -> NIC),\n SkipMissingLink(VlanServiceConnection -> NIC),\n SkipMissingLink(VlanServiceConnection -> NIC)]\nINFO:root:DB states after first and before second run\nINFO:root:{<class 'demo.desire.CloudServiceProvider'>: [CloudServiceProvider(name=IBM),\n                                              CloudServiceProvider(name=AWS),\n                                              CloudServiceProvider(name=AZURE)],\n <class 'demo.desire.CloudRegion'>: [CloudRegion(name=EU-Frankfurt, parent=CloudServiceProvider(name=IBM)),\n                                     CloudRegion(name=eu-west-2, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-west-1, parent=CloudServiceProvider(name=AWS))],\n <class 'demo.desire.CloudHandover'>: [CloudHandover(name=fra03, parent=CloudRegion(name=EU-Frankfurt)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-west-2)),\n                                       CloudHandover(name=INX6, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=LON1, parent=CloudRegion(name=eu-west-1))],\n <class 'demo.desire.NIC'>: [NIC(name=nic-4, parent=CloudHandover(name=fra03)),\n                             NIC(name=nic-3, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-1, parent=CloudHandover(name=INX6)),\n                             NIC(name=nic-2a, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-3a, parent=CloudHandover(name=LON1))]}\nINFO:root:{<class 'demo.daphne.VlanServiceProvider'>: [VlanServiceProvider(name=AZURE),\n                                             VlanServiceProvider(name=AWS),\n                                             VlanServiceProvider(name=IBM)],\n <class 'demo.daphne.VlanServiceConnection'>: [VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6),\n                                               VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03),\n                                               VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)]}\nINFO:root:✨ Adding NIC(name=nic-2, parent=CloudHandover(name=EqFA5))\nINFO:root:Sync with 16 operation(s) made\nINFO:root:Operations: [Linking(frozenset({VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6), CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS))})),\n Linking(frozenset({CloudRegion(name=eu-west-2, parent=CloudServiceProvider(name=AWS)), VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5)})),\n AttributeUpdated(CloudRegion(name=eu-west-2, parent=CloudServiceProvider(name=AWS)).external_ref:  -> nic3-eref from VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5)),\n Linking(frozenset({CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS)), VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)})),\n Linking(frozenset({CloudRegion(name=EU-Frankfurt, parent=CloudServiceProvider(name=IBM)), VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03)})),\n Linking(frozenset({VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5), CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS))})),\n Linking(frozenset({VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1), CloudRegion(name=eu-west-1, parent=CloudServiceProvider(name=AWS))})),\n Linking(frozenset({VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6), CloudHandover(name=INX6, parent=CloudRegion(name=eu-central-1))})),\n Linking(frozenset({CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-west-2)), VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5)})),\n AttributeUpdated(CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-west-2)).external_ref:  -> nic3-eref from VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5)),\n Linking(frozenset({CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-central-1)), VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)})),\n Linking(frozenset({CloudHandover(name=fra03, parent=CloudRegion(name=EU-Frankfurt)), VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03)})),\n Linking(frozenset({VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5), CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-central-1))})),\n Linking(frozenset({CloudHandover(name=LON1, parent=CloudRegion(name=eu-west-1)), VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)})),\n Addition(NIC(name=nic-2, parent=CloudHandover(name=EqFA5))),\n Linking(frozenset({NIC(name=nic-2, parent=CloudHandover(name=EqFA5)), VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5)}))]\nINFO:root:🙌 Final DB states\nINFO:root:{<class 'demo.desire.CloudServiceProvider'>: [CloudServiceProvider(name=IBM),\n                                              CloudServiceProvider(name=AWS),\n                                              CloudServiceProvider(name=AZURE)],\n <class 'demo.desire.CloudRegion'>: [CloudRegion(name=EU-Frankfurt, parent=CloudServiceProvider(name=IBM)),\n                                     CloudRegion(name=eu-west-2, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-central-1, parent=CloudServiceProvider(name=AWS)),\n                                     CloudRegion(name=eu-west-1, parent=CloudServiceProvider(name=AWS))],\n <class 'demo.desire.CloudHandover'>: [CloudHandover(name=fra03, parent=CloudRegion(name=EU-Frankfurt)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-west-2)),\n                                       CloudHandover(name=INX6, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=EqFA5, parent=CloudRegion(name=eu-central-1)),\n                                       CloudHandover(name=LON1, parent=CloudRegion(name=eu-west-1))],\n <class 'demo.desire.NIC'>: [NIC(name=nic-4, parent=CloudHandover(name=fra03)),\n                             NIC(name=nic-3, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-1, parent=CloudHandover(name=INX6)),\n                             NIC(name=nic-2a, parent=CloudHandover(name=EqFA5)),\n                             NIC(name=nic-3a, parent=CloudHandover(name=LON1)),\n                             NIC(name=nic-2, parent=CloudHandover(name=EqFA5))]}\nINFO:root:{<class 'demo.daphne.VlanServiceProvider'>: [VlanServiceProvider(name=AZURE),\n                                             VlanServiceProvider(name=AWS),\n                                             VlanServiceProvider(name=IBM)],\n <class 'demo.daphne.VlanServiceConnection'>: [VlanServiceConnection(name=nic-1, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=INX6),\n                                               VlanServiceConnection(name=nic-3, parent=VlanServiceProvider(name=AWS), region=eu-west-2, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-2, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-4, parent=VlanServiceProvider(name=IBM), region=EU-Frankfurt, pop=fra03),\n                                               VlanServiceConnection(name=nic-2a, parent=VlanServiceProvider(name=AWS), region=eu-central-1, pop=EqFA5),\n                                               VlanServiceConnection(name=nic-3a, parent=VlanServiceProvider(name=AWS), region=eu-west-1, pop=LON1)]}\nINFO:root:🎉🥳 Sync with 0 operations made. Synchronization has converged\nINFO:root:Operations: []\n\nProcess finished with exit code 0\n\n```\n\n# Celery Demo\n\n## Start the compose setup\n\n``` shell\n❯ docker-compose up -d --build\nCreating network \"synchronizer-framework_default\" with the default driver\nBuilding worker\nStep 1/11 : FROM python:3.8-slim\n ---> b281745b6df9\nStep 2/11 : RUN apt-get update ; apt-get install -y sqlite3 vim ; apt-get clean\n ---> Using cache\n ---> 25b681e3e49c\nStep 3/11 : WORKDIR /app/synchronizer-framework\n ---> Using cache\n ---> 20c652ac628d\nStep 4/11 : COPY ./requirements.txt .\n ---> Using cache\n ---> 9a1f9aa5c9a4\nStep 5/11 : RUN pip install -r requirements.txt\n ---> Using cache\n ---> ae9c400626e5\nStep 6/11 : COPY src/ ./src\n ---> Using cache\n ---> be73849dfe6f\nStep 7/11 : COPY tests ./tests\n ---> Using cache\n ---> 3e59bd21b326\nStep 8/11 : COPY conftest.py .\n ---> Using cache\n ---> 3c06b0dcc7f9\nStep 9/11 : ENV C_FORCE_ROOT=true\n ---> Using cache\n ---> 2a187de06fcd\nStep 10/11 : ENV PYTHONPATH=\"src/\"\n ---> Using cache\n ---> 027396f1f6f9\nStep 11/11 : CMD [ \"python\", \"-m\", \"demo.main\"]\n ---> Using cache\n ---> b8b1c92054b7\nSuccessfully built b8b1c92054b7\nSuccessfully tagged synchronizer-framework_worker:latest\nBuilding beat\nStep 1/11 : FROM python:3.8-slim\n ---> b281745b6df9\nStep 2/11 : RUN apt-get update ; apt-get install -y sqlite3 vim ; apt-get clean\n ---> Using cache\n ---> 25b681e3e49c\nStep 3/11 : WORKDIR /app/synchronizer-framework\n ---> Using cache\n ---> 20c652ac628d\nStep 4/11 : COPY ./requirements.txt .\n ---> Using cache\n ---> 9a1f9aa5c9a4\nStep 5/11 : RUN pip install -r requirements.txt\n ---> Using cache\n ---> ae9c400626e5\nStep 6/11 : COPY src/ ./src\n ---> Using cache\n ---> be73849dfe6f\nStep 7/11 : COPY tests ./tests\n ---> Using cache\n ---> 3e59bd21b326\nStep 8/11 : COPY conftest.py .\n ---> Using cache\n ---> 3c06b0dcc7f9\nStep 9/11 : ENV C_FORCE_ROOT=true\n ---> Using cache\n ---> 2a187de06fcd\nStep 10/11 : ENV PYTHONPATH=\"src/\"\n ---> Using cache\n ---> 027396f1f6f9\nStep 11/11 : CMD [ \"python\", \"-m\", \"demo.main\"]\n ---> Using cache\n ---> b8b1c92054b7\nSuccessfully built b8b1c92054b7\nSuccessfully tagged synchronizer-framework_beat:latest\nCreating synchronizer-framework_worker_1   ... done\nCreating synchronizer-framework_beat_1     ... done\nCreating synchronizer-framework_redis_1    ... done\nCreating synchronizer-framework_rabbitmq_1 ... done\n```\n\n## Show worker logs\n```shell\nworker_1    | [2021-04-21 18:16:06,166: INFO/MainProcess] Received task: sync.tasks.sync_all[281f9bc5-6ac8-4355-864e-692995abca5c]  \nworker_1    | [2021-04-21 18:16:06,341: INFO/ForkPoolWorker-2] Task sync.tasks.sync_all[281f9bc5-6ac8-4355-864e-692995abca5c] succeeded in 0.17173888799879933s: [Linking(frozenset({VlanServiceConnection(id=1, name=nic-1, region=eu-central-1, pop=INX6, externalRef=None, parent=VlanServiceProvider(id=2, name=AWS, canUpgrade=False)), CloudRegion(id=2, name=eu-central-1, external_ref=None, parent=CloudServiceProvider(id=2, name=AWS, upgrade_allowed=False))})), Linking(frozenset({CloudRegion(id=2, name=eu-central-1, external_ref=None, parent=CloudServiceProvider(id=2, name=AWS, upgrade_allowed=False)), VlanServiceConnection(id=2, name=nic-2, region=eu-central-1, pop=EqFA5, externalRef=None, parent=VlanServiceProvider(id=2, name=AWS, canUpgrade=False))})), Linking(frozenset({VlanServiceConnection(id=3, name=nic-3, region=eu-west-2, pop=EqFA5, externalRef=nic3-eref, parent=VlanServiceProvider(id=2, name=AWS, canUpgrade=False)), CloudRegion(id=4, name=eu-west-2, external_ref=None, parent=CloudServiceProvider(id=2, name=AWS, upgrade_allowed=False))})), Linking(frozenset({CloudRegion(id=1, name=EU-Frankfurt, external_ref=None, parent=CloudServiceProvider(id=1, name=IBM,..., Li..., ...]\nworker_1    | [2021-04-21 18:16:16,165: INFO/MainProcess] Received task: sync.tasks.sync_all[64b780e0-b5e3-4771-913d-de3f54b2ccec]  \nworker_1    | [2021-04-21 18:16:16,300: INFO/ForkPoolWorker-2] Task sync.tasks.sync_all[64b780e0-b5e3-4771-913d-de3f54b2ccec] succeeded in 0.13250631099799648s: []\n```\n\n## Issue a new object and synchronize it immediately\n\n```python\nfrom demo.daphne import VlanServiceProvider\nfrom demo.fixtures import daphne_sqa_ds, desire_sqa_ds, make_mappings\nfrom demo.celery import tasks\n\nif __name__ == \"__main__\":\n   ds = daphne_sqa_ds()\n   vlsp = VlanServiceProvider(name=\"test\")\n   ds.create(vlsp)\n\n   tasks.sync_one.delay(\n      daphne_sqa_ds, desire_sqa_ds, make_mappings(), vlsp.__class__, vlsp.id\n   )\n```\n\n\n```shell\n docker-compose exec worker python src/demo/create_and_sync.py\n```  \n\n## Worker log\n\n```shell\nworker_1    | [2021-04-21 18:22:12,938: INFO/MainProcess] Received task: sync.tasks.sync_one[11dfd53a-1198-47e8-b624-25218b463660]  \nworker_1    | [2021-04-21 18:22:12,957: INFO/ForkPoolWorker-2] ✨ Adding CloudServiceProvider(id=4, name=test, upgrade_allowed=None)\nworker_1    | [2021-04-21 18:22:12,959: INFO/ForkPoolWorker-2] Task sync.tasks.sync_one[11dfd53a-1198-47e8-b624-25218b463660] succeeded in 0.02017242200236069s: [Addition(CloudServiceProvider(id=4, name=test, upgrade_allowed=None)), Linking(frozenset({CloudServiceProvider(id=4, name=test, upgrade_allowed=None), VlanServiceProvider(id=4, name=test, canUpgrade=None)}))]\n```\n\n## Show link and synchronized entry\n```shell\n❯ docker-compose exec redis redis-cli smembers VlanServiceProvider:4:CloudServiceProvider\n1) \"CloudServiceProvider:4\"\n❯ docker-compose exec worker sqlite3 /tmp/desire.sqlite \"SELECT * FROM cloud_service_providers where id = 4;\"\n4|test|\n``` \n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.com/sebastianspies9/synchronizer-framework",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "synchronizer-framework",
+    "package_url": "https://pypi.org/project/synchronizer-framework/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/synchronizer-framework/",
+    "project_urls": {
+      "Homepage": "https://gitlab.com/sebastianspies9/synchronizer-framework"
+    },
+    "release_url": "https://pypi.org/project/synchronizer-framework/0.0.22/",
+    "requires_dist": null,
+    "requires_python": ">=3.8",
+    "summary": "Bi-directional synchronization of CRUD data sources",
+    "version": "0.0.22",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16195801,
+  "releases": {
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7baef21bf57dad6b02ccc00dfebbb156dc8ee81c5886ae48babc70bb2a188b88",
+          "md5": "33c735327e7c759d6d5f6beb2f473145",
+          "sha256": "3a14cc19edf892f4892ae98e405a6a16324368b0bd25d6dac6920538ff6e689a"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.10.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33c735327e7c759d6d5f6beb2f473145",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 37985,
+        "upload_time": "2021-12-09T14:51:56",
+        "upload_time_iso_8601": "2021-12-09T14:51:56.269372Z",
+        "url": "https://files.pythonhosted.org/packages/7b/ae/f21bf57dad6b02ccc00dfebbb156dc8ee81c5886ae48babc70bb2a188b88/synchronizer_framework-0.0.10.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "54acb898003e555f1c21d05f45925d6deeff13c5a3dc93c425a9fe044a1f3174",
+          "md5": "07ad21b7b9f3a76a331bb0db67be2901",
+          "sha256": "151b5ea4dd548ed9d27291ed2913351dc3a27a93ce1a5183708f5ca45cb797a5"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.10-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "07ad21b7b9f3a76a331bb0db67be2901",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.10",
+        "requires_python": ">=3.8",
+        "size": 49380,
+        "upload_time": "2021-12-09T14:51:58",
+        "upload_time_iso_8601": "2021-12-09T14:51:58.295864Z",
+        "url": "https://files.pythonhosted.org/packages/54/ac/b898003e555f1c21d05f45925d6deeff13c5a3dc93c425a9fe044a1f3174/synchronizer_framework-0.0.10-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5db7c9c94635b0514e516acf67b3772d8a3e6c82b25004c800e0abddd5743f2",
+          "md5": "0a9458bd7d9eab2f9e7aa25f0ea22450",
+          "sha256": "a0b26a7c730f067015a56b28f7948d8b4b515a3a950135cac176ce0b46bb82bf"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0a9458bd7d9eab2f9e7aa25f0ea22450",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23075,
+        "upload_time": "2021-12-09T14:51:54",
+        "upload_time_iso_8601": "2021-12-09T14:51:54.288544Z",
+        "url": "https://files.pythonhosted.org/packages/e5/db/7c9c94635b0514e516acf67b3772d8a3e6c82b25004c800e0abddd5743f2/synchronizer_framework-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ddd0f44a55281ad956d4adbff31f3d1e22601b5933108643c5cbdc790e91c80",
+          "md5": "b034ed567ca52f3fa7c9ef70433d47a4",
+          "sha256": "c3372d7a35e5dd8878590f1da9bf9ceca172650999ee6de6f81eee4894cfd323"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.11.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b034ed567ca52f3fa7c9ef70433d47a4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 37987,
+        "upload_time": "2021-12-09T16:11:18",
+        "upload_time_iso_8601": "2021-12-09T16:11:18.898636Z",
+        "url": "https://files.pythonhosted.org/packages/6d/dd/0f44a55281ad956d4adbff31f3d1e22601b5933108643c5cbdc790e91c80/synchronizer_framework-0.0.11.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ca96970794c144a30e5b2366cf70a592a676c0161c4765855e1243929d1443d",
+          "md5": "f43ec224cb3ad9bd52d4d2f865512997",
+          "sha256": "65efa7d9fe27f37ed9546759818d2722e20a4ba49259a6e8309d4aaba8abae6c"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f43ec224cb3ad9bd52d4d2f865512997",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23080,
+        "upload_time": "2021-12-09T16:11:16",
+        "upload_time_iso_8601": "2021-12-09T16:11:16.590379Z",
+        "url": "https://files.pythonhosted.org/packages/1c/a9/6970794c144a30e5b2366cf70a592a676c0161c4765855e1243929d1443d/synchronizer_framework-0.0.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ceb0e2b2554f0c09f2cca4d0d0e4434f93105a809b569b06d79b732f4ff52e9c",
+          "md5": "a41f13b70590f8945679be2acc546d42",
+          "sha256": "5e281781d60718506771aa6265b691ee60b6a080e6239cea7ea0a7696af04307"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.12-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "a41f13b70590f8945679be2acc546d42",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.12",
+        "requires_python": ">=3.8",
+        "size": 58727,
+        "upload_time": "2021-12-10T22:49:53",
+        "upload_time_iso_8601": "2021-12-10T22:49:53.793422Z",
+        "url": "https://files.pythonhosted.org/packages/ce/b0/e2b2554f0c09f2cca4d0d0e4434f93105a809b569b06d79b732f4ff52e9c/synchronizer_framework-0.0.12-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3fff6deb0a7beb48e002f45a4090161a72335f56014df7dacfceb0c7270fb0b",
+          "md5": "4ef8ea5fde96ac3078bd154c77cc826a",
+          "sha256": "8e8185176c66e731171ad61d84a3a53ce822208f13e3669412cbd86fb27f8345"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4ef8ea5fde96ac3078bd154c77cc826a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 26804,
+        "upload_time": "2021-12-10T22:49:51",
+        "upload_time_iso_8601": "2021-12-10T22:49:51.041960Z",
+        "url": "https://files.pythonhosted.org/packages/a3/ff/f6deb0a7beb48e002f45a4090161a72335f56014df7dacfceb0c7270fb0b/synchronizer_framework-0.0.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12f9ccfe3a19af268c0232d2bd0e29872bafe1e7c4261bafb2f25be6d33656b8",
+          "md5": "4b12b6c486dc10447c4509dcf398991f",
+          "sha256": "77e65c4815735b2a91ff9fd1eef18ab0308c2970bbe2730bbc6bdb76b5349370"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4b12b6c486dc10447c4509dcf398991f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28362,
+        "upload_time": "2021-12-10T22:49:56",
+        "upload_time_iso_8601": "2021-12-10T22:49:56.460497Z",
+        "url": "https://files.pythonhosted.org/packages/12/f9/ccfe3a19af268c0232d2bd0e29872bafe1e7c4261bafb2f25be6d33656b8/synchronizer_framework-0.0.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d28ab5e2e2b0155ca116757ac172ff334817767726907be9aad7c9a1b96ef01c",
+          "md5": "0c967aec1ae6e1ff6fef226ba9d0f7fe",
+          "sha256": "646b4a60b9bd3933704166818bda34fb8363a4f9cb2fc2893e58a2a7fde943a9"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.13-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "0c967aec1ae6e1ff6fef226ba9d0f7fe",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.13",
+        "requires_python": ">=3.8",
+        "size": 59990,
+        "upload_time": "2021-12-11T18:31:41",
+        "upload_time_iso_8601": "2021-12-11T18:31:41.859133Z",
+        "url": "https://files.pythonhosted.org/packages/d2/8a/b5e2e2b0155ca116757ac172ff334817767726907be9aad7c9a1b96ef01c/synchronizer_framework-0.0.13-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91dcfa57fc88485b8a44248edff39e776ea2dc5acb428033028ded2457c52c9a",
+          "md5": "1b45bdb53a063ff490f7c35681185c0e",
+          "sha256": "4bffec03efe1aece59b32eb308d355a6c23f2da5d26d8a233d0536716a62f4cf"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b45bdb53a063ff490f7c35681185c0e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 27236,
+        "upload_time": "2021-12-11T18:31:39",
+        "upload_time_iso_8601": "2021-12-11T18:31:39.260925Z",
+        "url": "https://files.pythonhosted.org/packages/91/dc/fa57fc88485b8a44248edff39e776ea2dc5acb428033028ded2457c52c9a/synchronizer_framework-0.0.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c07b8c67d08a2fb700ac6e1e7a53573ce33d5511d7cde8df7354665c9c3516bf",
+          "md5": "498f03f54b71d92a2210806dac0ffd0f",
+          "sha256": "aa40e5d8ab29db9690fc9d529ae45491e0db8ac4c9ca6aecab2a86722e42d79d"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "498f03f54b71d92a2210806dac0ffd0f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28782,
+        "upload_time": "2021-12-11T18:31:45",
+        "upload_time_iso_8601": "2021-12-11T18:31:45.089580Z",
+        "url": "https://files.pythonhosted.org/packages/c0/7b/8c67d08a2fb700ac6e1e7a53573ce33d5511d7cde8df7354665c9c3516bf/synchronizer_framework-0.0.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48590dcd6b1cce88eb3e5152e646042ff37220c612fee2443767a98a1b7f66ee",
+          "md5": "72e9f61f21e8ed3a3c7d2ac58185f835",
+          "sha256": "ada04c925f51e75e03c05e9191f03f60f8433e3baeb9ce3c87c977144027403c"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.14-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "72e9f61f21e8ed3a3c7d2ac58185f835",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.14",
+        "requires_python": ">=3.8",
+        "size": 60133,
+        "upload_time": "2021-12-11T23:03:51",
+        "upload_time_iso_8601": "2021-12-11T23:03:51.955869Z",
+        "url": "https://files.pythonhosted.org/packages/48/59/0dcd6b1cce88eb3e5152e646042ff37220c612fee2443767a98a1b7f66ee/synchronizer_framework-0.0.14-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2f3e7d98cfced764b6d3d439e044fca97ee4192b372ba49c7062c85311d801d",
+          "md5": "76c6c3156c7ec07cee59b3d74ed6699a",
+          "sha256": "ef5bc0b06d1eba7e70e9ef5282743e0377a7779d990c991794d90cc4db9bb225"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76c6c3156c7ec07cee59b3d74ed6699a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 27290,
+        "upload_time": "2021-12-11T23:03:49",
+        "upload_time_iso_8601": "2021-12-11T23:03:49.320756Z",
+        "url": "https://files.pythonhosted.org/packages/f2/f3/e7d98cfced764b6d3d439e044fca97ee4192b372ba49c7062c85311d801d/synchronizer_framework-0.0.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b67f9018bc87a1a122b3a6caae3255df574423b168338b7277448f7c6525608",
+          "md5": "d76f2868627b39cc9e182654a2ed6efb",
+          "sha256": "8f2852d3f410dee340a7bf17cef98a13d0a39a689d3cfc7fcf1973ae50031a1d"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d76f2868627b39cc9e182654a2ed6efb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28840,
+        "upload_time": "2021-12-11T23:03:54",
+        "upload_time_iso_8601": "2021-12-11T23:03:54.591896Z",
+        "url": "https://files.pythonhosted.org/packages/4b/67/f9018bc87a1a122b3a6caae3255df574423b168338b7277448f7c6525608/synchronizer_framework-0.0.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "67cde93eb69c076adddc9716ccd40b18f6910438861ad4e9a24dbc96f4f6b098",
+          "md5": "a1ffbfb900ef42d9d4d5ed21a8750e58",
+          "sha256": "8092588e45426f9f5de014e6c8e8ae9adcf3488b9181c0bca86a10520e8d8989"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.15-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "a1ffbfb900ef42d9d4d5ed21a8750e58",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.15",
+        "requires_python": ">=3.8",
+        "size": 50981,
+        "upload_time": "2021-12-12T14:39:40",
+        "upload_time_iso_8601": "2021-12-12T14:39:40.419254Z",
+        "url": "https://files.pythonhosted.org/packages/67/cd/e93eb69c076adddc9716ccd40b18f6910438861ad4e9a24dbc96f4f6b098/synchronizer_framework-0.0.15-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de2c303146f98241fadd84b486647126b319724e6f954a0969c33f961ff737d0",
+          "md5": "b83637aa5adfaef9dcf908fac1014558",
+          "sha256": "a15b30ce3897e003e0d8b0dd26c830d4e868cc5b7df1e22b0de867baf68f9c49"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b83637aa5adfaef9dcf908fac1014558",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23607,
+        "upload_time": "2021-12-12T14:39:38",
+        "upload_time_iso_8601": "2021-12-12T14:39:38.070462Z",
+        "url": "https://files.pythonhosted.org/packages/de/2c/303146f98241fadd84b486647126b319724e6f954a0969c33f961ff737d0/synchronizer_framework-0.0.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea98fe818177885c2e66ca13b268a104662586b0b5b7eadfe2854227ca8975fb",
+          "md5": "0b24c414b610aa21c36b1b7fbb3834f6",
+          "sha256": "e7c640340ce71d734fcdf0cc860a7134a95fc928872df925921462a0b2f8a739"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0b24c414b610aa21c36b1b7fbb3834f6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28824,
+        "upload_time": "2021-12-12T14:39:42",
+        "upload_time_iso_8601": "2021-12-12T14:39:42.337157Z",
+        "url": "https://files.pythonhosted.org/packages/ea/98/fe818177885c2e66ca13b268a104662586b0b5b7eadfe2854227ca8975fb/synchronizer_framework-0.0.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87f817d8500d9f886945332a067e734854bd66daa9a51892bda430e33d30f490",
+          "md5": "7a23e1202d5cf9ffec4133f3e607e816",
+          "sha256": "2b36a574559647224a9bdea4304d04cae062d145457524adce8eb46a4646a442"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.16-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "7a23e1202d5cf9ffec4133f3e607e816",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.16",
+        "requires_python": ">=3.8",
+        "size": 60302,
+        "upload_time": "2021-12-12T22:54:39",
+        "upload_time_iso_8601": "2021-12-12T22:54:39.532449Z",
+        "url": "https://files.pythonhosted.org/packages/87/f8/17d8500d9f886945332a067e734854bd66daa9a51892bda430e33d30f490/synchronizer_framework-0.0.16-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4012fdb17af2a2a014ea373fa88da584cb9b4fc6d914631ebae15e3ed5dfc987",
+          "md5": "9e10a5f3c88325dfbe759cf3f6442062",
+          "sha256": "972c6640510fbf850c3aa8e6bff618c0066bec882580c16a695680621d26378d"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9e10a5f3c88325dfbe759cf3f6442062",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 27332,
+        "upload_time": "2021-12-12T22:54:37",
+        "upload_time_iso_8601": "2021-12-12T22:54:37.050908Z",
+        "url": "https://files.pythonhosted.org/packages/40/12/fdb17af2a2a014ea373fa88da584cb9b4fc6d914631ebae15e3ed5dfc987/synchronizer_framework-0.0.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9c02b2590d38c480aa6f4ca6ba0df21aee420f620e979bc34d14934ab0b2a47f",
+          "md5": "cd16198f2c9ee5ac2ca3743259b45760",
+          "sha256": "128460fe3464b7dcab0e845b8cee5a4bac490bda529ce0af646b3ee31dd9eb3c"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cd16198f2c9ee5ac2ca3743259b45760",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28923,
+        "upload_time": "2021-12-12T22:54:42",
+        "upload_time_iso_8601": "2021-12-12T22:54:42.132536Z",
+        "url": "https://files.pythonhosted.org/packages/9c/02/b2590d38c480aa6f4ca6ba0df21aee420f620e979bc34d14934ab0b2a47f/synchronizer_framework-0.0.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ed4781691f574b13c7a0121e5cd226799b903859d96c8226a18260c84da9396",
+          "md5": "785ae7634135ba29c32af9d06802b766",
+          "sha256": "8e43869e7d203bbc583f7a699ed90ad614ca421d5a2b04ca31334cc61da581aa"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.17-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "785ae7634135ba29c32af9d06802b766",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.17",
+        "requires_python": ">=3.8",
+        "size": 51021,
+        "upload_time": "2022-03-02T17:03:37",
+        "upload_time_iso_8601": "2022-03-02T17:03:37.245176Z",
+        "url": "https://files.pythonhosted.org/packages/7e/d4/781691f574b13c7a0121e5cd226799b903859d96c8226a18260c84da9396/synchronizer_framework-0.0.17-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e50c911e33e51fea8731326ae9e4905ccdbc7f1bcf65f9a37e0a782c406af137",
+          "md5": "8bae6f80454afa921e6db9e198d39c77",
+          "sha256": "630501af1d8dfbcaa72a00d17a027d27aed56ec5867f7479fd25669e7c23fbcd"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8bae6f80454afa921e6db9e198d39c77",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23622,
+        "upload_time": "2022-03-02T17:03:34",
+        "upload_time_iso_8601": "2022-03-02T17:03:34.427804Z",
+        "url": "https://files.pythonhosted.org/packages/e5/0c/911e33e51fea8731326ae9e4905ccdbc7f1bcf65f9a37e0a782c406af137/synchronizer_framework-0.0.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "673e1446374f905de78f65238706f63fb8fef2c7b1e091b596d6da396c7cc54b",
+          "md5": "741795a2422d70fe9193e1c2b0b1fbd4",
+          "sha256": "e0e72df93c280e68ba61050a00599580c8261b8792d272f17b8f72733f229d75"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "741795a2422d70fe9193e1c2b0b1fbd4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28846,
+        "upload_time": "2022-03-02T17:03:39",
+        "upload_time_iso_8601": "2022-03-02T17:03:39.769500Z",
+        "url": "https://files.pythonhosted.org/packages/67/3e/1446374f905de78f65238706f63fb8fef2c7b1e091b596d6da396c7cc54b/synchronizer_framework-0.0.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "225f8aa7a201c52d2fa5f07e69ed5e91a4cd9cb7ff98839f2c87f6c4b8c56300",
+          "md5": "2fbd796e5adb173d5814fa50094abaa1",
+          "sha256": "b3b02c9e2890899446a59c7d52462c275c53f2cfebf6eb6c08b65e45d748a47e"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.18.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2fbd796e5adb173d5814fa50094abaa1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 39726,
+        "upload_time": "2022-03-03T08:31:38",
+        "upload_time_iso_8601": "2022-03-03T08:31:38.278658Z",
+        "url": "https://files.pythonhosted.org/packages/22/5f/8aa7a201c52d2fa5f07e69ed5e91a4cd9cb7ff98839f2c87f6c4b8c56300/synchronizer_framework-0.0.18.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98e1401e708b2efacc82dfc24a50b6c1c7ebf0b61916cf9c53b82eec19728a1c",
+          "md5": "f2ee9637caf833e52b202092768eb8ba",
+          "sha256": "e0f219ef903b20d2075c242ed92ae7ac33fa31bb31ab4806a560ef826dce6af5"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f2ee9637caf833e52b202092768eb8ba",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23622,
+        "upload_time": "2022-03-03T08:31:35",
+        "upload_time_iso_8601": "2022-03-03T08:31:35.893737Z",
+        "url": "https://files.pythonhosted.org/packages/98/e1/401e708b2efacc82dfc24a50b6c1c7ebf0b61916cf9c53b82eec19728a1c/synchronizer_framework-0.0.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b2b7bc03bac4f83080e9bbfc8f1038b810a7c2f3de13e26a70dfc658e03a857",
+          "md5": "a56c899f1f941bb0a35e9d444f0033bf",
+          "sha256": "3091a6a6237a074fcafd473b9390905ddfc42b06e7964f0d0e153f217c85f8d9"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.19.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a56c899f1f941bb0a35e9d444f0033bf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 39760,
+        "upload_time": "2022-06-21T09:16:40",
+        "upload_time_iso_8601": "2022-06-21T09:16:40.614185Z",
+        "url": "https://files.pythonhosted.org/packages/5b/2b/7bc03bac4f83080e9bbfc8f1038b810a7c2f3de13e26a70dfc658e03a857/synchronizer_framework-0.0.19.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3b9b1cef93a040362c76e5ba25d173424a056cb0bcdd5271eedbc9c0370b510",
+          "md5": "31a76140eafb87b07d3c1ffcc6c39605",
+          "sha256": "cdcecadc03e9d42b7cdd49b0316c90ef205b4172afcb5bb812c2f15e599caedd"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.19-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "31a76140eafb87b07d3c1ffcc6c39605",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23634,
+        "upload_time": "2022-06-21T09:16:37",
+        "upload_time_iso_8601": "2022-06-21T09:16:37.016903Z",
+        "url": "https://files.pythonhosted.org/packages/c3/b9/b1cef93a040362c76e5ba25d173424a056cb0bcdd5271eedbc9c0370b510/synchronizer_framework-0.0.19-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01adc6fe7400b0a7f93cd9f1de7c51e68725f6c5bdf5a78e5e8134e00b59ca52",
+          "md5": "696661c48afcfc7342eaa4ccf4e7dd10",
+          "sha256": "ba4d3f9ab5054b42d0ff0b0fc204776cd4d55884a6734fc7e1cc586ed812d75e"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "696661c48afcfc7342eaa4ccf4e7dd10",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22452,
+        "upload_time": "2021-08-27T20:08:46",
+        "upload_time_iso_8601": "2021-08-27T20:08:46.439668Z",
+        "url": "https://files.pythonhosted.org/packages/01/ad/c6fe7400b0a7f93cd9f1de7c51e68725f6c5bdf5a78e5e8134e00b59ca52/synchronizer_framework-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "586c7cfcae23a98722ffafb58fc80fccab4ad27ad92b6878488048a6d13764db",
+          "md5": "3f2838d0ec16d7d87f70eff14927c224",
+          "sha256": "4724ce1bda30de5b181af34a2afbaa82eff245a59bf38d03799bd2d508faf414"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3f2838d0ec16d7d87f70eff14927c224",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 26753,
+        "upload_time": "2021-08-27T20:08:50",
+        "upload_time_iso_8601": "2021-08-27T20:08:50.017888Z",
+        "url": "https://files.pythonhosted.org/packages/58/6c/7cfcae23a98722ffafb58fc80fccab4ad27ad92b6878488048a6d13764db/synchronizer_framework-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.20": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "800d017b609c52c362a2e868a8261bce5f77470f79d52f660cf6b1cb850e00bb",
+          "md5": "2ffeb997518988f40e22d6466a06d497",
+          "sha256": "f19c32a3327d11544fadcf824bb599df7bcfd52bbc7986db0be45ebd52577734"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.20.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2ffeb997518988f40e22d6466a06d497",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 40007,
+        "upload_time": "2022-06-21T15:07:04",
+        "upload_time_iso_8601": "2022-06-21T15:07:04.065844Z",
+        "url": "https://files.pythonhosted.org/packages/80/0d/017b609c52c362a2e868a8261bce5f77470f79d52f660cf6b1cb850e00bb/synchronizer_framework-0.0.20.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3dcb3a8cbc4a6b1b6cb9adececf954a61b78e864c770cbf6667fda6f10ca0779",
+          "md5": "8d34fc69d76119ca9726e37a8c009740",
+          "sha256": "3f7ad0df343d5691a93324060ecc3392bab92ad0e4e4df5578aa71dfc2a1931a"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.20-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8d34fc69d76119ca9726e37a8c009740",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23758,
+        "upload_time": "2022-06-21T15:07:01",
+        "upload_time_iso_8601": "2022-06-21T15:07:01.646773Z",
+        "url": "https://files.pythonhosted.org/packages/3d/cb/3a8cbc4a6b1b6cb9adececf954a61b78e864c770cbf6667fda6f10ca0779/synchronizer_framework-0.0.20-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc02bc43eacbb19566ca58bc0e4adbdfbde4a8e2624cdf074380c76a161c046d",
+          "md5": "f8564d86a350b1f8b804ef0de2c97013",
+          "sha256": "d118317b39154b84f807077ddd79bc18aa51c383277707c562c184de85980ad4"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.21.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f8564d86a350b1f8b804ef0de2c97013",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 40078,
+        "upload_time": "2022-08-09T12:59:22",
+        "upload_time_iso_8601": "2022-08-09T12:59:22.340886Z",
+        "url": "https://files.pythonhosted.org/packages/bc/02/bc43eacbb19566ca58bc0e4adbdfbde4a8e2624cdf074380c76a161c046d/synchronizer_framework-0.0.21.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff477d22ea8561435b2ab3518535074f1689a8672ad1a9303511f64d1c48677d",
+          "md5": "66783cff6064814425c3cdce70895db4",
+          "sha256": "7275ce463d9b8f2547640879b7794486d52daa27bd85d6423fe08680e18a2b65"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "66783cff6064814425c3cdce70895db4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23774,
+        "upload_time": "2022-08-09T12:59:19",
+        "upload_time_iso_8601": "2022-08-09T12:59:19.452201Z",
+        "url": "https://files.pythonhosted.org/packages/ff/47/7d22ea8561435b2ab3518535074f1689a8672ad1a9303511f64d1c48677d/synchronizer_framework-0.0.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "461835c343c34cd6046c0a23ed8eb49dfabe6a532479b3c4add7cd4e308558c5",
+          "md5": "9bc9cae7fe7583a6e72d8673ae49b605",
+          "sha256": "ebb4b514e4923d90811dca8ab2b9bae67fd6bf0a8ef83d598a0bfe9613f82111"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.22.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9bc9cae7fe7583a6e72d8673ae49b605",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 40669,
+        "upload_time": "2022-12-23T09:50:49",
+        "upload_time_iso_8601": "2022-12-23T09:50:49.449837Z",
+        "url": "https://files.pythonhosted.org/packages/46/18/35c343c34cd6046c0a23ed8eb49dfabe6a532479b3c4add7cd4e308558c5/synchronizer_framework-0.0.22.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b5b4271a3c6a4acd0fc8759e6612f06608601f30254d3297e22acaae01e85e3",
+          "md5": "9a35a49000dd964e9afbfddd832756e0",
+          "sha256": "c4d76fa4dab37c684a27548051a494f5ba0c1ec5af5f26d808e774e298600bbc"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9a35a49000dd964e9afbfddd832756e0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23892,
+        "upload_time": "2022-12-23T09:50:47",
+        "upload_time_iso_8601": "2022-12-23T09:50:47.442627Z",
+        "url": "https://files.pythonhosted.org/packages/7b/5b/4271a3c6a4acd0fc8759e6612f06608601f30254d3297e22acaae01e85e3/synchronizer_framework-0.0.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e72b8c090d82fa2b85adcdf907a499009ce07007a9ff30b5e11790e36feef43",
+          "md5": "a0504b47f6d1ae6d84c3b2d29581b756",
+          "sha256": "808c4e8900059c62ff9fe5513f48a9808726111f93c2efb834af746ac713ea83"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a0504b47f6d1ae6d84c3b2d29581b756",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22464,
+        "upload_time": "2021-10-14T18:51:56",
+        "upload_time_iso_8601": "2021-10-14T18:51:56.661138Z",
+        "url": "https://files.pythonhosted.org/packages/7e/72/b8c090d82fa2b85adcdf907a499009ce07007a9ff30b5e11790e36feef43/synchronizer_framework-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60dde6597f84ae09d23d0753921b5c068643430a9875297a7a5361d2aa493979",
+          "md5": "16e9ca25a0131eb1bf7dc5dc9bada0d5",
+          "sha256": "6dfb46a8d6417561a724fab785dc641c13d1628a48934d5a46cdfce4f3bb044e"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "16e9ca25a0131eb1bf7dc5dc9bada0d5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 27841,
+        "upload_time": "2021-10-14T18:51:59",
+        "upload_time_iso_8601": "2021-10-14T18:51:59.559704Z",
+        "url": "https://files.pythonhosted.org/packages/60/dd/e6597f84ae09d23d0753921b5c068643430a9875297a7a5361d2aa493979/synchronizer_framework-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c29cf12001345eb7339fe67006e8b58bd03745f7f2cb98ece48ae69f9142b09d",
+          "md5": "5eb3d15753370e8eed70ad0d1b4ffcb7",
+          "sha256": "217dec8ef6544dc76cd8ca30a359a83e075d124c2fb3412469167604891e5e52"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.5.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5eb3d15753370e8eed70ad0d1b4ffcb7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 36944,
+        "upload_time": "2021-10-19T21:43:18",
+        "upload_time_iso_8601": "2021-10-19T21:43:18.688881Z",
+        "url": "https://files.pythonhosted.org/packages/c2/9c/f12001345eb7339fe67006e8b58bd03745f7f2cb98ece48ae69f9142b09d/synchronizer_framework-0.0.5.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ea817c28bc4a39c901f4579206c1977e1513a3628f766745dbc038a6b5c18dd",
+          "md5": "4a39e6395e3da410ca07e88a15915977",
+          "sha256": "bb871553f4cdb5b77d95543df1ba4279a54ae6539c14a2115ed211614a872fe6"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.5-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "4a39e6395e3da410ca07e88a15915977",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.5",
+        "requires_python": ">=3.8",
+        "size": 48087,
+        "upload_time": "2021-10-19T21:43:21",
+        "upload_time_iso_8601": "2021-10-19T21:43:21.262722Z",
+        "url": "https://files.pythonhosted.org/packages/6e/a8/17c28bc4a39c901f4579206c1977e1513a3628f766745dbc038a6b5c18dd/synchronizer_framework-0.0.5-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1432092283c78e40d4bbf82c10f87085bd1087fe9f9fd292a0726c4fbd65b303",
+          "md5": "10a2eda03f087c9bcf9a71bc76c770fb",
+          "sha256": "59ae32fe16383ffba6f9b83f8a9b8a7e1f417da65975b8b7c2c2ba589d4c3747"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "10a2eda03f087c9bcf9a71bc76c770fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22577,
+        "upload_time": "2021-10-19T21:43:15",
+        "upload_time_iso_8601": "2021-10-19T21:43:15.853346Z",
+        "url": "https://files.pythonhosted.org/packages/14/32/092283c78e40d4bbf82c10f87085bd1087fe9f9fd292a0726c4fbd65b303/synchronizer_framework-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87785697522b3153a109de182dcb04cb9aa2c7ba90860927c508db1380d45ffa",
+          "md5": "45b4de3b38063465593e63443d6a8d54",
+          "sha256": "70d2df18800bdfcf2adc0b02d2c6e5ff9679a4c60e3dabf27841863403151037"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.6.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "45b4de3b38063465593e63443d6a8d54",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 36919,
+        "upload_time": "2021-10-29T21:42:02",
+        "upload_time_iso_8601": "2021-10-29T21:42:02.096421Z",
+        "url": "https://files.pythonhosted.org/packages/87/78/5697522b3153a109de182dcb04cb9aa2c7ba90860927c508db1380d45ffa/synchronizer_framework-0.0.6.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe2651c5771ee10b94d6970bdb68c94f137544271992e604b25453486ccb2686",
+          "md5": "7cda51b78cbd5ece58f96cbb6ec2bcd3",
+          "sha256": "4cc59a6f24bb3e5dafd5a4069ec3dd39a603c25ae2a5ec40e0e5deed0f550ac8"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.6-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "7cda51b78cbd5ece58f96cbb6ec2bcd3",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.6",
+        "requires_python": ">=3.8",
+        "size": 48066,
+        "upload_time": "2021-10-29T21:46:47",
+        "upload_time_iso_8601": "2021-10-29T21:46:47.172597Z",
+        "url": "https://files.pythonhosted.org/packages/fe/26/51c5771ee10b94d6970bdb68c94f137544271992e604b25453486ccb2686/synchronizer_framework-0.0.6-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f6cb229a0d16abab7269297e3f10d24c9ce65360c1f0fc0c1cbe32963970a4a8",
+          "md5": "b8e333cc8a1d96fc2e6f1d535672c0c7",
+          "sha256": "e4f1b97b3d80261237e302d54290911cac46430f6ae5f759bde97ef45b29e413"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b8e333cc8a1d96fc2e6f1d535672c0c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 28537,
+        "upload_time": "2021-10-29T21:41:56",
+        "upload_time_iso_8601": "2021-10-29T21:41:56.489511Z",
+        "url": "https://files.pythonhosted.org/packages/f6/cb/229a0d16abab7269297e3f10d24c9ce65360c1f0fc0c1cbe32963970a4a8/synchronizer_framework-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b0d52fcfc344e963b7a9e69f76e7c963841e3b4e43a61daf17c1021ab28b7a9e",
+          "md5": "a49ce5be2cdf8c81791275f87e3773e0",
+          "sha256": "54ddff98b36c40a8970bdf1c87bc5aae3ac74ddcbb45c27edd324b003666b1b9"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.7-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "a49ce5be2cdf8c81791275f87e3773e0",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.7",
+        "requires_python": ">=3.8",
+        "size": 57424,
+        "upload_time": "2021-10-29T22:12:16",
+        "upload_time_iso_8601": "2021-10-29T22:12:16.231781Z",
+        "url": "https://files.pythonhosted.org/packages/b0/d5/2fcfc344e963b7a9e69f76e7c963841e3b4e43a61daf17c1021ab28b7a9e/synchronizer_framework-0.0.7-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "10c2ab3e8c15f179805b13553dee93259081fa5ae59178bb3fa1aeb885aa2181",
+          "md5": "4278d0c7826c5cfebf59a7b2e9e59009",
+          "sha256": "11e7cd3fc5b4a9cb0138897821ed519ac0950dca4057e9fe84187608e180e1ab"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4278d0c7826c5cfebf59a7b2e9e59009",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 26267,
+        "upload_time": "2021-10-29T22:12:13",
+        "upload_time_iso_8601": "2021-10-29T22:12:13.447599Z",
+        "url": "https://files.pythonhosted.org/packages/10/c2/ab3e8c15f179805b13553dee93259081fa5ae59178bb3fa1aeb885aa2181/synchronizer_framework-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b393f2c152fde23184c8ee3d2162ed305a9f12f3f5b60679223284ff1a84cce",
+          "md5": "97ca795c9a01bd6b5572aef5dc4e8dec",
+          "sha256": "fa6b8bace3027496531451c60744cc4bdb3bcba9df143cf68b5f28f16430a287"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "97ca795c9a01bd6b5572aef5dc4e8dec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 27970,
+        "upload_time": "2021-10-29T22:12:18",
+        "upload_time_iso_8601": "2021-10-29T22:12:18.571494Z",
+        "url": "https://files.pythonhosted.org/packages/1b/39/3f2c152fde23184c8ee3d2162ed305a9f12f3f5b60679223284ff1a84cce/synchronizer_framework-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24ad72bf976d7f02dd2973e9551ffbb74e65b0ead56dd7a1101d6203e9c7dcc4",
+          "md5": "ada20b650816b2556415477efee0d1b6",
+          "sha256": "2b1e03c6da066bf6b03d71cc39b72e9296183a4bb9f53415ac85824c3aeb4632"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.8-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "ada20b650816b2556415477efee0d1b6",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.8",
+        "requires_python": ">=3.8",
+        "size": 49046,
+        "upload_time": "2021-11-27T22:23:45",
+        "upload_time_iso_8601": "2021-11-27T22:23:45.236553Z",
+        "url": "https://files.pythonhosted.org/packages/24/ad/72bf976d7f02dd2973e9551ffbb74e65b0ead56dd7a1101d6203e9c7dcc4/synchronizer_framework-0.0.8-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ead29690488d47dae3322526e8cbc9ba23d489ff52dc2d2babbefb4471d021b1",
+          "md5": "0a5e9d13d97b1737c1a228d184ba46a7",
+          "sha256": "cb2b4fa51e9ced57677a72827a58358e24f1816665924fca859dce3bfc5ab1d7"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0a5e9d13d97b1737c1a228d184ba46a7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22938,
+        "upload_time": "2021-11-27T22:16:57",
+        "upload_time_iso_8601": "2021-11-27T22:16:57.440950Z",
+        "url": "https://files.pythonhosted.org/packages/ea/d2/9690488d47dae3322526e8cbc9ba23d489ff52dc2d2babbefb4471d021b1/synchronizer_framework-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d9fb5e77cd4103605ad5c7800e051f30131ed377934de32de37ec4c521e48e61",
+          "md5": "2b6666fa374671062c88379606dffcb2",
+          "sha256": "ae47e34e56f41d362d6eb8ff82939f38b872c2b3f182aba4449a22888a01214d"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2b6666fa374671062c88379606dffcb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28194,
+        "upload_time": "2021-11-27T22:17:00",
+        "upload_time_iso_8601": "2021-11-27T22:17:00.033088Z",
+        "url": "https://files.pythonhosted.org/packages/d9/fb/5e77cd4103605ad5c7800e051f30131ed377934de32de37ec4c521e48e61/synchronizer_framework-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8d0c17002e73055f112b54d4869713371a0108e1dfc6cc10ec6268bb0d324c8",
+          "md5": "bcd00baa0849141854577b35ad29bdbd",
+          "sha256": "cf541c7e1cb7aa4fa13e7df4f6a267caea1bb4ce3fe55eee0d8be7aa7c3772d2"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.9.linux-x86_64.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bcd00baa0849141854577b35ad29bdbd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 46709,
+        "upload_time": "2021-12-05T16:38:20",
+        "upload_time_iso_8601": "2021-12-05T16:38:20.989782Z",
+        "url": "https://files.pythonhosted.org/packages/a8/d0/c17002e73055f112b54d4869713371a0108e1dfc6cc10ec6268bb0d324c8/synchronizer_framework-0.0.9.linux-x86_64.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4c96ec2a568476975c8d47ba7e44bb70a8b4b1db21a87008cde9fa69dd14466",
+          "md5": "51e5b7be30257f8f486b4f3750f1dfc5",
+          "sha256": "2dc4a8866dae818f89ad206c5a39f09bf54fd501bdde405f3ab262d204cf9cfa"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.9-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "51e5b7be30257f8f486b4f3750f1dfc5",
+        "packagetype": "bdist_egg",
+        "python_version": "0.0.9",
+        "requires_python": ">=3.8",
+        "size": 58598,
+        "upload_time": "2021-12-05T16:38:23",
+        "upload_time_iso_8601": "2021-12-05T16:38:23.046819Z",
+        "url": "https://files.pythonhosted.org/packages/d4/c9/6ec2a568476975c8d47ba7e44bb70a8b4b1db21a87008cde9fa69dd14466/synchronizer_framework-0.0.9-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6732973e3f243d7a841ae59480e45052b4abca71d5db6f5563bba6c022e2e37c",
+          "md5": "272d994f3085646d936bff9792be9b33",
+          "sha256": "eeddead93e3f6dc86ee8289c8458803420dd14e0f470bcaaef4821a01ae5b69f"
+        },
+        "downloads": -1,
+        "filename": "synchronizer_framework-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "272d994f3085646d936bff9792be9b33",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 26755,
+        "upload_time": "2021-12-05T16:38:18",
+        "upload_time_iso_8601": "2021-12-05T16:38:18.871719Z",
+        "url": "https://files.pythonhosted.org/packages/67/32/973e3f243d7a841ae59480e45052b4abca71d5db6f5563bba6c022e2e37c/synchronizer_framework-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "461835c343c34cd6046c0a23ed8eb49dfabe6a532479b3c4add7cd4e308558c5",
+        "md5": "9bc9cae7fe7583a6e72d8673ae49b605",
+        "sha256": "ebb4b514e4923d90811dca8ab2b9bae67fd6bf0a8ef83d598a0bfe9613f82111"
+      },
+      "downloads": -1,
+      "filename": "synchronizer_framework-0.0.22.linux-x86_64.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9bc9cae7fe7583a6e72d8673ae49b605",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 40669,
+      "upload_time": "2022-12-23T09:50:49",
+      "upload_time_iso_8601": "2022-12-23T09:50:49.449837Z",
+      "url": "https://files.pythonhosted.org/packages/46/18/35c343c34cd6046c0a23ed8eb49dfabe6a532479b3c4add7cd4e308558c5/synchronizer_framework-0.0.22.linux-x86_64.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7b5b4271a3c6a4acd0fc8759e6612f06608601f30254d3297e22acaae01e85e3",
+        "md5": "9a35a49000dd964e9afbfddd832756e0",
+        "sha256": "c4d76fa4dab37c684a27548051a494f5ba0c1ec5af5f26d808e774e298600bbc"
+      },
+      "downloads": -1,
+      "filename": "synchronizer_framework-0.0.22-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "9a35a49000dd964e9afbfddd832756e0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 23892,
+      "upload_time": "2022-12-23T09:50:47",
+      "upload_time_iso_8601": "2022-12-23T09:50:47.442627Z",
+      "url": "https://files.pythonhosted.org/packages/7b/5b/4271a3c6a4acd0fc8759e6612f06608601f30254d3297e22acaae01e85e3/synchronizer_framework-0.0.22-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

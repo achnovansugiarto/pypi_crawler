@@ -1,0 +1,891 @@
+{
+  "info": {
+    "author": "Ariel Shiftan",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Utilities"
+    ],
+    "description": "# Simple Sagemaker \nA **simpler** and **cheaper** way to distribute work (python/shell/training) work on machines of your choice in the (AWS) cloud.\n\nBlog posts:\n- [A quick introduction](https://towardsdatascience.com/a-very-simple-and-cheap-way-to-run-your-processing-job-on-the-cloud-c76af579f9e9)\n- [A detailed distributed pytorch model training example](https://towardsdatascience.com/single-line-distributed-pytorch-training-on-aws-sagemaker-813df77530d8)\n\n## Requirements\n1. Python 3.6+\n2. An AWS account + region and credentials configured for boto3, as explained on the [Boto3 docs](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)\n3. (Optional) The [Docker Engine](https://docs.docker.com/get-docker/), to be able to customize a docker image\n4. (Optional) The [Docker Compose](https://docs.docker.com/compose/install/), for local testing\n\n## Getting started\nTo install *Simple Sagemaker*\n```\npip install simple-sagemaker\n```\nThen, to get the shell command `cat /proc/cpuinfo && nvidia-smi` run on a single ml.p3.2xlarge instance, run the following `ssm` command (documentation of the `ssm` CLI is given [below](#cli)):\n```bash\nssm shell -p ssm-ex -t shell-task -o ./output --cmd_line \"cat /proc/cpuinfo && nvidia-smi\"\n```\n\nOutput including the logs with script stdout is downloaded to `./output`.\n\n```bash\n$ cat ./output/logs/logs0\nprocessor: 0\nmodel name: Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\ncpu cores: 4\n....\nprocessor: 2\n....\nprocessor: 7\n....\n+-----------------------------------------------------------------------------+\n| NVIDIA-SMI 440.33.01    Driver Version: 440.33.01    CUDA Version: 10.2     |\n|-------------------------------+----------------------+----------------------+\n| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |\n|===============================+======================+======================|\n|   0  Tesla V100-SXM2...  On   | 00000000:00:1E.0 Off |                    0 |\n| N/A   46C    P0    27W / 300W |      0MiB / 16160MiB |      0%      Default |\n+-------------------------------+----------------------+----------------------+\n....\n```\n\nSimilarly, to run the following `worker1.py` on two *ml.p3.2xlarge* *spot* instances\n```python\nimport torch\n\nfor i in range(torch.cuda.device_count()):\n    print(f\"-***- Device {i}: {torch.cuda.get_device_properties(i)}\")\n```\nJust run the below `ssm` command:\n```bash\nssm run -p ssm-ex -t python-task -e worker1.py -o ./output/example1 --it ml.p3.2xlarge --ic 2\n```\nThe output is saved to `./output/example1`, logs to `./output/example1/logs/logs0` and `./output/example1/logs/logs1`:\n```bash\n$ cat ./output/example1/logs/logs0\n...\n-***- Device 0: _CudaDeviceProperties(name='Tesla V100-SXM2-16GB', major=7, minor=0, total_memory=16160MB, multi_processor_count=80)\n...\n```\nIt's recommended to review the [fully featured advanced example](#A-fully-featured-advanced-example), as a demonstration of most features.\n\n## More examples (below)\nCLI based examples:\n- [Passing command line arguments](#Passing-command-line-arguments)\n- [Task state and output](#Task-state-and-output)\n- [Providing input data](#Providing-channel-data)\n- [Chaining tasks](#Chaining-tasks)\n- [Configuring the docker image](#Configuring-the-docker-image)\n- [Defining code dependencies](#Defining-code-dependencies)\n\nAPI based example:\n- [Single file example](#Single-file-example)\n\n## Motivation\nWell, I couldn't find a simple and cheap way to run my existing code on cloud. And, I wanted to try having my own OS project including documentation and a full automated testing and publishing piepline, so here it is :) \nPlease refer to [this blog post](https://medium.com/@shiftan/a-very-simple-and-cheap-way-to-run-your-processing-job-on-the-cloud-c76af579f9e9?postPublishedType=repub).\n\n# Background\n*Simple Sagemaker* is a thin wrapper around SageMaker's training and processing **jobs**, that makes distribution of work (python/shell) on [any supported instance type](https://aws.amazon.com/sagemaker/pricing/) **very simple**. \n\nThe distribution solution is composed of two parts, one on each side: a **runner** on the client machine that manages the distribution process, and a **worker** which is the code being distributed on the cloud.\n* The **runner** is the main part of this package, can mostly be controlled by using the `ssm` command line interface (CLI), or be fully customized by using the python API.\n* The **worker** is basically the work (shell/python code) being distributed. Python code may be adapted to use a small `task_toolkit` library (that is automatically injected to the **worker**) for getting the environment configuration (`WorkerConfig`, see [below](#Configuration)), i.e. input/output/state paths, running parameters. Shell command can access the same parameters on the command line, and completion is determined by the exit code (i.e. 0 is a success) etc.\n\nThe **runner** is used to configure **tasks** and **projects**: \n- A **task** is a logical step that runs on a defined input and provide output. It's defined by providing a local code path, entrypoint, and a list of additional local dependencies\n- A SageMaker **job** is a **task** instance, i.e. a single **job** is created each time a **task** is executed\n    - State is maintained between consecutive execution of the same **task** (see more [below](#Task-state-and-output))\n    - If a **task** was completed, by returnin 0 retcode from all instances, it'll be skipped automatically on the next time (unless enforced otherwise)\n- A **project** is a series of related **tasks**, with possible dependencies\n    - The output of a completed task can be consumed as input by a consecutive task\n\n# Main features\n1. \"Simpler\" - Except for holding an AWS account credentials, no other pre-configuration nor knowledge is assumed (well, almost :). Behind the scenes you get:\n    - Jobs IAM role creation, including policies for accessing needed S3 buckets\n    - Building and uploading a customized docker image to AWS (ECS service)\n    - Synchronizing local source code / input data to a S3 bucket\n    - Downloading the results from S3\n    - ...\n2. \"Cheaper\" - [\"pay only for what you use\"](https://aws.amazon.com/sagemaker/pricing/), and save [up to 90% of the cost](https://docs.aws.amazon.com/sagemaker/latest/dg/model-managed-spot-training.html) with spot instances, which got used by default!\n3. Abstraction of how data is maintained on AWS (S3 service)\n    - No need to mess with S3 paths, the data is automatically\n    - State is automatically maintained between consecutive execution of **jobs** that belongs to the same **task**\n4. A simple way to define how data flows between **tasks** of the same **project**, e.g. how the first **task**'s outputs is used as an input for a second **task**\n5. (Almost) no code changes are to the existing code - the API is mostly wrapped by a command line interface (named `ssm`) to control the execution (a.k.a implement the **runner**, see below)\n    - In most cases it's only about 1 line for getting the environment configuration (e.g. input/output/state paths and running parameters, see [below](#Configuration)) and passing it on to the original code\n6. Easy customization of the docker image (based on a pre-built one)\n7. The rest of the SageMaker advantages, which (mostly) behaves \"normally\" as defined by AWS, e.g.\n    - (Amazon SageMaker Developer Guide)[https://docs.aws.amazon.com/sagemaker/latest/dg/whatis.html]\n    - (Amazon SageMaker Python SDK @ Read the Docs)[https://sagemaker.readthedocs.io/en/stable/index.html]\n\n\n## High level flow diagram\n![High level flow diagram](https://github.com/shiftan/simple_sagemaker/blob/master/docs/high_level_flow.svg?raw=true \"High level flow\")\n\n# Worker environment\nThe worker entry point (`entry_point` parameter), directory (`source_dir` for python code / .sh script, `dir_files` for shell script), \nalong with all dependencies (`dependencies` parameter) are getting copied to a single directory (`/opt/ml/code`) on each instance, \nand the entry point is then executed. \nOn top of the above, for python code tasks, the `task_toolkit` library is also added as a dependency in this folder.\n\n## Configuration\nThe worker can access the environment configuration parameters in two ways:\n1. The environment variables, e.g. `SM_NUM_CPUS` represents the number of CPUs.\n2. Using the `worker_lib` library: initialize a `WorkerConfig` instance, `worker_config = worker_lib.WorkerConfig()`, and then all params can be accessible from the `worker_config` variable, e.g.  `worker_lib.num_cpus` is the number of CPUs.\n\nThe complete list of configuration parameters:\n\n| Description | Environment variable | `worker_config` field name | Example |\n| ----------- | ----------- | ----------- | ----------- |\n| The name of the current running **job** | SAGEMAKER_JOB_NAME | job_name | 'task1-2020-09-23-17-12-46-0JNcrR6H'\n| **Input channels**:|\n| Names of the input channels | SM_CHANNELS | channels | ['data']\n| The data input channel | SM_CHANNEL_DATA | channel_data | '/opt/ml/input/data/data'\n| Path where the input model (given by `model_uri` parameter) is located | SM_CHANNEL_MODEL | channel_model | '/opt/ml/input/data/model'\n| Generally - path where the channel [ChannelName] is located | SM_CHANNEL_[ChannelName] | channel_[ChannelName] | '/opt/ml/input/data/[ChannelName]'\n| Additional command line parameters / hyperparameters | SM_HPS | hps | {'arg': 'hello world!', 'task': 1, 'worker': 1}\n| **State**:|\n| The root path of where state should be stored | SSM_STATE | state | '/state'\n| The instance specific state path | SSM_INSTANCE_STATE | instance_state | '/state/algo-1'\n| **Output**:|\n| The path where output data should be stored | SM_OUTPUT_DATA_DIR | output_data_dir | '/opt/ml/output/data'\n| Path where model output should be stored | SM_MODEL_DIR | model_dir | '/opt/ml/model'\n| TensorBoard output | SSM_TENSORBOARD_DIR | tensorboard_dir | '/opt/ml/output/tensorboard'\n| **System**:|\n| The number of available CPUs on this instance | SM_NUM_CPUS | num_cpus | 2\n| The number of available GPUs  instance| SM_NUM_GPUS | num_gpus | 1\n| Name of the current host | SM_CURRENT_HOST | current_host | 'algo-1'\n| Names of all other hosts that are running on this **job** | SM_HOSTS | hosts | ['algo-1', 'algo-2']\n| The name of the network interface | SM_NETWORK_INTERFACE_NAME | network_interface_name | 'eth0'\n| The number of instance running for this **job** | SSM_NUM_NODES | num_nodes | 'eth0'\n| The rank of the current instance | SSM_HOST_RANK | host_rank | 'eth0'\n\n## State\nState is maintained between executions of the same **task**, i.e. between **jobs** that belongs to the same **task**.\nThe local path is available in `worker_config.state`. \nWhen running multiple instances, the state data is merged into a single directory (post execution).  To avoid collisions, set the `per_instance_state` parameter of `WorkerConfig` constructor to `True` (the default behavior), which initializes a per instance sub directory, and keep it in `worker_config.instance_state`. On top of that, the return value plays an important part: returning 0 means the **job** is completed. If all instances of a **job** marked it as completed, the **task** is assumed to be completed by that **job**, which allows:\n1. To skip it next time (unless enforced otherwise by using `--force_running` or a newer run of the same **task** failed)\n2. To use its output as input for other **tasks** (see below: [\"Chaining tasks\"](#Chaining-tasks))\n\n## Output\nOn top of the state, there're 3 main other output mechanisms:\n1. Logs - any output written to standard output / error\n2. Output data - any data in `worker_config.output_data_dir` is compressed into a output.tar.gz. Only the main instance output data is kept.\n3. Model - any data in `worker_config.model_dir` is compressed into a model.tar.gz. As data from all instance is merged, be carful with collisions.\n\n\n# Data maintenance on S3\nAll data, including input, code, state and output, is maintained on S3. The bucket to use can be defined, or the default one is used.\nThe files and directories structure is as follows:\n```\n[Bucket name]/[Project name]/[Task name]\n|-- state\n|-- input\n|-- [Job name]\n|   |-- output\n|   |   |-- model.tar.gz\n|   |   `-- output.tar.gz\n|   `-- source/sourcedir.tar.gz\n|-- [Job name 2]\n|        ...\n```\n- state - the task state, shared between all jobs, i.e. task executions\n- input - the task input, shared as well\n- [Job name] - a per job specific folder\n    - model.tar.gz - model output data, merged from *all instances*\n    - output.tar.gz - the *main instance* output data (other outputs are ignored)\n    - sourcedir.tar.gz - source code and dependencies\n- [Job name 2] - another execution of the same task\n\n# Local mode\nSageMaker offers partial [\"local mode\"](https://sagemaker.readthedocs.io/en/stable/overview.html#local-mode) support in order to test locally. The basic mode runs just the docker locally, while keep using S3 for input/output, and there's the `local_code` mode that does everything locally.\nTo use the basic mode with *Simple Sagemaker*, `local` or `local_gpu` as instance type and `local_mode = True` for `SageMakerProject` constructor (this is done automatically with `ssm` CLI).\nNotes:\n- sagemaker[local] is required: `pip install sagemaker[local]`\n- Local mode doesn't support all features, e.g. state isn't supported. More notes and exclusions can be seen on the [documentation]([\"local_mode\"](https://sagemaker.readthedocs.io/en/stable/overview.html#local-mode) )\n- `local_code` mode isn't currently supported by *Simple Sagemaker*\n\n# Distributed training\nSagemaker's PyTorch and TensorFlow pre-built images has extra customization for distributed training. Make sure to configure `framework`, \n`framework_version` and `py_version` to use the image that matches your needs ([the full list is here](https://github.com/aws/deep-learning-containers/blob/master/available_images.md)). For TensorFlow you'll need to use the `distribution` parameters. For more details on the built in support see:\n- PyTorch - [Distributed PyTorch Training](https://sagemaker.readthedocs.io/en/stable/frameworks/pytorch/using_pytorch.html#distributed-pytorch-training)\n- TensorFlow - [Distributed TensorFlow Training](https://sagemaker.readthedocs.io/en/stable/frameworks/tensorflow/using_tf.html#distributed-training). \n\nA full distributed ImageNet training pipeline can be found [here](https://github.com/shiftan/simple_sagemaker/tree/master/examples/imagenet), along with a detailed explanation on the [blog post](https://towardsdatascience.com/single-line-distributed-pytorch-training-on-aws-sagemaker-813df77530d8), \n\n# Processing tasks\nDocumentation TBD. For now, take a look [on the processing cli examples](https://github.com/shiftan/simple_sagemaker/tree/master/examples/processing_cli/run.sh), and the [`ssm process -h` output](#ssm-process).\n\n# CLI\nThe `ssm` CLI supports 4 commands:\n- run - to run a python / .sh script based task\n- shell - to run a shell based task\n- data - to manage (download/clear state) the data of an existing task\n- process - to run a processing command, script or generic\n```bash\n$ ssm -h\nusage: ssm [-h] {run,shell,data,process} ...\n\npositional arguments:\n  {run,shell,data,process}\n    run                 Run a python / .sh script task\n    shell               Run a shell task\n    data                Manage task data\n    process             Run a processing task\n\noptional arguments:\n  -h, --help            show this help message and exit\n```\n## ssm run\n```bash  \n$ ssm run -h\nusage: ssm run [-h] --project_name PROJECT_NAME [--prefix PREFIX] --task_name\n               TASK_NAME [--bucket_name BUCKET_NAME] [--source_dir SOURCE_DIR]\n               --entry_point ENTRY_POINT\n               [--dependencies DEPENDENCIES [DEPENDENCIES ...]]\n               [--instance_type INSTANCE_TYPE]\n               [--instance_count INSTANCE_COUNT] [--volume_size VOLUME_SIZE]\n               [--no_spot] [--use_spot_instances]\n               [--max_wait_mins MAX_WAIT_MINS] [--max_run_mins MAX_RUN_MINS]\n               [--aws_repo_name AWS_REPO_NAME] [--repo_name REPO_NAME]\n               [--image_tag IMAGE_TAG]\n               [--docker_file_path_or_content DOCKER_FILE_PATH_OR_CONTENT]\n               [--framework {pytorch,tensorflow}]\n               [--framework_version FRAMEWORK_VERSION]\n               [--py_version PY_VERSION]\n               [--input_path INPUT_PATH [INPUT_PATH ...]]\n               [--model_uri MODEL_URI] [--input_s3 INPUT_S3 [INPUT_S3 ...]]\n               [--input_task INPUT_TASK [INPUT_TASK ...]] [--force_running]\n               [--distribution DISTRIBUTION] [--clean_state] [--keep_state]\n               [--metric_definitions name regexp] [--tag key value]\n               [--output_path OUTPUT_PATH] [--download_state]\n               [--download_model] [--download_output]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  --project_name PROJECT_NAME, -p PROJECT_NAME\n                        Project name. (default: None)\n  --prefix PREFIX       S3 prefix. (default: None)\n  --task_name TASK_NAME, -t TASK_NAME\n                        Task name. (default: None)\n  --bucket_name BUCKET_NAME, -b BUCKET_NAME\n                        S3 bucket name (a default one is used if not given).\n                        (default: None)\n\nCode:\n  --source_dir SOURCE_DIR, -s SOURCE_DIR\n                        Path (absolute, relative or an S3 URI) to a directory\n                        with any other source code dependencies aside from the\n                        entry point file. If source_dir is an S3 URI, it must\n                        point to a tar.gz file. Structure within this\n                        directory are preserved when running on Amazon\n                        SageMaker. (default: None)\n  --entry_point ENTRY_POINT, -e ENTRY_POINT\n                        Path (absolute or relative) to the local Python source\n                        file or a .sh script which should be executed as the\n                        entry point. If source_dir is specified, then\n                        entry_point must point to a file located at the root\n                        of source_dir. (default: None)\n  --dependencies DEPENDENCIES [DEPENDENCIES ...], -d DEPENDENCIES [DEPENDENCIES ...]\n                        A list of paths to directories (absolute or relative)\n                        with any additional libraries that will be exported to\n                        the container The library folders will be copied to\n                        SageMaker in the same folder where the entrypoint is\n                        copied. (default: None)\n\nInstance:\n  --instance_type INSTANCE_TYPE, --it INSTANCE_TYPE\n                        Type of EC2 instance to use. (default: ml.m5.large)\n  --instance_count INSTANCE_COUNT, --ic INSTANCE_COUNT\n                        Number of EC2 instances to use. (default: 1)\n  --volume_size VOLUME_SIZE, -v VOLUME_SIZE\n                        Size in GB of the EBS volume to use for storing input\n                        data. Must be large enough to store input data.\n                        (default: 30)\n  --no_spot             Use on demand instances (default: True)\n  --use_spot_instances  Specifies whether to use SageMaker Managed Spot\n                        instances. (default: True)\n  --max_wait_mins MAX_WAIT_MINS\n                        Timeout in minutes waiting for spot instances. After\n                        this amount of time Amazon SageMaker will stop waiting\n                        for Spot instances to become available. If 0 is\n                        specified and spot instances are used, its set to\n                        max_run_mins (default: 0)\n  --max_run_mins MAX_RUN_MINS\n                        Timeout in minutes for running. After this amount of\n                        time Amazon SageMaker terminates the job regardless of\n                        its current status. (default: 1440)\n\nImage:\n  --aws_repo_name AWS_REPO_NAME, --ar AWS_REPO_NAME\n                        Name of ECS repository. (default: None)\n  --repo_name REPO_NAME, --rn REPO_NAME\n                        Name of local repository. (default: None)\n  --image_tag IMAGE_TAG\n                        Image tag. (default: latest)\n  --docker_file_path_or_content DOCKER_FILE_PATH_OR_CONTENT, --df DOCKER_FILE_PATH_OR_CONTENT\n                        Either a path to a directory containing the DockerFile\n                        or its content. In the first case, the base image\n                        should be set to `__BASE_IMAGE__` within the\n                        Dockerfile, and is automatically replaced with the\n                        correct base image. For the latter case, it should be\n                        the content of the docker file e.g. '--df \"RUN pip3\n                        install pandas==0.25.3 scikit-learn==0.21.3\"'\n                        (default: None)\n  --framework {pytorch,tensorflow}, -f {pytorch,tensorflow}\n                        The framework to use, see https://github.com/aws/deep-\n                        learning-containers/blob/master/available_images.md\n                        (default: pytorch)\n  --framework_version FRAMEWORK_VERSION, --fv FRAMEWORK_VERSION\n                        The framework version (default: None)\n  --py_version PY_VERSION, --pv PY_VERSION\n                        The python version (default: None)\n\nRunning:\n  --force_running, --fr\n                        Force running the task even if its already completed.\n                        (default: False)\n  --distribution DISTRIBUTION\n                        Tensorflows distribution policy, see https://sagemake\n                        r.readthedocs.io/en/stable/frameworks/tensorflow/using\n                        _tf.html#distributed-training. (default: None)\n  --tag key value       Tag to be attached to the jobs executed for this task.\n                        (default: None)\n\nI/O:\n  --input_path INPUT_PATH [INPUT_PATH ...], -i INPUT_PATH [INPUT_PATH ...]\n                        INPUT: PATH [DISTRIBUTION] [SUBDIR] Local/s3 path for\n                        the input data. If a local path is given, it will be\n                        synced to the task folder on the selected S3 bucket\n                        before launching the task. (default: None)\n  --model_uri MODEL_URI\n                        URI where a pre-trained model is stored, either\n                        locally or in S3. If specified, the estimator will\n                        create a channel pointing to the model so the training\n                        job can download it. This model can be a\n                        ‘model.tar.gz’ from a previous training job, or other\n                        artifacts coming from a different source. (default:\n                        None)\n  --input_s3 INPUT_S3 [INPUT_S3 ...], --iis INPUT_S3 [INPUT_S3 ...]\n                        INPUT_S3: INPUT_NAME S3_URI [DISTRIBUTION] [SUBDIR]\n                        Additional S3 input sources (a few can be given).\n                        (default: None)\n  --input_task INPUT_TASK [INPUT_TASK ...], --iit INPUT_TASK [INPUT_TASK ...]\n                        INPUT_TASK: INPUT_NAME TASK_NAME TYPE [DISTRIBUTION]\n                        [SUBDIR] Use an output of a completed task in the same\n                        project as an input source (a few can be given). Type\n                        should be one of ['state', 'model', 'source',\n                        'output']. (default: None)\n  --clean_state, --cs   Clear the task state before running it. The task will\n                        be running again even if it was already completed\n                        before. (default: False)\n  --keep_state, --ks    Keep the current task state. If the task is already\n                        completed, its current output will be taken without\n                        running it again. (default: True)\n  --metric_definitions name regexp, --md name regexp\n                        Name and regexp for a metric definition, a few can be\n                        given. See https://docs.aws.amazon.com/sagemaker/lates\n                        t/dg/training-metrics.html. (default: None)\n\nDownload:\n  --output_path OUTPUT_PATH, -o OUTPUT_PATH\n                        Local path to download the outputs to. (default: None)\n  --download_state      Download the state once task is finished (default:\n                        False)\n  --download_model      Download the model once task is finished (default:\n                        False)\n  --download_output     Download the output once task is finished (default:\n                        False)\n\nAnything after \"--\" (followed by a space) will be passed as-is to the executed\nscript command line\n```\n## ssm process\n```bash  \n$ ssm process -h\nusage: ssm process [-h] --project_name PROJECT_NAME [--prefix PREFIX]\n                   --task_name TASK_NAME [--bucket_name BUCKET_NAME]\n                   [--code CODE] [--entrypoint ENTRYPOINT [ENTRYPOINT ...]]\n                   [--dependencies DEPENDENCIES [DEPENDENCIES ...]]\n                   [--command COMMAND [COMMAND ...]]\n                   [--instance_type INSTANCE_TYPE]\n                   [--instance_count INSTANCE_COUNT]\n                   [--volume_size VOLUME_SIZE] [--max_run_mins MAX_RUN_MINS]\n                   [--aws_repo_name AWS_REPO_NAME] [--repo_name REPO_NAME]\n                   [--image_tag IMAGE_TAG]\n                   [--docker_file_path_or_content DOCKER_FILE_PATH_OR_CONTENT]\n                   [--framework FRAMEWORK]\n                   [--framework_version FRAMEWORK_VERSION]\n                   [--input_path INPUT_PATH [INPUT_PATH ...]]\n                   [--input_s3 INPUT_S3 [INPUT_S3 ...]]\n                   [--input_task INPUT_TASK [INPUT_TASK ...]]\n                   [--force_running] [--clean_state] [--keep_state]\n                   [--tag key value] [--env key value]\n                   [--arguments ARGUMENTS [ARGUMENTS ...]]\n                   [--output_path OUTPUT_PATH] [--download_state]\n                   [--download_model] [--download_output]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  --project_name PROJECT_NAME, -p PROJECT_NAME\n                        Project name. (default: None)\n  --prefix PREFIX       S3 prefix. (default: None)\n  --task_name TASK_NAME, -t TASK_NAME\n                        Task name. (default: None)\n  --bucket_name BUCKET_NAME, -b BUCKET_NAME\n                        S3 bucket name (a default one is used if not given).\n                        (default: None)\n\nCode:\n  --code CODE           An S3 URI or a local path to a file with the framework\n                        script to run. (default: None)\n  --entrypoint ENTRYPOINT [ENTRYPOINT ...], -e ENTRYPOINT [ENTRYPOINT ...]\n                        The entrypoint for the processing job (default: None).\n                        This is in the form of a list of strings that make a\n                        command (default: None)\n  --dependencies DEPENDENCIES [DEPENDENCIES ...], -d DEPENDENCIES [DEPENDENCIES ...]\n                        A list of paths to directories (absolute or relative)\n                        with any additional libraries that will be exported to\n                        the container The library folders will be copied to\n                        SageMaker in the same folder where the entrypoint is\n                        copied. (default: None)\n  --command COMMAND [COMMAND ...]\n                        The command to run, along with any command-line flags\n                        (defaults to: \"python3\"). (default: None)\n\nInstance:\n  --instance_type INSTANCE_TYPE, --it INSTANCE_TYPE\n                        Type of EC2 instance to use. (default: ml.t3.medium)\n  --instance_count INSTANCE_COUNT, --ic INSTANCE_COUNT\n                        Number of EC2 instances to use. (default: 1)\n  --volume_size VOLUME_SIZE, -v VOLUME_SIZE\n                        Size in GB of the EBS volume to use for storing input\n                        data. Must be large enough to store input data.\n                        (default: 30)\n  --max_run_mins MAX_RUN_MINS\n                        Timeout in minutes for running. After this amount of\n                        time Amazon SageMaker terminates the job regardless of\n                        its current status. (default: 1440)\n\nImage:\n  --aws_repo_name AWS_REPO_NAME, --ar AWS_REPO_NAME\n                        Name of ECS repository. (default: None)\n  --repo_name REPO_NAME, --rn REPO_NAME\n                        Name of local repository. (default: None)\n  --image_tag IMAGE_TAG\n                        Image tag. (default: latest)\n  --docker_file_path_or_content DOCKER_FILE_PATH_OR_CONTENT, --df DOCKER_FILE_PATH_OR_CONTENT\n                        Either a path to a directory containing the DockerFile\n                        or its content. In the first case, the base image\n                        should be set to `__BASE_IMAGE__` within the\n                        Dockerfile, and is automatically replaced with the\n                        correct base image. For the latter case, it should be\n                        the content of the docker file e.g. '--df \"RUN pip3\n                        install pandas==0.25.3 scikit-learn==0.21.3\"'\n                        (default: None)\n  --framework FRAMEWORK, -f FRAMEWORK\n                        The framework to use, see https://github.com/aws/deep-\n                        learning-containers/blob/master/available_images.md\n                        (default: sklearn)\n  --framework_version FRAMEWORK_VERSION, --fv FRAMEWORK_VERSION\n                        The framework version (default: 0.20.0)\n\nRunning:\n  --force_running, --fr\n                        Force running the task even if its already completed.\n                        (default: False)\n  --tag key value       Tag to be attached to the jobs executed for this task.\n                        (default: None)\n  --env key value       Environment variables for the running task. (default:\n                        None)\n  --arguments ARGUMENTS [ARGUMENTS ...]\n                        A list of string arguments to be passed to a\n                        processing job. Arguments can also be provided after\n                        \"--\" (followed by a space), which may be needed for\n                        parameters with dashes (default: None)\n\nI/O:\n  --input_path INPUT_PATH [INPUT_PATH ...], -i INPUT_PATH [INPUT_PATH ...]\n                        INPUT: PATH [DISTRIBUTION] [SUBDIR] Local/s3 path for\n                        the input data. If a local path is given, it will be\n                        synced to the task folder on the selected S3 bucket\n                        before launching the task. (default: None)\n  --input_s3 INPUT_S3 [INPUT_S3 ...], --iis INPUT_S3 [INPUT_S3 ...]\n                        INPUT_S3: INPUT_NAME S3_URI [DISTRIBUTION] [SUBDIR]\n                        Additional S3 input sources (a few can be given).\n                        (default: None)\n  --input_task INPUT_TASK [INPUT_TASK ...], --iit INPUT_TASK [INPUT_TASK ...]\n                        INPUT_TASK: INPUT_NAME TASK_NAME TYPE [DISTRIBUTION]\n                        [SUBDIR] Use an output of a completed task in the same\n                        project as an input source (a few can be given). Type\n                        should be one of ['state', 'model', 'source',\n                        'output']. (default: None)\n  --clean_state, --cs   Clear the task state before running it. The task will\n                        be running again even if it was already completed\n                        before. (default: False)\n  --keep_state, --ks    Keep the current task state. If the task is already\n                        completed, its current output will be taken without\n                        running it again. (default: True)\n\nDownload:\n  --output_path OUTPUT_PATH, -o OUTPUT_PATH\n                        Local path to download the outputs to. (default: None)\n  --download_state      Download the state once task is finished (default:\n                        False)\n  --download_model      Download the model once task is finished (default:\n                        False)\n  --download_output     Download the output once task is finished (default:\n                        False)\n\nAnything after \"--\" (followed by a space) will be passed as-is to the executed\nscript command line\n```\n\nRunning a shell based task is very similar, except for `source_dir` and `entry_point` which are replaced by\n`dir_files` and `cmd_line`, respectively. Run `ssm shell -h` for more details.\n\n## ssm data\nTo manage the data of an existing command:\n```bash\n$ ssm data -h \n\nusage: ssm data [-h] --project_name PROJECT_NAME --task_name TASK_NAME\n                [--bucket_name BUCKET_NAME] [--output_path OUTPUT_PATH]\n                [--download_state] [--download_model] [--download_output]\n\noptional arguments:\n  -h, --help            show this help message and exit\n  --project_name PROJECT_NAME, -p PROJECT_NAME\n                        Project name.\n  --task_name TASK_NAME, -t TASK_NAME\n                        Task name.\n  --bucket_name BUCKET_NAME, -b BUCKET_NAME\n                        S3 bucket name (a default one is used if not given).\n  --output_path OUTPUT_PATH, -o OUTPUT_PATH\n                        Local path to download the outputs to.\n  --download_state      Download the state once task is finished\n  --download_model      Download the model once task is finished\n  --download_output     Download the output once task is finished\n```\n\n# A fully featured advanced example\nAnd now to a real advanced and fully featured version, yet simple to implement.\nIn order to exemplify most of the possible features, the following files are used in [CLI Example 6_1](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/example6):\n```\n.\n|-- Dockerfile\n|-- code\n|   |-- internal_dependency\n|   |   `-- lib2.py\n|   |-- requirements.txt\n|   `-- worker6.py\n|-- data\n|   |-- sample_data1.txt\n|   `-- sample_data2.txt\n`-- external_dependency\n    `-- lib1.py\n```\n\n- Dockerfile - the dockerfile specifying how to extend the pre-built image\n    ```bash\n    # __BASE_IMAGE__ is automatically replaced with the correct base image\n    FROM __BASE_IMAGE__ \n    RUN pip3 install pandas==0.25.3 scikit-learn==0.21.3\n    ```\n- code - the source code folder\n    - internal_dependency - a dependency that is part of the source code folder\n    - requirements.txt - pip requirements file lists needed packages to be installed before running the worker\n        ```bash\n        transformers==3.0.2\n        ```\n    - worker6.py - the worker code\n- data - input data files\n- external_dependency - additional code dependency\n\nThe code is then launched a few time by [run.sh](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/run.sh), to demonstrate different features:\n```bash\n\n# Example 6_1 - a complete example part 1. \n#   - Uses local data folder as input, that is distributed among instances (--i, ShardedByS3Key)\n#   - Uses a public s3 bucket as an additional input (--iis)\n#   - Builds a custom docker image (--df, --repo_name, --aws_repo_name)\n#   - Hyperparameter task_type\n#   - 2 instance (--ic)\n#   - Use an on-demand instance (--no_spot)\nssm run -p ssm-ex -t task6-1 -s $BASEDIR/example6/code -e worker6.py \\\n    -i $BASEDIR/example6/data ShardedByS3Key \\\n    --iis persons s3://awsglue-datasets/examples/us-legislators/all/persons.json \\\n    --df $BASEDIR/example6 --repo_name \"task6_repo\" --aws_repo_name \"task6_repo\" --no_spot \\\n    --ic 2 --task_type 1 -o $1/example6_1\n\n# Example 6_2 - a complete example part 2.\n#   - Uses outputs from part 1 (--iit)\n#   - Uses additional local code dependencies (-d)\n#   - Uses the tensorflow framework as pre-built image (-f)\n#   - Tags the jobs (--tag)\n#   - Defines sagemaker metrics (--md)\nssm run -p ssm-ex -t task6-2 -s $BASEDIR/example6/code -e worker6.py \\\n    -d $BASEDIR/example6/external_dependency --iit task_6_1_model task6-1 model \\\n    --iit task_6_1_state task6-1 state ShardedByS3Key \\\n    -f tensorflow --md \"Score\" \"Score=(.*?);\" --tag \"MyTag\" \"MyValue\" \\\n    --ic 2 --task_type 2 -o $1/example6_2 &\n\n# Running task6_1 again\n#   - A completed task isn't executed again, but the current output is used instead. \n#       --ks (keep state, the default) is used to keep the current state\nssm run -p ssm-ex -t task6-1 -s $BASEDIR/example6/code -e worker6.py \\\n    -i $BASEDIR/example6/data ShardedByS3Key \\\n    --iis persons s3://awsglue-datasets/examples/us-legislators/all/persons.json \\\n    --df $BASEDIR/example6 --repo_name \"task6_repo\" --aws_repo_name \"task6_repo\" \\\n    --ic 2 --task_type 1 -o $1/example6_1 > $1/example6_1_2_stdout --ks &\n\n\nwait # wait for all processes\n```\n\n[`worker6.py`](https://github.com/shiftan/simple_sagemaker/blob/master/examples/readme_examples/example6/code/worker6.py) contains the following:\n```python\n    logger.info(\"Score=10;\")\n    time.sleep(60)  # sleep to be able to see the two scores\n    logger.info(\"Score=20;\")\n```\nThis get captured by the `\"Score=(.*?);\"` regular expression in the `ssm` command above, then the metrics graphs can be viewed on the AWS console:\n\n![Metrics example](https://github.com/shiftan/simple_sagemaker/blob/master/docs/metric_example.jpg?raw=true \"Metric Example\")\n\nMore information can be found [here](https://docs.aws.amazon.com/sagemaker/latest/dg/training-metrics.html).\n\nFeel free to dive more into the [files of this example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/example6). Specifically, note how the [same worker code](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/example6/code/worker6.py) is used for the two parts, and the `task_type` hyperparameter is used to distinguish between the two. \n\n# More examples\nCLI based examples:\n- [A fully featured advanced example](#A-fully-featured-advanced-example)\n- [Passing command line arguments](#Passing-command-line-arguments)\n- [Task state and output](#Task-state-and-output)\n- [Providing input data](#Providing-channel-data)\n- [Chaining tasks](#Chaining-tasks)\n- [Configuring the docker image](#Configuring-the-docker-image)\n- [Defining code dependencies](#Defining-code-dependencies)\n\nAPI based example:\n- [Single file example](#Single-file-example)\n\n## Passing command line arguments\nAny extra argument passed to the command line in the form of --[KEY_NAME] [VALUE] is passed as an hyperparameter, and anything after \"--\" (followed by a space) in passed as-is to the executed script command line. hyperparameters are accessible for the **worker** by the `hps` dictionary within the environment configuration or just by parsing the command time argument of the running script (e.g. sys.argv).\nFor example, see the following worker code `worker2.py`:\n```python\nfrom worker_toolkit import worker_lib\n\nworker_config = worker_lib.WorkerConfig(False)\nprint(\"-***-\", worker_config.hps[\"msg\"])\n```\nRunner CLI:\n```bash\nssm run -p ssm-ex -t task2 -e worker2.py --msg \"Hello, world!\" -o ./output/example2\n```\nOutput from the log file\n```\nInvoking script with the following command:\n\n/opt/conda/bin/python worker2.py --msg Hello, world!\n\nHello, world!\n```\n## Task state and output\n\n\nA complete example can be seen in `worker3.py`:\n```python\nimport os\n\nfrom worker_toolkit import worker_lib\n\nworker_config = worker_lib.WorkerConfig(False)\n\nopen(os.path.join(worker_config.output_data_dir, \"output_data_dir\"), \"wt\").write(\n    \"output_data_dir file\"\n)\nopen(os.path.join(worker_config.model_dir, \"model_dir\"), \"wt\").write(\"model_dir file\")\nopen(os.path.join(worker_config.state, \"state_dir\"), \"wt\").write(\"state_dir file\")\n\n# 0 retcode - marks the tasks as completed, to allow other tasks to use its output, \n# and to avoid re-running it (unless enforced)\n```\nRunner CLI:\n```bash\nssm run -p ssm-ex -t task3 -e worker3.py -o ./output/example3\n```\nOutput from the log file\n```\nInvoking script with the following command:\n\n/opt/conda/bin/python worker2.py --msg Hello, world!\n\nHello, world!\n```\n\n## Providing input data\nA **Job** can be configured to get a few data channels:\n* A single local path can be used with the `-i/--input_path` argument. This path is synchronized to the **task** directory on the S3 bucket before running the **task**. On the **worker** side the data is accessible in `worker_config.channel_data`\n* Additional S3 paths (many) can be set as well. Each input source is provided with `--iis [name] [S3 URI]`, and is accessible by the worker with `worker_config.channel_[name]` when [name] is the same one as was provided on the command line.\n* Setting an output of a another **task** on the same **project**, see below [\"Chaining tasks\"](#Chaining-tasks)\n\nAssuming a local `data` folder containing a single `sample_data.txt` file, a complete example can be seen in `worker4.py`:\n```python\nimport logging\nimport subprocess\nimport sys\n\nfrom worker_toolkit import worker_lib\n\nlogger = logging.getLogger(__name__)\n\n\ndef listDir(path):\n    logger.info(f\"*** START listing files in {path}\")\n    logger.info(\n        subprocess.run(\n            [\"ls\", \"-la\", \"-R\", path], stdout=subprocess.PIPE, universal_newlines=True\n        ).stdout\n    )\n    logger.info(f\"*** END file listing {path}\")\n\n\nif __name__ == \"__main__\":\n    logging.basicConfig(stream=sys.stdout)\n    worker_config = worker_lib.WorkerConfig(False)\n    listDir(worker_config.channel_data)\n    listDir(worker_config.channel_bucket)\n```\nRunning command:\n```bash\nssm run -p ssm-ex -t task4 -e worker4.py -i ./data \\\n    --iis bucket s3://awsglue-datasets/examples/us-legislators/all/persons.json -o ./output/example4\n```\nOutput from the log file\n```\n...\nINFO:__main__:*** START listing files in /opt/ml/input/data/data\nINFO:__main__:/opt/ml/input/data/data:\ntotal 12\ndrwxr-xr-x 2 root root 4096 Sep 14 21:51 .\ndrwxr-xr-x 4 root root 4096 Sep 14 21:51 ..\n-rw-r--r-- 1 root root   19 Sep 14 21:51 sample_data.txt\n\nINFO:__main__:*** END file listing /opt/ml/input/data/data\nINFO:__main__:*** START listing files in /opt/ml/input/data/bucket\nINFO:__main__:/opt/ml/input/data/bucket:\ntotal 7796\ndrwxr-xr-x 2 root root    4096 Sep 14 21:51 .\ndrwxr-xr-x 4 root root    4096 Sep 14 21:51 ..\n-rw-r--r-- 1 root root 7973806 Sep 14 21:51 persons.json\n\nINFO:__main__:*** END file listing /opt/ml/input/data/bucket\n...\n```\n\n## Chaining tasks\nThe output of a completed **task** on the same **project** can be used as an input to another **task**, by using the `--iit [name] [task name] [output type]` command line parameter, where:\n- [name] - is the name of the input source, accessible by the worker with `worker_config.channel_[name]`\n- [task name] - the name of the **task** whose output is used as input \n- [output type] - the **task** output type, one of \"model\", \"output\", \"state\"\n\nUsing the model output of *task3* and the same `worker4.py` code, we can now run:\n```bash\nssm run -p ssm-ex -t task5 -e worker4.py --iit bucket task3 model -o ./output/example5\n```\n\nAnd get the following output from in the log file:\n```\nINFO:__main__:*** START listing files in \nINFO:__main__:\nINFO:__main__:*** END file listing \nINFO:__main__:*** START listing files in /opt/ml/input/data/bucket\nINFO:__main__:/opt/ml/input/data/bucket:\ntotal 12\ndrwxr-xr-x 2 root root 4096 Sep 14 21:55 .\ndrwxr-xr-x 3 root root 4096 Sep 14 21:55 ..\n-rw-r--r-- 1 root root  128 Sep 14 21:55 model.tar.gz\n\nINFO:__main__:*** END file listing /opt/ml/input/data/bucket\n```\n\n## Configuring the docker image\nThe image used to run a task can either be selected from a [pre-built ones](https://github.com/aws/deep-learning-containers/blob/master/available_images.md) \nor extended with additional Dockerfile commands.\nThe `framework`, `framework_version` and `py_version` CLI parameters are used to define the pre-built image, then if a path to a directory containing the Dockerfile is given by `docker_file_path_or_content`, it used along with `aws_repo_name`, `repo_name` and `image_tag` to build and push an image to ECS, and then set it as the used image.\nThe base image should be set to `__BASE_IMAGE__` within the Dockerfile, and is automatically replaced with the correct base image (according to the provided parameters above) before building it.\nThe API parameter for the Dockerfile path is named `docker_file_path_or_content` and allows to provide the content of the Dockerfile, e.g. \n```python\ndockerFileContent = \"\"\"\n# __BASE_IMAGE__ is automatically replaced with the correct base image\nFROM __BASE_IMAGE__\nRUN pip3 install pandas==1.1 scikit-learn==0.21.3\n\"\"\"\n```\nSample usages:\n1. [CLI Example 6_1](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/example6)- a CLI example launched by [run.sh](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/run.sh)\n2. [single file example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_file/example.py) - API with Dockerfile content\n2. [single task example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_task/example.py) - API with Dockerfile path\n\n## Defining code dependencies\nAdditional local code dependencies can be specified with the `dependencies` CLI/API parameters. These dependencies are packed along with\nthe source code, and are extracted on the root code folder in run time.\n\nSample usages:\n1. [CLI Example 6_2](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/example6)- a CLI example launched by [run.sh](https://github.com/shiftan/simple_sagemaker/tree/master/examples/readme_examples/run.sh)\n2. [single task example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_task/example.py) - API\n\n## Single file example\nA [single file example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_file/example.py) can be found in the [examples directory](https://github.com/shiftan/simple_sagemaker/tree/master/examples).\nFirst, define the **runner**:\n```python\ndockerFileContent = \"\"\"\n# __BASE_IMAGE__ is automatically replaced with the correct base image\nFROM __BASE_IMAGE__\nRUN pip3 install pandas==1.1 scikit-learn==0.21.3\n\"\"\"\nfile_path = Path(__file__).parent\n\n\ndef runner(project_name=\"simple-sagemaker-sf\", prefix=\"\", postfix=\"\", output_path=None):\n    from simple_sagemaker.sm_project import SageMakerProject\n\n    sm_project = SageMakerProject(project_name, prefix=prefix)\n    # define the code parameters\n    sm_project.setDefaultCodeParams(\n        source_dir=None, entry_point=__file__, dependencies=[]\n    )\n    # define the instance parameters\n    sm_project.setDefaultInstanceParams(instance_count=2, max_run_mins=15)\n    # docker image\n    sm_project.setDefaultImageParams(\n        aws_repo_name=\"task_repo\",\n        repo_name=\"task_repo\",\n        image_tag=\"latest\",\n        docker_file_path_or_content=dockerFileContent,\n    )\n    image_uri = sm_project.buildOrGetImage(\n        instance_type=sm_project.defaultInstanceParams.instance_type\n    )\n\n    # *** Task 1 - process input data\n    task1_name = \"task1\"+postfix\n    # set the input data\n    input_data_path = file_path / \"data\"\n    # run the task\n    sm_project.runTask(\n        task1_name,\n        image_uri,\n        input_distribution=\"ShardedByS3Key\",  # distribute the input files among the workers\n        hyperparameters={\"worker\": 1, \"arg\": \"hello world!\", \"task\": 1},\n        input_data_path=str(input_data_path) if input_data_path.is_dir() else None,\n        clean_state=True,  # clean the current state, also forces re-running\n    )\n    # download the results\n    if not output_path:\n        output_path = file_path / \"output\"\n    shutil.rmtree(output_path, ignore_errors=True)\n    sm_project.downloadResults(task1_name, Path(output_path) / \"output1\")\n```\nAn additional **task** that depends on the previous one can now be scheduled as well:\n```python\n    # *** Task 2 - process the results of Task 1\n    task2_name = \"task2\"+postfix\n    # set the input\n    additional_inputs = {\n        \"task2_data\": sm_project.getInputConfig(task1_name, \"model\"),\n        \"task2_data_dist\": sm_project.getInputConfig(\n            task1_name, \"model\", distribution=\"ShardedByS3Key\"\n        ),\n    }\n    # run the task\n    sm_project.runTask(\n        task2_name,\n        image_uri,\n        hyperparameters={\"worker\": 1, \"arg\": \"hello world!\", \"task\": 2},\n        clean_state=True,  # clean the current state, also forces re-running\n        additional_inputs=additional_inputs,\n    )\n    # download the results\n    sm_project.downloadResults(task2_name, Path(output_path) / \"output2\")\n\n    return sm_project\n```\n\nThen, the worker code (note: the same function is used for the two different **tasks**, depending on the `task` hyperparameter):\n```python\ndef worker():\n    from worker_toolkit import worker_lib\n\n    logger.info(\"Starting worker...\")\n    # parse the arguments\n    worker_config = worker_lib.WorkerConfig()\n\n    logger.info(f\"Hyperparams: {worker_config.hps}\")\n    logger.info(f\"Input data files: {list(Path(worker_config.channel_data).rglob('*'))}\")\n    logger.info(f\"State files: { list(Path(worker_config.state).rglob('*'))}\")\n\n    if int(worker_config.hps[\"task\"]) == 1:\n        # update the state per running instance\n        open(\n            f\"{worker_config.instance_state}/state_{worker_config.current_host}\", \"wt\"\n        ).write(\"state\")\n        # write to the model output directory\n        for file in Path(worker_config.channel_data).rglob(\"*\"):\n            if file.is_file():\n                relp = file.relative_to(worker_config.channel_data)\n                path = Path(worker_config.model_dir) / (\n                    str(relp) + \"_proc_by_\" + worker_config.current_host\n                )\n                path.write_text(\n                    file.read_text() + \" processed by \" + worker_config.current_host\n                )\n        open(\n            f\"{worker_config.model_dir}/output_{worker_config.current_host}\", \"wt\"\n        ).write(\"output\")\n    elif int(worker_config.hps[\"task\"]) == 2:\n        logger.info(\n            f\"Input task2_data: {list(Path(worker_config.channel_task2_data).rglob('*'))}\"\n        )\n        logger.info(\n            f\"Input task2_data_dist: {list(Path(worker_config.channel_task2_data_dist).rglob('*'))}\"\n        )\n\n    logger.info(\"finished!\")\n    # The task is marked as completed\n```\n\nTo pack everything in a single file, we use the command line argument `--worker` (as defined in the `runner` function) to distinguish between **runner** and worker runs\n```python\nimport logging\nimport shutil\nimport sys\nfrom pathlib import Path\n\nlogger = logging.getLogger(__name__)\n\n...\n\ndef main():\n    logging.basicConfig(stream=sys.stdout, level=logging.INFO)\n    if \"--worker\" in sys.argv:\n        worker()\n    else:\n        runner()\n\n\nif __name__ == \"__main__\":\n    main()\n```\nRunning the file, with a sibling directory named `data` with a sample file [as on the example](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_file/data), prduces the following outputs for Task 1:\n```\nINFO:__main__:Hyperparams: {'arg': 'hello world!', 'task': 1, 'worker': 1}\nINFO:__main__:Input data files: [PosixPath('/opt/ml/input/data/data/sample_data1.txt')]\nINFO:__main__:State files: [PosixPath('/state/algo-1')]\nINFO:worker_toolkit.worker_lib:Creating instance specific state dir\nINFO:__main__:finished!\n```\n\n```\nINFO:__main__:Hyperparams: {'arg': 'hello world!', 'task': 1, 'worker': 1}\nINFO:__main__:Input data files: [PosixPath('/opt/ml/input/data/data/sample_data2.txt')]\nINFO:__main__:State files: [PosixPath('/state/algo-2')]\nINFO:worker_toolkit.worker_lib:Creating instance specific state dir\nINFO:__main__:finished!\n```\n\nAnd the following for Task 2:\n```\nINFO:__main__:Hyperparams: {'arg': 'hello world!', 'task': 2, 'worker': 1}\nINFO:__main__:Input data files: [PosixPath('worker_toolkit'), PosixPath('example.py'), PosixPath('worker_toolkit/worker_lib.py'), PosixPath('worker_toolkit/__pycache__'), PosixPath('worker_toolkit/__init__.py'), PosixPath('worker_toolkit/__pycache__/__init__.cpython-38.pyc'), PosixPath('worker_toolkit/__pycache__/worker_lib.cpython-38.pyc')]\nINFO:__main__:State files: [PosixPath('/state/algo-1')]\nINFO:__main__:Input task2_data: [PosixPath('/opt/ml/input/data/task2_data/model.tar.gz')]\nINFO:__main__:Input task2_data_dist: [PosixPath('/opt/ml/input/data/task2_data_dist/model.tar.gz')]\nINFO:worker_toolkit.worker_lib:Creating instance specific state dir\n```\n\n```\nINFO:__main__:Hyperparams: {'arg': 'hello world!', 'task': 1, 'worker': 1}\nINFO:__main__:Input data files: [PosixPath('/opt/ml/input/data/data/sample_data2.txt')]\nINFO:__main__:State files: [PosixPath('/state/algo-2')]\nINFO:worker_toolkit.worker_lib:Creating instance specific state dir\nINFO:__main__:finished!\n\n```\n\nAs mentioned, the complete code can be found in [this directory](https://github.com/shiftan/simple_sagemaker/tree/master/examples/single_file), \n\n\n# Development\n## Pushing a code change\n1. Develop ...\n2. Format & lint\n```bash\ntox -e cf\ntox -e lint\n```\n3. Cleanup\n```bash\ntox -e clean\n```\n3. Test\n```bash\ntox\n```\n4. Generate & test coverage\n```bash\ntox -e report\n```\n5. [Optionally] - bump the version string on /src/simple_sagemaker/__init__ to allow the release of a new version\n5. Push your code to a development branch\n    - Every push is tested for linting + some\n6. Create a pull request to the master branch\n    - Every master push is fully tested\n7. If the tests succeed, the new version is published to [PyPi](https://pypi.org/project/simple-sagemaker/)\n\n\n# Open issues\n1. S3_sync doesn't delete remote files if deleted locally. Optimization may be needed as well.\n2. Bug: If arguments after \"--\" (followed by a space) are used, please initialize `WorkerConfig` object with `update_argv=True` (the default) before parsing the command line arguments, e.g before calling `parser.parse_args()`.\n3. Known issues: State directory can't have too many files (how many? seems to be a SageMaker bug. TBD: open a bug)\n5. Handling spot instance / timeout termination / signals (seems to be opened bug [a bug in deep-learning-containers](https://github.com/aws/deep-learning-containers/issues/632))\n6. Full documentation of the APIs (Readme / Read the docs + CLI?)\n7. Add support for additional SageMaker features:\n    - Processing job (partial implementation exists)\n    - [Built in algorithms](https://docs.aws.amazon.com/sagemaker/latest/dg/algos.html)\n    - More [frameworks](https://sagemaker.readthedocs.io/en/stable/frameworks/index.html)\n    - [Experiments](https://docs.aws.amazon.com/sagemaker/latest/dg/experiments.html)\n    - [Debugger](https://docs.aws.amazon.com/sagemaker/latest/dg/train-debugger.html)\n    - [Automatic Tuning](https://docs.aws.amazon.com/sagemaker/latest/dg/automatic-model-tuning.html)\n8. Join an in progress task if there's a need to run it / depend on its output\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/shiftan/simple_sagemaker",
+    "keywords": "sagemaker,aws",
+    "license": "Apache 2.0",
+    "maintainer": "Ariel Shiftan",
+    "maintainer_email": "shiftan@gmail.com",
+    "name": "simple-sagemaker",
+    "package_url": "https://pypi.org/project/simple-sagemaker/",
+    "platform": "any",
+    "project_url": "https://pypi.org/project/simple-sagemaker/",
+    "project_urls": {
+      "Homepage": "https://github.com/shiftan/simple_sagemaker",
+      "Source": "https://github.com/shiftan/simple_sagemaker",
+      "Tracker": "https://github.com/shiftan/simple_sagemaker"
+    },
+    "release_url": "https://pypi.org/project/simple-sagemaker/0.9.24/",
+    "requires_dist": [
+      "docker",
+      "boto3",
+      "sagemaker",
+      "sphinx (>=2.0.0) ; extra == 'docs'",
+      "pytest (>=4.0.0) ; extra == 'testing'"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A **simpler** and **cheaper** way to distribute work (python/shell/training) work on machines of your choice in the (AWS) cloud",
+    "version": "0.9.24",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8533688,
+  "releases": {
+    "0.9.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0cf38f92230357bcda83237ff82147f8ca340d6ab5809063a7044a3b9f63f9ee",
+          "md5": "a81f72be54486150b9ac82322acd1e87",
+          "sha256": "e09e5db88e19a0bdad89371a811c59ae5f44589ccb7fda2580f2b511230fc60c"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a81f72be54486150b9ac82322acd1e87",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 28540,
+        "upload_time": "2020-09-17T21:39:42",
+        "upload_time_iso_8601": "2020-09-17T21:39:42.994249Z",
+        "url": "https://files.pythonhosted.org/packages/0c/f3/8f92230357bcda83237ff82147f8ca340d6ab5809063a7044a3b9f63f9ee/simple_sagemaker-0.9.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b2471babcf200a5cab8bb6d47d3e953d659827e49487f15abafb8d44cc9220c",
+          "md5": "114e4d6c87e908eb215322a5018a1afc",
+          "sha256": "bcdcd7cee478b2164c8e84a12d15d0af82cd145344ec966b0c169c67cba71e25"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "114e4d6c87e908eb215322a5018a1afc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 91146,
+        "upload_time": "2020-09-17T21:39:44",
+        "upload_time_iso_8601": "2020-09-17T21:39:44.306786Z",
+        "url": "https://files.pythonhosted.org/packages/4b/24/71babcf200a5cab8bb6d47d3e953d659827e49487f15abafb8d44cc9220c/simple_sagemaker-0.9.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63978c04cbe425e2672eed26b2f092ed4cc519eaa3d74678e64e1f2006e5a357",
+          "md5": "d905372bd145a9f8e2b248033f7fb016",
+          "sha256": "b9eca543e5ad440ee5daaeeefd5f238e8157570207d4704b1e005908011d9b17"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d905372bd145a9f8e2b248033f7fb016",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 28979,
+        "upload_time": "2020-09-20T20:04:51",
+        "upload_time_iso_8601": "2020-09-20T20:04:51.745164Z",
+        "url": "https://files.pythonhosted.org/packages/63/97/8c04cbe425e2672eed26b2f092ed4cc519eaa3d74678e64e1f2006e5a357/simple_sagemaker-0.9.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6dafe46591c90c7ac35fc71b68b6f47393680f22c98250e6b3a3fd63e651b99e",
+          "md5": "331565a23f3ccaaea9d455b67a84f1f3",
+          "sha256": "5a3a30c137862bfe3790e4f7ae7af7d1f8ad9d4289cf47be384282a99e02fb20"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "331565a23f3ccaaea9d455b67a84f1f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 91466,
+        "upload_time": "2020-09-20T20:04:53",
+        "upload_time_iso_8601": "2020-09-20T20:04:53.403283Z",
+        "url": "https://files.pythonhosted.org/packages/6d/af/e46591c90c7ac35fc71b68b6f47393680f22c98250e6b3a3fd63e651b99e/simple_sagemaker-0.9.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d23e60442c4332671b0b1d9ff9833736b673b3e037fbc7d92d5bcbddb21689f9",
+          "md5": "4a6bcb3bfd1c05443e82a4f60628e864",
+          "sha256": "0b853ef02c22304619718a0bdc199ff58c52c608afb4ee09a1b21ca86a9e6330"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a6bcb3bfd1c05443e82a4f60628e864",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 33204,
+        "upload_time": "2020-09-21T10:44:21",
+        "upload_time_iso_8601": "2020-09-21T10:44:21.952405Z",
+        "url": "https://files.pythonhosted.org/packages/d2/3e/60442c4332671b0b1d9ff9833736b673b3e037fbc7d92d5bcbddb21689f9/simple_sagemaker-0.9.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a771b4ed25887d47f89775fc932e9ddcbf10f8cf2a5bb5485072ebbb0d833a79",
+          "md5": "0f53df1120ae77cbf20570641560fd44",
+          "sha256": "f35cc5d6a4ce1b70c5f7b6a90f404dc25aaaace56ba80efd75de5d0b69b65c91"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f53df1120ae77cbf20570641560fd44",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 97712,
+        "upload_time": "2020-09-21T10:44:23",
+        "upload_time_iso_8601": "2020-09-21T10:44:23.510798Z",
+        "url": "https://files.pythonhosted.org/packages/a7/71/b4ed25887d47f89775fc932e9ddcbf10f8cf2a5bb5485072ebbb0d833a79/simple_sagemaker-0.9.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e318f211944b03c9d116947e3e6172a3d8f5c9a8fe2e5a08ca6e80ce67caf0a",
+          "md5": "fc226223fc2290b995b1de18acad4907",
+          "sha256": "f2b9ca7cf0f59b6ab2b3737b8ca40dfd876feb146e63d85664ea3bd2f135c6c0"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fc226223fc2290b995b1de18acad4907",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 33886,
+        "upload_time": "2020-09-21T16:36:49",
+        "upload_time_iso_8601": "2020-09-21T16:36:49.236057Z",
+        "url": "https://files.pythonhosted.org/packages/3e/31/8f211944b03c9d116947e3e6172a3d8f5c9a8fe2e5a08ca6e80ce67caf0a/simple_sagemaker-0.9.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f29682b37d8e26c60fbfc487a01c9462cdd4fff567b35667a1eff94e5de9dc4e",
+          "md5": "04923695fdfb02f63c30def964e2ffc4",
+          "sha256": "bf610a43c76beb70832d73add421dc6a98ce637cbd05cb8a8403d9295f2f5618"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "04923695fdfb02f63c30def964e2ffc4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 98574,
+        "upload_time": "2020-09-21T16:36:51",
+        "upload_time_iso_8601": "2020-09-21T16:36:51.118997Z",
+        "url": "https://files.pythonhosted.org/packages/f2/96/82b37d8e26c60fbfc487a01c9462cdd4fff567b35667a1eff94e5de9dc4e/simple_sagemaker-0.9.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b3f0d33746dca36e496e8b81f7c4f9fb76985af44c856e4e31e9d80635f155c7",
+          "md5": "2319d286ac112970048deee621bf5ce9",
+          "sha256": "933d76bf461d8daa3033ba71abe64598a9fa3dc43d6a428f381685ef2c1d8956"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2319d286ac112970048deee621bf5ce9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 36174,
+        "upload_time": "2020-09-22T15:06:54",
+        "upload_time_iso_8601": "2020-09-22T15:06:54.082861Z",
+        "url": "https://files.pythonhosted.org/packages/b3/f0/d33746dca36e496e8b81f7c4f9fb76985af44c856e4e31e9d80635f155c7/simple_sagemaker-0.9.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3bfa00434a09e705ca3b60873f468424e48f08245633cfb8d3f959526629a5d1",
+          "md5": "f83636ca83e9a5e2bcaaed959611f44a",
+          "sha256": "e9332bc24d738496e1521815acac14d8d95ed8071b29255519069ced10b0ee7e"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f83636ca83e9a5e2bcaaed959611f44a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 109920,
+        "upload_time": "2020-09-22T15:06:55",
+        "upload_time_iso_8601": "2020-09-22T15:06:55.533743Z",
+        "url": "https://files.pythonhosted.org/packages/3b/fa/00434a09e705ca3b60873f468424e48f08245633cfb8d3f959526629a5d1/simple_sagemaker-0.9.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dfc0c803e344a2204aa67c330672194c1cea518ff3faff7540021271df09f614",
+          "md5": "97311c34304b70f24ec9d6976468db5e",
+          "sha256": "24af8407eecad04bbac4a9168ac40b28ce7b890c5fe4fae79f0ee377e320c857"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "97311c34304b70f24ec9d6976468db5e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 39807,
+        "upload_time": "2020-09-24T17:41:16",
+        "upload_time_iso_8601": "2020-09-24T17:41:16.308210Z",
+        "url": "https://files.pythonhosted.org/packages/df/c0/c803e344a2204aa67c330672194c1cea518ff3faff7540021271df09f614/simple_sagemaker-0.9.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7be5e766eb5a621a1ab83b83466373e70acc57756dfb76ffdc89d3117ee11a8",
+          "md5": "51d945545fd3da66e26529017cc0ef41",
+          "sha256": "f3721c390bd1536952af447d0c8545c1d88dc56eeb7b538366af1355e701ba0c"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "51d945545fd3da66e26529017cc0ef41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 118055,
+        "upload_time": "2020-09-24T17:41:17",
+        "upload_time_iso_8601": "2020-09-24T17:41:17.766786Z",
+        "url": "https://files.pythonhosted.org/packages/a7/be/5e766eb5a621a1ab83b83466373e70acc57756dfb76ffdc89d3117ee11a8/simple_sagemaker-0.9.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04cdf436ce2860b8a4b599a4208549aa426fd8058d2250b3907ef8c88207df7b",
+          "md5": "a28c2aea012b20294f3e49ec4d8e51f3",
+          "sha256": "4acca4e3be196a93f0b08f505194a4868da172b2e8e82589f96cce40ba997187"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a28c2aea012b20294f3e49ec4d8e51f3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 40520,
+        "upload_time": "2020-09-25T15:21:43",
+        "upload_time_iso_8601": "2020-09-25T15:21:43.814794Z",
+        "url": "https://files.pythonhosted.org/packages/04/cd/f436ce2860b8a4b599a4208549aa426fd8058d2250b3907ef8c88207df7b/simple_sagemaker-0.9.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39a689b62857aeaf9729d126a4932cdd53e6ccd9576f891a43b59d1c7e441de8",
+          "md5": "b7be05aff789fa1df8a86bebfecbce66",
+          "sha256": "570346f637b7bd9fcfb44be3613bcccf342850fc548e1e9b582bb0450fcb5a34"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b7be05aff789fa1df8a86bebfecbce66",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 119716,
+        "upload_time": "2020-09-25T15:21:45",
+        "upload_time_iso_8601": "2020-09-25T15:21:45.458830Z",
+        "url": "https://files.pythonhosted.org/packages/39/a6/89b62857aeaf9729d126a4932cdd53e6ccd9576f891a43b59d1c7e441de8/simple_sagemaker-0.9.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3186639fff29392b6f3f807a32c55919941f31097de7eb54ae2495ce9e0dca7a",
+          "md5": "a5f4436fe667938ce924129a656a1951",
+          "sha256": "4c50654a0ab57b91ed69057088d0b0ac2b205aad9550b3cfe99d30bf11f452ae"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a5f4436fe667938ce924129a656a1951",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 41258,
+        "upload_time": "2020-09-29T16:15:26",
+        "upload_time_iso_8601": "2020-09-29T16:15:26.186783Z",
+        "url": "https://files.pythonhosted.org/packages/31/86/639fff29392b6f3f807a32c55919941f31097de7eb54ae2495ce9e0dca7a/simple_sagemaker-0.9.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84723942f1129a7ab75472aa05dd9361f4c4bce4990ddd19ce73d8465849a8b7",
+          "md5": "d22efbc8e67de39246f5086bdae3810f",
+          "sha256": "a681e4ae1a176bb3f440042b71e4dbb689fb73cd19488adb670ee6c9085e21dc"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d22efbc8e67de39246f5086bdae3810f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 124632,
+        "upload_time": "2020-09-29T16:15:28",
+        "upload_time_iso_8601": "2020-09-29T16:15:28.285169Z",
+        "url": "https://files.pythonhosted.org/packages/84/72/3942f1129a7ab75472aa05dd9361f4c4bce4990ddd19ce73d8465849a8b7/simple_sagemaker-0.9.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "67c94fd007a59c488a8c83591d3e5e0004c611e632a9c28c0f9b554f6c0d0794",
+          "md5": "6b599d5d3fa87faae49325ce8e52079f",
+          "sha256": "76cf75fc864d003f68a98b184377d800f74522d5db3dfebed64f1327c2eceeff"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6b599d5d3fa87faae49325ce8e52079f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 41326,
+        "upload_time": "2020-09-29T22:33:26",
+        "upload_time_iso_8601": "2020-09-29T22:33:26.703292Z",
+        "url": "https://files.pythonhosted.org/packages/67/c9/4fd007a59c488a8c83591d3e5e0004c611e632a9c28c0f9b554f6c0d0794/simple_sagemaker-0.9.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "65cb1373e637a203a8e3be76826e9207147737cbafe5cb7303e33bea78199b3c",
+          "md5": "3c894ddd509e74ddf37b0ce1ca03f683",
+          "sha256": "1f6842b3fbaef8b1596ba6e96135866e042faae3225c27fb6f8ca86c6c5c650c"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3c894ddd509e74ddf37b0ce1ca03f683",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 127687,
+        "upload_time": "2020-09-29T22:33:28",
+        "upload_time_iso_8601": "2020-09-29T22:33:28.197314Z",
+        "url": "https://files.pythonhosted.org/packages/65/cb/1373e637a203a8e3be76826e9207147737cbafe5cb7303e33bea78199b3c/simple_sagemaker-0.9.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb9f22529df7a81db4ad91b890ed222c65c679416fa7dea6f59cb5a57a995ecf",
+          "md5": "9c1928a348689dfe05be83afec19cd78",
+          "sha256": "0005be0b7944446270714632d26217f7bcf9e55eedf15afa3885db4f99b561d8"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.19-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9c1928a348689dfe05be83afec19cd78",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 42278,
+        "upload_time": "2020-10-01T09:39:47",
+        "upload_time_iso_8601": "2020-10-01T09:39:47.125475Z",
+        "url": "https://files.pythonhosted.org/packages/bb/9f/22529df7a81db4ad91b890ed222c65c679416fa7dea6f59cb5a57a995ecf/simple_sagemaker-0.9.19-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e5fc4ea95314a463abc78ceecb2e56853c9cfbf653232a5183ef70b9ce5f307",
+          "md5": "2bb680f483247d06dc393a3c575cd82d",
+          "sha256": "c23c17c3f12bc342242d35f2c6310d26edb26b28d3401609b44680ca4d098cdd"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.19.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2bb680f483247d06dc393a3c575cd82d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 129033,
+        "upload_time": "2020-10-01T09:39:48",
+        "upload_time_iso_8601": "2020-10-01T09:39:48.355246Z",
+        "url": "https://files.pythonhosted.org/packages/9e/5f/c4ea95314a463abc78ceecb2e56853c9cfbf653232a5183ef70b9ce5f307/simple_sagemaker-0.9.19.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.20": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "abc80b47dc3de4e65a54661a5b1758d7c622a92bf4dc551bee88cd47799e682a",
+          "md5": "e8b1242d8f62e4b25f10bed6d7bce0b6",
+          "sha256": "5d4abcd93c2051c818088c6a866cdb7964aa26a63d557a868ff62f75a60eb784"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.20-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e8b1242d8f62e4b25f10bed6d7bce0b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 47535,
+        "upload_time": "2020-10-10T17:37:45",
+        "upload_time_iso_8601": "2020-10-10T17:37:45.934085Z",
+        "url": "https://files.pythonhosted.org/packages/ab/c8/0b47dc3de4e65a54661a5b1758d7c622a92bf4dc551bee88cd47799e682a/simple_sagemaker-0.9.20-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "722f700a180468047c14ce2c8be40caf80976929426601ed60025ac0731fcd6a",
+          "md5": "a533f05cd53c0801301727337c88a21e",
+          "sha256": "361a15f2fa710483cb4716620ffb89372da39778b25577e12b737547323e3219"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.20.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a533f05cd53c0801301727337c88a21e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 161238,
+        "upload_time": "2020-10-10T17:37:47",
+        "upload_time_iso_8601": "2020-10-10T17:37:47.322788Z",
+        "url": "https://files.pythonhosted.org/packages/72/2f/700a180468047c14ce2c8be40caf80976929426601ed60025ac0731fcd6a/simple_sagemaker-0.9.20.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30a6590a1efc7fe8ef5967d79b6243f889fc7fb912917ecf4ad0801513e2e1ba",
+          "md5": "704d5eae97dac946cde2aef891cbfbbd",
+          "sha256": "78757e96ce338702a9ac749216d85a554b4b41f756795e424ea53e0d83712aea"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "704d5eae97dac946cde2aef891cbfbbd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 47739,
+        "upload_time": "2020-10-11T13:57:41",
+        "upload_time_iso_8601": "2020-10-11T13:57:41.010780Z",
+        "url": "https://files.pythonhosted.org/packages/30/a6/590a1efc7fe8ef5967d79b6243f889fc7fb912917ecf4ad0801513e2e1ba/simple_sagemaker-0.9.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "53e3078b9fdf22cd860a626e4fbfe143886cae6a6393ed8d4abdb287ab48d506",
+          "md5": "63ab3cf5acb5db57e52fa6e2231d4735",
+          "sha256": "19509843e4ee83c2adea7c4dc8587eff27bcb3e504778dad1301e84dd9496bdd"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.21.tar.gz",
+        "has_sig": false,
+        "md5_digest": "63ab3cf5acb5db57e52fa6e2231d4735",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 216865,
+        "upload_time": "2020-10-11T13:57:42",
+        "upload_time_iso_8601": "2020-10-11T13:57:42.440136Z",
+        "url": "https://files.pythonhosted.org/packages/53/e3/078b9fdf22cd860a626e4fbfe143886cae6a6393ed8d4abdb287ab48d506/simple_sagemaker-0.9.21.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06705d0902c36f90f20ef728d5ed0b55d53d0821cb4a9b62352e3434255035f9",
+          "md5": "d72d87e4398cf303e4c2b122302d1008",
+          "sha256": "ec2c2b669b50b8bbd41a134b54961db57ab4c1765a065f69e3b997f47c8c238c"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d72d87e4398cf303e4c2b122302d1008",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 47673,
+        "upload_time": "2020-10-12T13:46:35",
+        "upload_time_iso_8601": "2020-10-12T13:46:35.402206Z",
+        "url": "https://files.pythonhosted.org/packages/06/70/5d0902c36f90f20ef728d5ed0b55d53d0821cb4a9b62352e3434255035f9/simple_sagemaker-0.9.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "714ad097ee261dbd077d6fe0ad416e9f578fded18b871238c771aef96cee1da9",
+          "md5": "fa4aecc23b20a108c79881f51ac865dc",
+          "sha256": "4404195ff9c96a1f25347043e735a107a96a1c749eba5d140c150043a119abed"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.22.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fa4aecc23b20a108c79881f51ac865dc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 216531,
+        "upload_time": "2020-10-12T13:46:37",
+        "upload_time_iso_8601": "2020-10-12T13:46:37.411664Z",
+        "url": "https://files.pythonhosted.org/packages/71/4a/d097ee261dbd077d6fe0ad416e9f578fded18b871238c771aef96cee1da9/simple_sagemaker-0.9.22.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.23": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "befbcf4cfdaa0adfb6c3a7021c975bc5910637951c8e16d00986390460ba4b36",
+          "md5": "0e13a8983b0aa9e2d02c1dd27890c66c",
+          "sha256": "d1120d2a02daf1e97489a93d2125806d91ab861b88c2d111e3f65053467feef7"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.23-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0e13a8983b0aa9e2d02c1dd27890c66c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 47667,
+        "upload_time": "2020-10-17T23:20:22",
+        "upload_time_iso_8601": "2020-10-17T23:20:22.538593Z",
+        "url": "https://files.pythonhosted.org/packages/be/fb/cf4cfdaa0adfb6c3a7021c975bc5910637951c8e16d00986390460ba4b36/simple_sagemaker-0.9.23-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e126893166446d691ea6f7d0cc80acb4891d5dcc956cb86eb51ef69817690c1",
+          "md5": "3420b0d0bbea0a6c012dc8d7d8c55d1b",
+          "sha256": "edb114f048d6c39f96bc678db3ffb02c0f9cbd0be6e73eeb3c60adaf9a09caf2"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.23.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3420b0d0bbea0a6c012dc8d7d8c55d1b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 216633,
+        "upload_time": "2020-10-17T23:20:24",
+        "upload_time_iso_8601": "2020-10-17T23:20:24.175137Z",
+        "url": "https://files.pythonhosted.org/packages/4e/12/6893166446d691ea6f7d0cc80acb4891d5dcc956cb86eb51ef69817690c1/simple_sagemaker-0.9.23.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.24": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "528af985b503fa5a13f954c288d525f88c1229e1e3f087ed3a9024c4b450dde1",
+          "md5": "85fdd2d9280239dd454a8e1e46150043",
+          "sha256": "ab6554848cc0302426543c111c9b71c67656c407dc62558c6551840fc64fc54c"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.24-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "85fdd2d9280239dd454a8e1e46150043",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 47938,
+        "upload_time": "2020-10-29T15:53:53",
+        "upload_time_iso_8601": "2020-10-29T15:53:53.218782Z",
+        "url": "https://files.pythonhosted.org/packages/52/8a/f985b503fa5a13f954c288d525f88c1229e1e3f087ed3a9024c4b450dde1/simple_sagemaker-0.9.24-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c783046408f7ae93a7358094d903ba126925a339fa1c70ec9a44ebe3dc1444c",
+          "md5": "035fb46a3a6d0ed4d6532a38188d0c3c",
+          "sha256": "7c5a2bec0d11105f148f70d13b855b36f4574a07b283daa5db25314ecb3bb73d"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.24.tar.gz",
+        "has_sig": false,
+        "md5_digest": "035fb46a3a6d0ed4d6532a38188d0c3c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 217190,
+        "upload_time": "2020-10-29T15:53:55",
+        "upload_time_iso_8601": "2020-10-29T15:53:55.558465Z",
+        "url": "https://files.pythonhosted.org/packages/2c/78/3046408f7ae93a7358094d903ba126925a339fa1c70ec9a44ebe3dc1444c/simple_sagemaker-0.9.24.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44dad9f961109eac6dbcf38550bda8b19728a6e18f373137bbbaa8313bf6dc52",
+          "md5": "45c1f1cda88defa6bdf36900a51d6241",
+          "sha256": "5c26fc394c9e0763a52baac65cbfa6c7f84f006209f558aeba1df31f62991dd7"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "45c1f1cda88defa6bdf36900a51d6241",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 20684,
+        "upload_time": "2020-09-07T12:57:01",
+        "upload_time_iso_8601": "2020-09-07T12:57:01.738471Z",
+        "url": "https://files.pythonhosted.org/packages/44/da/d9f961109eac6dbcf38550bda8b19728a6e18f373137bbbaa8313bf6dc52/simple_sagemaker-0.9.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "225f78d9c96f72cdf438799f1dd66a3cf0cbb8bd0bf058761c796a722cab559a",
+          "md5": "e3c153b6705a05ef3a5cd4c6a343f8db",
+          "sha256": "60ccfc2058402f388456d5a9ebe87834f62f325d3f80121e994ef8d78b643fb6"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e3c153b6705a05ef3a5cd4c6a343f8db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 68622,
+        "upload_time": "2020-09-07T12:57:03",
+        "upload_time_iso_8601": "2020-09-07T12:57:03.342933Z",
+        "url": "https://files.pythonhosted.org/packages/22/5f/78d9c96f72cdf438799f1dd66a3cf0cbb8bd0bf058761c796a722cab559a/simple_sagemaker-0.9.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f78850c23dcc8e032229b3ca821e981cb6a642cc8a4be599afd97dc6684fdea",
+          "md5": "e287a329dd0eb5682f768496530a2d13",
+          "sha256": "655281a8b38eb7578d3ea3c9554f4460295336e7789492706af9e76628520286"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e287a329dd0eb5682f768496530a2d13",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 25759,
+        "upload_time": "2020-09-14T19:41:59",
+        "upload_time_iso_8601": "2020-09-14T19:41:59.060716Z",
+        "url": "https://files.pythonhosted.org/packages/8f/78/850c23dcc8e032229b3ca821e981cb6a642cc8a4be599afd97dc6684fdea/simple_sagemaker-0.9.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fb8a438750586b67445773d2e3dc0266876ba3ee46fa23edbcb2fe07f7033c3",
+          "md5": "d0c4eb4cec00a0de440a0b115fa8c8f3",
+          "sha256": "c5f1faf0d8b3669bf7e6a247a69396c66670eb5350ce76f904466955c9e0cca8"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d0c4eb4cec00a0de440a0b115fa8c8f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 83663,
+        "upload_time": "2020-09-14T19:42:00",
+        "upload_time_iso_8601": "2020-09-14T19:42:00.539920Z",
+        "url": "https://files.pythonhosted.org/packages/8f/b8/a438750586b67445773d2e3dc0266876ba3ee46fa23edbcb2fe07f7033c3/simple_sagemaker-0.9.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d33df1ce1017220028b146a229dbb67f48460c0fc6e676b206508c7b4b73908",
+          "md5": "72fb3691774332d6b276728fb0359029",
+          "sha256": "163ec9cb2eada75d566764a3b0ca6579016031fda93ea0a139825e32c3ab2e15"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "72fb3691774332d6b276728fb0359029",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 28524,
+        "upload_time": "2020-09-17T09:43:06",
+        "upload_time_iso_8601": "2020-09-17T09:43:06.792142Z",
+        "url": "https://files.pythonhosted.org/packages/7d/33/df1ce1017220028b146a229dbb67f48460c0fc6e676b206508c7b4b73908/simple_sagemaker-0.9.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8e3997fb69259a125674ccebcc758a36bbead52181439ef825138962461e2af",
+          "md5": "4a1b62af5f1000552bc5a482e50e3571",
+          "sha256": "7efb79a7265e92c9e94d68376645b61f1c9fdc6cf8efad364b23d9c854b6eacd"
+        },
+        "downloads": -1,
+        "filename": "simple_sagemaker-0.9.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4a1b62af5f1000552bc5a482e50e3571",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 90058,
+        "upload_time": "2020-09-17T09:43:08",
+        "upload_time_iso_8601": "2020-09-17T09:43:08.342420Z",
+        "url": "https://files.pythonhosted.org/packages/b8/e3/997fb69259a125674ccebcc758a36bbead52181439ef825138962461e2af/simple_sagemaker-0.9.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "528af985b503fa5a13f954c288d525f88c1229e1e3f087ed3a9024c4b450dde1",
+        "md5": "85fdd2d9280239dd454a8e1e46150043",
+        "sha256": "ab6554848cc0302426543c111c9b71c67656c407dc62558c6551840fc64fc54c"
+      },
+      "downloads": -1,
+      "filename": "simple_sagemaker-0.9.24-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "85fdd2d9280239dd454a8e1e46150043",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 47938,
+      "upload_time": "2020-10-29T15:53:53",
+      "upload_time_iso_8601": "2020-10-29T15:53:53.218782Z",
+      "url": "https://files.pythonhosted.org/packages/52/8a/f985b503fa5a13f954c288d525f88c1229e1e3f087ed3a9024c4b450dde1/simple_sagemaker-0.9.24-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2c783046408f7ae93a7358094d903ba126925a339fa1c70ec9a44ebe3dc1444c",
+        "md5": "035fb46a3a6d0ed4d6532a38188d0c3c",
+        "sha256": "7c5a2bec0d11105f148f70d13b855b36f4574a07b283daa5db25314ecb3bb73d"
+      },
+      "downloads": -1,
+      "filename": "simple_sagemaker-0.9.24.tar.gz",
+      "has_sig": false,
+      "md5_digest": "035fb46a3a6d0ed4d6532a38188d0c3c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 217190,
+      "upload_time": "2020-10-29T15:53:55",
+      "upload_time_iso_8601": "2020-10-29T15:53:55.558465Z",
+      "url": "https://files.pythonhosted.org/packages/2c/78/3046408f7ae93a7358094d903ba126925a339fa1c70ec9a44ebe3dc1444c/simple_sagemaker-0.9.24.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

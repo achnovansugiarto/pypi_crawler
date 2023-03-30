@@ -1,0 +1,266 @@
+{
+  "info": {
+    "author": "RequestForCoffee",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# SCD30 CO₂\tsensor I²C driver in Python 3\n\n**Status: initial release**\n\nThe [SCD30](https://www.sensirion.com/en/environmental-sensors/carbon-dioxide-sensors/carbon-dioxide-sensors-co2/)\nis a high-precision CO2 sensor based on [NDIR](https://en.wikipedia.org/wiki/Nondispersive_infrared_sensor) spectroscopy.\nThe sensor module also includes an\n[SHT31](https://www.sensirion.com/en/environmental-sensors/humidity-sensors/digital-humidity-sensors-for-various-applications/)\ntemperature and humidity sensor onboard (see\n[description of the PCB layout](https://www.sensirion.com/fileadmin/user_upload/customers/sensirion/Dokumente/9.5_CO2/Sensirion_SCD30_Design-In_Guidelines_D1.pdf)).\n\n## Overview\nThis library provides a Python interface to the main I²C-level commands supported by the SCD30 as listed in the\n[interface description](https://www.sensirion.com/fileadmin/user_upload/customers/sensirion/Dokumente/9.5_CO2/Sensirion_CO2_Sensors_SCD30_Interface_Description.pdf).\n\nThe primary intended use case is driving the sensor directly from a Raspberry Pi using hardware I²C.\nHowever, the code may be adapted for use with other devices supporting the protocol and/or software I²C.\n\n## Installation\nThe library is available for download from the Python Package Index (tested with Python 3.7.3):\n```bash\npython3 -m pip install scd30_i2c\n```\n\n## System setup\nThe library was developed using a Raspberry Pi 4B (8GB RAM) running Raspberry Pi OS Buster. For more details about the chip, see the\n[BCM2711 datasheet](https://www.raspberrypi.org/documentation/hardware/raspberrypi/bcm2711/rpi_DATA_2711_1p0.pdf).\n\n### Wiring\nThe Raspberry Pi can drive the SCD30 module via its hardware I²C interface directly without any additional components:\n\nSCD30  | Raspberry Pi\n------ | ------------\nVDD    | 3V3 Power\nGND    | Ground\nTX/SCL | BCM 3 (SCL)\nRX/SDA | BCM 2 (SDA)\nSEL    | Ground¹\n\n¹ To select I²C mode, the SEL pin should be left floating or connected to ground.\n[This forum post](https://forum.arduino.cc/index.php?topic=561246.msg3828228#msg3828228) suggests grounding the pin may be the\nmore reliable option.\n\n**Note the sequential order of the power, ground, and I²C pins on the SCD30 may be different from other popular sensor breakouts.**\nFor instance, the [Pimoroni breakouts](https://shop.pimoroni.com/collections/pimoroni-breakouts) use (3V3, SDA, SCL, INT, GND).\n\nFor more details, see the [Raspberry Pi I2C pinout](https://pinout.xyz/pinout/i2c).\n\n### Software configuration and I²C clock stretching\nThe SCD30 supports a maximal I²C speed of 100kHz (the default of the Pi 4B).\n\nIt also requires the I²C bus to support clock stretching of up to 150ms. By default, the `bcm2835-i2c` driver which is still\nused by the 4B (BCM2711) hard-codes the timeout to 35ms regardless of the speed. This does not seem to matter for one-off\nreadings, however may interfere with the long-term stability and particularly the automatic self-calibration feature.\n\nAs a workaround, the [rpi-i2c](https://github.com/RequestForCoffee/rpi-i2c-timings) binary utility provides means to\nmanipulate the relevant I2C controller registers directly.\n\n## Usage\nContrary to other sensors that provide one-off readings, the SCD30 is designed to run continuously. Upon activation, periodic\nmeasurements are stored in a buffer. A \"data ready status\" command is provided to check whether a reading is available.\n\n### Sample code\n\nThe following example code will begin periodic measurements at a two-second interval and print the readings:\n\n```py\nfrom scd30_i2c import SCD30\n\nscd30 = SCD30()\n\nscd30.set_measurement_interval(2)\nscd30.start_periodic_measurement()\n\ntime.sleep(2)\n\nwhile True:\n    if scd30.get_data_ready():\n        m = scd30.read_measurement()\n        if m is not None:\n            print(f\"CO2: {m[0]:.2f}ppm, temp: {m[1]:.2f}'C, rh: {m[2]:.2f}%\")\n        time.sleep(2)\n    else:\n        time.sleep(0.2)\n```\n\nNote that this minimal example script will NOT issue a stop command upon termination and the sensor will continue taking\nperiodic measurements unless powered off. This may or may not be appropriate depending on the use case.\n\nFor a more complete example, see [here](examples/continuous_measurement.py).\n\n### Temperature calibration\nThe SCD30 module contains a temperature and humidity sensor, which allows for temperature compensation of the CO₂ sensor\nsignal. Therefore, the correctness of the temperature measurements is critical to achieving highly accurate CO₂ readings.\n\nDue to the small size of the module, the inherent self-heating of the various electrical components on and around the\nPCB are likely to cause values above ambient temperature to be reported. To counteract this, a temperature offset can be\nconfigured via the I²C interface. The correct value will depend on the placement and configuration of the sensor and\nshould be updated if any changes are made. For instance, setting a different measurement interval can change the average\npower draw of the sensor, and in turn, the heat produced by its components. Changing its position relative to other\ncomponents, altering the airflow or installing additional sensors nearby may similarly change the offset required.\n\nBy default, the temperature offset is disabled, i.e. set to 0'C. However, the following calculations apply in the general\ncase, even with non-zero temperature offsets already set.\n\nTo determine the correct temperature offset, consider the following values:\n* `T_ambient`: the \"reference\" ambient temperature, measured through means other than the SCD30.\n* `T_measured`: the raw temperature reading obtained internally onboard the SCD30; we assume `T_measured >= T_ambient`.\n* `T_reported`: the temperature reported by the SCD30 after applying the configured offset, i.e. `T_reported = T_measured - T_offset`.\n\nClearly, the end goal is to minimize the error:\n```\nΔ = |T_reported - T_ambient|\n  = |T_measured - T_offset - T_ambient|\n  = |T_measured - T_ambient - T_offset|\n```\nConsequently:\n```\nT_offset = T_measured - T_ambient\n```\n\nNote that the SCD30 does not expose `T_measured` directly; the value returned by `read_measurement()` already has the\ncurrent offset applied, i.e. `T_reported` is returned instead. Recall that:\n```\nT_reported = T_measured - T_offset\n```\nTherefore, the raw value `T_measured` can be computed by factoring in the current offset `T_offset_old` (obtained using\n`get_temperature_offset()`):\n```\nT_measured = T_reported + T_offset_old\n```\n\nHaving obtained `T_measured` and a \"true\" reference temperature `T_ambient` (e.g. using a different thermometer) a new\noffset can be calculated:\n```\nT_offset_new = T_measured - T_ambient = (T_reported + T_offset_old) - T_ambient.\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/RequestForCoffee/scd30",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "scd30-i2c",
+    "package_url": "https://pypi.org/project/scd30-i2c/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/scd30-i2c/",
+    "project_urls": {
+      "Homepage": "https://github.com/RequestForCoffee/scd30"
+    },
+    "release_url": "https://pypi.org/project/scd30-i2c/0.0.6/",
+    "requires_dist": [
+      "smbus2 (~=0.3.0)"
+    ],
+    "requires_python": ">=3.7.3",
+    "summary": "SCD30 CO₂ sensor Python driver",
+    "version": "0.0.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8202332,
+  "releases": {
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "256a94bf89e0ddaca8b8bcb098be73d18a9b8254560bd3a8ed5af36a2aaf47dc",
+          "md5": "817b19bfc16b142646154b12b199301e",
+          "sha256": "ea7c192a824cced0e1f10f5c61f13a5976c593c8e5e5335e1c1bead27e5941b9"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "817b19bfc16b142646154b12b199301e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.3",
+        "size": 7028,
+        "upload_time": "2020-06-27T23:33:27",
+        "upload_time_iso_8601": "2020-06-27T23:33:27.810473Z",
+        "url": "https://files.pythonhosted.org/packages/25/6a/94bf89e0ddaca8b8bcb098be73d18a9b8254560bd3a8ed5af36a2aaf47dc/scd30_i2c-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e0342d27b5c78a48a389b57d914fc5cdeda597912616f22cb5d31cc6e179d28",
+          "md5": "f69426ffa181d817a26997de698c5ebd",
+          "sha256": "866f91f3d1dce0bf98a62b57b5eab8e354151a58dd43cb7d6978a9708248ace6"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f69426ffa181d817a26997de698c5ebd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.3",
+        "size": 6040,
+        "upload_time": "2020-06-27T23:33:30",
+        "upload_time_iso_8601": "2020-06-27T23:33:30.165625Z",
+        "url": "https://files.pythonhosted.org/packages/0e/03/42d27b5c78a48a389b57d914fc5cdeda597912616f22cb5d31cc6e179d28/scd30_i2c-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b387e50a032cbebbb7b33d5a256dc5f893d75c161d13002ae1eeb73fc5cb922",
+          "md5": "4d1d71d0f87ff17b2041aaadf1cd07e2",
+          "sha256": "7881251650d6d81e3766494df69549c12e096d1ce171701ad50b4b64bfe24f51"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4d1d71d0f87ff17b2041aaadf1cd07e2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.3",
+        "size": 8674,
+        "upload_time": "2020-06-28T13:54:47",
+        "upload_time_iso_8601": "2020-06-28T13:54:47.592211Z",
+        "url": "https://files.pythonhosted.org/packages/8b/38/7e50a032cbebbb7b33d5a256dc5f893d75c161d13002ae1eeb73fc5cb922/scd30_i2c-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "181c07544a065dd2f30e0283e315d5a7ce34777d8498d6a97b0c568625f8a175",
+          "md5": "e8b1b2978ad4726d683c1addc5e5aadf",
+          "sha256": "acec8911720313451594269f4479da13dd4519c3f4c2b84f8ecdba3d1c8694ef"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e8b1b2978ad4726d683c1addc5e5aadf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.3",
+        "size": 7794,
+        "upload_time": "2020-06-28T13:54:49",
+        "upload_time_iso_8601": "2020-06-28T13:54:49.261626Z",
+        "url": "https://files.pythonhosted.org/packages/18/1c/07544a065dd2f30e0283e315d5a7ce34777d8498d6a97b0c568625f8a175/scd30_i2c-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "65c6da62260828b91b0cbfa08f4bf1680807c70b6d208b2b3ecb9720269a57b0",
+          "md5": "b0c5d3c2f0b5c03ea8fe2d19bbfc3493",
+          "sha256": "c1797d1fae6d91b6c2a39ac38642f76876937d828e6825b055dcb56a4c574cc9"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0c5d3c2f0b5c03ea8fe2d19bbfc3493",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.3",
+        "size": 8676,
+        "upload_time": "2020-06-28T13:58:08",
+        "upload_time_iso_8601": "2020-06-28T13:58:08.174130Z",
+        "url": "https://files.pythonhosted.org/packages/65/c6/da62260828b91b0cbfa08f4bf1680807c70b6d208b2b3ecb9720269a57b0/scd30_i2c-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ff9d6760a05c70cb3095dd131def3a143272bffd666412d3d07cc5a2b6d7988",
+          "md5": "b3f879cdfe6aaf531866d517b72024cb",
+          "sha256": "af55a2a50c03b81bc33b77ba4614e228e03d6282812cba0e03ce719ea64035b8"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b3f879cdfe6aaf531866d517b72024cb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.3",
+        "size": 7798,
+        "upload_time": "2020-06-28T13:58:09",
+        "upload_time_iso_8601": "2020-06-28T13:58:09.964119Z",
+        "url": "https://files.pythonhosted.org/packages/5f/f9/d6760a05c70cb3095dd131def3a143272bffd666412d3d07cc5a2b6d7988/scd30_i2c-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "65515b5a4d8c1655f2e8be2538a27591902044b7e0d23f458c03e2483932aa4a",
+          "md5": "bc105765e33ba4a4542de53658957f59",
+          "sha256": "bf326ae20faad9c58deb85a79cafd9ec7d417eccc374a2855d36faa433d9222b"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc105765e33ba4a4542de53658957f59",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.3",
+        "size": 8695,
+        "upload_time": "2020-09-16T19:31:05",
+        "upload_time_iso_8601": "2020-09-16T19:31:05.608887Z",
+        "url": "https://files.pythonhosted.org/packages/65/51/5b5a4d8c1655f2e8be2538a27591902044b7e0d23f458c03e2483932aa4a/scd30_i2c-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "29e1cf2973a621b94d0a748edf03bb30a1b844d3a3e23697e08e9e8b0c45d5aa",
+          "md5": "8781dfa2b50c7083c9d823acec71a7aa",
+          "sha256": "a19bb9dee183e35aa0d77ad73f75733ed0c243faa24bff7efe5f48d360979efa"
+        },
+        "downloads": -1,
+        "filename": "scd30_i2c-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8781dfa2b50c7083c9d823acec71a7aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.3",
+        "size": 7843,
+        "upload_time": "2020-09-16T19:31:08",
+        "upload_time_iso_8601": "2020-09-16T19:31:08.409446Z",
+        "url": "https://files.pythonhosted.org/packages/29/e1/cf2973a621b94d0a748edf03bb30a1b844d3a3e23697e08e9e8b0c45d5aa/scd30_i2c-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "65515b5a4d8c1655f2e8be2538a27591902044b7e0d23f458c03e2483932aa4a",
+        "md5": "bc105765e33ba4a4542de53658957f59",
+        "sha256": "bf326ae20faad9c58deb85a79cafd9ec7d417eccc374a2855d36faa433d9222b"
+      },
+      "downloads": -1,
+      "filename": "scd30_i2c-0.0.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "bc105765e33ba4a4542de53658957f59",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7.3",
+      "size": 8695,
+      "upload_time": "2020-09-16T19:31:05",
+      "upload_time_iso_8601": "2020-09-16T19:31:05.608887Z",
+      "url": "https://files.pythonhosted.org/packages/65/51/5b5a4d8c1655f2e8be2538a27591902044b7e0d23f458c03e2483932aa4a/scd30_i2c-0.0.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "29e1cf2973a621b94d0a748edf03bb30a1b844d3a3e23697e08e9e8b0c45d5aa",
+        "md5": "8781dfa2b50c7083c9d823acec71a7aa",
+        "sha256": "a19bb9dee183e35aa0d77ad73f75733ed0c243faa24bff7efe5f48d360979efa"
+      },
+      "downloads": -1,
+      "filename": "scd30_i2c-0.0.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "8781dfa2b50c7083c9d823acec71a7aa",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7.3",
+      "size": 7843,
+      "upload_time": "2020-09-16T19:31:08",
+      "upload_time_iso_8601": "2020-09-16T19:31:08.409446Z",
+      "url": "https://files.pythonhosted.org/packages/29/e1/cf2973a621b94d0a748edf03bb30a1b844d3a3e23697e08e9e8b0c45d5aa/scd30_i2c-0.0.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,477 @@
+{
+  "info": {
+    "author": "duanhongyi",
+    "author_email": "duanhyi@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "smartdns\n========\n## 使用场景\n\nsmartdns是python3语言编写，smartdns基于[小米smartdns](https://github.com/xiaomi-sa/smartdns)二次开发，支持类似Dnspod的D监控功能，能够支持针对不同的dns请求根据配置返回不同的解析结果。smartdns获取dns请求的源IP或者客户端IP（支持edns协议的请求可以获取客户端IP），根据本地的静态IP库获取请求IP的特性，包括所在的国家、省份、城市、ISP等，然后根据我们的调度配置返回解析结果，smartdns的典型使用场景：\n\n* 服务的多机房流量调度，比如电信流量调度到电信机房、联通流量调度到联通机房；\n* 用户访问控制，将用户调度到离用户最近或者链路质量最好的节点上。\n\n举个简单的例子，我们的一个站点test.test.com同时部署在电信和联通两个机房，该站点在电信机房的ip为1.1.1.1、在联通机房的ip为2.2.2.2，就可以通过smartdns做到该站点域名解析时判断源IP为电信的IP时返回1.1.1.1、判断源IP为联通的IP时返回2.2.2.2，从而达到不同运营商机房流量调度的目的。\n\n## 安装方法\n1. 安装python-devel以及bzip2包，以centos为例：`yum install -y bzip2 python-devel`\n2. 执行`pip install smartdns`脚本即可完成安装\n\n## 支持的功能\n支持A、SOA、NS记录的查询，支持DNS forward功能\n\n## 性能\n在虚拟机2.4G CPU上能够处理1000QPS查询请求，打开debug日志后可以到800QPS。3-5台dns server组成的集群已经能够满足大部分站点的需求。\n\n目前我们正在实现和小流量测试go语言实现的smartdns，能够达到3wQPS以上，后续测试稳定后会开源出来，大家敬请期待：）\n\n## 原理\n\nsmartdns响应dns请求的处理流程如下：\n\n![dns请求处理流程](http://noops.me/wp-content/uploads/2013/08/dns%E8%AF%B7%E6%B1%82%E5%A4%84%E7%90%86%E6%B5%81%E7%A8%8B.png)\n\nIPPool类的初始化和该类中FindIP方法进行解析处理是smartdns中最关键的两个要素，这两个要素在下面详细介绍。其他的特性比如继承twisted中dns相关类并重写处理dns请求的方法、升级twisted代码支持解析和处理edns请求等大家可以通过代码了解。edns知识可以猛戳这里：<a href=\"http://noops.me/?p=653\" title=\"DNS support edns-client-subnet\" target=\"_blank\">DNS support edns-client-subnet</a>\n\n#### IPPool初始化\n\n![IPPool初始化流程](http://noops.me/wp-content/uploads/2013/08/ippool%E5%88%9D%E5%A7%8B%E5%8C%96.png)\n\nip.csv内容格式如下：\n``200000001, 200000010,中国,陕西,西安,电信``\n\n其中各个字段含义分别为 ``IP段起始，IP段截止，IP段所属国家，IP段所属省份，IP段所属城市，IP段所属ISP``\n\na.yaml配置文件格式：\n<pre class=\"lang:default decode:true\">test.test.com:\n  ttl: 3600\n  default: 5.5.5.5 2.2.2.2\n  中国,广东,,联通: 1.1.1.1 3.3.3.1\n  中国,广东,,电信: 1.1.1.2 3.3.3.2</pre>\n\n配置中地域信息的key包括四个字段，分别带有不同的权重：\n- 国家：    8\n- 省份：\t4\n- 城市：\t2\n- 运营商：  1\n\n初始化阶段，会生成一个名为iphash的dict，具体数据结构如下图：\n\n![iphash数据结构](http://noops.me/wp-content/uploads/2013/08/iphash%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84.png)\n\n其中，iphash的key为ip.csv每一条记录的起始IP，value为一个list，list长度为6，list前5个字段分别为以该key为起始IP记录的IP段截止、IP段所属国家、IP段所属省份、IP段所属城市、IP段所属ISP，第六个字段是一个hash，key为a.yaml里面配置的域名，value为长度为2的list，iphash[IP段起始][6][域名1][0]为域名1在该IP段的最优解析，iphash[IP段起始][6][域名1][1]为该最优解析的总权值，该总权值暂时只做参考。\n\niphash初始化过程中最关键的是iphash[IP段起始][6][域名1]的最优解析的计算，最简单直接的方式是直接遍历域名1的所有调度配置，挑选出满足条件且总权值最高的解析，即为最优解析。这种方式记录整个iphash的时间复杂度为O(xyz)，x为ip.csv记录数，y为域名总数量，z为各个域名的调度配置数。为了优化启动速度，优化了寻找最优解析的方法：事先将每个域名调度配置生成一颗树，这棵树是用dict模拟出来的，这样需要最优解的时候就不需要遍历所有调度配置，而是最多检索15次即可找到最优，即时间复杂度为O(15xy)，具体实现参考IPPool的LoadRecord和JoinIP两个方法。\n\n有了初始化后的iphash数据结构之后，每次请求处理的时候，只需要定位请求IP处在哪个IP段，找到IP段起始IP，然后从iphash中取出最优解析，取出最优解析的过程是O(1)的。具体流程如下：\n\n![ippool的findip方法](http://noops.me/wp-content/uploads/2013/08/ippool%E7%9A%84findip%E6%96%B9%E5%BC%8F.png)\n\n## 监控\n\n监控配置详见配置目录的monitor.yaml，内容如下：\n\n```\ntest.test.cn:\n  interval: 30\n  frequency: 3\n  url: https://www.baidu.com\n```\n\n分别代表监控域名、监控周期(秒)、容错次数、监控url，监控失败的次数大于容错次数则停止该条记录的解析。\n\n\n## 代码\n\ngithub： https://github.com/duanhongyi/smartdns\n\n## 安装\n\n依赖：\n\ngcc\nbzip2\npython3以及相关dev包\nTwisted\n\n安装：\n\ngit clone smartdns到本地路径，执行`python setup.py install`命令安装。\n\n启动：\n\n执行sdns /etc/smartdns即可启动smartdns\n\n## 测试\n\n本地测试 dig test.test.com @127.0.0.1\n\n或者将搭建的smartdns加到测试域名的ns中进行测试。\n\n## 支持\n\nmail: duanhongyi@doopai.com\n\ngithub: duanhongyi\n\nEDNS相关请参考：<a href=\"http://noops.me/?p=653\" title=\"DNS support edns-client-subnet\" target=\"_blank\">DNS support edns-client-subnet</a>\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/duanhongyi/smartdns",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "smartdns",
+    "package_url": "https://pypi.org/project/smartdns/",
+    "platform": "all platform",
+    "project_url": "https://pypi.org/project/smartdns/",
+    "project_urls": {
+      "Homepage": "https://github.com/duanhongyi/smartdns"
+    },
+    "release_url": "https://pypi.org/project/smartdns/3.5.1/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "An Intelligent DNS Similar to DNSPod",
+    "version": "3.5.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12023671,
+  "releases": {
+    "3.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9407ecad28d79de1e95bb7843783ea7bf5d9dba978f25ceac980e44544ed5700",
+          "md5": "688257155bba302e970fd653a328632c",
+          "sha256": "994d1a780276dc6666c650fedf4cd26b4064117399293c0506f6e396ce3d8d72"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "688257155bba302e970fd653a328632c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14842,
+        "upload_time": "2019-10-29T02:30:31",
+        "upload_time_iso_8601": "2019-10-29T02:30:31.376167Z",
+        "url": "https://files.pythonhosted.org/packages/94/07/ecad28d79de1e95bb7843783ea7bf5d9dba978f25ceac980e44544ed5700/smartdns-3.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "432f136776c28896f0665d034419a2ef3588a0681fd146ab351492ac21dbd8a7",
+          "md5": "dd44c0a2139ad7a7a962b63900ad998a",
+          "sha256": "2e41c699e7d1093b47e464bf4169876d26ac4cd33e8bcf2195cb5f448508390f"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dd44c0a2139ad7a7a962b63900ad998a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1521719,
+        "upload_time": "2019-08-16T08:28:19",
+        "upload_time_iso_8601": "2019-08-16T08:28:19.955797Z",
+        "url": "https://files.pythonhosted.org/packages/43/2f/136776c28896f0665d034419a2ef3588a0681fd146ab351492ac21dbd8a7/smartdns-3.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "461a34c89cdcf4f3912088e4ac38d236142048599bf32adca48a678782e19934",
+          "md5": "03b8d536377adf48a0ef91c1311614cd",
+          "sha256": "48dd310c1f7de045092c5d780ac19fe3217e02210b143338bf716676d8b8562b"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03b8d536377adf48a0ef91c1311614cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1521684,
+        "upload_time": "2019-08-16T08:36:44",
+        "upload_time_iso_8601": "2019-08-16T08:36:44.823469Z",
+        "url": "https://files.pythonhosted.org/packages/46/1a/34c89cdcf4f3912088e4ac38d236142048599bf32adca48a678782e19934/smartdns-3.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3179962bccec71af1fc6b1be17bd986709457ba00d3d65a467dc93bc29a42e9",
+          "md5": "78950ab84410ffc89460856b02f04161",
+          "sha256": "e429b96cc29924d82ff531b6c5cabfe1242c34980fe1cd99082dbeaf560ace75"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "78950ab84410ffc89460856b02f04161",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14814,
+        "upload_time": "2019-08-21T06:51:58",
+        "upload_time_iso_8601": "2019-08-21T06:51:58.847283Z",
+        "url": "https://files.pythonhosted.org/packages/c3/17/9962bccec71af1fc6b1be17bd986709457ba00d3d65a467dc93bc29a42e9/smartdns-3.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94ea80c1e58064171f97a501d8922c87c3dad901b924e4f468d453deedebb434",
+          "md5": "0475ce08ddb65e4135a3ddac70061073",
+          "sha256": "cf26f3844dc41356ba54bac29f5e6f3fb62b74bda0fedb75aeb1655b36e99dd3"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0475ce08ddb65e4135a3ddac70061073",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14612,
+        "upload_time": "2020-05-29T06:36:46",
+        "upload_time_iso_8601": "2020-05-29T06:36:46.945419Z",
+        "url": "https://files.pythonhosted.org/packages/94/ea/80c1e58064171f97a501d8922c87c3dad901b924e4f468d453deedebb434/smartdns-3.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1eecd1d2224afe1fef14268d937b994b2ff3aa3369f0868963901d292a5d4ef2",
+          "md5": "3f6d75ec1b2ad3aaffdb79c64231d2c8",
+          "sha256": "473374fcd388fb0ec7031ae1ad65b991517bd593cfd49ac27e751d960fbd463f"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3f6d75ec1b2ad3aaffdb79c64231d2c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14690,
+        "upload_time": "2020-05-29T09:54:36",
+        "upload_time_iso_8601": "2020-05-29T09:54:36.772064Z",
+        "url": "https://files.pythonhosted.org/packages/1e/ec/d1d2224afe1fef14268d937b994b2ff3aa3369f0868963901d292a5d4ef2/smartdns-3.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f96b3d019dd2ffab3b0aa9157165dce320733df71b5c6c00d69f06da80d67912",
+          "md5": "acc144c349b3d6974e5ba2860d6fdb23",
+          "sha256": "dbb6d04e969d18a0212277d8ece90a560d3580b3e0ef960fe741cd0bb27e8128"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "acc144c349b3d6974e5ba2860d6fdb23",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14652,
+        "upload_time": "2020-05-29T10:33:57",
+        "upload_time_iso_8601": "2020-05-29T10:33:57.167390Z",
+        "url": "https://files.pythonhosted.org/packages/f9/6b/3d019dd2ffab3b0aa9157165dce320733df71b5c6c00d69f06da80d67912/smartdns-3.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec435fa988cda21fbc2fe7c6d06ca5483d0bc21803f61a77606eb18fc8731abb",
+          "md5": "d8fe4c58a66e0bcf68d8e93904ef93ed",
+          "sha256": "eaace5f565e9e90a4a4df3db624c23692a0b71855a8599596c4a50541595ccb0"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.10-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "d8fe4c58a66e0bcf68d8e93904ef93ed",
+        "packagetype": "bdist_egg",
+        "python_version": "3.3.10",
+        "requires_python": null,
+        "size": 12195,
+        "upload_time": "2021-04-12T05:05:39",
+        "upload_time_iso_8601": "2021-04-12T05:05:39.290392Z",
+        "url": "https://files.pythonhosted.org/packages/ec/43/5fa988cda21fbc2fe7c6d06ca5483d0bc21803f61a77606eb18fc8731abb/smartdns-3.3.10-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3ff27597540ef2a97c58cecd3833757ae96e2007bc2bf85c47755806032498b6",
+          "md5": "14900e738ff0bcc22a8c27763f98135d",
+          "sha256": "aa8a43adf5a8a6bc3b465730dc4dd3dc417ed82e6b93ec9a4276f5f24c9b4457"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14900e738ff0bcc22a8c27763f98135d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13407,
+        "upload_time": "2020-05-30T17:26:19",
+        "upload_time_iso_8601": "2020-05-30T17:26:19.018935Z",
+        "url": "https://files.pythonhosted.org/packages/3f/f2/7597540ef2a97c58cecd3833757ae96e2007bc2bf85c47755806032498b6/smartdns-3.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "443e21f63bab450dbed17846734dff3712815be506cbc2384dfbaf501fc7a43a",
+          "md5": "fcb5a85754dabab38a021adf64cf4b91",
+          "sha256": "820e44da936586b24e68be2bde110f281337997a3115ae936ef9ff6f38256b56"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fcb5a85754dabab38a021adf64cf4b91",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14062,
+        "upload_time": "2020-06-03T08:15:43",
+        "upload_time_iso_8601": "2020-06-03T08:15:43.664531Z",
+        "url": "https://files.pythonhosted.org/packages/44/3e/21f63bab450dbed17846734dff3712815be506cbc2384dfbaf501fc7a43a/smartdns-3.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ecb6437f90b3598f8feba56abd47b4f1f2bd8afbbdf82852d3965e8748709482",
+          "md5": "e206001d4a738db0d8f6ff4baf2415d2",
+          "sha256": "45faa16c110852328eff0f6715f34e9c46bbb131e72819048cb04330e31b4fbb"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e206001d4a738db0d8f6ff4baf2415d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14063,
+        "upload_time": "2020-06-03T08:19:54",
+        "upload_time_iso_8601": "2020-06-03T08:19:54.678516Z",
+        "url": "https://files.pythonhosted.org/packages/ec/b6/437f90b3598f8feba56abd47b4f1f2bd8afbbdf82852d3965e8748709482/smartdns-3.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d2481ee1121f27927ac24ab929f84729af5ce7160b0089bf0c61bcfa23a55832",
+          "md5": "65c2c2efb2dd0724ae195f2e52cd9247",
+          "sha256": "ec17ab9f22bec3722006ff324915849f12e80ce13b0130edd262d60c29a7094f"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65c2c2efb2dd0724ae195f2e52cd9247",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14150,
+        "upload_time": "2020-09-23T08:56:20",
+        "upload_time_iso_8601": "2020-09-23T08:56:20.649130Z",
+        "url": "https://files.pythonhosted.org/packages/d2/48/1ee1121f27927ac24ab929f84729af5ce7160b0089bf0c61bcfa23a55832/smartdns-3.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ead9b6bbbc964c9cf790febf4470cbbfdca685a2fabbb65adcfa552364aee681",
+          "md5": "976d74186de9a281d3c5e14db804d6d5",
+          "sha256": "436182d57285aff17d06fa88b860a0089314ca0ec722a1ef77c7d9ed08a9c959"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "976d74186de9a281d3c5e14db804d6d5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14167,
+        "upload_time": "2020-09-24T03:36:54",
+        "upload_time_iso_8601": "2020-09-24T03:36:54.108798Z",
+        "url": "https://files.pythonhosted.org/packages/ea/d9/b6bbbc964c9cf790febf4470cbbfdca685a2fabbb65adcfa552364aee681/smartdns-3.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2933da0472e6ed6a3c28d95fce2ea6699559ab36518013b2809677854ca9cdfe",
+          "md5": "7a44a5e505a877b17db9d397c2bdb007",
+          "sha256": "e35483fa5d4c87784ab43705a002673575fee1aadd4cdba6a87632a3bd011902"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7a44a5e505a877b17db9d397c2bdb007",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14605,
+        "upload_time": "2021-03-26T06:18:49",
+        "upload_time_iso_8601": "2021-03-26T06:18:49.716055Z",
+        "url": "https://files.pythonhosted.org/packages/29/33/da0472e6ed6a3c28d95fce2ea6699559ab36518013b2809677854ca9cdfe/smartdns-3.3.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "090b5c5ea9a33f9b1175a315bfb8ee34a4529eed6c69ffbb665ca5e7f176f331",
+          "md5": "9d3dddea071919d4eb18e9769329cfca",
+          "sha256": "2f138629202a23c58c9f1d1d48afa449f0a3d502d6726e9e949320f8788f0b54"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.3.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9d3dddea071919d4eb18e9769329cfca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14653,
+        "upload_time": "2021-04-01T08:08:24",
+        "upload_time_iso_8601": "2021-04-01T08:08:24.113688Z",
+        "url": "https://files.pythonhosted.org/packages/09/0b/5c5ea9a33f9b1175a315bfb8ee34a4529eed6c69ffbb665ca5e7f176f331/smartdns-3.3.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eebe8b7a8992dbb7810ef75a72e66007e48845128be965b1f4b519456547a0a5",
+          "md5": "86d1b94887ce8b11d660ad2e6a4cb29e",
+          "sha256": "6967d57e165e780c438da8b950780cd90512f57809862f731c5c688cd7c3c189"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "86d1b94887ce8b11d660ad2e6a4cb29e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14758,
+        "upload_time": "2021-08-10T02:18:52",
+        "upload_time_iso_8601": "2021-08-10T02:18:52.687444Z",
+        "url": "https://files.pythonhosted.org/packages/ee/be/8b7a8992dbb7810ef75a72e66007e48845128be965b1f4b519456547a0a5/smartdns-3.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f203a7f5fbaa5510a07b9cc0e234e60bf9627db6561e080e1f95fc3f8be2161",
+          "md5": "a229052144eacf351e08fabcad8c5868",
+          "sha256": "25404c9972f485128e477ba9c3c7eaf05f8f18e2772b7c4e20e73945b7538da8"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a229052144eacf351e08fabcad8c5868",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14742,
+        "upload_time": "2021-08-12T06:49:59",
+        "upload_time_iso_8601": "2021-08-12T06:49:59.064064Z",
+        "url": "https://files.pythonhosted.org/packages/6f/20/3a7f5fbaa5510a07b9cc0e234e60bf9627db6561e080e1f95fc3f8be2161/smartdns-3.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40cc637165eeaaaf92b99e95a61af363a217df89c5892b6813a5c8ca32f628e4",
+          "md5": "0ef7ed64bbff3b9f7633932511808d01",
+          "sha256": "61e65ff1cc10d366eadb6eca121a6e3ddd4ee132f76f887fc623d666ef4a444d"
+        },
+        "downloads": -1,
+        "filename": "smartdns-3.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0ef7ed64bbff3b9f7633932511808d01",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15438,
+        "upload_time": "2021-11-15T05:49:13",
+        "upload_time_iso_8601": "2021-11-15T05:49:13.680331Z",
+        "url": "https://files.pythonhosted.org/packages/40/cc/637165eeaaaf92b99e95a61af363a217df89c5892b6813a5c8ca32f628e4/smartdns-3.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "40cc637165eeaaaf92b99e95a61af363a217df89c5892b6813a5c8ca32f628e4",
+        "md5": "0ef7ed64bbff3b9f7633932511808d01",
+        "sha256": "61e65ff1cc10d366eadb6eca121a6e3ddd4ee132f76f887fc623d666ef4a444d"
+      },
+      "downloads": -1,
+      "filename": "smartdns-3.5.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0ef7ed64bbff3b9f7633932511808d01",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 15438,
+      "upload_time": "2021-11-15T05:49:13",
+      "upload_time_iso_8601": "2021-11-15T05:49:13.680331Z",
+      "url": "https://files.pythonhosted.org/packages/40/cc/637165eeaaaf92b99e95a61af363a217df89c5892b6813a5c8ca32f628e4/smartdns-3.5.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

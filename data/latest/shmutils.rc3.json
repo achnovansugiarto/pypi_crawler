@@ -1,0 +1,1156 @@
+{
+  "info": {
+    "author": "Autumn Jolitz",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: BSD License",
+      "Operating System :: MacOS :: MacOS X",
+      "Operating System :: POSIX :: BSD",
+      "Operating System :: POSIX :: Linux",
+      "Topic :: Software Development :: Libraries :: Python Modules",
+      "Topic :: System :: Hardware :: Symmetric Multi-processing"
+    ],
+    "description": "shmutils - Shared Memory structures in Python\n=================================================\n\n|Release Status| |Style Status| |Test Status|\n\nI've wondered why isn't it easier to have multiple processes be able to have a shared memory space.\n\nI've also wondered about how to pass shared memory definitions between processes.\n\nExamples\n-----------\n\n\n.. code-block:: python\n\n    import multiprocessing\n    from contextlib import suppress\n    from concurrent.futures import ProcessPoolExecutor, as_completed\n    from shmutils import MappedMemory, MapFlags, MapProtections\n    from shmutils.utils import cffiwrapper\n    from shmutils.lock import Lock\n    from shmutils.shm import shm_open, shm_unlink\n\n\n    def _increment_to(m, lock: Lock, value: cffiwrapper, limit: int):\n        \"\"\"\n        Returns the number of times we increments the number\n        \"\"\"\n        count = value[0]\n        num_incr = 0\n        while count < limit:\n            with lock:\n                count = value[0]\n                if count >= limit:\n                    break\n                num_incr += 1\n                value[0] = count + 1\n        return num_incr\n\n\n    if __name__ == \"__main__\":\n        with suppress(FileNotFoundError):\n            shm_unlink(\"test-lock\")\n\n        fd = shm_open(\"test-lock\", \"w+\")\n        size = 4096 * 100\n        fd.truncate(size)\n        assert fd.size() == size\n        with MappedMemory(0, size, MapProtections.READ_WRITE, MapFlags.SHARED, fd) as m:\n            with ProcessPoolExecutor(mp_context=multiprocessing.get_context(\"fork\")) as exe:\n                lock = Lock(m)\n                counter = m.new(\"size_t *\", 0)\n                with lock:\n                    result1 = exe.submit(_increment_to, m, lock, cffiwrapper(counter, m), 2_0000)\n                    result2 = exe.submit(_increment_to, m, lock, cffiwrapper(counter, m), 2_0000)\n                tuple(as_completed((result1, result2)))\n                r1, r2 = result1.result(), result2.result()\n            assert (result1.exception(), result2.exception()) == (None, None)\n            assert counter[0] == 2_0000\n            assert r1 + r2 == 2_0000\n\n\nA MappedMemory is helpful for straddling the relative/absolute address world.\n\n.. code-block: pycon\n\n    >>> from shmutils import MappedMemory\n    >>> m = MappedMemory(0, 51342411)\n    >>> m.pages.length\n    12535\n    >>> ptr1, *_, ptr2 = m.pages[44:124]\n    >>> len(m.absolute_at[ptr1:ptr1+10])\n    10\n    >>> len(m.absolute_at[ptr1:ptr2])\n    327680\n    >>> m.absolute_at[ptr1:ptr1+10] = b'x' * 10\n    >>> m.relative_address_at[ptr1]\n    180224\n    >>> m.seek(180224)\n    180224\n    >>> m.read(10)\n    b'xxxxxxxxxx'\n    >>>\n\n\nRoadmap\n--------\n\n- |done| Virtual address stability\n\n  - ``MappedMemory.at`` (relative address to bytes)\n  - ``MappedMemory.absolute_at`` (absolute address to bytes)\n  - ``MappedMemory.abs_address_at`` (relative address -> absolute address)\n  - ``MappedMemory.relative_address_at`` (absolute address -> relative address)\n\n- |inprogress| Support Python ``multiprocessing.get_context(\"spawn\")``\n- |todo| figure out pickling of ``cffi.CData``\n-   |todo| switch to ``instruct`` for internal classes\n\n    - implement something like:\n\n      .. code-block:: python\n\n        from instruct import CBase, class_metadata, astuple\n        from shmutils import MemoryMap, MemoryFlags, ffi as shmffi\n\n        ...\n        fd = shm_open(...).truncate(PAGE_SIZE)\n        page = MemoryMap(None, PAGE_SIZE, flags=MemoryFlags.SHARED, fd=fd)\n        ...\n\n        ffi = cffi.FFI()\n        # You can include other ffi's to reuse c type declarations\n        ffi.include(shmffi)\n        ffi.cdef('''\n            typedef enum {INACTIVE, ACTIVE, DELETED} OrgUserStatus_t;\n        ''')\n        # pass into the instruct.CBase class an ffi instead of ``instruct.default_ffi``\n        class User(CBase, ffi=ffi):\n            __slots__ = '''\n            struct org_user_t {\n                uint64_t id;\n                char     *fullname;\n                uint8_t  fullname_len;\n                OrgUserStatus_t status;   \n            };\n            '''\n\n        assert User.__slots__ == ()\n        assert ffi.typeof(class_metadata(User, \"cdecl\")) is ffi.typeof('struct org_user_t)\n        assert ffi.sizeof('struct org_user_t') == class_metadata(User, \"csizeof\")\n        assert ffi is class_metadata(User, \"default_ffi\")\n\n        lib = ffi.dlopen(None)\n        # Allocate using ``ffi.new``\n        u = User.new(12345, b\"Autumn\", 6, lib.ACTIVE)\n        assert User.typeof(u) == 'struct org_user_t*'\n        assert ffi.typeof(u.id) is ffi.typeof('uint64_t')\n        assert ffi.typeof(u.fullname) is ffi.typeof('char*')\n        assert ffi.typeof(u.fullname_len) is ffi.typeof('uint8_t')\n        assert len(memoryview(User.getbuffer(u))) == User.sizeof()\n        assert len(memoryview(User.getbuffer(u))) == User.sizeof(u)\n        assert not hasattr(u, 'sizeof')\n        assert u.__internals__[\"heap\"] is None\n\n        # Allocate using an alternate function\n        # in this case, use the ``.new`` malloc for the\n        # shared page\n        SharedUser: Type[User] = User.with_heap(page)\n        u2 = SharedUser.new()\n        assert u2.__internals__[\"heap\"] is page\n        assert u2.id == 0\n        assert u2.fullname == ffi.NULL\n        assert u2.fullname_len == 0\n        assert u2.status == 0\n\n        # as far as the cdata is concerned, it points into the ``page``'s heap\n        # User the ``CBase``'s ``.addressof`` call to get a pointer to the entity\n        abs_ptr = ffi.cast('uintptr_t', User.addressof(u2))\n        assert page.address.begin <= int(abs_ptr) < page.address.end\n        # page contents and buffer match each other\n        assert page.absolute_at[abs_ptr: abs_ptr + User.sizeof()] == User.getbuffer()[0: User.sizeof()]\n\n        # demo assign\n        # allocate space for a name\n        raw_u2_fullname = page.new('char*', b'Autumn Jolitz')\n        u2.id = 4123\n        u2.fullname = u2_fullname  # assign the pointer\n        u2.fullname_len = 13\n        u2.status = lib.ACTIVE\n        assert astuple(u2) == (u2.id, raw_u2_fullname, u2.fullname_len, lib.ACTIVE)\n        u2_copy = pickle.loads(pickle.dumps(u2))\n        assert u2_copy.__internals__[\"heap\"] is page\n        assert astuple(u2) == astuple(u2_copy)\n\n- |todo| split Locks into ``RawLock|RawRLock`` (consumes a ``memoryview|bytebuffer|ffi.buffer``, allocates from 0 to length of lock size)\n- |todo| split Locks into ``Lock|RLock``\n- |todo| reimplement locking in terms of a condition variable\n- |todo| use liblfs for a freelist\n- |todo| make a shared heap process-safe\n\nLimitations\n------------------\n\n- Toy allocator, does not synchronize writes between processes (only parent is expected to have allocated ahead of time).\n\nspawn vs fork\n*******************\n\n\nUse \"fork\" multiprocessing method instead.\n\nThe \"spawn\" multiprocessing method is subject to ASLR and **sometimes** the kernel locates a child process starting much higher than our process. This has the effect of breaking the requirement for absolute pointers working.\n\nHowever, it is observed that if a parent process manages to get a high enough memory page, the probability of the child process being able to ``mmap(2)`` the same address increases significantly.\n\n.. code-block:: python\n\n    import multiprocessing\n    from contextlib import suppress\n    from concurrent.futures import ProcessPoolExecutor, wait\n    from mmap import PAGESIZE\n\n    from shmutils import MappedMemory, MapFlags\n    from shmutils.mmap import munmap, round_to_page_size\n    from shmutils.shm import shm_open, ffi, shm_unlink\n    from shmutils.utils import cffiwrapper\n\n    # cffiwrapper - use to pickle/unpickle cffi objects between processes\n\n\n    def _set_data_to(value: cffiwrapper, to: int) -> int:\n        was = value[0]\n        for i in range(was, to):\n            value[0] = i\n        value[0] = to\n        return was\n\n\n    if __name__ == \"__main__\":\n        with suppress(FileNotFoundError):\n            shm_unlink(\"test-mmap-spawn\")\n        with shm_open(\"test-mmap-spawn\", \"x+\") as fd:\n            shared_size = round_to_page_size(1024 * 1024 * 1024)\n            fd.truncate(shared_size)\n            # Allocate a dummy 512 MiB blockrange\n            unused_space = MappedMemory(None, 512 * 1024 * 1024)\n            # write to the pages to ensure we're not being fooled\n            unused_space[len(unused_space) - PAGESIZE : len(unused_space) - PAGESIZE + 4] = b\"sink\"\n\n            # Calculate the last page in the unused space range\n            start_address: int = unused_space.abs_address_at[len(unused_space) - PAGESIZE]\n            # detach the unused space guts so we can free all bu the last page\n            raw_address, size = unused_space.detach()\n            # free all BUT the last page\n            munmap(raw_address, size - PAGESIZE)\n            del unused_space\n\n            # Prove our start address is the last page of the mostly freed range\n            # (our last page is still mapped.)\n            assert int(ffi.cast(\"uintptr_t\", raw_address)) + size - PAGESIZE == start_address\n\n            with MappedMemory(\n                start_address, shared_size, flags=MapFlags.SHARED | MapFlags.FIXED, fd=fd\n            ) as m:\n                with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context(\"spawn\")) as exe:\n                    value = m.new(\"int64_t*\", 1923)\n                    assert value[0] == 1923\n                    # The child process will now be able to mess with this counter\n                    future = exe.submit(_set_data_to, cffiwrapper(value, m), 8900)\n                    wait([future])\n                    # And we can see the results both on the value in memory and from the\n                    # return\n                    assert future.done() and not future.exception()\n                    assert (future.result(), value[0]) == (1923, 8900)\n\n.. |done| unicode:: U+2705\n.. |warning| unicode:: U+FE0F\n.. |error| unicode:: U+274C\n.. |inprogress| unicode:: U+1F6A7\n.. |todo| unicode:: U+2610\n\n.. |Release Status| image:: https://github.com/autumnjolitz/shmutils/actions/workflows/release.yml/badge.svg\n    :target: https://github.com/autumnjolitz/shmutils/actions/workflows/release.yml\n\n.. |Style Status| image:: https://github.com/autumnjolitz/shmutils/actions/workflows/style.yml/badge.svg\n    :target: https://github.com/autumnjolitz/shmutils/actions/workflows/style.yml\n\n.. |Test Status| image:: https://github.com/autumnjolitz/shmutils/actions/workflows/test.yml/badge.svg\n    :target: https://github.com/autumnjolitz/shmutils/actions/workflows/test.yml\n\n\n\n\n\n\n\n\n\n",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/autumnjolitz/shmutils",
+    "keywords": "shm,shared,memory,posix,mmap,munmap,shm_open,shm_unlink,pickle,cffi,cdata,shared,heap",
+    "license": "BSD 3-Clause License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "shmutils",
+    "package_url": "https://pypi.org/project/shmutils/",
+    "platform": "posix",
+    "project_url": "https://pypi.org/project/shmutils/",
+    "project_urls": {
+      "Homepage": "https://github.com/autumnjolitz/shmutils"
+    },
+    "release_url": "https://pypi.org/project/shmutils/0.0.2/",
+    "requires_dist": [
+      "cffi (>=1.15.0)",
+      "intervaltree",
+      "pytest ; extra == 'test'",
+      "black ; extra == 'test'",
+      "flake8 ; extra == 'test'",
+      "wheel ; extra == 'test'",
+      "twine ; extra == 'test'"
+    ],
+    "requires_python": "",
+    "summary": "Shared memory structures",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14011235,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b46c338f3b12fe259d15f5b139a2da7137b3f2bbc50aecd389eca9557e5a63a",
+          "md5": "7093ab16e63dc5605c9f193e6d52e60c",
+          "sha256": "06ec45aa09f97de5bce97dee1c451341fbcbda86dd6608d614a4634d0d5ed28b"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp310-cp310-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "7093ab16e63dc5605c9f193e6d52e60c",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 32254,
+        "upload_time": "2022-06-02T09:27:06",
+        "upload_time_iso_8601": "2022-06-02T09:27:06.057161Z",
+        "url": "https://files.pythonhosted.org/packages/8b/46/c338f3b12fe259d15f5b139a2da7137b3f2bbc50aecd389eca9557e5a63a/shmutils-0.0.0-cp310-cp310-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a038e2ba67f7bffbeba1d37d2510cfab103767cfb4384edce90f634f5c08646c",
+          "md5": "2e5e2039bd834d16aeb8b2013149fc67",
+          "sha256": "146e1f8c4dbf462c1403677b82d4ec44ecf79b1006f829b9ef075be07c0c9967"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "2e5e2039bd834d16aeb8b2013149fc67",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 59808,
+        "upload_time": "2022-06-02T09:27:07",
+        "upload_time_iso_8601": "2022-06-02T09:27:07.677881Z",
+        "url": "https://files.pythonhosted.org/packages/a0/38/e2ba67f7bffbeba1d37d2510cfab103767cfb4384edce90f634f5c08646c/shmutils-0.0.0-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b98ccc2f32e0560fec949bf883c0c0531c96970e6d7afa8a3b4741ed1ae64cb",
+          "md5": "127be6c1ba547b165f117553adad406f",
+          "sha256": "9960ab109c6c31913aff71212f240145e31468c586ee5f5bbc982a80957ab3fd"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "127be6c1ba547b165f117553adad406f",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 61230,
+        "upload_time": "2022-06-02T09:27:09",
+        "upload_time_iso_8601": "2022-06-02T09:27:09.364392Z",
+        "url": "https://files.pythonhosted.org/packages/1b/98/ccc2f32e0560fec949bf883c0c0531c96970e6d7afa8a3b4741ed1ae64cb/shmutils-0.0.0-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd74b5b590c1a82fa6b7a52f08665c82ba673741819c75d11ba8bfbc737d9469",
+          "md5": "72d2ce821a5cc10f6bad9d86f9622cb7",
+          "sha256": "3d218f2c49e706d0525340fd4a8d4d40e1f3c28d263fa08e4f0d643b8e74f409"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "72d2ce821a5cc10f6bad9d86f9622cb7",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 32195,
+        "upload_time": "2022-06-02T09:10:53",
+        "upload_time_iso_8601": "2022-06-02T09:10:53.243342Z",
+        "url": "https://files.pythonhosted.org/packages/bd/74/b5b590c1a82fa6b7a52f08665c82ba673741819c75d11ba8bfbc737d9469/shmutils-0.0.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3bd7c271016527050ce6df23d0b45ccac0152c84a039c05cdcc2dac567780f90",
+          "md5": "6712ad7c9c83b00de578d19cb267c519",
+          "sha256": "6ba78d1111f713407ebce921ba68fea5d49e5172b2685a29c37129b3aec7933a"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "6712ad7c9c83b00de578d19cb267c519",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 59741,
+        "upload_time": "2022-06-02T09:10:55",
+        "upload_time_iso_8601": "2022-06-02T09:10:55.000356Z",
+        "url": "https://files.pythonhosted.org/packages/3b/d7/c271016527050ce6df23d0b45ccac0152c84a039c05cdcc2dac567780f90/shmutils-0.0.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3ffd72c297882bc3bfda4e0469a60bd649ebccb04478df75e14778407d8fb21",
+          "md5": "4a162f38a4a1d2c5cc932f59fc295fec",
+          "sha256": "076012246f57912f69e64d44d692994eaef673f968a64df393a857f0444faac8"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "4a162f38a4a1d2c5cc932f59fc295fec",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 61225,
+        "upload_time": "2022-06-02T09:10:56",
+        "upload_time_iso_8601": "2022-06-02T09:10:56.932710Z",
+        "url": "https://files.pythonhosted.org/packages/f3/ff/d72c297882bc3bfda4e0469a60bd649ebccb04478df75e14778407d8fb21/shmutils-0.0.0-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "52d5860b73245d488db27c8bc4e5dcc73c13cd2d5821d6f432f0059cbdf45563",
+          "md5": "18365d0d1bd0aecbe5b833081b936caf",
+          "sha256": "06f3913004f8e631e8c79ca3894d8e7bd34dfd5a5d0eb659c000b2dd80f46955"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "18365d0d1bd0aecbe5b833081b936caf",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 32251,
+        "upload_time": "2022-06-02T09:10:58",
+        "upload_time_iso_8601": "2022-06-02T09:10:58.131551Z",
+        "url": "https://files.pythonhosted.org/packages/52/d5/860b73245d488db27c8bc4e5dcc73c13cd2d5821d6f432f0059cbdf45563/shmutils-0.0.0-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ede1eb41f23d07ee31f5e9e867f7e64a135fe624ed07825e6d85660f527bffb",
+          "md5": "b90b73a5fe7711d6d4f0967316c27403",
+          "sha256": "7de8a8a82a61d973845c1ecd6549d4962a4af38609d593f6fb963e2471490bfa"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "b90b73a5fe7711d6d4f0967316c27403",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 59948,
+        "upload_time": "2022-06-02T09:10:59",
+        "upload_time_iso_8601": "2022-06-02T09:10:59.338880Z",
+        "url": "https://files.pythonhosted.org/packages/6e/de/1eb41f23d07ee31f5e9e867f7e64a135fe624ed07825e6d85660f527bffb/shmutils-0.0.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "887fe9fe4c3fa88dbf56fb07598dd04467caef9fbb8eb55863fd7d64bef1332b",
+          "md5": "2923a866d8a851b8982c8a0ec4b02524",
+          "sha256": "e9259af8aea8305c4ff96879be1b1636b2ed14265ab8e2a368ec46f368ff611a"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "2923a866d8a851b8982c8a0ec4b02524",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 61670,
+        "upload_time": "2022-06-02T09:11:00",
+        "upload_time_iso_8601": "2022-06-02T09:11:00.661957Z",
+        "url": "https://files.pythonhosted.org/packages/88/7f/e9fe4c3fa88dbf56fb07598dd04467caef9fbb8eb55863fd7d64bef1332b/shmutils-0.0.0-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b95fe7ebf20e54ff789c3366d1f48c4a1e501de81a53e35306df0ddf753efab",
+          "md5": "d341f50bdc932f43cbc792397dab0c05",
+          "sha256": "fc6ae46270ac68c63de990c57f9db2105d6f93bd707aa93ba40407fa2c5f5e40"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp39-cp39-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "d341f50bdc932f43cbc792397dab0c05",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 32251,
+        "upload_time": "2022-06-02T09:11:01",
+        "upload_time_iso_8601": "2022-06-02T09:11:01.982927Z",
+        "url": "https://files.pythonhosted.org/packages/0b/95/fe7ebf20e54ff789c3366d1f48c4a1e501de81a53e35306df0ddf753efab/shmutils-0.0.0-cp39-cp39-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8bd11d2e2dfbab10ee30f975f58429044c7b59b8b52ab3d2f3078805abfd1b78",
+          "md5": "bc526918a5ddb7a2b7c8ad8032c15f5d",
+          "sha256": "3f4228c16319748bd9af3366f9be7b9c3fc51d99862067ff9ca214b0bcd5eeaa"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "bc526918a5ddb7a2b7c8ad8032c15f5d",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 59798,
+        "upload_time": "2022-06-02T09:11:03",
+        "upload_time_iso_8601": "2022-06-02T09:11:03.793593Z",
+        "url": "https://files.pythonhosted.org/packages/8b/d1/1d2e2dfbab10ee30f975f58429044c7b59b8b52ab3d2f3078805abfd1b78/shmutils-0.0.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b3091ac789efcaa6d2a4c09a41af6fbde2baf286eeaa1c08a35927b54603bdc",
+          "md5": "51079a93627586b6870c6be536bd8778",
+          "sha256": "3a7869b75d5e53c40fcf3e8a664a6e90957997fc747b91391ca236667cd8fc00"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "51079a93627586b6870c6be536bd8778",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 61267,
+        "upload_time": "2022-06-02T09:11:05",
+        "upload_time_iso_8601": "2022-06-02T09:11:05.863276Z",
+        "url": "https://files.pythonhosted.org/packages/8b/30/91ac789efcaa6d2a4c09a41af6fbde2baf286eeaa1c08a35927b54603bdc/shmutils-0.0.0-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a035c38400b3af6d1cabefd7a0a1ef9f21d4e0b12c67c203c8bc5f6eaf84b1f",
+          "md5": "b5e9cbadbaee174cd5451360ce4d8db3",
+          "sha256": "afed17184525fa607a502743fc1af01cc5bbd4cbcf7c3be6a5d3683d83e72d3b"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b5e9cbadbaee174cd5451360ce4d8db3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20896,
+        "upload_time": "2022-06-01T09:20:06",
+        "upload_time_iso_8601": "2022-06-01T09:20:06.587095Z",
+        "url": "https://files.pythonhosted.org/packages/5a/03/5c38400b3af6d1cabefd7a0a1ef9f21d4e0b12c67c203c8bc5f6eaf84b1f/shmutils-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b629d01cd28f9f12f91e8b3b6fc6fa1937ae8cc62b4d26d333fcdb83f881abd",
+          "md5": "fefcc14b5018694d9dba6c6d46eda474",
+          "sha256": "8e9ea8244945d23dbada160a88d1b6ab7113f36083901cd3c30cadb1b86e02ad"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp310-cp310-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "fefcc14b5018694d9dba6c6d46eda474",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 32254,
+        "upload_time": "2022-06-02T09:48:28",
+        "upload_time_iso_8601": "2022-06-02T09:48:28.154294Z",
+        "url": "https://files.pythonhosted.org/packages/3b/62/9d01cd28f9f12f91e8b3b6fc6fa1937ae8cc62b4d26d333fcdb83f881abd/shmutils-0.0.1-cp310-cp310-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b1e38043720d38adc6188cc0261048d1c16a36753fd97dc1bdcabd1a8abb957",
+          "md5": "ed3cb023e14d28c1facd15c880895476",
+          "sha256": "3e82b41eb417d81261ab77491c9a4534421ae4d1101c052cb818c3c418afea2a"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "ed3cb023e14d28c1facd15c880895476",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 59811,
+        "upload_time": "2022-06-02T09:48:30",
+        "upload_time_iso_8601": "2022-06-02T09:48:30.078040Z",
+        "url": "https://files.pythonhosted.org/packages/9b/1e/38043720d38adc6188cc0261048d1c16a36753fd97dc1bdcabd1a8abb957/shmutils-0.0.1-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37da810a8c67071d7a57024508f2f53ae4c65743db4704aaa4227a0e6651c5a7",
+          "md5": "cb27a8af8018fc910a263a8338d62ad7",
+          "sha256": "5f77e58eecdabbcfe1c5bfa436a813217e3bcbe49fa80c2c1e298265217c3d1b"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "cb27a8af8018fc910a263a8338d62ad7",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 61229,
+        "upload_time": "2022-06-02T09:48:31",
+        "upload_time_iso_8601": "2022-06-02T09:48:31.556049Z",
+        "url": "https://files.pythonhosted.org/packages/37/da/810a8c67071d7a57024508f2f53ae4c65743db4704aaa4227a0e6651c5a7/shmutils-0.0.1-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c086917fa121f732171ffb5999cd4735d7f87b3e7e63150ce77723d9d84963c",
+          "md5": "9b6cd0cf5452559615d3f99a7477659f",
+          "sha256": "94abd21de5d7a0322c2e26fd30a1761bb575c3eb37bf8162da68be9d9cadfb8e"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "9b6cd0cf5452559615d3f99a7477659f",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 32197,
+        "upload_time": "2022-06-02T09:48:33",
+        "upload_time_iso_8601": "2022-06-02T09:48:33.611863Z",
+        "url": "https://files.pythonhosted.org/packages/2c/08/6917fa121f732171ffb5999cd4735d7f87b3e7e63150ce77723d9d84963c/shmutils-0.0.1-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce5e18bd453d1271740f512c8e6f88b5685e0b549e3aba4bad9832597ba17b43",
+          "md5": "84e782df4868416045aab528e704569c",
+          "sha256": "4ae2cc93ddddcb7b21f824dd213c8bfac2713ca763ab36374fc19e9153932bb2"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "84e782df4868416045aab528e704569c",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 59741,
+        "upload_time": "2022-06-02T09:48:35",
+        "upload_time_iso_8601": "2022-06-02T09:48:35.866912Z",
+        "url": "https://files.pythonhosted.org/packages/ce/5e/18bd453d1271740f512c8e6f88b5685e0b549e3aba4bad9832597ba17b43/shmutils-0.0.1-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d470f103f4ebd3d67eb87ebc16152a73dfa5aa6c499d2b0e38b2d0848218840d",
+          "md5": "345c36dd7c48c8688cd7c67ef476944d",
+          "sha256": "efe39421d178a88957b0b9ede95f9e9336bde4017f088f598e06d5689ccf4940"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "345c36dd7c48c8688cd7c67ef476944d",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 61226,
+        "upload_time": "2022-06-02T09:48:37",
+        "upload_time_iso_8601": "2022-06-02T09:48:37.695537Z",
+        "url": "https://files.pythonhosted.org/packages/d4/70/f103f4ebd3d67eb87ebc16152a73dfa5aa6c499d2b0e38b2d0848218840d/shmutils-0.0.1-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6de3c52a374ddb983c57edb589fc9c125da6afab8bed68b78332705bb34debca",
+          "md5": "4ad90f62ee88ff77b128cfe1f98243b7",
+          "sha256": "7efcb50090da9511ba6705480f842cf044cc1e422e564069692880636687282e"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "4ad90f62ee88ff77b128cfe1f98243b7",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 32251,
+        "upload_time": "2022-06-02T09:48:39",
+        "upload_time_iso_8601": "2022-06-02T09:48:39.920909Z",
+        "url": "https://files.pythonhosted.org/packages/6d/e3/c52a374ddb983c57edb589fc9c125da6afab8bed68b78332705bb34debca/shmutils-0.0.1-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39fa7bb4d372c3600ad35aba74edf65f0a930c2255cf9af4a8de2898a4a12ce1",
+          "md5": "5445a8766e4c38f3fadc11f686ef10d4",
+          "sha256": "6dc5b5d6d85be06daa8493085650c802e86a802588b41f4c93d57cbe1f63e92c"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "5445a8766e4c38f3fadc11f686ef10d4",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 59946,
+        "upload_time": "2022-06-02T09:48:41",
+        "upload_time_iso_8601": "2022-06-02T09:48:41.439470Z",
+        "url": "https://files.pythonhosted.org/packages/39/fa/7bb4d372c3600ad35aba74edf65f0a930c2255cf9af4a8de2898a4a12ce1/shmutils-0.0.1-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd7069d5872a31c3b6aad2c38fd63497f018a7d864e1e635de67d506f561a4eb",
+          "md5": "98d2233800e56844ee40bf4ba8aa67b6",
+          "sha256": "da15c883054178a8b1b610239a8718032ce5e32eb020bd4d101db7dc4cdd9756"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "98d2233800e56844ee40bf4ba8aa67b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 61671,
+        "upload_time": "2022-06-02T09:48:43",
+        "upload_time_iso_8601": "2022-06-02T09:48:43.107047Z",
+        "url": "https://files.pythonhosted.org/packages/dd/70/69d5872a31c3b6aad2c38fd63497f018a7d864e1e635de67d506f561a4eb/shmutils-0.0.1-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb7b32f9b3103876df53166ecc811af749c060ca4887601044e168a039e4cff8",
+          "md5": "b95a6ea3c84decfbc656c31aadd943da",
+          "sha256": "041731e2b48003258339b24cc02760497a2f12425b370afd0888dafd7ae15c88"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp39-cp39-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "b95a6ea3c84decfbc656c31aadd943da",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 32251,
+        "upload_time": "2022-06-02T09:48:44",
+        "upload_time_iso_8601": "2022-06-02T09:48:44.928887Z",
+        "url": "https://files.pythonhosted.org/packages/eb/7b/32f9b3103876df53166ecc811af749c060ca4887601044e168a039e4cff8/shmutils-0.0.1-cp39-cp39-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "397b28479f8e513315b4458b8d4121c0bed841a948f225f36dae2e8833d611bf",
+          "md5": "a4763afb8ff948d7e95dbef10d568139",
+          "sha256": "b1bda7e5660e790059a3510b7328e1109a2c4d5a9ee110ccf2a562f8ec33c2b3"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "a4763afb8ff948d7e95dbef10d568139",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 59798,
+        "upload_time": "2022-06-02T09:48:46",
+        "upload_time_iso_8601": "2022-06-02T09:48:46.911022Z",
+        "url": "https://files.pythonhosted.org/packages/39/7b/28479f8e513315b4458b8d4121c0bed841a948f225f36dae2e8833d611bf/shmutils-0.0.1-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "00dcbf5b250b8b4c682c1a18c5a33b2177b493f2a146f76297f39b36a621cade",
+          "md5": "a0d5755d0045559b7a23363e1f419d37",
+          "sha256": "89fc59bb8ca3dfc2aa9467458e15e640dfba6905f872d8de165e3738ae575349"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "a0d5755d0045559b7a23363e1f419d37",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 61267,
+        "upload_time": "2022-06-02T09:48:48",
+        "upload_time_iso_8601": "2022-06-02T09:48:48.493671Z",
+        "url": "https://files.pythonhosted.org/packages/00/dc/bf5b250b8b4c682c1a18c5a33b2177b493f2a146f76297f39b36a621cade/shmutils-0.0.1-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2a08706171069201e2c9a8551825e5f42985c957181be9b18162d32244a9adc",
+          "md5": "f49b7eb97c6572a877166cbf303ec5a6",
+          "sha256": "a4fd1997c0385021bb4804333a90a9d8a28f159879b7d6e7453283b85b3f4af5"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f49b7eb97c6572a877166cbf303ec5a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24366,
+        "upload_time": "2022-06-02T09:48:49",
+        "upload_time_iso_8601": "2022-06-02T09:48:49.704382Z",
+        "url": "https://files.pythonhosted.org/packages/f2/a0/8706171069201e2c9a8551825e5f42985c957181be9b18162d32244a9adc/shmutils-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4aa475d1be8dbad3c944e21a10e03077e27259d683a90546ba5b689512c34f9e",
+          "md5": "740ab5e580fc85ac70d4d5be858e3a6d",
+          "sha256": "36510615f267e06bceeb300bf55c896522e63ba4ebb973012413710b68b455ce"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp310-cp310-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "740ab5e580fc85ac70d4d5be858e3a6d",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 32255,
+        "upload_time": "2022-06-02T10:45:14",
+        "upload_time_iso_8601": "2022-06-02T10:45:14.280950Z",
+        "url": "https://files.pythonhosted.org/packages/4a/a4/75d1be8dbad3c944e21a10e03077e27259d683a90546ba5b689512c34f9e/shmutils-0.0.2-cp310-cp310-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5626fd359f15136a800b085e07ce1e61fe5ad5593b6dad274b35273448e65f5a",
+          "md5": "99c54811c5cb56f5247bb868c0c8c195",
+          "sha256": "9a2402130937158cbe61da1f87bc4c8999b0176f74d3a372d7d1ae25fdd5a74d"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "99c54811c5cb56f5247bb868c0c8c195",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 59810,
+        "upload_time": "2022-06-02T10:45:15",
+        "upload_time_iso_8601": "2022-06-02T10:45:15.729229Z",
+        "url": "https://files.pythonhosted.org/packages/56/26/fd359f15136a800b085e07ce1e61fe5ad5593b6dad274b35273448e65f5a/shmutils-0.0.2-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cfa16144fea89f7aab5a2008c411a94295b68caf696ad205f30652b1ee20e302",
+          "md5": "9e74c1b549e10b7da29c8f6d350f11f3",
+          "sha256": "7dfeeda298efc9d455fc6ce1a720a8c001494a1f382e7c41c8030e9f47f6462a"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "9e74c1b549e10b7da29c8f6d350f11f3",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp310",
+        "requires_python": null,
+        "size": 61230,
+        "upload_time": "2022-06-02T10:45:17",
+        "upload_time_iso_8601": "2022-06-02T10:45:17.008651Z",
+        "url": "https://files.pythonhosted.org/packages/cf/a1/6144fea89f7aab5a2008c411a94295b68caf696ad205f30652b1ee20e302/shmutils-0.0.2-cp310-cp310-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b96af5dcdbdf0c41184a572e0ffc068d0dd8737b276ba6f3b9b6d8a3c8b7ae4",
+          "md5": "51a0fe7f44d0853f4d6388196870f428",
+          "sha256": "54cd88acc60dbf2812d7ec8e0d2c319578d5616673eb6d9f2a543038fabe50d6"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "51a0fe7f44d0853f4d6388196870f428",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 32197,
+        "upload_time": "2022-06-02T10:45:18",
+        "upload_time_iso_8601": "2022-06-02T10:45:18.449447Z",
+        "url": "https://files.pythonhosted.org/packages/3b/96/af5dcdbdf0c41184a572e0ffc068d0dd8737b276ba6f3b9b6d8a3c8b7ae4/shmutils-0.0.2-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93e436ffe833503a962056d65877f4c923d3b342434b60a253433bb1f429c883",
+          "md5": "881b8c0f6152562a6bc7a9f277477bdf",
+          "sha256": "4bb5c93a3258209d86e8c477e7e1dc8e6bd9c9d1321fd05ef3ef28320ac8b173"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "881b8c0f6152562a6bc7a9f277477bdf",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 59743,
+        "upload_time": "2022-06-02T10:45:20",
+        "upload_time_iso_8601": "2022-06-02T10:45:20.792925Z",
+        "url": "https://files.pythonhosted.org/packages/93/e4/36ffe833503a962056d65877f4c923d3b342434b60a253433bb1f429c883/shmutils-0.0.2-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e610d521583149da4e6d4b6f212442722cd35d8a476819faf349ad92c22be1d",
+          "md5": "6f23161fb909e896777d987d38b3f5dd",
+          "sha256": "4f8345eb917f3113b5aac86b82b4602376c16d82968cb9e6b1bd5e786fbbcbd5"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "6f23161fb909e896777d987d38b3f5dd",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 61228,
+        "upload_time": "2022-06-02T10:45:21",
+        "upload_time_iso_8601": "2022-06-02T10:45:21.957123Z",
+        "url": "https://files.pythonhosted.org/packages/6e/61/0d521583149da4e6d4b6f212442722cd35d8a476819faf349ad92c22be1d/shmutils-0.0.2-cp37-cp37m-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf4123924229cc59f9a00baa1acba9ea18255df505503c0a6196744b466cc91f",
+          "md5": "e9a4554cd78047628af94908111b1939",
+          "sha256": "61a84c3ee80216a8f536fed33269d7ee840571b7eff50767b4afd29f6801f916"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "e9a4554cd78047628af94908111b1939",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 32255,
+        "upload_time": "2022-06-02T10:45:23",
+        "upload_time_iso_8601": "2022-06-02T10:45:23.245602Z",
+        "url": "https://files.pythonhosted.org/packages/cf/41/23924229cc59f9a00baa1acba9ea18255df505503c0a6196744b466cc91f/shmutils-0.0.2-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "171c94a657db26c7dca23e9852d365805e55d0b6e2b66b6b3b0a6d6f7cb49ba7",
+          "md5": "e7d12b495f7c8b393f4729b19714075d",
+          "sha256": "0d5215d68c380c05e1bf758dcfe4e90dc465158a4dae9e1ce3dbf6058bd1547e"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "e7d12b495f7c8b393f4729b19714075d",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 59948,
+        "upload_time": "2022-06-02T10:45:24",
+        "upload_time_iso_8601": "2022-06-02T10:45:24.672077Z",
+        "url": "https://files.pythonhosted.org/packages/17/1c/94a657db26c7dca23e9852d365805e55d0b6e2b66b6b3b0a6d6f7cb49ba7/shmutils-0.0.2-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "827b1093fbb576545f130c03506967a1b1df9e80dff72cab8dc9e655d160729f",
+          "md5": "1ad7ffbeee1765566c6410c4a782b949",
+          "sha256": "199a3d3916771aac341a96a3243ae2dc79813ced721fa12ab864762cbd7ae9d0"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "1ad7ffbeee1765566c6410c4a782b949",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 61672,
+        "upload_time": "2022-06-02T10:45:26",
+        "upload_time_iso_8601": "2022-06-02T10:45:26.413047Z",
+        "url": "https://files.pythonhosted.org/packages/82/7b/1093fbb576545f130c03506967a1b1df9e80dff72cab8dc9e655d160729f/shmutils-0.0.2-cp38-cp38-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8755572491a8aef88eb292380d7e528fa783bcde1bc894e0df40d3e7102f758e",
+          "md5": "7d114deb3c55e110f80ccbb5aaa331f0",
+          "sha256": "73a9b076f36799ce7671d6770fa2af66adee9e43f4bd0510347f9cad42f155ae"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp39-cp39-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "7d114deb3c55e110f80ccbb5aaa331f0",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 32253,
+        "upload_time": "2022-06-02T10:45:28",
+        "upload_time_iso_8601": "2022-06-02T10:45:28.167527Z",
+        "url": "https://files.pythonhosted.org/packages/87/55/572491a8aef88eb292380d7e528fa783bcde1bc894e0df40d3e7102f758e/shmutils-0.0.2-cp39-cp39-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a6065c5ea8615653c95d5a100278b4f1aaf1e8bf7e4e9cc0088d92c43cf89d7",
+          "md5": "85c8f8ddba652ae7303489f73bb73b43",
+          "sha256": "24e5e96f10d5625d0ea1704c3b484471ed02b6f7913aa1ffd7b8224f27123113"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "85c8f8ddba652ae7303489f73bb73b43",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 59800,
+        "upload_time": "2022-06-02T10:45:29",
+        "upload_time_iso_8601": "2022-06-02T10:45:29.311479Z",
+        "url": "https://files.pythonhosted.org/packages/8a/60/65c5ea8615653c95d5a100278b4f1aaf1e8bf7e4e9cc0088d92c43cf89d7/shmutils-0.0.2-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c58f43060d06350571b35eb564da031bfa206c8588e370df6a7c0680f794b972",
+          "md5": "2dc789f64b50d61e152beff34774d703",
+          "sha256": "c6be8e6a8ca1ababfe16c0f1c436d09648a98599bfe1123e836762d77aea59ef"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "2dc789f64b50d61e152beff34774d703",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 61270,
+        "upload_time": "2022-06-02T10:45:30",
+        "upload_time_iso_8601": "2022-06-02T10:45:30.752885Z",
+        "url": "https://files.pythonhosted.org/packages/c5/8f/43060d06350571b35eb564da031bfa206c8588e370df6a7c0680f794b972/shmutils-0.0.2-cp39-cp39-musllinux_1_1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b83c519cc7a5aa97e91d30bcb1a7f2242d44c4e5e088afb71ec68b55ecaa21f",
+          "md5": "47faa6f03af582ab90a5b0aa3429f9ef",
+          "sha256": "ac3b977c3f187ba3677fa8c7833c83beeedf348edb42aeca755986de4b8e2678"
+        },
+        "downloads": -1,
+        "filename": "shmutils-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "47faa6f03af582ab90a5b0aa3429f9ef",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24360,
+        "upload_time": "2022-06-02T10:45:32",
+        "upload_time_iso_8601": "2022-06-02T10:45:32.032159Z",
+        "url": "https://files.pythonhosted.org/packages/9b/83/c519cc7a5aa97e91d30bcb1a7f2242d44c4e5e088afb71ec68b55ecaa21f/shmutils-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4aa475d1be8dbad3c944e21a10e03077e27259d683a90546ba5b689512c34f9e",
+        "md5": "740ab5e580fc85ac70d4d5be858e3a6d",
+        "sha256": "36510615f267e06bceeb300bf55c896522e63ba4ebb973012413710b68b455ce"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp310-cp310-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "740ab5e580fc85ac70d4d5be858e3a6d",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp310",
+      "requires_python": null,
+      "size": 32255,
+      "upload_time": "2022-06-02T10:45:14",
+      "upload_time_iso_8601": "2022-06-02T10:45:14.280950Z",
+      "url": "https://files.pythonhosted.org/packages/4a/a4/75d1be8dbad3c944e21a10e03077e27259d683a90546ba5b689512c34f9e/shmutils-0.0.2-cp310-cp310-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5626fd359f15136a800b085e07ce1e61fe5ad5593b6dad274b35273448e65f5a",
+        "md5": "99c54811c5cb56f5247bb868c0c8c195",
+        "sha256": "9a2402130937158cbe61da1f87bc4c8999b0176f74d3a372d7d1ae25fdd5a74d"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "99c54811c5cb56f5247bb868c0c8c195",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp310",
+      "requires_python": null,
+      "size": 59810,
+      "upload_time": "2022-06-02T10:45:15",
+      "upload_time_iso_8601": "2022-06-02T10:45:15.729229Z",
+      "url": "https://files.pythonhosted.org/packages/56/26/fd359f15136a800b085e07ce1e61fe5ad5593b6dad274b35273448e65f5a/shmutils-0.0.2-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "cfa16144fea89f7aab5a2008c411a94295b68caf696ad205f30652b1ee20e302",
+        "md5": "9e74c1b549e10b7da29c8f6d350f11f3",
+        "sha256": "7dfeeda298efc9d455fc6ce1a720a8c001494a1f382e7c41c8030e9f47f6462a"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp310-cp310-musllinux_1_1_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "9e74c1b549e10b7da29c8f6d350f11f3",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp310",
+      "requires_python": null,
+      "size": 61230,
+      "upload_time": "2022-06-02T10:45:17",
+      "upload_time_iso_8601": "2022-06-02T10:45:17.008651Z",
+      "url": "https://files.pythonhosted.org/packages/cf/a1/6144fea89f7aab5a2008c411a94295b68caf696ad205f30652b1ee20e302/shmutils-0.0.2-cp310-cp310-musllinux_1_1_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3b96af5dcdbdf0c41184a572e0ffc068d0dd8737b276ba6f3b9b6d8a3c8b7ae4",
+        "md5": "51a0fe7f44d0853f4d6388196870f428",
+        "sha256": "54cd88acc60dbf2812d7ec8e0d2c319578d5616673eb6d9f2a543038fabe50d6"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp37-cp37m-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "51a0fe7f44d0853f4d6388196870f428",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 32197,
+      "upload_time": "2022-06-02T10:45:18",
+      "upload_time_iso_8601": "2022-06-02T10:45:18.449447Z",
+      "url": "https://files.pythonhosted.org/packages/3b/96/af5dcdbdf0c41184a572e0ffc068d0dd8737b276ba6f3b9b6d8a3c8b7ae4/shmutils-0.0.2-cp37-cp37m-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "93e436ffe833503a962056d65877f4c923d3b342434b60a253433bb1f429c883",
+        "md5": "881b8c0f6152562a6bc7a9f277477bdf",
+        "sha256": "4bb5c93a3258209d86e8c477e7e1dc8e6bd9c9d1321fd05ef3ef28320ac8b173"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "881b8c0f6152562a6bc7a9f277477bdf",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 59743,
+      "upload_time": "2022-06-02T10:45:20",
+      "upload_time_iso_8601": "2022-06-02T10:45:20.792925Z",
+      "url": "https://files.pythonhosted.org/packages/93/e4/36ffe833503a962056d65877f4c923d3b342434b60a253433bb1f429c883/shmutils-0.0.2-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6e610d521583149da4e6d4b6f212442722cd35d8a476819faf349ad92c22be1d",
+        "md5": "6f23161fb909e896777d987d38b3f5dd",
+        "sha256": "4f8345eb917f3113b5aac86b82b4602376c16d82968cb9e6b1bd5e786fbbcbd5"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp37-cp37m-musllinux_1_1_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "6f23161fb909e896777d987d38b3f5dd",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 61228,
+      "upload_time": "2022-06-02T10:45:21",
+      "upload_time_iso_8601": "2022-06-02T10:45:21.957123Z",
+      "url": "https://files.pythonhosted.org/packages/6e/61/0d521583149da4e6d4b6f212442722cd35d8a476819faf349ad92c22be1d/shmutils-0.0.2-cp37-cp37m-musllinux_1_1_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "cf4123924229cc59f9a00baa1acba9ea18255df505503c0a6196744b466cc91f",
+        "md5": "e9a4554cd78047628af94908111b1939",
+        "sha256": "61a84c3ee80216a8f536fed33269d7ee840571b7eff50767b4afd29f6801f916"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp38-cp38-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "e9a4554cd78047628af94908111b1939",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 32255,
+      "upload_time": "2022-06-02T10:45:23",
+      "upload_time_iso_8601": "2022-06-02T10:45:23.245602Z",
+      "url": "https://files.pythonhosted.org/packages/cf/41/23924229cc59f9a00baa1acba9ea18255df505503c0a6196744b466cc91f/shmutils-0.0.2-cp38-cp38-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "171c94a657db26c7dca23e9852d365805e55d0b6e2b66b6b3b0a6d6f7cb49ba7",
+        "md5": "e7d12b495f7c8b393f4729b19714075d",
+        "sha256": "0d5215d68c380c05e1bf758dcfe4e90dc465158a4dae9e1ce3dbf6058bd1547e"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "e7d12b495f7c8b393f4729b19714075d",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 59948,
+      "upload_time": "2022-06-02T10:45:24",
+      "upload_time_iso_8601": "2022-06-02T10:45:24.672077Z",
+      "url": "https://files.pythonhosted.org/packages/17/1c/94a657db26c7dca23e9852d365805e55d0b6e2b66b6b3b0a6d6f7cb49ba7/shmutils-0.0.2-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "827b1093fbb576545f130c03506967a1b1df9e80dff72cab8dc9e655d160729f",
+        "md5": "1ad7ffbeee1765566c6410c4a782b949",
+        "sha256": "199a3d3916771aac341a96a3243ae2dc79813ced721fa12ab864762cbd7ae9d0"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp38-cp38-musllinux_1_1_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "1ad7ffbeee1765566c6410c4a782b949",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 61672,
+      "upload_time": "2022-06-02T10:45:26",
+      "upload_time_iso_8601": "2022-06-02T10:45:26.413047Z",
+      "url": "https://files.pythonhosted.org/packages/82/7b/1093fbb576545f130c03506967a1b1df9e80dff72cab8dc9e655d160729f/shmutils-0.0.2-cp38-cp38-musllinux_1_1_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8755572491a8aef88eb292380d7e528fa783bcde1bc894e0df40d3e7102f758e",
+        "md5": "7d114deb3c55e110f80ccbb5aaa331f0",
+        "sha256": "73a9b076f36799ce7671d6770fa2af66adee9e43f4bd0510347f9cad42f155ae"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp39-cp39-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "7d114deb3c55e110f80ccbb5aaa331f0",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 32253,
+      "upload_time": "2022-06-02T10:45:28",
+      "upload_time_iso_8601": "2022-06-02T10:45:28.167527Z",
+      "url": "https://files.pythonhosted.org/packages/87/55/572491a8aef88eb292380d7e528fa783bcde1bc894e0df40d3e7102f758e/shmutils-0.0.2-cp39-cp39-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8a6065c5ea8615653c95d5a100278b4f1aaf1e8bf7e4e9cc0088d92c43cf89d7",
+        "md5": "85c8f8ddba652ae7303489f73bb73b43",
+        "sha256": "24e5e96f10d5625d0ea1704c3b484471ed02b6f7913aa1ffd7b8224f27123113"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "85c8f8ddba652ae7303489f73bb73b43",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 59800,
+      "upload_time": "2022-06-02T10:45:29",
+      "upload_time_iso_8601": "2022-06-02T10:45:29.311479Z",
+      "url": "https://files.pythonhosted.org/packages/8a/60/65c5ea8615653c95d5a100278b4f1aaf1e8bf7e4e9cc0088d92c43cf89d7/shmutils-0.0.2-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c58f43060d06350571b35eb564da031bfa206c8588e370df6a7c0680f794b972",
+        "md5": "2dc789f64b50d61e152beff34774d703",
+        "sha256": "c6be8e6a8ca1ababfe16c0f1c436d09648a98599bfe1123e836762d77aea59ef"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2-cp39-cp39-musllinux_1_1_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "2dc789f64b50d61e152beff34774d703",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 61270,
+      "upload_time": "2022-06-02T10:45:30",
+      "upload_time_iso_8601": "2022-06-02T10:45:30.752885Z",
+      "url": "https://files.pythonhosted.org/packages/c5/8f/43060d06350571b35eb564da031bfa206c8588e370df6a7c0680f794b972/shmutils-0.0.2-cp39-cp39-musllinux_1_1_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9b83c519cc7a5aa97e91d30bcb1a7f2242d44c4e5e088afb71ec68b55ecaa21f",
+        "md5": "47faa6f03af582ab90a5b0aa3429f9ef",
+        "sha256": "ac3b977c3f187ba3677fa8c7833c83beeedf348edb42aeca755986de4b8e2678"
+      },
+      "downloads": -1,
+      "filename": "shmutils-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "47faa6f03af582ab90a5b0aa3429f9ef",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 24360,
+      "upload_time": "2022-06-02T10:45:32",
+      "upload_time_iso_8601": "2022-06-02T10:45:32.032159Z",
+      "url": "https://files.pythonhosted.org/packages/9b/83/c519cc7a5aa97e91d30bcb1a7f2242d44c4e5e088afb71ec68b55ecaa21f/shmutils-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

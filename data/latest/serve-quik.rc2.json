@@ -1,0 +1,180 @@
+{
+  "info": {
+    "author": "Don Chesworth",
+    "author_email": "donald.chesworth@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "# serve-quik\n\nFor creating torch archived transformer models and TorchServe containers (much quik-er)\n\n## Summary\n\n### Quick Start\n\nThe process of building a torch model archive, building a torch serve container, determining the appropriate ports, and testing your container can be tedious, so I tried to create an automated process for all of this. Most of my automation is centered around MarianMT models, but can be used for other models (I use it for a BERT model). For instance, to build and deploy a container with some MarianMT models that will translate from Brazilian Portuguese, Chinese, French, German, Japanese, Korean, and Spanish to English, you could run the following:\n\n``` bash\npython serve-quik -p \"text-translate\" -mt marianmt -src ja de es fr bzs zh ko\n```\n\nNot only is everything set up, but the container is up and running on the server:\n\n``` bash\n$ docker ps --filter name=local_text_translate --format \"table {{.Names}}\\t{{.Image}}\\t{{.RunningFor}}\"\nNAMES                  IMAGE                         CREATED\nlocal_text_translate   serve-text-translate:latest   3 seconds ago\n$ docker ps --filter name=local_text_translate --format \"table {{.Ports}}\"\nPORTS\n7070-7071/tcp, 8081/tcp, 0.0.0.0:8180->8080/tcp, :::8180->8080/tcp, 0.0.0.0:8182->8082/tcp, :::8182->8082/tcp\n```\n\n> **Note:** serve-quik realized that ports 8080 and 8082 were being used by the host, and built this container to use 8180 and 8182. For more information, see [Dockerfile automation](#dockerfile-automation)\n\n### Inference Testing\n\nNow the container is up and running, to test this, you can then run:\n\n``` python\n>>> import serve_quik as sq\n>>> import pandas as pd\n>>> import numpy as np\n>>>\n>>> PORT = 8180\n>>>\n>>> text_dict = {\n...     \"opus-mt-ja-en\": [\"口は災いの元\"],\n...     \"opus-mt-de-en\": [\"Alles hat ein Ende, nur die Wurst hat zwei\"],\n...     \"opus-mt-es-en\": [\"Es tan corto el amor y tan largo el olvido\"],\n...     \"opus-mt-zh-en\": [\" 笑一笑,十年少\"],\n...     \"opus-mt-fr-en\": [\"Dans une grande âme tout est grand\"],\n...     \"opus-mt-bzs-en\": [\"Quando a alma fala, já não fala nada\"],\n...     \"opus-mt-ko-en\": [\"멈추지 말고 계속 해나가기만 한다면 늦어도 상관없다.\"],\n... }\n>>> res = pd.DataFrame()\n>>> for key, value in text_dict.items():\n...     x = np.array(value, dtype='object')\n...     url = f\"http://localhost:{PORT}/predictions/{key}\"\n...     sr = sq.api.ServeRequest(x, 2, url)\n...     df = sr.batch_inference()\n...     res = pd.concat([res, df])\n... \nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\nINFO:serve_quik.api:Batch 0, status_code: 200\n>>> print(res)\n                                       translation\n0                            The mouth is a curse.\n0  Everything has an end, only the sausage has two\n0       Love is so short and forgetfulness so long\n0                       Smile. Ten years is short.\n0              In a great soul everything is great\n0      When the soul speaks, there is nothing else\n0                   I don't care if it's too late.\n```\n\n## Process\n\nPretty cool right? But what exactly is being automated? Hypothetically, any `huggingface.co` tokenizer and model could be placed into a torch archive and served with TorchServe. serve-quik completes the following four steps for this to happen:\n\n1. Builds a project directory\n2. Builds a model directory (or multiple directories)\n3. Builds a model-archive file\n4. Builds and runs the serving container\n\n<img src=\"serve-quik.png\" align=\"center\" width=\"750\" />\n\n### Set Directories\n\n#### Build a project directory\n\nBuilding a project directory allows all files/config required for a serving container to be located in one place. Doing this will both create the directory, but also let the rest of the process know where your project is stored. Second, there's a .env file added to the directory. This can be done manually, but there are automations if you use serve-quik. These are both done with:\n\n``` python\nfrom serve_quik import container, utils\nserve_dir = utils.set_serve_dir(args.project_name)\ncontainer.build_dot_env(serve_dir)\n```\n\n#### Build a model directory\n\nAs multiple models can be served from a container, you can do this multiple times (e.g. different models for different translations). Here we'll just create the dir for later use. `args.module_type` can be something like \"marianmt\", and kwargs would be the source langage (e.g. \"es\") and the target language (e.g. \"en\"):\n\n``` python\nmodel_dir = utils.set_model_dir(\n    serve_dir,\n    args.model_type,\n    args.kwargs\n    )\n```\n\n### Pull and prepare tokenizer\n\nI've only implemented BERT, RoBERTA, and MarianMT, but more are to come. The tokenizer functions do the following:\n- maps a string to a model name and tokenizer, such as:\n    - `bert` to `bert-base-uncased` and `BertTokenizer`\n    - `roberta` to `roberta-base` and `RobertaTokenizer`\n    - `marianmt` _(with source and target like es and en)_ to `Helsinki-NLP/opus-mt-es-en` and `MarianTokenizer`\n- pulls the appropriate tokenizer, then converts the cached tokenizer files to the input files `config.json`, `tokenizer_config.json`, `special_tokens_map.json`, then does the same for the tokenizer specific files, such as :\n    - `index_to_name.json`, `sample_text.txt`, `vocab.txt` for sequence_classification models\n    - `vocab.json`, `source.spm` and `target.spm` for sequence_to_sequence models\n\n### Pull and prepare a serialized model\n\nTo prepare a model, you pull it, add model weights, and then save it. If you are using the pretrained model as-is, you can just provide the weights already in the model. The steps are:\n- mapping a string to a model name, such as:\n    - `bert` to `BertForSequenceClassification`\n    - `roberta` to `RobertaForSequenceClassification`\n    - `marianmt` to `MarianMTModel`\n- pulling the pretrained model\n- builds the model archive's `setup_config.json` file with defaults\n\n> **Note:** If you aren't providing your own trained weights (`state_dict`), you can just provide back the original weights to the pulled model `model.state_dict()`\n\n### Choose a handler\n\nHuggingface created a [great example handler](https://github.com/pytorch/serve/blob/master/examples/Huggingface_Transformers/Transformer_handler_generalized.py) which I used to use, but there are some `captum` dependencies that I don't use, and there's not an example for a sequence to sequence model like I use, so I rebuilt it. Feel free to use mine, but if you want to use your own, make sure to copy it into the directory where your mar files will be, and add `handler=\"yourhandlername.py` to `create_mar` in the next section.\n\n### Build a Model Archive\n\nPyTorch has a helpful feature called [Torch Model archiver for TorchServe](https://github.com/pytorch/serve/blob/master/model-archiver/README.md). It's a command line tool that will pull the 6+ tokenizer files, `setup_config.json`, and the serialized model (i.e. `pytorch_model.bin`) into one model archive (mar) file.\n\n#### Setup\n\nIf you install `serve-quik`, it install this for you, but you should know it's a completely separate package you'd install:\n\n``` bash\npip install torch-model-archiver\n```\n\nThe command for creating the mar would be something like this:\n\n``` bash\ntorch-model-archiver\n    --model-name=text-translate\n    --version=1.0\n    --serialized-file= <serialized_file>\n    --handler=<handler_file>\n    --extra-files \"<file_1><file_2><file_3><file_4><file_5><file_6>\"\n    --export-path=<export_dir}>\n```\n\nIt seems simple, but the directory structure can make it difficult, so serve-quik does this for you. If you've saved your [tokenizer](#pull-and-prepare-tokenizer) and [model](#pull-and-prepare-a-serialized-model), then:\n\n``` python\n>>> import serve_quik as sq\n>>> from pathlib import Path\n>>>\n>>> dir = Path.cwd().joinpath('opus-mt-en-es')\n>>> sq.mar.create_mar(model_type=\"marianmt\", model_dir=dir)\nINFO:serve_quik.mar:torch archive opus-mt-en-es.mar created\n```\n\n\n### Dockerfile automation\n\nUsually a container is built with a Dockerfile, docker-compose, or both. Although most TorchServe API containers are similar, there will always be differences, such as port numbers and container name. serve-quik takes these steps:\n\n- _Determine ports_: Search for ports similar to the container's 8080 for the Inference API and 8082 for the Metrics API that aren't being used (in a **80 and **82 pattern)\n- _Build `.env` file_: In order to use a common Dockerfile and docker-compose, a `.env` is built with `CONTAINER_DIR`, `IMAGE_NAME`, `CONTAINER_NAME`, `DIR_NAME`, `API_PORT`, and `METRIC_PORT`.\n- _Build and start container_: Using the model archive directory, docker-compose directory, and `.env` file, build a torchserve container, and start it on the determined ports. the basic process is to `cd` to the `serve_quik/container` directory, and run:\n\n``` bash\n$ docker-compose --project-directory=<yourprojectdirectory> up --detach\n```\n\nserve-quik will figure this out for you, and you can just run:\n\n``` python\nimport serve_quik as sq\n\ndir = Path.cwd().joinpath('text-translation')\nsq.container.start_container(dir)\n```\n\nTo summarize, I have a `main.py` in serve_quik, but here is what you'd likely run:\n\n```\nimport serve_quik as sq\n\nLANGS = {source='es', target='en'}\nserve_dir = sq.utils.set_serve_dir(\"text-translation\")\nmodel_dir = utils.set_model_dir(serve_dir, \"marianmt\", LANGS)\n            )\nsq.container.build_dot_env(serve_dir)\n\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/donchesworth/serve-quik",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "serve-quik",
+    "package_url": "https://pypi.org/project/serve-quik/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/serve-quik/",
+    "project_urls": {
+      "Homepage": "https://github.com/donchesworth/serve-quik"
+    },
+    "release_url": "https://pypi.org/project/serve-quik/0.0.2/",
+    "requires_dist": [
+      "hugging-quik",
+      "torchserve",
+      "torch-model-archiver",
+      "ruamel.yaml"
+    ],
+    "requires_python": "",
+    "summary": "functions to make working with TorchServe quik-er",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14048829,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc1b793dc7a810772053b8eaa7258878be25fbac5f5ccd06cff25bc5c64ebfda",
+          "md5": "0773874eedf2fd16cc3efdd15d8f7316",
+          "sha256": "32e10a07ba7752c874caa73b10c9155c8cee7dff406b6611a14dd860ddbc56c2"
+        },
+        "downloads": -1,
+        "filename": "serve_quik-0.0.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0773874eedf2fd16cc3efdd15d8f7316",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9998,
+        "upload_time": "2022-05-12T16:29:55",
+        "upload_time_iso_8601": "2022-05-12T16:29:55.111622Z",
+        "url": "https://files.pythonhosted.org/packages/bc/1b/793dc7a810772053b8eaa7258878be25fbac5f5ccd06cff25bc5c64ebfda/serve_quik-0.0.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a29d5d14e9880245c224b02c3c03399c9bd6ed83aca7562e1c11f35eedb9f85",
+          "md5": "1883442ca8f6117bef0798c1591c8f06",
+          "sha256": "e116e5d7492e5b466f1fd3eb309e39b12617a58809b2a35b6102bcd7479c93d3"
+        },
+        "downloads": -1,
+        "filename": "serve-quik-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1883442ca8f6117bef0798c1591c8f06",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17881,
+        "upload_time": "2022-05-12T16:29:57",
+        "upload_time_iso_8601": "2022-05-12T16:29:57.062997Z",
+        "url": "https://files.pythonhosted.org/packages/8a/29/d5d14e9880245c224b02c3c03399c9bd6ed83aca7562e1c11f35eedb9f85/serve-quik-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad55c8d3a16fc9b42f3812454ec8371e55119e88b668eff4b90ef102fa98ffe0",
+          "md5": "8db872daf1f88ada515ab1970245b542",
+          "sha256": "c175f232f3984e083b659d3f77652e0ac80d2a0cde9493b54541d994fd5ebcef"
+        },
+        "downloads": -1,
+        "filename": "serve_quik-0.0.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8db872daf1f88ada515ab1970245b542",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 13767,
+        "upload_time": "2022-06-06T20:00:27",
+        "upload_time_iso_8601": "2022-06-06T20:00:27.518516Z",
+        "url": "https://files.pythonhosted.org/packages/ad/55/c8d3a16fc9b42f3812454ec8371e55119e88b668eff4b90ef102fa98ffe0/serve_quik-0.0.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa08fd2e8b1a1ed7bd90bd4cec4fc909b573a35414234b5fb6a2613beb948776",
+          "md5": "0070e7759b2dc39ae9c941d283707583",
+          "sha256": "09951de7d603be2743a432b5d068093c9ba54a2e16c059926a3e3a899d29cb9e"
+        },
+        "downloads": -1,
+        "filename": "serve-quik-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0070e7759b2dc39ae9c941d283707583",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20595,
+        "upload_time": "2022-06-06T20:00:29",
+        "upload_time_iso_8601": "2022-06-06T20:00:29.304649Z",
+        "url": "https://files.pythonhosted.org/packages/aa/08/fd2e8b1a1ed7bd90bd4cec4fc909b573a35414234b5fb6a2613beb948776/serve-quik-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ad55c8d3a16fc9b42f3812454ec8371e55119e88b668eff4b90ef102fa98ffe0",
+        "md5": "8db872daf1f88ada515ab1970245b542",
+        "sha256": "c175f232f3984e083b659d3f77652e0ac80d2a0cde9493b54541d994fd5ebcef"
+      },
+      "downloads": -1,
+      "filename": "serve_quik-0.0.2-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8db872daf1f88ada515ab1970245b542",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 13767,
+      "upload_time": "2022-06-06T20:00:27",
+      "upload_time_iso_8601": "2022-06-06T20:00:27.518516Z",
+      "url": "https://files.pythonhosted.org/packages/ad/55/c8d3a16fc9b42f3812454ec8371e55119e88b668eff4b90ef102fa98ffe0/serve_quik-0.0.2-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "aa08fd2e8b1a1ed7bd90bd4cec4fc909b573a35414234b5fb6a2613beb948776",
+        "md5": "0070e7759b2dc39ae9c941d283707583",
+        "sha256": "09951de7d603be2743a432b5d068093c9ba54a2e16c059926a3e3a899d29cb9e"
+      },
+      "downloads": -1,
+      "filename": "serve-quik-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0070e7759b2dc39ae9c941d283707583",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 20595,
+      "upload_time": "2022-06-06T20:00:29",
+      "upload_time_iso_8601": "2022-06-06T20:00:29.304649Z",
+      "url": "https://files.pythonhosted.org/packages/aa/08/fd2e8b1a1ed7bd90bd4cec4fc909b573a35414234b5fb6a2613beb948776/serve-quik-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

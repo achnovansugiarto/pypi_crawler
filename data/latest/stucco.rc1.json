@@ -1,0 +1,142 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Sheng Zhong <zhsh@umich.edu>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only"
+    ],
+    "description": "# STUCCO\nThis is the official library code for the paper [Soft Tracking Using Contacts for Cluttered Objects (STUCCO) to Perform Blind Object Retrieval](https://ieeexplore.ieee.org/document/9696372).\nIf you use it, please cite\n\n```\n@article{zhong2022soft,\n  title={Soft tracking using contacts for cluttered objects to perform blind object retrieval},\n  author={Zhong, Sheng and Fazeli, Nima and Berenson, Dmitry},\n  journal={IEEE Robotics and Automation Letters},\n  volume={7},\n  number={2},\n  pages={3507--3514},\n  year={2022},\n  publisher={IEEE}\n}\n```\n\n## Installation\n```pip install stucco```\n\n\n## Usage\nThis package is meant as a light-weight library for usage in your projects. \nSee the [website](https://johnsonzhong.me/projects/stucco/) for videos and a high level introduction.\nTo reproduce the results from the paper, see [stucco_experiments](https://github.com/UM-ARM-Lab/stucco_experiments).\n\nThis library provides code for both 1) contact detection and isolation, and 2) contact tracking. However, they can be\nused independently of each other; i.e. you can supply the contact point manually to update the tracker instead of getting\nit from the detector.\n\nThis section describes how to use each component, and provide implementation tips. The `pxpen` function measuring\ndistance between contact points and robot surfaces in given configurations need to be efficient, and we provide a guide\non how to implement them. The other key function, `pxdyn`, just needs to be callable with signature\n\n```\n(B x N x 3 points, B x N x SE(3) poses, B x N x se(3) change in poses) -> (B x N x 3 new points, B x N x SE(3) new poses)\n```\n\nWhere `B` represent arbitrary batch dimension(s), `N` represent a number of contact points per step, some of which may\nbe missing or 1 and should behave under standard broadcasting rules.\n\n### Contact Detection and Isolation\n\nDetection and isolation uses the momentum observer. At high frequency, we get residual feedback that estimates applied\nexternal wrench (force and torque) at the end effector. In simulation, we can get applied forces directly.\n\nTo manage the process, we have a `ContactDetector` object, created like:\n\n```python\nfrom stucco.detection import ContactDetector\nfrom stucco.detection import ResidualPlanarContactSensor\nimport numpy as np\n\n# sample points on the robot surface and the associated surface normals (your function)\n# these should be in link frame\nsurface_points, surface_normals = get_robot_points()\n\n# for end-effector force-torque residual, torque magnitudes are a lot smaller\n# in sim without noise, select a precision to balance out the magnitudes\nresidual_precision = np.diag([1, 1, 1, 50, 50, 50])\nresidual_threshold = 3\n\n# the Planar version is concretely implemented; a similar one could be implemented to handle more general cases\ncontact_detector = ContactDetector(residual_precision)\nsensor = ResidualPlanarContactSensor(surface_points, surface_normals, residual_threshold)\ncontact_detector.register_contact_sensor(sensor)\n```\n\nYou then feed this object high frequency residual data along with end-effector poses\n\n```python\n# get reaction force and reaction torque at end-effector \nif contact_detector.observe_residual(np.r_[reaction_force, reaction_torque], pose):\n    contact_detector.observe_dx(dx)\n    # other book-keeping in case of making a contact\n```\n\nThis object can later be queried like `contact_detector.in_contact()` and passed to update the tracking\n\n### Contact Point Tracking\n\nThe tracking is performed through the `ContactSetSoft` object, created like:\n\n```python\nfrom stucco.tracking import ContactSetSoft, ContactParameters, LinearTranslationalDynamics\nfrom stucco.movable_sdf import PlanarMovableSDF\n\n# tune through maximizing median FMI and minimizing median contact error on a training set\ncontact_params = ContactParameters(length=0.02,\n                                   penetration_length=0.002,\n                                   hard_assignment_threshold=0.4,\n                                   intersection_tolerance=0.002)\n\n# need an efficient implementation of pxpen; point to robot surface distance at a certain config\n# see section below for how to implement one\n# here we pass in a cached discretized signed distance field and its description\npxpen = PlanarMovableSDF(d_cache, min_x, min_y, max_x, max_y, cache_resolution, cache_y_len)\n\n# pxdyn is LinearTranslationalDynamics by default, here we are making it explicit\ncontact_set = ContactSetSoft(pxpen, contact_params, pxdyn=LinearTranslationalDynamics())\n```\n\nYou then update it every control step with robot pose and contact point info\n\n```python\n# get latest contact point through the contact detector \n# (or can be supplied manually through other means)\n# supplying None indicates we are not in contact\n# also retrieve dx for each p\np, dx = contact_detector.get_last_contact_location()\n# observed current x\ncontact_set.update(x, dx, p)\n```\n\nSegment the belief into hard assignments of objects for downstream usage:\n\n```python\n# MAP particle\npts = contact_set.get_posterior_points()\n# contact parameters are stored in contact_set.p\n# list of indices; each element of list corresponds to an object\ngroups = contact_set.get_hard_assignment(contact_set.p.hard_assignment_threshold)\n\nfor group in groups:\n    object_pts = pts[group]\n    # use points associated with the object downstream\n```\n\n### Implementing `pxpen` (point to robot surface distance)\n\nOur recommendation for this function is to discretize and cache the signed distance function (SDF)\nof the robot end effector in link frame. To support this, we provide the base class `PlanarPointToConfig` that supplies\nall the other functionality when provided the SDF cache and accompanying information.\n\nHere are some tips for how to create this discretized SDF:\n\n```python\nimport os\nimport torch\nimport numpy as np\nfrom stucco.movable_sdf import PlanarMovableSDF\n\n\n# note that this is for a planar environment with fixed orientation; \n# however, it is very easy to extend to 3D and free rotations; \n# the extension to free rotations will require a parallel way to perform rigid body transforms \n# on multiple points, which can be provided by pytorch_kinematics.transforms\nclass SamplePointToConfig(PlanarMovableSDF):\n    def __init__(self):\n        # save cache to file for easy loading (use your own path)\n        fullname = 'sample_point_to_config.pkl'\n        if os.path.exists(fullname):\n            super().__init__(*torch.load(fullname))\n        else:\n            # first time creating cache\n            # we need some environment where we can get its bounding box and query an SDF\n            # create robot in simulation (use your own function)\n            robot_id, gripper_id, pos = create_sim_robot()\n            # get axis-aligned bounding box values\n            aabb_min, aabb_max = get_aabb()\n            min_x, min_y = aabb_min[:2]\n            max_x, max_y = aabb_max[:2]\n\n            # select a cache resolution (doesn't have to be very small)\n            cache_resolution = 0.001\n            # create mesh grid\n            x = np.arange(min_x, max_x + cache_resolution, cache_resolution)\n            y = np.arange(min_y, max_y + cache_resolution, cache_resolution)\n            cache_y_len = len(y)\n\n            d = np.zeros((len(x), len(y)))\n            for i, xi in enumerate(x):\n                for j, yj in enumerate(y):\n                    pt = [xi, yj, pos[2]]\n                    # point query of SDF (use your own function)\n                    d[i, j] = closest_point_on_surface(robot_id, pt)\n            # flatten to allow parallel query of multiple indices\n            d_cache = d.reshape(-1)\n            # save things in (rotated) link frame\n            min_x -= pos[0]\n            max_x -= pos[0]\n            min_y -= pos[1]\n            max_y -= pos[1]\n            data = [d_cache, min_x, min_y, max_x, max_y, cache_resolution, cache_y_len]\n            torch.save(data, fullname)\n            super().__init__(*data)\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "robotics,perception,tracking,pytorch,contact",
+    "license": "Copyright (c) 2023 University of Michigan ARM Lab  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  ",
+    "maintainer": "",
+    "maintainer_email": "Sheng Zhong <zhsh@umich.edu>",
+    "name": "stucco",
+    "package_url": "https://pypi.org/project/stucco/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/stucco/",
+    "project_urls": {
+      "Bug Reports": "https://github.com/UM-ARM-Lab/stucco/issues",
+      "Homepage": "https://github.com/UM-ARM-Lab/stucco",
+      "Source": "https://github.com/UM-ARM-Lab/stucco"
+    },
+    "release_url": "https://pypi.org/project/stucco/1.2.0/",
+    "requires_dist": [
+      "torch",
+      "numpy",
+      "arm-pytorch-utilities",
+      "pytorch-kinematics",
+      "pytest ; extra == 'test'"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Soft Tracking Using Contacts for Cluttered Objects",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16879031,
+  "releases": {
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f6cffc41728db58ffd19945c15bd8f93540b1ba5a298232806a2fd1cce3f181",
+          "md5": "48be74683dc1dc0e09a5a617f065fff0",
+          "sha256": "a6d5b77ac95c884eb578323696530bfd55dd9d51e1c1c419f480df70d8939b0d"
+        },
+        "downloads": -1,
+        "filename": "stucco-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "48be74683dc1dc0e09a5a617f065fff0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14859,
+        "upload_time": "2023-02-15T23:24:05",
+        "upload_time_iso_8601": "2023-02-15T23:24:05.549265Z",
+        "url": "https://files.pythonhosted.org/packages/7f/6c/ffc41728db58ffd19945c15bd8f93540b1ba5a298232806a2fd1cce3f181/stucco-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "80dd39ae48612ce59e4860884b1e50043d0e6a775e9feebd3df78179169879f5",
+          "md5": "6ea7e94033b25b4c0bd03ca19f09b7f4",
+          "sha256": "1cc63fdfa252b0bbce5fa8c978d227010ba7280c38ddd4d1112411f999da5bec"
+        },
+        "downloads": -1,
+        "filename": "stucco-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ea7e94033b25b4c0bd03ca19f09b7f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19413,
+        "upload_time": "2023-02-15T23:24:07",
+        "upload_time_iso_8601": "2023-02-15T23:24:07.068353Z",
+        "url": "https://files.pythonhosted.org/packages/80/dd/39ae48612ce59e4860884b1e50043d0e6a775e9feebd3df78179169879f5/stucco-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7f6cffc41728db58ffd19945c15bd8f93540b1ba5a298232806a2fd1cce3f181",
+        "md5": "48be74683dc1dc0e09a5a617f065fff0",
+        "sha256": "a6d5b77ac95c884eb578323696530bfd55dd9d51e1c1c419f480df70d8939b0d"
+      },
+      "downloads": -1,
+      "filename": "stucco-1.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "48be74683dc1dc0e09a5a617f065fff0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 14859,
+      "upload_time": "2023-02-15T23:24:05",
+      "upload_time_iso_8601": "2023-02-15T23:24:05.549265Z",
+      "url": "https://files.pythonhosted.org/packages/7f/6c/ffc41728db58ffd19945c15bd8f93540b1ba5a298232806a2fd1cce3f181/stucco-1.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "80dd39ae48612ce59e4860884b1e50043d0e6a775e9feebd3df78179169879f5",
+        "md5": "6ea7e94033b25b4c0bd03ca19f09b7f4",
+        "sha256": "1cc63fdfa252b0bbce5fa8c978d227010ba7280c38ddd4d1112411f999da5bec"
+      },
+      "downloads": -1,
+      "filename": "stucco-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6ea7e94033b25b4c0bd03ca19f09b7f4",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 19413,
+      "upload_time": "2023-02-15T23:24:07",
+      "upload_time_iso_8601": "2023-02-15T23:24:07.068353Z",
+      "url": "https://files.pythonhosted.org/packages/80/dd/39ae48612ce59e4860884b1e50043d0e6a775e9feebd3df78179169879f5/stucco-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

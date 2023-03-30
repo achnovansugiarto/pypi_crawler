@@ -1,0 +1,792 @@
+{
+  "info": {
+    "author": "Conrad Mukai",
+    "author_email": "conrad@mukai-home.net",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Spotilyzer - AWS Spot Fleet Analyzer\n\nSpotilyzer is a tool that defines AWS spot fleet pools for EKS. It uses spot\nfleet price data to select instance types for your pools. While there are many\nexcellent articles which describe the architecture (such as\n[this one](https://aws.amazon.com/blogs/compute/cost-optimization-and-resilience-eks-with-spot-instances/#)),\nthe task of selecting instance types is generally glossed over. This tool fills\nthat gap by making the selection process a data-driven one.\n\n## Requirements\n\nTo run spotilyzer you need the following:\n* Python 3.6 or later; and\n* an AWS account with ec2:Describe* privileges.\n\n## Installation\n\nIf you just want to use the tool, you can install it with pip:\n\n    pip install spotilyzer\n\nIf you want to work on the code you can download and install it in developer\nmode like so:\n\n    git clone https://github.com/conrad-mukai/spotilyzer\n    cd spotilyzer\n    python setup.py develop\n\n## Background\n\nThe goal of spotilyzer is to provide a selection of spot fleet pools that can\nbe used for EKS worker nodes, where the worker nodes are autoscaled with the\n[Cluster Autoscaler](https://docs.aws.amazon.com/eks/latest/userguide/cluster-autoscaler.html).\nThe autoscaler requires that all instance types in the spot fleet are\napproximately the same size (i.e., they have the same vCPU and memory). In\naddition, to optimize resource allocation several groups of spot fleets are\nprovided where each instance type in a group has a similar memory to core\nratio. Pods are assigned into groups based upon the ratio of the pod's memory\nto the pod's core.\n\n## Usage\n\nThe process of generating recommendations for spot fleets is done as follows:\n1. `spotilyzer init` (optional);\n1. edit `~/.spotilyzer/seeds.json` (optional);\n1. `spotilyzer create-candidates candidates.json`;\n1. `spotilyzer group-requests candidates.json requests.csv grouped-requests.json`; and\n1. `spotilyzer size-fleets candidates.json grouped-requests.json`\n\n### Help\n\nTo get a list of subcommands use the `-h` option like so:\n\n    spotilyzer -h\n\nTo get details for a specific subcommand use the `-h` option again:\n\n    spotilyzer create-candidates -h\n\n### Setup\n\nTo satisfy the memory to core and similar size requirements, instance types are\ngrouped in a JSON file called `seeds.json`. These groupings are used throughout\nspotilyzer calculations. The file has the following structure:\n\n    {\n      \"seeds\": [\n        {\n          \"group\": \"compute\",\n          \"candidates\": [\n            {\n              \"candidate-name\": \"large\",\n              \"instance-types\": [\n                \"c3.large\", \"c4.large\", \"c5.large\", \"c5d.large\", \"c5a.large\",\n                \"c5ad.large\", \"c5n.large\", \"c6g.large\", \"c6gd.large\", \"c6gn.large\"\n              ]\n            },\n            {\n              \"candidate-name\": \"xlarge\",\n              \"instance-types\": [\n                \"c3.xlarge\", \"c4.xlarge\", \"c5.xlarge\", \"c5d.xlarge\", \"c5a.xlarge\",\n                \"c5ad.xlarge\", \"c5n.xlarge\", \"c6g.xlarge\", \"c6gd.xlarge\",\n                \"c6gn.xlarge\"\n              ]\n            },\n            ...\n          ]\n        },\n        {\n          \"group\": \"general\",\n          \"candidates\": [\n            {\n              \"candidate-name\": \"large\",\n              \"instance-types\": [\n                \"m3.large\", \"m4.large\", \"m5.large\", \"m5d.large\", \"m5a.large\",\n                \"m5ad.large\", \"m5n.large\", \"m5dn.large\", \"m5zn.large\", \"m6g.large\",\n                \"m6gd.large\"\n              ]\n            },\n            ...\n          ]\n        },\n        {\n          \"group\": \"memory\",\n          \"candidates\": [\n            {\n              \"candidate-name\": \"large\",\n              \"instance-types\": [\n                \"r3.large\", \"r4.large\", \"r5.large\", \"r5d.large\", \"r5a.large\",\n                \"r5ad.large\", \"r5b.large\", \"r5n.large\", \"r5dn.large\", \"r6g.large\",\n                \"r6gd.large\"\n              ]\n            },\n            ...\n          ]\n        },\n        ...\n      ]\n    }\n\nThe `seeds` array has 3 objects which describe groups. A group is a collection\nof instance types that have similar memory to core ratios, which AWS refers to\nas a family. The `seeds.json` uses 3 families: `c` for compute optimized\n(~2G/core), `m` for general purpose (~4G/core), and `r` for memory optimized\n(~8G/core). Each group contains a `candidates` array which clusters instance\ntypes according to size. For example in the `compute` group the `large`\ncandidate instance types generally have 4G memory and 2 cores, the `xlarge`\ncandidate instance types generally have 8G memory and 4 cores, etc.\n\nSpotilyzer is packaged with `seeds.json`, but the user can get an editable copy\nof the file in their home directory by running `spotilyzer init` which copies\nthe file to `~/.spotilyzer/seeds.json`. If the user does this, that file takes\nprecedence over the file in the spotilyzer package. The user can also specify\nan arbitrary seeds file using the `create-candidates -s` option.\n\n### Creating Candidates\n\nThe `create-candidates` subcommand pulls data from AWS to create spot fleet\ncandidates based upon the seeds file. The selection process uses the spot price\nhistory for each instance type in every availability zone the instance type is\noffered. Spotilyzer computes the average and standard deviation for every\ninstance type/availability zone combination. The n-lowest dynamic prices (where\ndynamic price is average plus standard deviation) determines which instance\ntypes are placed in the candidate pools.\n\nThe n-lowest calculation is driven by the minimum number of pools in a\ncandidate. This defaults to 20, but can be adjusted using the `-m` option.\nThe actual number of pools in a candidate can be less than the minimum if\ninstance type availability limits the selection size.\n\nThe results of the calculation are stored in a JSON file and summarized in the\nconsole like so:\n\n    group: compute\n    +-------------+---------+-----------------+---------------------------------------------+\n    | Candidate   |   Price | Instance Type   | Availability Zones                          |\n    +=============+=========+=================+=============================================+\n    | large       |   0.033 | c5d.large       | us-west-2c,us-west-2d,us-west-2a,us-west-2b |\n    |             |         | c3.large        | us-west-2a,us-west-2b,us-west-2c            |\n    |             |         | c5n.large       | us-west-2a,us-west-2c,us-west-2b            |\n    |             |         | c6g.large       | us-west-2a,us-west-2b,us-west-2c,us-west-2d |\n    |             |         | c4.large        | us-west-2a,us-west-2b,us-west-2c            |\n    |             |         | c5.large        | us-west-2a,us-west-2d,us-west-2b,us-west-2c |\n    +-------------+---------+-----------------+---------------------------------------------+\n    | xlarge      |   0.068 | c3.xlarge       | us-west-2c,us-west-2a,us-west-2b            |\n    |             |         | c6g.xlarge      | us-west-2a,us-west-2b,us-west-2c,us-west-2d |\n    |             |         | c4.xlarge       | us-west-2c,us-west-2b,us-west-2a            |\n    |             |         | c5n.xlarge      | us-west-2c,us-west-2b,us-west-2a            |\n    |             |         | c5d.xlarge      | us-west-2b,us-west-2c,us-west-2d,us-west-2a |\n    |             |         | c5ad.xlarge     | us-west-2a,us-west-2b,us-west-2d            |\n    +-------------+---------+-----------------+---------------------------------------------+\n\nThis shows the candidate name, the average hourly price across the candidate\nfleet, and the pools (the instance types and all availability zones they are\noffered). The information stored in the JSON file is difficult to read. To\nview the contents of the JSON file in the same tabular format as shown above\nuse the `show-candidates` subcommand.\n\nThe `create-candidates` subcommand can be run against any AWS region and with\nany  subset of availability zones (the default is all availability zones in a\nregion). The candidates should only be used in the specified region since\nspot prices and instance type availability vary greatly across regions.\n\n### Grouping Resources\n\nAfter creating candidates, pod requests are assigned to node groups. The\n`group-requests` subcommand loads a file describing all pods to be deployed\nonto spot fleets and assigns each pod to a group in the candidates file. This\nis done by comparing the memory to cores ratio of each pod with the group\naverage memory to cores ratios. The closest match determines the group\nassignment.\n\nThe requests are specified in either CSV or JSON format. The CSV format is\nintended to load data from a spreadsheet. Generally the cluster administrator\ndoes not know the details of all pods deployed, so they can request that\ndevelopment teams fill out a spreadsheet with the relevant data. After\ncollecting all data in a single spreadsheet, it is exported to a CSV file. An\nexample of the spreadsheet is shown below:\n\n![requests spreadsheet](https://github.com/conrad-mukai/spotilyzer/raw/master/images/requests.png)\n\nThe headers are used to set keys in a JSON document, so they must be present in\nthe CSV file.\n\nThe `group-requests` subcommand results are summarized on the console like so:\n\n    Pod               Group\n    ----------------  -------\n    web-app-a         compute\n    spark-executor-a  memory\n    spark-executor-b  general\n    web-app-b         compute\n    spark-executor-c  memory\n    web-app-c         general\n    spark-executor-d  memory\n\nThe user can then update the `node-selector` or `node-affinity` specs in the\nKubernetes manifest to the designated node groups.\n\n### Sizing Fleets\n\nThe `size-fleets` subcommand takes the results of `create-candidates` and\n`group-requests` to create an estimate of each spot fleet candidate's size and\ncost. The results of this analysis is presented on the console like so:\n\n    +---------+----------+------------------+--------------+\n    | Group   | Fleet    |   Instance Count |   Total Cost |\n    +=========+==========+==================+==============+\n    | compute | xlarge   |               95 |        6.481 |\n    |         | 2xlarge  |               50 |        6.821 |\n    |         | 16xlarge |                6 |        7.010 |\n    |         | 4xlarge  |               25 |        7.136 |\n    |         | 8xlarge  |               13 |        7.175 |\n    |         | 12xlarge |                9 |        7.569 |\n    |         | 24xlarge |                5 |        8.040 |\n    +---------+----------+------------------+--------------+\n    | general | xlarge   |              210 |       14.577 |\n    |         | 12xlarge |               18 |       15.445 |\n    |         | 2xlarge  |              105 |       15.543 |\n    |         | 4xlarge  |               55 |       15.995 |\n    |         | 8xlarge  |               28 |       16.306 |\n    |         | 16xlarge |               14 |       17.213 |\n    |         | 24xlarge |                9 |       17.409 |\n    +---------+----------+------------------+--------------+\n    | memory  | 2xlarge  |               90 |       13.320 |\n    |         | 12xlarge |               15 |       13.629 |\n    |         | 4xlarge  |               45 |       13.877 |\n    |         | 8xlarge  |               23 |       14.396 |\n    |         | 16xlarge |               12 |       14.783 |\n    |         | 24xlarge |                8 |       15.675 |\n    +---------+----------+------------------+--------------+\n\nThe output shows an estimate of the number of instances and total hourly cost\nfor each spot fleet candidate. The fleets are ordered by cost.\n\nIn order to account for overhead and wasted resources due to random packing of\npods a buffer is applied to the requests. The default buffer is 20%, but this\ncan be adjusted using the `-b` option.\n\nA selection of fleets are presented so specific requirements can be applied.\nFor example, too few nodes can result in an adverse *blast radius* effect where\nthe loss of a single node is overly disruptive. On the other hand if there is a\nlimit on the number of instances available, then too many nodes is undesirable.\nGiven all the choices, the tool provides a data driven rationale for selecting\nspot fleet pools.\n\n## Testing\n\nTo run the unit tests download the code and enter the following command in the\nroot directory of the repository:\n\n    python -m unittest\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/conrad-mukai/spotilyzer",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "spotilyzer",
+    "package_url": "https://pypi.org/project/spotilyzer/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/spotilyzer/",
+    "project_urls": {
+      "Homepage": "https://github.com/conrad-mukai/spotilyzer"
+    },
+    "release_url": "https://pypi.org/project/spotilyzer/0.2.0/",
+    "requires_dist": [
+      "jsonschema",
+      "boto3",
+      "tabulate"
+    ],
+    "requires_python": "",
+    "summary": "AWS Spot Fleet Analyzer",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9416394,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16a3f88694dab6ab0d83557b7119125196b647f8452f3323d1509131be81c171",
+          "md5": "e3d5cdf3fa52ca718adb0e7fd81cd1ef",
+          "sha256": "e032807ea8164a49c774e993e16dc18bb87b5cae33e8601f1c86ff328a14441a"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e3d5cdf3fa52ca718adb0e7fd81cd1ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25100,
+        "upload_time": "2021-01-01T18:04:43",
+        "upload_time_iso_8601": "2021-01-01T18:04:43.780361Z",
+        "url": "https://files.pythonhosted.org/packages/16/a3/f88694dab6ab0d83557b7119125196b647f8452f3323d1509131be81c171/spotilyzer-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c28408bfe86670aed68f29b71930be2eae42a958752470bda165b572aeab8902",
+          "md5": "3974a28cbdce67d4fa1ab68aa847d96e",
+          "sha256": "51061d6a00b8969ae90418cdf1e57b92112ec079f0eeddd7c73a296687acbe88"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3974a28cbdce67d4fa1ab68aa847d96e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21699,
+        "upload_time": "2021-01-01T18:04:45",
+        "upload_time_iso_8601": "2021-01-01T18:04:45.371595Z",
+        "url": "https://files.pythonhosted.org/packages/c2/84/08bfe86670aed68f29b71930be2eae42a958752470bda165b572aeab8902/spotilyzer-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd649d24760a81ed263e814ca151dd90cfd8ebe6da2caa5322c85ba7cee46ce8",
+          "md5": "a84e58bd625438542096e2d113a3db37",
+          "sha256": "90e97407fa7f95ebc68e386c836d2ae49eb4be0ed627d32bf75aa6ddc71855ce"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a84e58bd625438542096e2d113a3db37",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25099,
+        "upload_time": "2021-01-01T18:08:42",
+        "upload_time_iso_8601": "2021-01-01T18:08:42.989541Z",
+        "url": "https://files.pythonhosted.org/packages/bd/64/9d24760a81ed263e814ca151dd90cfd8ebe6da2caa5322c85ba7cee46ce8/spotilyzer-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "66a2d2ba08dec40c636ed0f4cf4acda3ed4a33c8f9e5417c5aadd0b284a0fc4f",
+          "md5": "b1d59668d0764d7a4bcf1fa6c04cf8d2",
+          "sha256": "ac5278167082b15799aaf4a95cb347ed277e7d52618517576dbd554c4931e140"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b1d59668d0764d7a4bcf1fa6c04cf8d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21752,
+        "upload_time": "2021-01-01T18:08:45",
+        "upload_time_iso_8601": "2021-01-01T18:08:45.066882Z",
+        "url": "https://files.pythonhosted.org/packages/66/a2/d2ba08dec40c636ed0f4cf4acda3ed4a33c8f9e5417c5aadd0b284a0fc4f/spotilyzer-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "243fde8ebaa7f82e94e275bac39092b4e22f9a8ae33793f17015886750c2fd70",
+          "md5": "11181619616777de482d190311ca6572",
+          "sha256": "aa08e04b8a8ea6258ca3b12036166ab1e6692065c7533e01d86d6ce5d150a111"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "11181619616777de482d190311ca6572",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24864,
+        "upload_time": "2021-01-05T23:06:10",
+        "upload_time_iso_8601": "2021-01-05T23:06:10.608437Z",
+        "url": "https://files.pythonhosted.org/packages/24/3f/de8ebaa7f82e94e275bac39092b4e22f9a8ae33793f17015886750c2fd70/spotilyzer-0.1.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5b3b0a49c71262fdd9631645e6ea3eed6ae66cb0b154de2ab4624a739adae49",
+          "md5": "d999243ec0bcbe5fbcfb816c980f7c14",
+          "sha256": "3faad6b050f14ea7a95f6f394c218849ab3baa5e0195ba6b63dd6f05e1dbd873"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d999243ec0bcbe5fbcfb816c980f7c14",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22892,
+        "upload_time": "2021-01-05T23:06:11",
+        "upload_time_iso_8601": "2021-01-05T23:06:11.682557Z",
+        "url": "https://files.pythonhosted.org/packages/c5/b3/b0a49c71262fdd9631645e6ea3eed6ae66cb0b154de2ab4624a739adae49/spotilyzer-0.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91915574a0a43528dc2965c298f8e263ce11fbcad9c694621fba8ac88a728cf6",
+          "md5": "ee31fba7a38b8208b9766a37489c4fce",
+          "sha256": "4e4eb9735a10fca4e2a82acdfdf9d70b3dd67ed5575079e5a32d3467ef412f97"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ee31fba7a38b8208b9766a37489c4fce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24876,
+        "upload_time": "2021-01-05T23:45:51",
+        "upload_time_iso_8601": "2021-01-05T23:45:51.250697Z",
+        "url": "https://files.pythonhosted.org/packages/91/91/5574a0a43528dc2965c298f8e263ce11fbcad9c694621fba8ac88a728cf6/spotilyzer-0.1.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f0cb056ea0282f9a8fed08f323c6ae2be7fd89be431ffb5bc4cab1ababcf2e2",
+          "md5": "48deccb3143809874c9cd33e6b095bf8",
+          "sha256": "75b207f7554b37992b8b7d70c5169a643f9ce690e112a08263e015e01793a62e"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "48deccb3143809874c9cd33e6b095bf8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22915,
+        "upload_time": "2021-01-05T23:45:52",
+        "upload_time_iso_8601": "2021-01-05T23:45:52.302804Z",
+        "url": "https://files.pythonhosted.org/packages/4f/0c/b056ea0282f9a8fed08f323c6ae2be7fd89be431ffb5bc4cab1ababcf2e2/spotilyzer-0.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ef490e6749407683a5376593a008d0a7b7daf3d24689ac69fd2ac2e3bf4dc49",
+          "md5": "489f3c13c0fe264d179d12559132b0db",
+          "sha256": "0d6ea22b620d48629631ca727190a16fb42403d8a3ffecdf6a69de99f044f5e9"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "489f3c13c0fe264d179d12559132b0db",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24877,
+        "upload_time": "2021-01-07T02:46:48",
+        "upload_time_iso_8601": "2021-01-07T02:46:48.894638Z",
+        "url": "https://files.pythonhosted.org/packages/7e/f4/90e6749407683a5376593a008d0a7b7daf3d24689ac69fd2ac2e3bf4dc49/spotilyzer-0.1.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fa447b952e9c8380c422203195cbae17c7dd939e1881d043bdd22a234cf6482",
+          "md5": "f0879fb85c3a731a0cdebf3f542787b1",
+          "sha256": "63efbb05b525b9f41449629176b1ea495027ed592b1384b7efb92bb28a6e288a"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f0879fb85c3a731a0cdebf3f542787b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22941,
+        "upload_time": "2021-01-07T02:46:49",
+        "upload_time_iso_8601": "2021-01-07T02:46:49.953766Z",
+        "url": "https://files.pythonhosted.org/packages/8f/a4/47b952e9c8380c422203195cbae17c7dd939e1881d043bdd22a234cf6482/spotilyzer-0.1.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8788a934b472557ef169ee1e8b649add4c92da98b4e0b5f3df1e3b737c24dc96",
+          "md5": "3ac76a8dd796aaf52c6ff5b40e477983",
+          "sha256": "04bed139956d9e23c43a8e495df7758161dde9c03c1966425545da4691c54b70"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ac76a8dd796aaf52c6ff5b40e477983",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25057,
+        "upload_time": "2021-01-09T20:08:26",
+        "upload_time_iso_8601": "2021-01-09T20:08:26.391384Z",
+        "url": "https://files.pythonhosted.org/packages/87/88/a934b472557ef169ee1e8b649add4c92da98b4e0b5f3df1e3b737c24dc96/spotilyzer-0.1.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5747527f75594e176dc08c93bc15a79cc7b3593479f04f874b288f58e3947f4f",
+          "md5": "2bfa7e972d38c0313be03c2934e1576d",
+          "sha256": "a41460986e7dc75576823e8c391388c1792d6b96308fb761efba0ae69850bd0f"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2bfa7e972d38c0313be03c2934e1576d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23096,
+        "upload_time": "2021-01-09T20:08:27",
+        "upload_time_iso_8601": "2021-01-09T20:08:27.445087Z",
+        "url": "https://files.pythonhosted.org/packages/57/47/527f75594e176dc08c93bc15a79cc7b3593479f04f874b288f58e3947f4f/spotilyzer-0.1.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d439bd748e4c8f3527087c6f72acddc8dce3923a3cbde55acac8b5d3c730929a",
+          "md5": "4a19168dc241b7254ea46a29cce4d7e8",
+          "sha256": "5020ce869e6abd6613b5317c9dd464d0ddb6f5994801b08d494d792bc540bea1"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a19168dc241b7254ea46a29cce4d7e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25085,
+        "upload_time": "2021-02-05T03:20:55",
+        "upload_time_iso_8601": "2021-02-05T03:20:55.312572Z",
+        "url": "https://files.pythonhosted.org/packages/d4/39/bd748e4c8f3527087c6f72acddc8dce3923a3cbde55acac8b5d3c730929a/spotilyzer-0.1.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a6d7baf96870a09d56dd6035a05a54b391b0ad7eb75edffb9ce854a2b37a65f",
+          "md5": "23b66fcd87bdf3acda223063e3d816e0",
+          "sha256": "6aea84ec034244fae81e96a479f6b56ddee7d4e9926f710feca1cc6496272033"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "23b66fcd87bdf3acda223063e3d816e0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23130,
+        "upload_time": "2021-02-05T03:20:56",
+        "upload_time_iso_8601": "2021-02-05T03:20:56.391132Z",
+        "url": "https://files.pythonhosted.org/packages/6a/6d/7baf96870a09d56dd6035a05a54b391b0ad7eb75edffb9ce854a2b37a65f/spotilyzer-0.1.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3473daacad9365659b6490bf1766f1353131f6097a094fb41f76d9beef56832e",
+          "md5": "14d29eaf33170a560e7f2caa2f62890f",
+          "sha256": "d0ff76103f3b0f70eae2dc9cd7c8f6ec8bd873f25e94c10fd35880bb17b4c57c"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "14d29eaf33170a560e7f2caa2f62890f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25114,
+        "upload_time": "2021-01-01T19:18:54",
+        "upload_time_iso_8601": "2021-01-01T19:18:54.266142Z",
+        "url": "https://files.pythonhosted.org/packages/34/73/daacad9365659b6490bf1766f1353131f6097a094fb41f76d9beef56832e/spotilyzer-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd2b68797c7e5291a88525eba3b70d6f78723489d3881a7114d61014c1b5f80a",
+          "md5": "03a67656bdb5db3ec6384377ce282284",
+          "sha256": "6f2a438f55516a6bdd01a8b762bfd59e149878480122cfcbf5a4d1aff22218cd"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03a67656bdb5db3ec6384377ce282284",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21740,
+        "upload_time": "2021-01-01T19:18:55",
+        "upload_time_iso_8601": "2021-01-01T19:18:55.172040Z",
+        "url": "https://files.pythonhosted.org/packages/cd/2b/68797c7e5291a88525eba3b70d6f78723489d3881a7114d61014c1b5f80a/spotilyzer-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b2abd438edeb4390c945000131338f24eb48e1aa94f17558ec6e87d3208ac07",
+          "md5": "1ae21c9381fac277120bcb14c026cfc6",
+          "sha256": "139aaa3cdf24b8eef533647e648e384e72bdab0b64d97d7ee04e9f660dc691d1"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ae21c9381fac277120bcb14c026cfc6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25112,
+        "upload_time": "2021-01-01T20:05:23",
+        "upload_time_iso_8601": "2021-01-01T20:05:23.715886Z",
+        "url": "https://files.pythonhosted.org/packages/3b/2a/bd438edeb4390c945000131338f24eb48e1aa94f17558ec6e87d3208ac07/spotilyzer-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6421901c68e1001109ed56b4d3587e0ca74df4b38296157f3f33beaae7a67e5e",
+          "md5": "b4dc6e35f98e0a169eccbc5b37073d96",
+          "sha256": "b44d73d24a048bd4aa7293774f4769f4e6f37b9f8fb132e0fdc830b3e556c8f7"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b4dc6e35f98e0a169eccbc5b37073d96",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21744,
+        "upload_time": "2021-01-01T20:05:24",
+        "upload_time_iso_8601": "2021-01-01T20:05:24.727862Z",
+        "url": "https://files.pythonhosted.org/packages/64/21/901c68e1001109ed56b4d3587e0ca74df4b38296157f3f33beaae7a67e5e/spotilyzer-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cba7550f9c79a999e4eb83f2f7fdc29785d764c625e2153675cb7bcf76699221",
+          "md5": "63efd592da46ced0f881dc57f983fd7d",
+          "sha256": "6564f96140ad5bff155e9ccabeecb6b188650ee50696179633aafeaea2d475ec"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "63efd592da46ced0f881dc57f983fd7d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23423,
+        "upload_time": "2021-01-03T06:12:45",
+        "upload_time_iso_8601": "2021-01-03T06:12:45.153522Z",
+        "url": "https://files.pythonhosted.org/packages/cb/a7/550f9c79a999e4eb83f2f7fdc29785d764c625e2153675cb7bcf76699221/spotilyzer-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b8f3f3dd2c2b405db7917cc1c8998d53d5ccf5d5bf0cb1c58aa072756aea230",
+          "md5": "118f34c0a851cf8f03e104fcfd08313a",
+          "sha256": "4e5231ba6b2f39c7bc57410fca5467651ac16def28f966440dd75b37694a4d6d"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "118f34c0a851cf8f03e104fcfd08313a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22047,
+        "upload_time": "2021-01-03T06:12:46",
+        "upload_time_iso_8601": "2021-01-03T06:12:46.730346Z",
+        "url": "https://files.pythonhosted.org/packages/4b/8f/3f3dd2c2b405db7917cc1c8998d53d5ccf5d5bf0cb1c58aa072756aea230/spotilyzer-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "073071e338f8b3474a3fcfded39abf524eb9d791335d9c10cd0dc0b89ba7cbda",
+          "md5": "ab5f43040d4da40fb83b5857334852a4",
+          "sha256": "5c815f446a9e3c143fc73240793caf5fd5b5617ca06336a25826ccdd340102af"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ab5f43040d4da40fb83b5857334852a4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23414,
+        "upload_time": "2021-01-04T06:14:46",
+        "upload_time_iso_8601": "2021-01-04T06:14:46.492002Z",
+        "url": "https://files.pythonhosted.org/packages/07/30/71e338f8b3474a3fcfded39abf524eb9d791335d9c10cd0dc0b89ba7cbda/spotilyzer-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d5120f7ac3d0a7d028c21e8df083ad01ae274c39230c04461d9db83f3d358ef",
+          "md5": "5d1f1ebaac34fac8f140d6a2145ab56d",
+          "sha256": "7c1f0c64d5b9f27ecc9dc6a0c701f5c06b14dbe2b5ead683c8ff2ac966328b67"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5d1f1ebaac34fac8f140d6a2145ab56d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21807,
+        "upload_time": "2021-01-04T06:14:47",
+        "upload_time_iso_8601": "2021-01-04T06:14:47.419931Z",
+        "url": "https://files.pythonhosted.org/packages/2d/51/20f7ac3d0a7d028c21e8df083ad01ae274c39230c04461d9db83f3d358ef/spotilyzer-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a14930d112d0a4d5a3090176f8bfc6d0aeadb9e02d640640c7059b60672e29a2",
+          "md5": "7eb667b52b713beac9d477a4d459c9f5",
+          "sha256": "649d051ea76c2271964d7c76235af359ff35fc819176199429f52b5d82dac7ef"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7eb667b52b713beac9d477a4d459c9f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 23414,
+        "upload_time": "2021-01-04T23:55:10",
+        "upload_time_iso_8601": "2021-01-04T23:55:10.432466Z",
+        "url": "https://files.pythonhosted.org/packages/a1/49/30d112d0a4d5a3090176f8bfc6d0aeadb9e02d640640c7059b60672e29a2/spotilyzer-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93d50820cbf3164ed6672717092eb1bcc6fe5ee3c718f99356dac6d04c455256",
+          "md5": "36734bf4af24a7d9a2c5968ce63ed20f",
+          "sha256": "535bfe8c6fc68a327fe0fceb4dd209c6c927f2b51c18cadbbf7bc8e23e82f504"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "36734bf4af24a7d9a2c5968ce63ed20f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21800,
+        "upload_time": "2021-01-04T23:55:11",
+        "upload_time_iso_8601": "2021-01-04T23:55:11.533326Z",
+        "url": "https://files.pythonhosted.org/packages/93/d5/0820cbf3164ed6672717092eb1bcc6fe5ee3c718f99356dac6d04c455256/spotilyzer-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ae9089f665b26a61a6e38f59ca376e6e189e890001b34f4fc140bb29563c9ae",
+          "md5": "8e43757d25dcfbdec8ccc40a41ee5636",
+          "sha256": "a46e02cfe601d34e02040fda7f999a0d3ebaebb974405d276640aceb9863c26a"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8e43757d25dcfbdec8ccc40a41ee5636",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24756,
+        "upload_time": "2021-01-05T01:02:46",
+        "upload_time_iso_8601": "2021-01-05T01:02:46.602366Z",
+        "url": "https://files.pythonhosted.org/packages/7a/e9/089f665b26a61a6e38f59ca376e6e189e890001b34f4fc140bb29563c9ae/spotilyzer-0.1.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3feb0c66cb2b27afca2e631a81649540a71b34474c1a799be8adc34efc5fc4f",
+          "md5": "89ba194b3a9dce7fb0e406db4686fd9a",
+          "sha256": "e2b122442603870aba9b0f10a912e34b6b7481b6811e1b8b46ea91e69fa14c26"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89ba194b3a9dce7fb0e406db4686fd9a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22845,
+        "upload_time": "2021-01-05T01:02:47",
+        "upload_time_iso_8601": "2021-01-05T01:02:47.473218Z",
+        "url": "https://files.pythonhosted.org/packages/a3/fe/b0c66cb2b27afca2e631a81649540a71b34474c1a799be8adc34efc5fc4f/spotilyzer-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44ed6b56d0f20fc05f2e71c4a67c58e9484b5e3889f653e4ff3dd3c8ce1d0092",
+          "md5": "1bd7ab2a6161a3445dbec6c07ae4b306",
+          "sha256": "01560276e3668b1046a5c7b26277cff11adbb63c3ee141dde7e5f4ec8287bb57"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1bd7ab2a6161a3445dbec6c07ae4b306",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24852,
+        "upload_time": "2021-01-05T21:50:14",
+        "upload_time_iso_8601": "2021-01-05T21:50:14.986972Z",
+        "url": "https://files.pythonhosted.org/packages/44/ed/6b56d0f20fc05f2e71c4a67c58e9484b5e3889f653e4ff3dd3c8ce1d0092/spotilyzer-0.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "13dd9bdda5638f0a04c81e66c53d888363c689779609a95e43a2e227e2960a2f",
+          "md5": "1a9368ae39bb03324df0e9a8516afbf7",
+          "sha256": "1e80977b091d9e20d78cb2e2c4ae577bcb113591ff3a29dfd536246115169468"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a9368ae39bb03324df0e9a8516afbf7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22930,
+        "upload_time": "2021-01-05T21:50:15",
+        "upload_time_iso_8601": "2021-01-05T21:50:15.903655Z",
+        "url": "https://files.pythonhosted.org/packages/13/dd/9bdda5638f0a04c81e66c53d888363c689779609a95e43a2e227e2960a2f/spotilyzer-0.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5d67909a8e4a49981bd9ab49c3426f9260b255d732dd055e25f8a61c90b11c1",
+          "md5": "f91c83e7a41ed6ecbb6e4b2edb1b1bac",
+          "sha256": "f8a380978cff7d8e73f38364dd46aa0441bb3c57002b7bce64bf4f775529e378"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f91c83e7a41ed6ecbb6e4b2edb1b1bac",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24851,
+        "upload_time": "2021-01-05T23:00:00",
+        "upload_time_iso_8601": "2021-01-05T23:00:00.324323Z",
+        "url": "https://files.pythonhosted.org/packages/e5/d6/7909a8e4a49981bd9ab49c3426f9260b255d732dd055e25f8a61c90b11c1/spotilyzer-0.1.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d1ba5cbdb744727f1bec6e8d640e6cede7c550dbf38dde910cf47f8ea24c4882",
+          "md5": "9255309b28933df2579b882f46fb9e02",
+          "sha256": "6e9a0c2100c1eda13a672f3d5aa9ade477a42c64947f4f3ed28cd464f6e26bf3"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9255309b28933df2579b882f46fb9e02",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22904,
+        "upload_time": "2021-01-05T23:00:01",
+        "upload_time_iso_8601": "2021-01-05T23:00:01.714783Z",
+        "url": "https://files.pythonhosted.org/packages/d1/ba/5cbdb744727f1bec6e8d640e6cede7c550dbf38dde910cf47f8ea24c4882/spotilyzer-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc18cff247030766f0da3af6335681c9192e6f1c743950fb86ef1fc8c984be0d",
+          "md5": "b46a97f0fc72834e4a3bb3f1c847a980",
+          "sha256": "0d2482aa6315f28d83faf25d0cbc0668b915b7032c193000f890895c9b1d2128"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b46a97f0fc72834e4a3bb3f1c847a980",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 26371,
+        "upload_time": "2021-02-14T17:48:30",
+        "upload_time_iso_8601": "2021-02-14T17:48:30.641650Z",
+        "url": "https://files.pythonhosted.org/packages/bc/18/cff247030766f0da3af6335681c9192e6f1c743950fb86ef1fc8c984be0d/spotilyzer-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb83dab2683e4842601b53a996d0c5aa8aafebfebdd81eb4f1e1950d9147d52c",
+          "md5": "cf06b1fb21273a9784b356d34673b452",
+          "sha256": "4bd5dfbf8c4d88ee1f95f4c879950b9062fe0544f023a0f5f7b2db5ed3a022b9"
+        },
+        "downloads": -1,
+        "filename": "spotilyzer-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf06b1fb21273a9784b356d34673b452",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23741,
+        "upload_time": "2021-02-14T17:48:31",
+        "upload_time_iso_8601": "2021-02-14T17:48:31.650815Z",
+        "url": "https://files.pythonhosted.org/packages/bb/83/dab2683e4842601b53a996d0c5aa8aafebfebdd81eb4f1e1950d9147d52c/spotilyzer-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bc18cff247030766f0da3af6335681c9192e6f1c743950fb86ef1fc8c984be0d",
+        "md5": "b46a97f0fc72834e4a3bb3f1c847a980",
+        "sha256": "0d2482aa6315f28d83faf25d0cbc0668b915b7032c193000f890895c9b1d2128"
+      },
+      "downloads": -1,
+      "filename": "spotilyzer-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b46a97f0fc72834e4a3bb3f1c847a980",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 26371,
+      "upload_time": "2021-02-14T17:48:30",
+      "upload_time_iso_8601": "2021-02-14T17:48:30.641650Z",
+      "url": "https://files.pythonhosted.org/packages/bc/18/cff247030766f0da3af6335681c9192e6f1c743950fb86ef1fc8c984be0d/spotilyzer-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bb83dab2683e4842601b53a996d0c5aa8aafebfebdd81eb4f1e1950d9147d52c",
+        "md5": "cf06b1fb21273a9784b356d34673b452",
+        "sha256": "4bd5dfbf8c4d88ee1f95f4c879950b9062fe0544f023a0f5f7b2db5ed3a022b9"
+      },
+      "downloads": -1,
+      "filename": "spotilyzer-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "cf06b1fb21273a9784b356d34673b452",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 23741,
+      "upload_time": "2021-02-14T17:48:31",
+      "upload_time_iso_8601": "2021-02-14T17:48:31.650815Z",
+      "url": "https://files.pythonhosted.org/packages/bb/83/dab2683e4842601b53a996d0c5aa8aafebfebdd81eb4f1e1950d9147d52c/spotilyzer-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

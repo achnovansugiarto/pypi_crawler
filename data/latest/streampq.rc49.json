@@ -1,0 +1,2244 @@
+{
+  "info": {
+    "author": "Department for International Trade",
+    "author_email": "sre@digital.trade.gov.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Topic :: Database"
+    ],
+    "description": "# streampq [![CircleCI](https://circleci.com/gh/uktrade/streampq.svg?style=shield)](https://circleci.com/gh/uktrade/streampq) [![Test Coverage](https://api.codeclimate.com/v1/badges/d96c6b7b6f8cf6ecfd9c/test_coverage)](https://codeclimate.com/github/uktrade/streampq/test_coverage)\n\nStream results of multi-statement PostgreSQL queries from Python without server-side cursors. Has benefits over some other Python PostgreSQL libraries:\n\n- Streams results from complex multi-statement queries even though SQL doesn't allow server-side cursors for such queries - suitable for large amounts of results that don't fit in memory.\n\n- CTRL+C (SIGINT) by default behaves as expected even during slow queries - a `KeyboardInterrupt` is raised and quickly bubbles up through streampq code. Unless client code prevents it, the program will exit.\n\n- Every effort is made to cancel queries on `KeyboardInterrupt`, `SystemExit`, or errors - the server doesn't continue needlessly using resources.\n\nParticularly useful when temporary tables are needed to store intermediate results in multi-statement SQL scripts, or when using a server-side cursor would make a query slower. Instead of server-side cursors [libpq's single-row mode](https://www.postgresql.org/docs/current/libpq-single-row-mode.html) is used.\n\n\n## Installation\n\n```bash\npip install streampq\n```\n\nThe `libpq` binary library is also required. This is typically either already installed, or installed by: \n\n- macOS + brew: `brew install libpq`\n- Linux (Debian): `apt install libpq5`\n- Linux (Red Hat):`yum install postgresql-libs`\n\nThe only runtime dependencies are `libpq` and Python itself.\n\n\n## Usage\n\n```python\nfrom streampq import streampq_connect\n\n# libpq connection paramters\n# https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-PARAMKEYWORDS\n#\n# Any can be ommitted and environment variables will be used instead\n# https://www.postgresql.org/docs/current/libpq-envars.html\nconnection_params = (\n    ('host', 'localhost'),\n    ('port', '5432'),\n    ('dbname', 'postgres'),\n    ('user', 'postgres'),\n    ('password', 'password'),\n)\n\n# SQL statement(s) - if more than one, separate by ;\nsql = '''\n    SELECT * FROM my_table;\n    SELECT * FROM my_other_table;\n'''\n\n# Connection and querying is via a context manager\nwith streampq_connect(connection_params) as query:\n    for (columns, rows) in query(sql):\n        print(columns)  # Tuple of column names (see below)\n\n        for row in rows:\n            print(row)  # Tuple of row values\n```\n\n### Single pandas dataframe of SQL query results\n\nYou can create a Pandas dataframe of SQL query results. This loads all results into memory.\n\n```python\nimport itertools\nimport pandas as pd\nfrom streampq import streampq_connect\n\nconnection_params = (\n    ('host', 'localhost'),\n    ('port', '5432'),\n    ('dbname', 'postgres'),\n    ('user', 'postgres'),\n    ('password', 'password'),\n)\n\nsql = '''\n    SELECT * FROM my_table;\n    SELECT * FROM my_other_table;\n'''\n\nwith streampq_connect(connection_params) as query:\n    for columns, rows in query(sql):\n        df = pd.DataFrame(rows, columns=columns)\n        print(df)\n```\n\n### Chunked Pandas dataframes of SQL query results\n\nFor larger sets of results that don't fit into memory, you can create chunked Pandas dataframes of SQL query results, similar to the output of using the `chunksize` parameter of the Pandas `read_csv` function. This uses a helper function to do the chunking.\n\n```python\nimport itertools\nimport pandas as pd\nfrom streampq import streampq_connect\n\nconnection_params = (\n    ('host', 'localhost'),\n    ('port', '5432'),\n    ('dbname', 'postgres'),\n    ('user', 'postgres'),\n    ('password', 'password'),\n)\n\nsql = '''\n    SELECT * FROM my_table;\n    SELECT * FROM my_other_table;\n'''\n\ndef query_chunked_dfs(query, sql, chunk_size):\n\n    def _chunked_df(columns, rows):\n        it = iter(rows)\n        while True:\n            df = pd.DataFrame(itertools.islice(it, chunk_size), columns=columns)\n            if len(df) == 0:\n                break\n            yield df\n\n    for columns, rows in query(sql):\n        yield _chunked_df(columns, rows)\n\nwith streampq_connect(connection_params) as query:\n    for chunked_dfs in query_chunked_dfs(query, sql, chunk_size=10000):\n        for df in chunked_dfs:\n            print(df)\n```\n\n### Column names\n\nEach column is an instance of streampq.Column, a subclass of str with two extra attributes:\n\n- **type_id**\n\n  The PostgresSQL type id of the column. For example 25 indicates text.\n\n- **type_modifier**\n\n  The PostgreSQL type modifier of the column. This is often -1 to indicate no modification.\n\nWhile it's not typical to subclass str in Python, it's much more frequent to only need the column name for query results than the PostgreSQL type ID and modifier.\n\n### PostgreSQL types to Python type decoding\n\nThere are [194 built-in PostgreSQL data types (including array types)](https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat), and streampq converts them to Python types. In summary:\n\n| PostgreSQL types                                       | Python type                                                                                                   |\n|:-------------------------------------------------------| :-------------------------------------------------------------------------------------------------------------|\n| null                                                   | None                                                                                                          |\n| text (e.g. varchar), xml, network addresses, and money | str                                                                                                           |\n| byte (e.g. bytea)                                      | bytes                                                                                                         |\n| integer (e.g. int4)                                    | int                                                                                                           |\n| inexact real number (e.g. float4)                      | float                                                                                                         |\n| exact real number (e.g. numeric)                       | Decimal                                                                                                       |\n| date                                                   | date<br>(+ and - infinity are mapped to date.max and date.min respectively)                                   |\n| timestamp                                              | datetime<br>(without timezone, + and - infinity are mapped to datetime.max and datetime.min respectively)     |\n| timestamptz                                            | datetime<br>(with offset timezone, + and - infinity are mapped to datetime.max and datetime.min respectively) |\n| json and jsonb                                         | output of json.loads                                                                                          |\n| interval                                               | [streampq.Interval](#streampqinterval)                                                                        |\n| range (e.g. daterange)                                 | [streampq.Range](#streampqrange)                                                                              |\n| multirange (e.g. datemultirange)                       | tuples of [streampq.Range](#streampqrange)                                                                    |\n| arrays and vectors                                     | tuple (of any of the above types, or of nested tuples)                                                        |\n\nTo customise these, override the default value of the `get_decoders` parameter of the `streampq_connect` function in [streampq.py](./streampq.py).\n\nIn general, built-in types are preferred over custom types, and immutable types are preferred over mutable.\n\n#### streampq.Interval\n\nThe Python built-in timedelta type is not used for PostgreSQL interval since timedelta does not offer a way to store PostgreSQL intervals of years or months, other than converting to days which would be a loss of information.\n\nInstead, a [namedtuple](https://docs.python.org/3/library/collections.html#collections.namedtuple) is defined, streampq.Interval, with members:\n\n| Member  | Type    |\n|:--------|:--------|\n| years   | int     |\n| months  | int     |\n| days    | int     |\n| hours   | int     |\n| minutes | int     |\n| seconds | Decimal |\n\n\n#### streampq.Range\n\nThere is no Python built-in type for a PosgreSQL range. So for these, a [namedtuple](https://docs.python.org/3/library/collections.html#collections.namedtuple) is defined, streampq.Range, with members:\n\n| Member  | Type                                                                       |\n|:--------|:---------------------------------------------------------------------------|\n| lower   | int, date, datetime (without timezone), or datetime (with offset timezone) |\n| upper   | int, date, datetime (without timezone), or datetime (with offset timezone) |\n| bounds  | str - one of `()`, `(]`, `[)`, or `[]`                                     |\n\n\n### Bind parameters - literals\n\nDynamic SQL literals can be bound using the `literals` parameter of the query function. It must be an iterable of key-value pairs.\n\n```python\nsql = '''\n    SELECT * FROM my_table WHERE my_col = {my_col_value};\n'''\n\nwith streampq_connect(connection_params) as query:\n    for (columns, rows) in query(sql, literals=(\n        ('my_col_value', 'my-value'),\n    )):\n        for row in rows:\n            pass\n```\n\n\n### Bind parameters - identifiers\n\nDynamic SQL identifiers, e.g. column names, can be bound using the `identifiers` parameter of the query function. It must be an iterable of key-value pairs.\n\n```python\nsql = '''\n    SELECT * FROM my_table WHERE {column_name} = 'my-value';\n'''\n\nwith streampq_connect(connection_params) as query:\n    for (columns, rows) in query(sql, identifiers=(\n        ('column_name', 'my_col'),\n    )):\n        for row in rows:\n            pass\n```\n\nIdentifiers and literals use different escaping rules - hence the need for 2 different parameters.\n\n\n### Single-statement SQL queries\n\nWhile this library is specialsed for multi-statement queries, it works fine when there is only one. In this case the iterable returned from the query function yields only a single `(columns, rows)` pair.\n\n\n## Exceptions\n\nExceptions derive from `streampq.StreamPQError`. If there is any more information available on the error, it's added as a string in its `args` property. This is included in the string representation of the exception by default.\n\n\n## Exception hierarchy\n\n  - **StreamPQError**\n\n    Base class for all explicitly-thrown exceptions\n\n    - **ConnectionError**\n\n      An error occurred while attempting to connect to the database.\n\n    - **QueryError**\n\n      An error occurred while attempting to run a query. Typically this is due to a syntax error or a missing column. A QueryError has an extra attribute:\n\n      - **fields**\n\n        A tuple of (error field name, value) pairs with more detailed information on the error. The [libpq error field names](https://www.postgresql.org/docs/current/libpq-exec.html#LIBPQ-PQRESULTERRORFIELD) are used, but in lowercase and without the `PG_DIAG_` prefix.\n\n    - **CancelError**\n\n      An error occurred while attempting to cancel a query.\n\n    - **CommunicationError**\n\n      An error occurred communicating with the database after successful connection.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/uktrade/streampq",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "streampq",
+    "package_url": "https://pypi.org/project/streampq/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/streampq/",
+    "project_urls": {
+      "Homepage": "https://github.com/uktrade/streampq"
+    },
+    "release_url": "https://pypi.org/project/streampq/0.0.48/",
+    "requires_dist": null,
+    "requires_python": ">=3.8.0",
+    "summary": "PostgreSQL adapter to stream results of multi-statement queries without a server-side cursor",
+    "version": "0.0.48",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15144156,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9624b3ada35d62d5b49f2a8985eca900dbbd01448528ff6c02e5c2bc3560f544",
+          "md5": "8831208fdd5448e6cdae65b8ac66144f",
+          "sha256": "9ae202a6aa7c4ef2305de5716741de71b2e04dc8cf2c50825d5e8f44c17de77f"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8831208fdd5448e6cdae65b8ac66144f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.0",
+        "size": 2204,
+        "upload_time": "2022-04-06T11:46:22",
+        "upload_time_iso_8601": "2022-04-06T11:46:22.586136Z",
+        "url": "https://files.pythonhosted.org/packages/96/24/b3ada35d62d5b49f2a8985eca900dbbd01448528ff6c02e5c2bc3560f544/streampq-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b757029062fa739a8a37efc099b2d9db3d48b65ee546d08a798370988f719e9d",
+          "md5": "aae77d0c23bef9e68bca41f2fde94f48",
+          "sha256": "db188487a361f1da9be2326b545487c14c645c172603e75eacba7a710d669ff6"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aae77d0c23bef9e68bca41f2fde94f48",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.0",
+        "size": 1922,
+        "upload_time": "2022-04-06T11:46:24",
+        "upload_time_iso_8601": "2022-04-06T11:46:24.115021Z",
+        "url": "https://files.pythonhosted.org/packages/b7/57/029062fa739a8a37efc099b2d9db3d48b65ee546d08a798370988f719e9d/streampq-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea92d4a3624d424a719bcdec8431684aabbe213ca222b7e4cd98411e61ee1b89",
+          "md5": "fe855fab297def09998d846a8339605f",
+          "sha256": "e926aedc8c73a6ac7a6a22bce9fbc3104b611fec2026772784305ca9d5bb524b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fe855fab297def09998d846a8339605f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.0",
+        "size": 3906,
+        "upload_time": "2022-04-07T03:16:54",
+        "upload_time_iso_8601": "2022-04-07T03:16:54.773868Z",
+        "url": "https://files.pythonhosted.org/packages/ea/92/d4a3624d424a719bcdec8431684aabbe213ca222b7e4cd98411e61ee1b89/streampq-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3fb00c4382d1c05d34972e0f2ad76051d7569c2b404adf9c8c0c5deaa817dda6",
+          "md5": "46513c04a212af39344af78a925652da",
+          "sha256": "23e5ffacb8a9e75e0a0fcf2e38b5a09a6f0e671eed72a354f4ca018b4ea43c41"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "46513c04a212af39344af78a925652da",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.0",
+        "size": 3651,
+        "upload_time": "2022-04-07T03:16:56",
+        "upload_time_iso_8601": "2022-04-07T03:16:56.731301Z",
+        "url": "https://files.pythonhosted.org/packages/3f/b0/0c4382d1c05d34972e0f2ad76051d7569c2b404adf9c8c0c5deaa817dda6/streampq-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d2b9db315542ce4fab66e7ca738bd952899737b5565c04d33b93bcbc59832fd1",
+          "md5": "cc0b483453ceea4df6417865fd1b1fc4",
+          "sha256": "97b5b2894af17e9c80b9c863a6291ba06f0e78397dedac35efbd68a4c10fd237"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cc0b483453ceea4df6417865fd1b1fc4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6335,
+        "upload_time": "2022-04-09T16:59:59",
+        "upload_time_iso_8601": "2022-04-09T16:59:59.854130Z",
+        "url": "https://files.pythonhosted.org/packages/d2/b9/db315542ce4fab66e7ca738bd952899737b5565c04d33b93bcbc59832fd1/streampq-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a07703153f08785e17ecaf7aac79c95727775a8d59ded5379df25e4da0390e89",
+          "md5": "b0d873c28d1cc28545b2f870ae2c94ec",
+          "sha256": "cbd025a82d4d3b33172c9c53d5fde043f46de007225db96da64be3a5c0e97e74"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b0d873c28d1cc28545b2f870ae2c94ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 5996,
+        "upload_time": "2022-04-09T17:00:01",
+        "upload_time_iso_8601": "2022-04-09T17:00:01.835660Z",
+        "url": "https://files.pythonhosted.org/packages/a0/77/03153f08785e17ecaf7aac79c95727775a8d59ded5379df25e4da0390e89/streampq-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96422ab625a276a9311754ec27bd9a085c920d4b20e93a1977217a4ae056323c",
+          "md5": "6eab699b0534357934d1ea30ba8c0918",
+          "sha256": "da14d4066e27271c5b5401ef9f7904f8232237a2c2ecdf91b1ae2c6e7faab319"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6eab699b0534357934d1ea30ba8c0918",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6336,
+        "upload_time": "2022-04-09T17:38:40",
+        "upload_time_iso_8601": "2022-04-09T17:38:40.691975Z",
+        "url": "https://files.pythonhosted.org/packages/96/42/2ab625a276a9311754ec27bd9a085c920d4b20e93a1977217a4ae056323c/streampq-0.0.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f19f367ebb3ccf781ea82228fb6ded7f6886dc8154cc721b5686a30f0b07316f",
+          "md5": "66cffceb7a7c8c5086c612515e2ae47d",
+          "sha256": "e9b46d4e02654bc7ef8663ed8586aeb0bc6b8546f46f24447701fb2be263c57b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "66cffceb7a7c8c5086c612515e2ae47d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6007,
+        "upload_time": "2022-04-09T17:38:42",
+        "upload_time_iso_8601": "2022-04-09T17:38:42.564131Z",
+        "url": "https://files.pythonhosted.org/packages/f1/9f/367ebb3ccf781ea82228fb6ded7f6886dc8154cc721b5686a30f0b07316f/streampq-0.0.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07d328b05bc28b60a2a37fb67a9a2c184214f80810c7f0c7ca8c2421a07b4ab1",
+          "md5": "7bda004585bcb92fee74aa70a13f97b2",
+          "sha256": "0574359d443f023c272ee240311cccb9e196d8d3a73accb2188c463b56bc0f87"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7bda004585bcb92fee74aa70a13f97b2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6359,
+        "upload_time": "2022-04-10T05:47:12",
+        "upload_time_iso_8601": "2022-04-10T05:47:12.745663Z",
+        "url": "https://files.pythonhosted.org/packages/07/d3/28b05bc28b60a2a37fb67a9a2c184214f80810c7f0c7ca8c2421a07b4ab1/streampq-0.0.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b5ba61eaaf719c158cfe301fadc5671ac5f3d39c9fca8c9ad4804066fb29e85",
+          "md5": "ed519eb308a13a04e20826febc66b97d",
+          "sha256": "9a9ba474a817944cc014c9661a3b112bb66f79f5fc28267fb350cadd82b94282"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed519eb308a13a04e20826febc66b97d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6019,
+        "upload_time": "2022-04-10T05:47:14",
+        "upload_time_iso_8601": "2022-04-10T05:47:14.500119Z",
+        "url": "https://files.pythonhosted.org/packages/5b/5b/a61eaaf719c158cfe301fadc5671ac5f3d39c9fca8c9ad4804066fb29e85/streampq-0.0.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf6c731c93f95b88d57c7107ca25140ec686c68daa4c0cf57397f322b1fe03cc",
+          "md5": "bd845726e3a98620c3b23b9436c971ce",
+          "sha256": "d5abe1a5a76ecae1ab062b9e2fd5d7554507a986da7e36a4c46e788a72cd40e1"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bd845726e3a98620c3b23b9436c971ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6407,
+        "upload_time": "2022-04-10T05:58:47",
+        "upload_time_iso_8601": "2022-04-10T05:58:47.176261Z",
+        "url": "https://files.pythonhosted.org/packages/cf/6c/731c93f95b88d57c7107ca25140ec686c68daa4c0cf57397f322b1fe03cc/streampq-0.0.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c419d2e75f4c12e0eaa698f85a3ff40adf1076ac0f54fc2732f25eb66a695fd",
+          "md5": "dfbc6c2bd5489da006bc447da02c2d5f",
+          "sha256": "cbe025531e9d381330c5e8bc0b88be1c42a12ec07026d4e0252ae2cd11869dc7"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dfbc6c2bd5489da006bc447da02c2d5f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6070,
+        "upload_time": "2022-04-10T05:58:49",
+        "upload_time_iso_8601": "2022-04-10T05:58:49.070454Z",
+        "url": "https://files.pythonhosted.org/packages/1c/41/9d2e75f4c12e0eaa698f85a3ff40adf1076ac0f54fc2732f25eb66a695fd/streampq-0.0.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47ad93da37f1137aa826b0b38e5368746287472b9a1f35c1178240c222c4071d",
+          "md5": "f9961dcab64f40f8fa942227b23bfc64",
+          "sha256": "e604ce4379c773432ff0815a0c23e64867bf04e99f2a57a4cfe85fed5bb5ec1d"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f9961dcab64f40f8fa942227b23bfc64",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6402,
+        "upload_time": "2022-04-10T21:02:58",
+        "upload_time_iso_8601": "2022-04-10T21:02:58.212885Z",
+        "url": "https://files.pythonhosted.org/packages/47/ad/93da37f1137aa826b0b38e5368746287472b9a1f35c1178240c222c4071d/streampq-0.0.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "57f868061f1a7ffe3925be7d8b1b4069230a97e2695b728d883b91280006776c",
+          "md5": "4e1fa378883ace6802c88ca05f1bc2ee",
+          "sha256": "bae2114d359be3961555f76632cd520b1f51d15368fe5838a1e74872f2aefd33"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4e1fa378883ace6802c88ca05f1bc2ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6081,
+        "upload_time": "2022-04-10T21:02:59",
+        "upload_time_iso_8601": "2022-04-10T21:02:59.831732Z",
+        "url": "https://files.pythonhosted.org/packages/57/f8/68061f1a7ffe3925be7d8b1b4069230a97e2695b728d883b91280006776c/streampq-0.0.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5b15ce95b8f6d87a1f5878c282b293214c811208de99398d46f39432fdcf90e",
+          "md5": "4d3351162ef676b10311be3a596e3161",
+          "sha256": "10e715e8ff8a88263a41ab775b6fb68b664072152a5a8f75590913ab04303781"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4d3351162ef676b10311be3a596e3161",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6476,
+        "upload_time": "2022-04-10T21:53:34",
+        "upload_time_iso_8601": "2022-04-10T21:53:34.473448Z",
+        "url": "https://files.pythonhosted.org/packages/e5/b1/5ce95b8f6d87a1f5878c282b293214c811208de99398d46f39432fdcf90e/streampq-0.0.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e43e6b5144116b260caf6ef8d63afcc184f952a3a2700375a5811a639c9939f0",
+          "md5": "1ff457629f1102c1dbc5d7411821c445",
+          "sha256": "ddd0a644b04b9b35d113f767bff64f044e1153f8b077ba1ce7fdd36fe63f3db5"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ff457629f1102c1dbc5d7411821c445",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6154,
+        "upload_time": "2022-04-10T21:53:36",
+        "upload_time_iso_8601": "2022-04-10T21:53:36.074453Z",
+        "url": "https://files.pythonhosted.org/packages/e4/3e/6b5144116b260caf6ef8d63afcc184f952a3a2700375a5811a639c9939f0/streampq-0.0.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9bd6dc0ca3b7b52abae7e859ccb24d5b9b3384da9e4bca28b2fccee3ad0a6641",
+          "md5": "ed7b363d60e1cd907c46e765fedbf5f9",
+          "sha256": "2f7a228bfea8e62d542d0faf43db1b182209ad46b3beb06adb2444702b2a7438"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ed7b363d60e1cd907c46e765fedbf5f9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6813,
+        "upload_time": "2022-04-11T09:40:27",
+        "upload_time_iso_8601": "2022-04-11T09:40:27.886802Z",
+        "url": "https://files.pythonhosted.org/packages/9b/d6/dc0ca3b7b52abae7e859ccb24d5b9b3384da9e4bca28b2fccee3ad0a6641/streampq-0.0.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9f691143b2d50980651c4fc22dea2b458d5824cd5604768542bfd22dbb56eee",
+          "md5": "2c538815c71f4e02231275db372deaa2",
+          "sha256": "b8e072517cebef78afd3fadf717214cb0db93759a91f401257f466f244c7c541"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c538815c71f4e02231275db372deaa2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6548,
+        "upload_time": "2022-04-11T09:40:29",
+        "upload_time_iso_8601": "2022-04-11T09:40:29.376032Z",
+        "url": "https://files.pythonhosted.org/packages/e9/f6/91143b2d50980651c4fc22dea2b458d5824cd5604768542bfd22dbb56eee/streampq-0.0.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2b3e313b76c30060e6985028e8bcc38a82a9dd7f5c972b2db9c6ffadd38283e",
+          "md5": "10407c662872e05996dd7a6b8be6b27b",
+          "sha256": "6092fe6c93aa13ce73fdb53c95ab87d2dd341e9f2a38993254cf9a979c8aa0a5"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "10407c662872e05996dd7a6b8be6b27b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 7034,
+        "upload_time": "2022-04-15T14:59:24",
+        "upload_time_iso_8601": "2022-04-15T14:59:24.573827Z",
+        "url": "https://files.pythonhosted.org/packages/e2/b3/e313b76c30060e6985028e8bcc38a82a9dd7f5c972b2db9c6ffadd38283e/streampq-0.0.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "446218dd41fe738f0c535ffeebb83c6029747a0328ac1fe0f72a245b43d29208",
+          "md5": "69b8be86bab578b17e9ec65da2b8133d",
+          "sha256": "9235cf72d70a68a66cdac1f7895cf78a06ce97074d176f080b7b32852b8f8225"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "69b8be86bab578b17e9ec65da2b8133d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6761,
+        "upload_time": "2022-04-15T14:59:26",
+        "upload_time_iso_8601": "2022-04-15T14:59:26.444209Z",
+        "url": "https://files.pythonhosted.org/packages/44/62/18dd41fe738f0c535ffeebb83c6029747a0328ac1fe0f72a245b43d29208/streampq-0.0.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "23410c3affe29d34e78153da0c98cfd18b16868dcc4e1cfcdb15b961e93af141",
+          "md5": "03e5854ed511359459ab09a8eb7477ad",
+          "sha256": "16c9c237000a43554df2c8b1ca8d88f6940704f277fea0a56e4e7ac38ae2fe95"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "03e5854ed511359459ab09a8eb7477ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 7074,
+        "upload_time": "2022-04-15T16:32:12",
+        "upload_time_iso_8601": "2022-04-15T16:32:12.813047Z",
+        "url": "https://files.pythonhosted.org/packages/23/41/0c3affe29d34e78153da0c98cfd18b16868dcc4e1cfcdb15b961e93af141/streampq-0.0.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca958e470e29cdc240cb3ed74a435e7c3278efedd1af7f039e63fc18b119c8d5",
+          "md5": "e8bacce3d65c9b6f685aafef0e7b0293",
+          "sha256": "73617c1be2b58a1893eef6688396ca1f23e00ba04e6f09a6c20cd9804b97f49f"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e8bacce3d65c9b6f685aafef0e7b0293",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6793,
+        "upload_time": "2022-04-15T16:32:14",
+        "upload_time_iso_8601": "2022-04-15T16:32:14.630463Z",
+        "url": "https://files.pythonhosted.org/packages/ca/95/8e470e29cdc240cb3ed74a435e7c3278efedd1af7f039e63fc18b119c8d5/streampq-0.0.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62b582f643477d0dbe3f3bf5269849a806b3fcf9755209193cf53d0589b94e4a",
+          "md5": "a95355c9338e2a645aaed383138a610f",
+          "sha256": "6d429c7998b4283f9e5a608bf9b3d91f3e868b00ae85fce9c0d226b2f1b4c97d"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.19-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a95355c9338e2a645aaed383138a610f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 7276,
+        "upload_time": "2022-04-15T21:33:40",
+        "upload_time_iso_8601": "2022-04-15T21:33:40.511082Z",
+        "url": "https://files.pythonhosted.org/packages/62/b5/82f643477d0dbe3f3bf5269849a806b3fcf9755209193cf53d0589b94e4a/streampq-0.0.19-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da5a8af240e474dc45b6adf235aab8d2f8d9ef852a5a1ef3b8a2db04a0c9f34f",
+          "md5": "e87a10e452e331d55b6d6e0b36eba362",
+          "sha256": "c7dd7efb09610b68631d313fe9d64374cee9589e1736202835f5c937784f3d2e"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.19.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e87a10e452e331d55b6d6e0b36eba362",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6999,
+        "upload_time": "2022-04-15T21:33:42",
+        "upload_time_iso_8601": "2022-04-15T21:33:42.279631Z",
+        "url": "https://files.pythonhosted.org/packages/da/5a/8af240e474dc45b6adf235aab8d2f8d9ef852a5a1ef3b8a2db04a0c9f34f/streampq-0.0.19.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ccca7bb87b581395a9ac4431930eae3065f3482e508ab9539b2fbc49908e88c",
+          "md5": "d73dada0eccfd93b99f3af7464f7bea6",
+          "sha256": "c531a4c50cd25c686ec31a2ca78e4fcaec330a79acedc10d29fecd7f3a1503fe"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d73dada0eccfd93b99f3af7464f7bea6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 4818,
+        "upload_time": "2022-04-08T08:54:59",
+        "upload_time_iso_8601": "2022-04-08T08:54:59.944697Z",
+        "url": "https://files.pythonhosted.org/packages/7c/cc/a7bb87b581395a9ac4431930eae3065f3482e508ab9539b2fbc49908e88c/streampq-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "34bae33b46378c3263fb0b41a81a583e1e8cb8c76f4208d6d1dc82ec5b6c5b4e",
+          "md5": "511daef3dcb8908291759dd91295b11a",
+          "sha256": "2f2cf41b3b4161c1aec5270f58c8b80182c46eaa24ba5a6d14cb1e43907653df"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "511daef3dcb8908291759dd91295b11a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 4545,
+        "upload_time": "2022-04-08T08:55:01",
+        "upload_time_iso_8601": "2022-04-08T08:55:01.420367Z",
+        "url": "https://files.pythonhosted.org/packages/34/ba/e33b46378c3263fb0b41a81a583e1e8cb8c76f4208d6d1dc82ec5b6c5b4e/streampq-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.20": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42f9f114c7009d112986a0b68ea52f61e3b790437b277e5be9ba578de3bbafcd",
+          "md5": "1dd990b3fc1fb613b262708231756ccf",
+          "sha256": "ea3699e23c0214a9f66dd01518aacfe7a0f7b4b427d81c4df40ff8caa7e65529"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.20-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1dd990b3fc1fb613b262708231756ccf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 7325,
+        "upload_time": "2022-04-15T21:53:39",
+        "upload_time_iso_8601": "2022-04-15T21:53:39.718380Z",
+        "url": "https://files.pythonhosted.org/packages/42/f9/f114c7009d112986a0b68ea52f61e3b790437b277e5be9ba578de3bbafcd/streampq-0.0.20-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11bf4ac1da739600ae8892ac9f9916f87e55a1f3fa16e346120da608313cc09e",
+          "md5": "d3c8294d2bac5a8b7ed595363e1677ee",
+          "sha256": "55ab53bedc2c4941fd5fa56f4e6c430ec7ec1af4f3d13c6e5974522ce64cef70"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.20.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d3c8294d2bac5a8b7ed595363e1677ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 7038,
+        "upload_time": "2022-04-15T21:53:41",
+        "upload_time_iso_8601": "2022-04-15T21:53:41.396003Z",
+        "url": "https://files.pythonhosted.org/packages/11/bf/4ac1da739600ae8892ac9f9916f87e55a1f3fa16e346120da608313cc09e/streampq-0.0.20.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4a7b11adc6d566e9f38a43ff8acf8ec74bfeef934a6caa84f5c93757ad7a521",
+          "md5": "062e0b90da06ce825e64d46b00c0b776",
+          "sha256": "002bf2798b612d7406ab9da80b6569629948d8215963cfb4637350cdf87b4914"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "062e0b90da06ce825e64d46b00c0b776",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 7721,
+        "upload_time": "2022-04-16T08:54:39",
+        "upload_time_iso_8601": "2022-04-16T08:54:39.855139Z",
+        "url": "https://files.pythonhosted.org/packages/e4/a7/b11adc6d566e9f38a43ff8acf8ec74bfeef934a6caa84f5c93757ad7a521/streampq-0.0.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea39f670ccdb8f714f932fe16089c4a91c08672d9f63da5d7ee6b636ba4f3986",
+          "md5": "3f920744d2e0d08cad4ab097c80311f5",
+          "sha256": "6957dcec84216487ca4912baf5e4b587f0498e497a0f7fa6653db68e54940381"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.21.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3f920744d2e0d08cad4ab097c80311f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 7440,
+        "upload_time": "2022-04-16T08:54:42",
+        "upload_time_iso_8601": "2022-04-16T08:54:42.194127Z",
+        "url": "https://files.pythonhosted.org/packages/ea/39/f670ccdb8f714f932fe16089c4a91c08672d9f63da5d7ee6b636ba4f3986/streampq-0.0.21.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9d76ea236b818ca112f219572d76d9bc8b77d756e04a5ecba88fab993620e00",
+          "md5": "fcc64f389f2fcbd37f0ff2e9c382b5c7",
+          "sha256": "5c1f25c82fc93ff50fec19756438f06fda534b6cb2af727d21e414d45a16c7a9"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fcc64f389f2fcbd37f0ff2e9c382b5c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8182,
+        "upload_time": "2022-04-16T21:18:58",
+        "upload_time_iso_8601": "2022-04-16T21:18:58.397885Z",
+        "url": "https://files.pythonhosted.org/packages/e9/d7/6ea236b818ca112f219572d76d9bc8b77d756e04a5ecba88fab993620e00/streampq-0.0.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e09ff8806c501be16d4ba9a6ed1d514d128d0257cdc726f30ae3c40da7f8e93a",
+          "md5": "219566a394142863ee00a6f167c94b17",
+          "sha256": "f85e58b5ee320b275a6e2d762bfd90456df629a38960c293579463782554fe26"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.22.tar.gz",
+        "has_sig": false,
+        "md5_digest": "219566a394142863ee00a6f167c94b17",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 7878,
+        "upload_time": "2022-04-16T21:19:00",
+        "upload_time_iso_8601": "2022-04-16T21:19:00.284909Z",
+        "url": "https://files.pythonhosted.org/packages/e0/9f/f8806c501be16d4ba9a6ed1d514d128d0257cdc726f30ae3c40da7f8e93a/streampq-0.0.22.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.23": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9ef68f469ba5f493b96ea4070951a3880f161b2eed6f1fdd6e939607cab1b85",
+          "md5": "2b8aa6bf2d60c6e2c37ace5dcc77e22d",
+          "sha256": "eabe8a273d352059dd2b128de78465f556c5609be22e371c51a53de4d01e5965"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.23-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2b8aa6bf2d60c6e2c37ace5dcc77e22d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8342,
+        "upload_time": "2022-04-17T06:55:04",
+        "upload_time_iso_8601": "2022-04-17T06:55:04.995087Z",
+        "url": "https://files.pythonhosted.org/packages/b9/ef/68f469ba5f493b96ea4070951a3880f161b2eed6f1fdd6e939607cab1b85/streampq-0.0.23-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03e0063edf245c1cd598b3bdf8bdb686b5990b8e7d4291b93d754e848d360291",
+          "md5": "bfc59414152cb6510749ed9b72e2926d",
+          "sha256": "5e8d429df8c9e27839fdd749f2c7335f62753af6400693233ba76c5fac3c75c3"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.23.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bfc59414152cb6510749ed9b72e2926d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8041,
+        "upload_time": "2022-04-17T06:55:06",
+        "upload_time_iso_8601": "2022-04-17T06:55:06.438132Z",
+        "url": "https://files.pythonhosted.org/packages/03/e0/063edf245c1cd598b3bdf8bdb686b5990b8e7d4291b93d754e848d360291/streampq-0.0.23.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.24": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7edb24712151ef21f1d111f9fbcae8c9c949f80224581fde22d4d5a85b68eb1e",
+          "md5": "b05c6d9bd74879367af68eb224f3f031",
+          "sha256": "7960f32b0496abbccec2f6c298ad5fb4a24daf5f5568a5f4f1e0b14e82a63bfa"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.24-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b05c6d9bd74879367af68eb224f3f031",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8799,
+        "upload_time": "2022-04-17T15:12:12",
+        "upload_time_iso_8601": "2022-04-17T15:12:12.241105Z",
+        "url": "https://files.pythonhosted.org/packages/7e/db/24712151ef21f1d111f9fbcae8c9c949f80224581fde22d4d5a85b68eb1e/streampq-0.0.24-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e89dedd5f9d302c9a5bc621b947e38af025f93af7d87fc7280aab73b1fa88c52",
+          "md5": "1174e91353c184d709503d46379765fd",
+          "sha256": "d521bb0fdb9ebb757f287caa9c12b4bdf190cb1940dde29798cb87f20ec5a226"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.24.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1174e91353c184d709503d46379765fd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8531,
+        "upload_time": "2022-04-17T15:12:14",
+        "upload_time_iso_8601": "2022-04-17T15:12:14.101010Z",
+        "url": "https://files.pythonhosted.org/packages/e8/9d/edd5f9d302c9a5bc621b947e38af025f93af7d87fc7280aab73b1fa88c52/streampq-0.0.24.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.25": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "51e524f447803dacba9dc8779bef31cba9016d735d84c7e044cd4736ba107b0e",
+          "md5": "1f1793110e049e656886f9e3c2c028a0",
+          "sha256": "0a87a5d5b7105bce75c46b6b98f306c65edc7573dc906dec99444d7be29e8329"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.25-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1f1793110e049e656886f9e3c2c028a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8783,
+        "upload_time": "2022-04-17T15:23:12",
+        "upload_time_iso_8601": "2022-04-17T15:23:12.875551Z",
+        "url": "https://files.pythonhosted.org/packages/51/e5/24f447803dacba9dc8779bef31cba9016d735d84c7e044cd4736ba107b0e/streampq-0.0.25-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24e7285c1d8085d5968fd3ac6c4d5ffe589445d97a0dbd270b3954994280e108",
+          "md5": "03775389a9400013eda34836f21ee537",
+          "sha256": "2b85ecba70b8eb49b7f19ebd6f0fc19d0395c039ac48cd46d41282658843cab1"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.25.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03775389a9400013eda34836f21ee537",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8518,
+        "upload_time": "2022-04-17T15:23:14",
+        "upload_time_iso_8601": "2022-04-17T15:23:14.869108Z",
+        "url": "https://files.pythonhosted.org/packages/24/e7/285c1d8085d5968fd3ac6c4d5ffe589445d97a0dbd270b3954994280e108/streampq-0.0.25.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.26": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1935adf582dc8f7116f42972eabb04a54ea127846b5b48da20a3e3ea2a70ca0f",
+          "md5": "e9037fc47e76a7aa0df1ce0fcd829b9a",
+          "sha256": "22eab1e034623010d5c6784ce139a572dbc07c14f7e39db17cd4db6fb3402c17"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.26-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e9037fc47e76a7aa0df1ce0fcd829b9a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8971,
+        "upload_time": "2022-04-17T16:33:26",
+        "upload_time_iso_8601": "2022-04-17T16:33:26.916420Z",
+        "url": "https://files.pythonhosted.org/packages/19/35/adf582dc8f7116f42972eabb04a54ea127846b5b48da20a3e3ea2a70ca0f/streampq-0.0.26-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8840fe2571c0ef4b35c43520593d7fffd857a0c245edc5683e58582000d0210d",
+          "md5": "d5d535463700bb5b32e2b33926524762",
+          "sha256": "aefb6642da4b93c1f98220d41c9ac244f701be0534245e3a29c34954c852e850"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.26.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d5d535463700bb5b32e2b33926524762",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8679,
+        "upload_time": "2022-04-17T16:33:28",
+        "upload_time_iso_8601": "2022-04-17T16:33:28.430750Z",
+        "url": "https://files.pythonhosted.org/packages/88/40/fe2571c0ef4b35c43520593d7fffd857a0c245edc5683e58582000d0210d/streampq-0.0.26.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.27": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56dc52fb1b10ce4e3057a15d1e145610b9b970bd2351b86d0ab9b697532602c7",
+          "md5": "9b847922e1e9e7881989c812b2546eb4",
+          "sha256": "c3026610a3adc9c8ab265aa9b66178fcca94d69b20c3a797d52260ae58c7fd50"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.27-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9b847922e1e9e7881989c812b2546eb4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 8966,
+        "upload_time": "2022-04-17T17:08:38",
+        "upload_time_iso_8601": "2022-04-17T17:08:38.510408Z",
+        "url": "https://files.pythonhosted.org/packages/56/dc/52fb1b10ce4e3057a15d1e145610b9b970bd2351b86d0ab9b697532602c7/streampq-0.0.27-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38e90b55ef93ff2ef22f195554e11b5066c7fa96d79628ba67fec5dd97b465c3",
+          "md5": "e97829689b2fc85d85db4cc8a67a2d0c",
+          "sha256": "39d26c3178cc2274fbf3a2ecc4392a0a9b31e1df4b4190eb060e01febad29fbe"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.27.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e97829689b2fc85d85db4cc8a67a2d0c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8679,
+        "upload_time": "2022-04-17T17:08:40",
+        "upload_time_iso_8601": "2022-04-17T17:08:40.868930Z",
+        "url": "https://files.pythonhosted.org/packages/38/e9/0b55ef93ff2ef22f195554e11b5066c7fa96d79628ba67fec5dd97b465c3/streampq-0.0.27.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.28": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7da8271484bebf48763a9f916a62e1d779bd36877e26b985218f2eae7097635b",
+          "md5": "881b4dbdf7c3cbc8fb6ec376aa6fa1d5",
+          "sha256": "17fca967cf6429fdf8703e2434559c1ade2054347ca0a56eed7a866478d0465f"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.28-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "881b4dbdf7c3cbc8fb6ec376aa6fa1d5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9018,
+        "upload_time": "2022-04-17T21:44:24",
+        "upload_time_iso_8601": "2022-04-17T21:44:24.783370Z",
+        "url": "https://files.pythonhosted.org/packages/7d/a8/271484bebf48763a9f916a62e1d779bd36877e26b985218f2eae7097635b/streampq-0.0.28-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5dfeacf241e498ae91e8691b8052891106157d2e5610b44915c8d18759acb6e5",
+          "md5": "2dd5cb5ac49859dd1bf7df83d0fe243b",
+          "sha256": "0c4066695a23729398abb1a290e8049618716dbd37795848c564bef90bcd380e"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.28.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2dd5cb5ac49859dd1bf7df83d0fe243b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8738,
+        "upload_time": "2022-04-17T21:44:26",
+        "upload_time_iso_8601": "2022-04-17T21:44:26.672662Z",
+        "url": "https://files.pythonhosted.org/packages/5d/fe/acf241e498ae91e8691b8052891106157d2e5610b44915c8d18759acb6e5/streampq-0.0.28.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.29": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "55b4880961bcab7e8f70ed887b60879412cf0b8fce4211b43a9f30c12317f26b",
+          "md5": "14fe59a2720f8b8409c75def97285096",
+          "sha256": "6794c1f4bb9fd7489c8ee2275a531aee72045b576392618cdf8eee0c647bf24b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.29-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "14fe59a2720f8b8409c75def97285096",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9031,
+        "upload_time": "2022-04-18T07:30:09",
+        "upload_time_iso_8601": "2022-04-18T07:30:09.345598Z",
+        "url": "https://files.pythonhosted.org/packages/55/b4/880961bcab7e8f70ed887b60879412cf0b8fce4211b43a9f30c12317f26b/streampq-0.0.29-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e4b0b14f01e2c0b15f3f56d5479ac88595760d075fd3dd0361ae8a7d775a060",
+          "md5": "645969d191d0bee8c58be182cadc9287",
+          "sha256": "a0758b1c3d0e2c88f41aaa5bc1548441bfd0d1e4a1537ce3244915bd29437258"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.29.tar.gz",
+        "has_sig": false,
+        "md5_digest": "645969d191d0bee8c58be182cadc9287",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8737,
+        "upload_time": "2022-04-18T07:30:11",
+        "upload_time_iso_8601": "2022-04-18T07:30:11.426582Z",
+        "url": "https://files.pythonhosted.org/packages/5e/4b/0b14f01e2c0b15f3f56d5479ac88595760d075fd3dd0361ae8a7d775a060/streampq-0.0.29.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "957f0a0c73bb718179b7a7017c29a9cb78a2da5dabe4cfcf8c0df6c812b7c1ee",
+          "md5": "d43856edd6523d5e7244419c4433c6c1",
+          "sha256": "56fcd824408b69daf2789c7307c7f61d2db87ba471e03ebd2bf4eddeb11a4295"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d43856edd6523d5e7244419c4433c6c1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 5277,
+        "upload_time": "2022-04-08T22:56:16",
+        "upload_time_iso_8601": "2022-04-08T22:56:16.900497Z",
+        "url": "https://files.pythonhosted.org/packages/95/7f/0a0c73bb718179b7a7017c29a9cb78a2da5dabe4cfcf8c0df6c812b7c1ee/streampq-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a77af75c924e21d428c35a82295c7c2e461f1c9941ab0a53aa1b5edcbfd3ab1f",
+          "md5": "eccce300eaeb4b3b99775cd748eef4d7",
+          "sha256": "46539d97aa2b7ec2d53b096f5ef0236551848340d3ad719e65386101d6e76499"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eccce300eaeb4b3b99775cd748eef4d7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 4945,
+        "upload_time": "2022-04-08T22:56:18",
+        "upload_time_iso_8601": "2022-04-08T22:56:18.826375Z",
+        "url": "https://files.pythonhosted.org/packages/a7/7a/f75c924e21d428c35a82295c7c2e461f1c9941ab0a53aa1b5edcbfd3ab1f/streampq-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.30": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44c1f9c7c24882d3ddac89063f395831af08a428d6cdb34e347278d7a2ffacce",
+          "md5": "00aa2723747f5a5ce446c3c9a0f00978",
+          "sha256": "668461279b47ba0a9abaed4e77167798ec3c915667eee0abc93f0fad4be17ec4"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.30-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "00aa2723747f5a5ce446c3c9a0f00978",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9095,
+        "upload_time": "2022-04-18T10:46:49",
+        "upload_time_iso_8601": "2022-04-18T10:46:49.963049Z",
+        "url": "https://files.pythonhosted.org/packages/44/c1/f9c7c24882d3ddac89063f395831af08a428d6cdb34e347278d7a2ffacce/streampq-0.0.30-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b7d304d72269058cb70e9ed0bec180cabeafff3d1caaf1c8fadc1ce8e40d7166",
+          "md5": "3e9812bc95dc5ebcfb599296af2d3fc5",
+          "sha256": "71fcc422154f8827ec2fa34e21a71a574b8d0f3e060ee19c65cd7bdd0249ad22"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.30.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3e9812bc95dc5ebcfb599296af2d3fc5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 8815,
+        "upload_time": "2022-04-18T10:46:51",
+        "upload_time_iso_8601": "2022-04-18T10:46:51.925347Z",
+        "url": "https://files.pythonhosted.org/packages/b7/d3/04d72269058cb70e9ed0bec180cabeafff3d1caaf1c8fadc1ce8e40d7166/streampq-0.0.30.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.31": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48bc3c02c77dd793d6447dbfcc1185d67fb2d3c5ca491547e6b9f8b040774868",
+          "md5": "1ffd3a2c0539fc0b774362f4071e4a62",
+          "sha256": "00438e6917a37990b2b0962ed41ab35793e06c6ead9bc39a2e3531004c61141a"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.31-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ffd3a2c0539fc0b774362f4071e4a62",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9277,
+        "upload_time": "2022-04-18T17:18:14",
+        "upload_time_iso_8601": "2022-04-18T17:18:14.844668Z",
+        "url": "https://files.pythonhosted.org/packages/48/bc/3c02c77dd793d6447dbfcc1185d67fb2d3c5ca491547e6b9f8b040774868/streampq-0.0.31-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5376f3c89d6310e9292ef217bfdf1663b04d7ebb28e21f1a962b0d19baeba17d",
+          "md5": "30f864097935cc242fda5753c2969013",
+          "sha256": "c23b8fe78f191682a0b6629d2cd5418675a9c06348d1e8c5d3365738b87fe26b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.31.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30f864097935cc242fda5753c2969013",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 9055,
+        "upload_time": "2022-04-18T17:18:16",
+        "upload_time_iso_8601": "2022-04-18T17:18:16.335540Z",
+        "url": "https://files.pythonhosted.org/packages/53/76/f3c89d6310e9292ef217bfdf1663b04d7ebb28e21f1a962b0d19baeba17d/streampq-0.0.31.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.32": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ff2223ac23377dbe34281289bcc2e98a1010ebebcd46993285be17675ca136c",
+          "md5": "44d1a18f701cadb0ee731f110e260d09",
+          "sha256": "3ba3248a180718088b7bc22c493c73c9940c050698844521eebc26977f93bbaf"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.32-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "44d1a18f701cadb0ee731f110e260d09",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9320,
+        "upload_time": "2022-04-19T08:09:21",
+        "upload_time_iso_8601": "2022-04-19T08:09:21.448016Z",
+        "url": "https://files.pythonhosted.org/packages/6f/f2/223ac23377dbe34281289bcc2e98a1010ebebcd46993285be17675ca136c/streampq-0.0.32-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0d7b07283ce52100701aec06989d725c7d7ed1bdd958ed3a54ee49a3cae4a44",
+          "md5": "6ebf7237e7403f1da032908f1d0293c3",
+          "sha256": "e2b7666590dec06e287b13fa23abd3ac475a1efbba090e8a767e5c19a62d5f87"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.32.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6ebf7237e7403f1da032908f1d0293c3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 9083,
+        "upload_time": "2022-04-19T08:09:23",
+        "upload_time_iso_8601": "2022-04-19T08:09:23.507416Z",
+        "url": "https://files.pythonhosted.org/packages/f0/d7/b07283ce52100701aec06989d725c7d7ed1bdd958ed3a54ee49a3cae4a44/streampq-0.0.32.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.33": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "651488981063d35f8511b2e047df50d3e92f71883bcfa546377f9937e00c4fe0",
+          "md5": "35c2e5f5be9a1e8597403c846e5c38e6",
+          "sha256": "4f209b3265a946379cdf96f894472f2dc0fa4e7f119284d40a00df5bde44e239"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.33-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "35c2e5f5be9a1e8597403c846e5c38e6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9613,
+        "upload_time": "2022-04-28T07:41:44",
+        "upload_time_iso_8601": "2022-04-28T07:41:44.430009Z",
+        "url": "https://files.pythonhosted.org/packages/65/14/88981063d35f8511b2e047df50d3e92f71883bcfa546377f9937e00c4fe0/streampq-0.0.33-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "635b5c97fa1f0f4ad788e21cc6b363dc248a6d70a7342dab4d9e4e5f1dbba63a",
+          "md5": "e127af64eb190125a556a0bfca609b7f",
+          "sha256": "897664c92dac4737fe077c32b265146e8f06290371547478564e5b2d71dd1be5"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.33.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e127af64eb190125a556a0bfca609b7f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 9380,
+        "upload_time": "2022-04-28T07:41:47",
+        "upload_time_iso_8601": "2022-04-28T07:41:47.330296Z",
+        "url": "https://files.pythonhosted.org/packages/63/5b/5c97fa1f0f4ad788e21cc6b363dc248a6d70a7342dab4d9e4e5f1dbba63a/streampq-0.0.33.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.34": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb586f9de94ff04cbb51c93646f532a4d98f58b03a70206fa52de5c2b8974460",
+          "md5": "d1eada29514e9f000e63857faa96a95e",
+          "sha256": "65e8e436a244f6c08869220a519aa7d2f71a74873e29a610b72dc0cf262c33cd"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.34-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d1eada29514e9f000e63857faa96a95e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9618,
+        "upload_time": "2022-04-28T08:05:04",
+        "upload_time_iso_8601": "2022-04-28T08:05:04.781357Z",
+        "url": "https://files.pythonhosted.org/packages/cb/58/6f9de94ff04cbb51c93646f532a4d98f58b03a70206fa52de5c2b8974460/streampq-0.0.34-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a8906778485aa2b93de5fea71863f71b149b91304f7efe866bbf2c7d60b76f4",
+          "md5": "3224db5ced2cd2ef7b7450bce21fc49a",
+          "sha256": "68d2ca2e46713eb3014ebe942762cd60b51dffaee8ec64df2f1b2a3272762b14"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.34.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3224db5ced2cd2ef7b7450bce21fc49a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 9393,
+        "upload_time": "2022-04-28T08:05:13",
+        "upload_time_iso_8601": "2022-04-28T08:05:13.284362Z",
+        "url": "https://files.pythonhosted.org/packages/2a/89/06778485aa2b93de5fea71863f71b149b91304f7efe866bbf2c7d60b76f4/streampq-0.0.34.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.35": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ccb5f56a273aa9a2ed216060b4ec294688bd5601f8fec127737c57eb17227e98",
+          "md5": "f42488722c7e4d22bfcfc7140f70ca53",
+          "sha256": "cbc8f83121d9ae9947a5c7524a2d45dd97b523dd3246438bd84a99320e2b3e3b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.35-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f42488722c7e4d22bfcfc7140f70ca53",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 9832,
+        "upload_time": "2022-04-28T19:16:19",
+        "upload_time_iso_8601": "2022-04-28T19:16:19.128886Z",
+        "url": "https://files.pythonhosted.org/packages/cc/b5/f56a273aa9a2ed216060b4ec294688bd5601f8fec127737c57eb17227e98/streampq-0.0.35-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b26d2ff0d0af29ba73fc53b448ef8955c2d8caa84b72317d961ef0a416127c3",
+          "md5": "310fc535b76b64e9d7a198f0d9c6fc18",
+          "sha256": "c28dac0b3455d316918558a2be74f178e0012a3e0000500cd9c95ecd8d6f9211"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.35.tar.gz",
+        "has_sig": false,
+        "md5_digest": "310fc535b76b64e9d7a198f0d9c6fc18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 9607,
+        "upload_time": "2022-04-28T19:16:21",
+        "upload_time_iso_8601": "2022-04-28T19:16:21.880367Z",
+        "url": "https://files.pythonhosted.org/packages/7b/26/d2ff0d0af29ba73fc53b448ef8955c2d8caa84b72317d961ef0a416127c3/streampq-0.0.35.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.36": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62c7e756e390dc5d330f08e40fd3e52ea08adeb5904f01b5e4bed288cd3ff45c",
+          "md5": "c69f00c9fe7d7b3d91d364b565e04b66",
+          "sha256": "e01a36c409831298197d538f407ef993d1fb4c6447be26752ccd898cd0437f47"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.36-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c69f00c9fe7d7b3d91d364b565e04b66",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10233,
+        "upload_time": "2022-05-01T07:51:07",
+        "upload_time_iso_8601": "2022-05-01T07:51:07.971385Z",
+        "url": "https://files.pythonhosted.org/packages/62/c7/e756e390dc5d330f08e40fd3e52ea08adeb5904f01b5e4bed288cd3ff45c/streampq-0.0.36-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ae7b057aec46a69e9030a2309ac96141afe93849800f41ed6b11e7bed1fa6445",
+          "md5": "e2f87bf9a14cd806a30995ae98d47c62",
+          "sha256": "635239971d14877d35a6d22536a3fd1570fb78e8889893ed8de56d5e0220a2f5"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.36.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e2f87bf9a14cd806a30995ae98d47c62",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10003,
+        "upload_time": "2022-05-01T07:51:09",
+        "upload_time_iso_8601": "2022-05-01T07:51:09.859369Z",
+        "url": "https://files.pythonhosted.org/packages/ae/7b/057aec46a69e9030a2309ac96141afe93849800f41ed6b11e7bed1fa6445/streampq-0.0.36.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.37": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16d46d0af42e826a9a7389147f37e8af1d78eb9d9154e6ad7dbdecfffeedc0b7",
+          "md5": "d272c5629a18f7262f5dd16d3ef43cc8",
+          "sha256": "0bc6e14f69d6dec52e82592cf9831fa4fb1d63260ea2998863a080fcb9164ec7"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.37-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d272c5629a18f7262f5dd16d3ef43cc8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10234,
+        "upload_time": "2022-05-01T11:11:53",
+        "upload_time_iso_8601": "2022-05-01T11:11:53.358604Z",
+        "url": "https://files.pythonhosted.org/packages/16/d4/6d0af42e826a9a7389147f37e8af1d78eb9d9154e6ad7dbdecfffeedc0b7/streampq-0.0.37-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3ba9067715ec7ee1511304e5e97efc401c84329aa4be68d5f40a9ad6930f082",
+          "md5": "f93bd9c9bc811a62a212d55cb4c1ead6",
+          "sha256": "97c712628820f79289631be6df48fcb10aeb11aee90324023aff086127ac8f34"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.37.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f93bd9c9bc811a62a212d55cb4c1ead6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10014,
+        "upload_time": "2022-05-01T11:11:55",
+        "upload_time_iso_8601": "2022-05-01T11:11:55.109423Z",
+        "url": "https://files.pythonhosted.org/packages/a3/ba/9067715ec7ee1511304e5e97efc401c84329aa4be68d5f40a9ad6930f082/streampq-0.0.37.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.38": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4004663f20b500b60655f65902f924138f770fd047fdbe6869385c3729cf109f",
+          "md5": "9ca55313b5abcae5f0a5fa424daacdc9",
+          "sha256": "c801cf4a9382518a020eb74bb056f24c06cc1be3587ec8e40ac36ca205dc3c39"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.38-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9ca55313b5abcae5f0a5fa424daacdc9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10523,
+        "upload_time": "2022-05-07T10:07:13",
+        "upload_time_iso_8601": "2022-05-07T10:07:13.265542Z",
+        "url": "https://files.pythonhosted.org/packages/40/04/663f20b500b60655f65902f924138f770fd047fdbe6869385c3729cf109f/streampq-0.0.38-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "941f1f1bbe1fcd876c3e7a422c2b7c67b6ce323ae47d9d53ed045703349499fd",
+          "md5": "62cd24e3c1f7b4e1c728183f1b3d1bfa",
+          "sha256": "e2b14dd5fe2dcf51b831502246958fbd47fc987ed22a53adfb0d503f4cd38477"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.38.tar.gz",
+        "has_sig": false,
+        "md5_digest": "62cd24e3c1f7b4e1c728183f1b3d1bfa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10286,
+        "upload_time": "2022-05-07T10:07:15",
+        "upload_time_iso_8601": "2022-05-07T10:07:15.430182Z",
+        "url": "https://files.pythonhosted.org/packages/94/1f/1f1bbe1fcd876c3e7a422c2b7c67b6ce323ae47d9d53ed045703349499fd/streampq-0.0.38.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.39": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d57b148b6802dbb5328c0b351001d65e4e28a4e0b5378dacc1037738dbed3cea",
+          "md5": "d23f0cc69979fb0749c54c44aafdd0eb",
+          "sha256": "79ec8efce86ef0bbcf94960c4a8d200e3bde12ec987525c08b4d65cf49d58b71"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.39-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d23f0cc69979fb0749c54c44aafdd0eb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10543,
+        "upload_time": "2022-05-21T08:43:51",
+        "upload_time_iso_8601": "2022-05-21T08:43:51.923796Z",
+        "url": "https://files.pythonhosted.org/packages/d5/7b/148b6802dbb5328c0b351001d65e4e28a4e0b5378dacc1037738dbed3cea/streampq-0.0.39-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "43b1cf1f8e91b5963be534c9b95baff74a253f4d1a95120f93eda8ac33963d61",
+          "md5": "7b5e3a9489a4311ff19277783ec30f03",
+          "sha256": "5eab6ba6d8abdfd626fbdb947bd7a292ff8b7ee71a5e62ee423e19e52c599fa1"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.39.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7b5e3a9489a4311ff19277783ec30f03",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10302,
+        "upload_time": "2022-05-21T08:43:54",
+        "upload_time_iso_8601": "2022-05-21T08:43:54.266850Z",
+        "url": "https://files.pythonhosted.org/packages/43/b1/cf1f8e91b5963be534c9b95baff74a253f4d1a95120f93eda8ac33963d61/streampq-0.0.39.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4be8f8fe9de45c7c370e72718b88121550107d96c41af993dbe25780da05fac7",
+          "md5": "adb7f84fbc86eafc1d51c328ecaba0c9",
+          "sha256": "66c83e5506ab75403e09f321a5b2fb2d4ddb6c974ee063a7079cab29a3d8564b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "adb7f84fbc86eafc1d51c328ecaba0c9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 5360,
+        "upload_time": "2022-04-09T06:00:17",
+        "upload_time_iso_8601": "2022-04-09T06:00:17.288140Z",
+        "url": "https://files.pythonhosted.org/packages/4b/e8/f8fe9de45c7c370e72718b88121550107d96c41af993dbe25780da05fac7/streampq-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eaec4f8240892c9391d9a97ffa6d9f89812b58c51f62478bf17bb000e6341ba5",
+          "md5": "f286da54265eef0b9ba9017aebbfac5e",
+          "sha256": "6ad6b5ab33a09f5d1fb00aa43aac7e924d004f8666b4279d45878b4ab4dfbf5c"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f286da54265eef0b9ba9017aebbfac5e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 4998,
+        "upload_time": "2022-04-09T06:00:19",
+        "upload_time_iso_8601": "2022-04-09T06:00:19.529453Z",
+        "url": "https://files.pythonhosted.org/packages/ea/ec/4f8240892c9391d9a97ffa6d9f89812b58c51f62478bf17bb000e6341ba5/streampq-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.40": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc5866a17111563348bd1ce03acf13439a2951b2e2053dccc97c09e9814e4438",
+          "md5": "94f2e5fc3fa51ac750aab1fa43b14aef",
+          "sha256": "c3663448b4a9a7121e542b6491bed09475e59984108405d9ce65a659420cdf23"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.40-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "94f2e5fc3fa51ac750aab1fa43b14aef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10544,
+        "upload_time": "2022-05-21T08:45:46",
+        "upload_time_iso_8601": "2022-05-21T08:45:46.201786Z",
+        "url": "https://files.pythonhosted.org/packages/fc/58/66a17111563348bd1ce03acf13439a2951b2e2053dccc97c09e9814e4438/streampq-0.0.40-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "13b585673721de50b7e6acdd0c4580bb9a41a10ac12f950f28b022f54176f7c7",
+          "md5": "ca3cdc31f0be0b69c0b6a46a8099bb89",
+          "sha256": "9e723381a467d8b6effbfa28cb7b9d543af54710c7f62dcd62f71f4ebc14f6d1"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.40.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ca3cdc31f0be0b69c0b6a46a8099bb89",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10286,
+        "upload_time": "2022-05-21T08:45:49",
+        "upload_time_iso_8601": "2022-05-21T08:45:49.987852Z",
+        "url": "https://files.pythonhosted.org/packages/13/b5/85673721de50b7e6acdd0c4580bb9a41a10ac12f950f28b022f54176f7c7/streampq-0.0.40.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.41": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3074dc35100cb0c41593ff21f625f36760cc19e706c86395ea0f3578fa976ff",
+          "md5": "702da60e0d62d7d552b8cc12d0215d14",
+          "sha256": "44b46a3c087c6acb5e6219cd673689a5423eeb49795edc8dbfd0a3d39eafb4df"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.41-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "702da60e0d62d7d552b8cc12d0215d14",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10727,
+        "upload_time": "2022-09-16T13:05:51",
+        "upload_time_iso_8601": "2022-09-16T13:05:51.654790Z",
+        "url": "https://files.pythonhosted.org/packages/c3/07/4dc35100cb0c41593ff21f625f36760cc19e706c86395ea0f3578fa976ff/streampq-0.0.41-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "627206809941d643d3070421cf3c7111ef700adff843f8b7da0d8f91de8d6d7e",
+          "md5": "09fe57f7f926e3e48f773b3466a93235",
+          "sha256": "41b53fd035e5db0703c0bf60b284570f239fd4fcc0f2ebd9109bc9f0e6bc7053"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.41.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09fe57f7f926e3e48f773b3466a93235",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10561,
+        "upload_time": "2022-09-16T13:05:53",
+        "upload_time_iso_8601": "2022-09-16T13:05:53.948126Z",
+        "url": "https://files.pythonhosted.org/packages/62/72/06809941d643d3070421cf3c7111ef700adff843f8b7da0d8f91de8d6d7e/streampq-0.0.41.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.42": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb8f75c841d94af9ba49b72fe4500e3dfcd2f1368577548a930237f888338a30",
+          "md5": "8ebf8931bd35d155141d44f0f669d821",
+          "sha256": "21e28871627e16d050fbda28ea92cf5f756dff94f1dc38796ccf835237865468"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.42-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ebf8931bd35d155141d44f0f669d821",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 10964,
+        "upload_time": "2022-09-17T09:19:35",
+        "upload_time_iso_8601": "2022-09-17T09:19:35.695213Z",
+        "url": "https://files.pythonhosted.org/packages/fb/8f/75c841d94af9ba49b72fe4500e3dfcd2f1368577548a930237f888338a30/streampq-0.0.42-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c34df5ecff2ca32504656ee1f335903db632ad74ff9489bf90408bfdb02b2912",
+          "md5": "b77fd5b5b8f1bae3aa02d7f9916b9c7c",
+          "sha256": "339365e5abf625e60814c72e3d60298dba48f4474a48dcab60917c50ca24dbdb"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.42.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b77fd5b5b8f1bae3aa02d7f9916b9c7c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 10804,
+        "upload_time": "2022-09-17T09:19:37",
+        "upload_time_iso_8601": "2022-09-17T09:19:37.987802Z",
+        "url": "https://files.pythonhosted.org/packages/c3/4d/f5ecff2ca32504656ee1f335903db632ad74ff9489bf90408bfdb02b2912/streampq-0.0.42.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.43": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32b75441842ab8f4cdd9e06ed307fd3f9857b1b327fbe4d5d7865a17d99ded7a",
+          "md5": "781508b8140e13da28c00ffa795c0b7c",
+          "sha256": "aa73ebc6f5cadd258c2bc0f91e2d2577b6fce34bc643e015199b3597b1b1f21b"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.43-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "781508b8140e13da28c00ffa795c0b7c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11470,
+        "upload_time": "2022-09-17T17:00:47",
+        "upload_time_iso_8601": "2022-09-17T17:00:47.108237Z",
+        "url": "https://files.pythonhosted.org/packages/32/b7/5441842ab8f4cdd9e06ed307fd3f9857b1b327fbe4d5d7865a17d99ded7a/streampq-0.0.43-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48d7fe96c4995c02cc8924889c51df862d46b85fe666bb063765ea5d0f89601a",
+          "md5": "b8054e544dddfe1a88d9b9a494344a0d",
+          "sha256": "59e22ec5d646357b5b9ddfacd0663a401685f37341405d3896b79504d718b6ab"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.43.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8054e544dddfe1a88d9b9a494344a0d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11301,
+        "upload_time": "2022-09-17T17:00:50",
+        "upload_time_iso_8601": "2022-09-17T17:00:50.042778Z",
+        "url": "https://files.pythonhosted.org/packages/48/d7/fe96c4995c02cc8924889c51df862d46b85fe666bb063765ea5d0f89601a/streampq-0.0.43.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.44": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bba9624cc8c0e6fc07de7915bfc0c4e97cf54d1041b7c64b5b8b8f1373fa00c",
+          "md5": "50c60f9bdd79e2e99ba53ad48480f0aa",
+          "sha256": "3d40b9cbe8bbd7bb8e07e35b321d9df97cda4a4a7354ffce2cc8cb6c37149f5a"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.44-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "50c60f9bdd79e2e99ba53ad48480f0aa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11520,
+        "upload_time": "2022-09-18T08:48:31",
+        "upload_time_iso_8601": "2022-09-18T08:48:31.196954Z",
+        "url": "https://files.pythonhosted.org/packages/5b/ba/9624cc8c0e6fc07de7915bfc0c4e97cf54d1041b7c64b5b8b8f1373fa00c/streampq-0.0.44-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "51b78e08625706f7390bdac738fa9932d56b7b9ee5557d1c1308c274580e70f9",
+          "md5": "c08cb64b1ba942a0eef1f3cc929b1b2e",
+          "sha256": "7c1a48bbdf16fea9b5f62dbef3436de51df616c21fe4a919e45ce9f08d6c1917"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.44.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c08cb64b1ba942a0eef1f3cc929b1b2e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11440,
+        "upload_time": "2022-09-18T08:48:33",
+        "upload_time_iso_8601": "2022-09-18T08:48:33.526937Z",
+        "url": "https://files.pythonhosted.org/packages/51/b7/8e08625706f7390bdac738fa9932d56b7b9ee5557d1c1308c274580e70f9/streampq-0.0.44.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.45": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aedf7f837ac782c10802507dead116f2286c43315d407812e430eba6c9f16204",
+          "md5": "2ba9b66193dd07d893e6df7e53f47780",
+          "sha256": "c8190c1452104f1cb8e99bcbbe053189a7576a392924d916121ab9a94d3ca471"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.45-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2ba9b66193dd07d893e6df7e53f47780",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11553,
+        "upload_time": "2022-09-18T21:22:34",
+        "upload_time_iso_8601": "2022-09-18T21:22:34.208170Z",
+        "url": "https://files.pythonhosted.org/packages/ae/df/7f837ac782c10802507dead116f2286c43315d407812e430eba6c9f16204/streampq-0.0.45-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b8adc1e8fc564c4fd8fc5a0ba2134d2a3a440748208c225ee66f2fa24d564b8",
+          "md5": "ee6a0fd61558a36e8cb11acb8c7384d2",
+          "sha256": "a379c3f54337abac12e796e25c9673c3ba73a735249388312c97d99e7166e779"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.45.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ee6a0fd61558a36e8cb11acb8c7384d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11495,
+        "upload_time": "2022-09-18T21:22:36",
+        "upload_time_iso_8601": "2022-09-18T21:22:36.531559Z",
+        "url": "https://files.pythonhosted.org/packages/1b/8a/dc1e8fc564c4fd8fc5a0ba2134d2a3a440748208c225ee66f2fa24d564b8/streampq-0.0.45.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.46": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e77b062ea3d8271161a37fdb2cef61374da6442393207a313d3197b3796663d3",
+          "md5": "88193c694e60d1c346bd6cac3544f7fa",
+          "sha256": "0a57a29ff3ff876bfa486a45846bf15c569bc52dfaf9b6596d4b4d0b5414d667"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.46-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "88193c694e60d1c346bd6cac3544f7fa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11554,
+        "upload_time": "2022-09-19T08:23:32",
+        "upload_time_iso_8601": "2022-09-19T08:23:32.090642Z",
+        "url": "https://files.pythonhosted.org/packages/e7/7b/062ea3d8271161a37fdb2cef61374da6442393207a313d3197b3796663d3/streampq-0.0.46-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "599519825e5984b25207e9f851d1a32f3e9bba0f0fa5dd627c0518138965d2b1",
+          "md5": "f7fc90be9dcb5e4bfc36ae6f1135801d",
+          "sha256": "ddc3b87f06ebba76af905dd5ce3b9ef452ae722fe3c126fa48782619852fc66c"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.46.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f7fc90be9dcb5e4bfc36ae6f1135801d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11504,
+        "upload_time": "2022-09-19T08:23:34",
+        "upload_time_iso_8601": "2022-09-19T08:23:34.364275Z",
+        "url": "https://files.pythonhosted.org/packages/59/95/19825e5984b25207e9f851d1a32f3e9bba0f0fa5dd627c0518138965d2b1/streampq-0.0.46.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.47": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9712e0dbd70db91355e0e67ea454a3aaecd8c37f5d46a0c610cece5c71e18ccf",
+          "md5": "76a14215f0c75f500e3772f9b47f0c7d",
+          "sha256": "abea80d20380a18aa9ad92a26f2b8f48bfe26cb25d01e9a07583d810374e9c70"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.47-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "76a14215f0c75f500e3772f9b47f0c7d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11669,
+        "upload_time": "2022-09-19T14:23:38",
+        "upload_time_iso_8601": "2022-09-19T14:23:38.805653Z",
+        "url": "https://files.pythonhosted.org/packages/97/12/e0dbd70db91355e0e67ea454a3aaecd8c37f5d46a0c610cece5c71e18ccf/streampq-0.0.47-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e560c08b1fb829a87f557d866f45677bac62e4a6fcecaf1ec07f616e72c9119",
+          "md5": "4895535a2382b58216fbdc5a96c809f4",
+          "sha256": "6ea86cbd3c5978a4dde2421b1dedc4ecab18a51412f1132f2ba55c991174259a"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.47.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4895535a2382b58216fbdc5a96c809f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11634,
+        "upload_time": "2022-09-19T14:23:41",
+        "upload_time_iso_8601": "2022-09-19T14:23:41.546367Z",
+        "url": "https://files.pythonhosted.org/packages/0e/56/0c08b1fb829a87f557d866f45677bac62e4a6fcecaf1ec07f616e72c9119/streampq-0.0.47.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.48": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6887a340c99e2603e8c6ff32782a71223aef0158719c081d3bc7caf96a38fc1",
+          "md5": "4fb9f621128d51ae6a01f36bceeeb104",
+          "sha256": "5dc1e0aa14505a59bd163c91eaffcff2ee308788af0cdc5830e06ce04ddc278e"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.48-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4fb9f621128d51ae6a01f36bceeeb104",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.0",
+        "size": 11705,
+        "upload_time": "2022-09-19T14:45:58",
+        "upload_time_iso_8601": "2022-09-19T14:45:58.710907Z",
+        "url": "https://files.pythonhosted.org/packages/d6/88/7a340c99e2603e8c6ff32782a71223aef0158719c081d3bc7caf96a38fc1/streampq-0.0.48-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0fa62fe0fc9d756a162f40ab2f6aca8c952148759f6ae6e5ce8060168575d599",
+          "md5": "b473a9fc19530e04b6ec398cc1eb86cb",
+          "sha256": "3bafe96fb0862d5dd321855c44e8a7dd3ff48d4de9c57b8e319a02f10574db06"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.48.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b473a9fc19530e04b6ec398cc1eb86cb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 11676,
+        "upload_time": "2022-09-19T14:46:01",
+        "upload_time_iso_8601": "2022-09-19T14:46:01.269479Z",
+        "url": "https://files.pythonhosted.org/packages/0f/a6/2fe0fc9d756a162f40ab2f6aca8c952148759f6ae6e5ce8060168575d599/streampq-0.0.48.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f0dd92c246afbb33b9225289912c198b4c82983c8498806040824fb149fb930",
+          "md5": "e6e1ad6b75a770f0f379191e7a0f68a8",
+          "sha256": "9c7acc15dccacaed22f249abafd56e27fc7b528895e120a34023b45b71c67050"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e6e1ad6b75a770f0f379191e7a0f68a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 5671,
+        "upload_time": "2022-04-09T06:39:05",
+        "upload_time_iso_8601": "2022-04-09T06:39:05.364204Z",
+        "url": "https://files.pythonhosted.org/packages/3f/0d/d92c246afbb33b9225289912c198b4c82983c8498806040824fb149fb930/streampq-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b311586f9918cc2ffffaa6dd85149c7fe5b30660afcf41883f83340d29eeeca",
+          "md5": "3016ba8f1ffb0c045ce49abc90f05e0e",
+          "sha256": "158b5da9b8b422a7e4f2b356d01dfd3bf2afbf340f51e388adeecb2a7f2abc85"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3016ba8f1ffb0c045ce49abc90f05e0e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 5366,
+        "upload_time": "2022-04-09T06:39:07",
+        "upload_time_iso_8601": "2022-04-09T06:39:07.188883Z",
+        "url": "https://files.pythonhosted.org/packages/5b/31/1586f9918cc2ffffaa6dd85149c7fe5b30660afcf41883f83340d29eeeca/streampq-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a17e92af1ab377f73a9e02d61c6076e07b36fb9dfbdd5bc7ae95600ef5f59abb",
+          "md5": "95293ff0bec70be7a85d2cf6ded782c7",
+          "sha256": "ef3c5868bfa8e482d79dee06da4cd984a192bbfce604770ba5d4fa7ac48ca152"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "95293ff0bec70be7a85d2cf6ded782c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6017,
+        "upload_time": "2022-04-09T12:14:47",
+        "upload_time_iso_8601": "2022-04-09T12:14:47.082844Z",
+        "url": "https://files.pythonhosted.org/packages/a1/7e/92af1ab377f73a9e02d61c6076e07b36fb9dfbdd5bc7ae95600ef5f59abb/streampq-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db48da306fcd8799046f054b38dcea409fe717900970229818955f19d974d097",
+          "md5": "a23ec71cf130399209ef5f280d453a72",
+          "sha256": "ff53e237c3a45ce71ceb5852ce26a80f036764b00cf0d256de52968b24f51311"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a23ec71cf130399209ef5f280d453a72",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 5704,
+        "upload_time": "2022-04-09T12:14:48",
+        "upload_time_iso_8601": "2022-04-09T12:14:48.638232Z",
+        "url": "https://files.pythonhosted.org/packages/db/48/da306fcd8799046f054b38dcea409fe717900970229818955f19d974d097/streampq-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ce91bb738285639674744e05488db327ce4f0520f203d8c59171b18b6281e4e",
+          "md5": "92dc033ab763539e9be024db57a660b6",
+          "sha256": "3b98aee498839f271911800ef4aacb003bea9e3bccae8e899ec48c9e0461f1b6"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "92dc033ab763539e9be024db57a660b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6270,
+        "upload_time": "2022-04-09T13:57:47",
+        "upload_time_iso_8601": "2022-04-09T13:57:47.629533Z",
+        "url": "https://files.pythonhosted.org/packages/5c/e9/1bb738285639674744e05488db327ce4f0520f203d8c59171b18b6281e4e/streampq-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "51699afc2ef39d391c017c74041a4d18e6721d5d3a33cf05c11cfd5496b59169",
+          "md5": "84645e513da431980abb67a6acd89b21",
+          "sha256": "5915263b1cb3ff93e445225c7e0f2e26eb58f15f5cb5b9e03bf3a550f4da8183"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "84645e513da431980abb67a6acd89b21",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 5942,
+        "upload_time": "2022-04-09T13:57:49",
+        "upload_time_iso_8601": "2022-04-09T13:57:49.404749Z",
+        "url": "https://files.pythonhosted.org/packages/51/69/9afc2ef39d391c017c74041a4d18e6721d5d3a33cf05c11cfd5496b59169/streampq-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa91635e488078cf727aa58ed3fe9e3bb2e12ab1a2ae57c2b8cdd077fd379024",
+          "md5": "bfc56043de0077c71ac7cbb1be25df97",
+          "sha256": "cb050fd72a13593d3dbbaa84985b28049decf92f2e5c55fffa7baa2f66edb80e"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bfc56043de0077c71ac7cbb1be25df97",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6323,
+        "upload_time": "2022-04-09T14:24:01",
+        "upload_time_iso_8601": "2022-04-09T14:24:01.807031Z",
+        "url": "https://files.pythonhosted.org/packages/aa/91/635e488078cf727aa58ed3fe9e3bb2e12ab1a2ae57c2b8cdd077fd379024/streampq-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a587714259dabe323312dba15d571fb7c4043470ca18e5a0e55b1e30d45a7365",
+          "md5": "dcd737a6e8cfb9e7f6f2524dd82ad15c",
+          "sha256": "b25e83a5af138c749a8023b4d310fdf11a6b16245d0df064a5a3ba8e60c03418"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dcd737a6e8cfb9e7f6f2524dd82ad15c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6009,
+        "upload_time": "2022-04-09T14:24:03",
+        "upload_time_iso_8601": "2022-04-09T14:24:03.547625Z",
+        "url": "https://files.pythonhosted.org/packages/a5/87/714259dabe323312dba15d571fb7c4043470ca18e5a0e55b1e30d45a7365/streampq-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09a0d8844a711784d6a2a2a2cf856f99dba84ad72dd1f89618e5988d9a3736fc",
+          "md5": "2e46662a099dd38bdbd4aadc541fe95b",
+          "sha256": "fcd10b74ba10d837f51fd64be579ea26b485191f027b02edec2a5c08182a4d7c"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e46662a099dd38bdbd4aadc541fe95b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7.0",
+        "size": 6324,
+        "upload_time": "2022-04-09T14:37:06",
+        "upload_time_iso_8601": "2022-04-09T14:37:06.095522Z",
+        "url": "https://files.pythonhosted.org/packages/09/a0/d8844a711784d6a2a2a2cf856f99dba84ad72dd1f89618e5988d9a3736fc/streampq-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97012a49ec854368c82bafa8752a07a4a45554b53eee212c6b7ed4d0d969a625",
+          "md5": "cc9ee4d610421b4144be48e0df118333",
+          "sha256": "a9e1ed1c6edd7da7fc02370d4fdb8f416f1b5fb046f730cd78131ec058bf8115"
+        },
+        "downloads": -1,
+        "filename": "streampq-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc9ee4d610421b4144be48e0df118333",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 6008,
+        "upload_time": "2022-04-09T14:37:07",
+        "upload_time_iso_8601": "2022-04-09T14:37:07.832013Z",
+        "url": "https://files.pythonhosted.org/packages/97/01/2a49ec854368c82bafa8752a07a4a45554b53eee212c6b7ed4d0d969a625/streampq-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d6887a340c99e2603e8c6ff32782a71223aef0158719c081d3bc7caf96a38fc1",
+        "md5": "4fb9f621128d51ae6a01f36bceeeb104",
+        "sha256": "5dc1e0aa14505a59bd163c91eaffcff2ee308788af0cdc5830e06ce04ddc278e"
+      },
+      "downloads": -1,
+      "filename": "streampq-0.0.48-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4fb9f621128d51ae6a01f36bceeeb104",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8.0",
+      "size": 11705,
+      "upload_time": "2022-09-19T14:45:58",
+      "upload_time_iso_8601": "2022-09-19T14:45:58.710907Z",
+      "url": "https://files.pythonhosted.org/packages/d6/88/7a340c99e2603e8c6ff32782a71223aef0158719c081d3bc7caf96a38fc1/streampq-0.0.48-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0fa62fe0fc9d756a162f40ab2f6aca8c952148759f6ae6e5ce8060168575d599",
+        "md5": "b473a9fc19530e04b6ec398cc1eb86cb",
+        "sha256": "3bafe96fb0862d5dd321855c44e8a7dd3ff48d4de9c57b8e319a02f10574db06"
+      },
+      "downloads": -1,
+      "filename": "streampq-0.0.48.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b473a9fc19530e04b6ec398cc1eb86cb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8.0",
+      "size": 11676,
+      "upload_time": "2022-09-19T14:46:01",
+      "upload_time_iso_8601": "2022-09-19T14:46:01.269479Z",
+      "url": "https://files.pythonhosted.org/packages/0f/a6/2fe0fc9d756a162f40ab2f6aca8c952148759f6ae6e5ce8060168575d599/streampq-0.0.48.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

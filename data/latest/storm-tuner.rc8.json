@@ -1,0 +1,441 @@
+{
+  "info": {
+    "author": "Ben Arnao",
+    "author_email": "arnaoben@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# StoRM (Stochastic Random Mutator)\nA robust hyperparameter tuner for high-dimensional, categorically and/or conditionally-parameterized, intractable optimization problems (Ex. Neural Network)\n\n# Motivations of this tuner\n\nNeural network hyper parameter optimization is an especially challenging task due to a few different reasons:\n\nParameters can be highly codependent. Adjusting a single parameter may not be enough to get over a saddle point, you will likely have to adjust many parameters simultaneously to escape local minima. \n\nYou may have scenarios where adjusting a parameter can completely alter the performance of other parameters as well, making it very difficult to sample historically better values more often and run the risk of sampling values based on the modeling of a suboptimal parameter space. \n\nAttempting to model which parameters are more likely to be better will also require a lot of trials to overcome this level of variance/noise. Even then, as alluded to above, the best parameter value on average will not always be the best parameter value overall. \n\nThe search space can be highly non-convex, with many categorical, discrete-valued, conditional, and nested parameters. This sort of parameter space makes it very difficult to generate any sort of quantitative probability model.\n\nFor high-end performance where local minima is not good enough and we want the best possible performance, or for domains where there has not been extensive research and there is not a general understanding on what types of choices work better than others, we might want to tune many parameters at once and the dimensionality of the search space can get very large, such that Bayesian Optimization-related methods are not very effective.\n\nRecent research has discussed there is not a lot of reproducible evidence that show any of today's state of the art techniques significantly beat a plain old random search with some form of early stopping- https://arxiv.org/pdf/1902.07638.pdf\n\n# How does this tuner attempt to solve these issues?\n\nAll of the issues mentioned above make it very difficult if not impossible to do any sort of intelligently guided search for NN architecture/training hyperparameters. That is why this tuner opts against attempting to build some sort of surrogate function or gradient-based method to model the probability of the search space, and instead aims for something simpler and hopefully more robust to the problems we're facing. The user shouldn't expect a magic algorithm that takes the least amount of steps possible to reach global minima, but they should be able to expect something that beats brute force/random search for almost all use cases by a respectable margin, which is really what NN tuning needs at this stage.\n\nThe StoRM tuner can be thought of intuitively as a combination of a grid search combined with random search, where the \"distance\" between the current best configuration and the next evaluation candidate, is probability based. We randomly mutate the current best configuration along different axes (and sometimes even multiple times along the same axis). The number of mutations made for the next evaluation candidate, is based on a user-defined probability.\n\nThe default value for ```randomize_axis_factor``` is 0.5 which means that there is a 50% chance just one mutation will be made. There is a 25% chance two mutations will be made. A 12.5% chance that three mutations will be made, and so on.\n\nThis approach aims to address the issues stated above by allowing enough freedom so that we do respect the non-convexities of the search space and co-dependency of variables, while also probabilistically restricting how different the next evaluation candidate is from the current best, to provide some level of guidance and locality to the search.\n\n# Installation\n\n```pip install storm-tuner```\n\n# Usage\n\nHere we define our hyperparameter space by providing our own configuration building method.\n\nNOTE: The configuration building method is an important component of StoRM's functionality. Even though parameters can be accessed elsewhere, for example when the model is trained or during data preprocessing, all parameters must be defined in this method. This is because StoRM will execute this function in the background prior to the user defined execution of a trial. The reason for this is that StoRM will flag parameters that are actually drawn from and then create a hash of this particular configuration. This is a vital component as it ensures we never waste resources testing virtually identical configurations.\n\nAfter we define our HP space, it will usually make the most sense for our function to return an untrained model at this point. However, one may opt to return more than a model in some circumstances (for example an optimizer) or they may even opt to not return anything at all and build the model later. This is entirely up to the user.\n\nAll parameters take the form: ```hp.Param('parameter_name', [value1, value2...], ordered=False)```. Setting a parameter to ```ordered=True```, will ensure the tuner is only able to select adjacent values per a single mutation step. This is an important feature for parameters where there is ordinality.\n\n```python\ndef build_model(hp, *args):\n    model = Sequential()\n\n    # we can define train-time param in the build model function to be used later on in run_trial\n    hp.Param('batch_size', [32, 64, 128, 256], ordered=True)\n\n    # storm works easily with loops as well\n    for x in range(hp.Param('num_layers', [1, 2, 3, 4], ordered=True)):\n        model.add(Dense(hp.Param('kernel_size_' + str(x), [50, 100, 200], ordered=True)))\n\n    # here is a categorical parameter that most tuners do not do well with\n    activation_choices = ['tanh', 'softsign', 'selu', 'relu', 'elu', 'softplus']\n    model.add(Activation(hp.Param('activation', activation_choices)))\n\n    # example of nested parameter\n    if hp.Param('dropout', [True, False]):\n        model.add(Dropout(hp.Param('dropout_val', [0.1, 0.2, 0.3, 0.4, 0.5], ordered=True)))\n\n    model.add(Dense(1))\n\n    model.compile(loss='mse', optimizer=SGD(momentum=0.9))\n    return model\n```\n\nWe are required to override the ```run_trial()``` method for our own Tuner implementation, this encapsulates all the execution of a single trial. All the ```run_trial``` method needs to do is assign a score to the trial ```self.score_trial(trial, score)``` using a given parameter configuration ```trial.hyperparameters```. How the user generates a score for the configuration is entirely at their discretion.\n\nThe ```self.build_fn(hp)``` function called in ```run_trial``` is what will supply us with a blank model (as mentioned above).\n\nAs we can see, any arguments you provide in the ```search()``` entry method, can be accessed in your ```run_trial()``` method. This is also true for ```build_model``` as well, if any parameters need to be passed in at this scope.\n\n```python\nfrom storm_tuner import Tuner\n\nclass MyTuner(Tuner):\n\n    def run_trial(self, trial, *args):\n        # retrieve hyperparameters\n        hp = trial.hyperparameters\n\n        # retrieve any parameters supplied via main search method\n        X_train, y_train, X_test, y_test = args[0], args[1], args[2], args[3]\n\n        # create our model/configuration\n        model = self.build_fn(hp)\n\n        # train model\n        history = model.fit(X_train,\n                            y_train,\n                            epochs=25,\n                            validation_data=(X_test, y_test),\n\n                            # here we access a parameter at train time\n                            batch_size=hp.values['batch_size'])\n\n        # calculate score\n        score = history.history['val_loss'][-1]\n\n        # assign score to the trial\n        self.score_trial(trial, score)\n```\n\nWe initialize our Tuner and provide our training data\n\n```python\ntuner = MyTuner(objective_direction='min', build_fn=build_model)\ntuner.search(X_train, y_train, X_test, y_test)\n```\n\n# Customizing the tuner\n\nOne of the main goals of this library is to save the user from having to tune the tuner itself. An excess of tunable variables can confuse the user, make intuitive documentation more difficult, and even have a substantial negative effect on the tuner's performance if they are not set correctly.\n\nWith this tuner we have 2 main adjustable parameters to customize your search preferences...\n\n```python\n\n    def __init__(self,\n                 build_fn=build_model,\n                 objective_direction='min',\n                 init_random=10,\n                 max_trials=100,\n                 randomize_axis_factor=0.5)\n```\n\n```init_random```: How many initial iterations to perform random search for (3 -> 10+). This is helpful for getting the search to an average/decent configuration, so that we don't waste too much time descending from a suboptimal starting point.\n\n```randomize_axis_factor```: The main exploitative/explorative tradeoff parameter (0 -> 1). A value closer to 1 means that steps will generally have more mutations. A value closer to 0 will mean steps are more likely to only do a single mutation. A value of 0.5 seems reasonable in most cases and will almost always be good enough.\n\nFor both of these parameters, the higher degree of parameter codependency that is expected and/or the more parameters that you are optimizing, it may be beneficial to set these values higher... ex. 10 initial random iterations, and 0.66 or 0.75 randomize acis factor.\n\n# StoRM's design goals\n\nThe StoRM tuner is designed to be as simple as possible. The tuner supplies a parameter configuration and the user assigns this configuration a score. We leave it up to the user to implement any number of methodologies that might fit their goals and use cases. These can include:\n\n- Techniques to reduce variance (k-fold cross validation, trailing average of epoch loss, average of multiple trains)\n- Techniques where we might abandon training of the current model if there is a high enough certainty that this model will not beat the best score at the end of the training. *Because the tuner only cares if we beat the best score, not necessarily how much a trial lost, this means we can safely discard the configuration by just returning from our trial at this point. This will cause the trial's score to be defaulted to None so it is not tested again. Note: if we decide to run metrics on variables across all trials after tuning is complete, this may skew the results.*\n\nStorm should be designed to be as generic as possible AND there is actually nothing specific to neural networks or a particular NN library coded in this project. This type of freedom also allows the user to optimize parameters used at various stages of the experiment as well, ex. data pre-processing, model architecture, and training.\n\nBecause of the tuner's experiment-agnostic approach, StoRM can be even more advantageous when used with various branches of ML that utilize NNs for the model yet have another set of hyper parameters to optimize that can make the search space even trickier and harder for traditional approaches to handle. For example, reinforcement learning.\n\n# How to get the most out of StoRM\n\nOf course, most of the success of StoRM revolves around the user's ability to parameterize the search space appropriately. StoRM will only be as good as the parameter space it operates on. A few things to keep in mind when parameterizing your search space...\n\n- For a parameter with ordinal values that can also be turned completely of, such as dropout, one might consider adding an extra boolean parameter to unlock the dropout rate ordinal parameter. If optimization initializes to a suboptimal higher dropout value and dropout is not good for this particular problem, it will probably take more iterations to traverse the dropout value space than it would to turn dropout off for a configuration to escape this minimum.\n- For ordinal parameters where it is not an option to use an additional \"gateway\" parameter, it is suggested to keep the amount of values under 10 and ideally around 5 for reasons explained above.\n- For parameters that are coupled with one another (for example learning rate and weight decay). One might decide to parameterize weight decay as a factor of LR, instead of optimizing both separately. This way, we only search for the best step size to weight decay ratio, instead of forcing the model to try and find LR and WD values that meet at the right scale.\n- Most NN hyper parameters are not very sensitive and it is far more important to find a good general area/scale for a parameter than it is for example to know that a learning rate of 1e-3 performs slightly better than 2e-3. We want to ensure there is a good distribution of values such that we capture the various points a parameter is commonly experimented with, yet do not have an overabundance of ordinal values so that our tuner has to stochastically traverse this space if initialized to a poor value. StoRM leaves it up to the user to provide the appropriate binning/sampling of values (log, exp, linear, etc.) which is very parameter-dependent.\n\nIn most cases the selection of values should be fairly intuitive...\n\nbatch size: [32, 64, 128, 256]\n\nmomentum: [0.8, 0.9, 0.98]\n\nkernel size: [50, 100, 200, 400]\n\nlr: [1e-2, 1e-3, 1e-4]\n\nAt the end of the day there is then nothing stopping the user from re-parameterizing their search space after narrowing in on promising areas from running storm tuner at a broader scope.\n\n# StoRM is library-agnostic.\n\nAlthough the examples here use Tensorflow/Keras, StoRM works with any library or algorithm (sklearn, pytorch, etc.). One simply defines any parameters we are optimizing in  ```build_fn```. The user can decide to return a model right here and utilize StoRM's inline parameterization, or they can opt to use parameters in ```run_trial```.\n\n# What types of problems can StoRM be used for?\n\nStoRM should be used for optimization problems where the parameter space can be high dimensional and has many categorical/conditional variables. StoRM should also be used when parameters do not need to be optimized at very fine levels, but rather we need to find good general choices. In short, StoRM will be most effective when there are many codependent decisions to be made.\n\nStoRM will probably not be the best tuner to use if you are optimizing many real valued parameters that always have an affect on the target function, with low codependencies, and which can be sensitive to small changes such that we should offer the real valued spectrum of values, and not just a few bins to chose from. For these types of problems, Bayesian Optimization will still be more effective.\n\n# Other notes/features\n\nA StoRM ```Trial``` like the one used in the run trial method above, has a ```metrics dictionary``` to easily allows us to store any pertinent information to this trial for review later on.\n\n# Performance\n\nRun ```compare_to_random_search.py``` from ```examples``` directory to compare performance to random search for yourself.\n\nHere we can see that over ten trials each, StoRM has a clear advantage.\n\n```tuned scores mean: 0.0013418583347811364 | stdev: 0.001806810901973602```\n\n```random scores mean: 0.010490878883283586 | stdev: 0.006145158964894091```\n\n\nRun ```compare_to_optuna.py``` from ```examples``` directory to compare performance to a state of the art optimizer like Optuna.\n\nHere we can see that with 100 tuning iterations and 25 trials per each tuner, StoRM has a slight edge and is definitely competitive.\n\n```storm scores mean: 0.6252435888846715 std: 0.012562026804848855```\n\n```optuna scores mean: 0.6011923088630041 std: 0.011612774221843973```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ben-arnao/StoRM",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "storm-tuner",
+    "package_url": "https://pypi.org/project/storm-tuner/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/storm-tuner/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/ben-arnao/StoRM/issues",
+      "Homepage": "https://github.com/ben-arnao/StoRM"
+    },
+    "release_url": "https://pypi.org/project/storm-tuner/0.0.9/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "neural network hyperparameter tuner",
+    "version": "0.0.9",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10900666,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24953f6404cb86a584767b327229470b0310d2e73e68fb4137ed921905289e39",
+          "md5": "fd761a49c67cba51e2b7ac951f26ee90",
+          "sha256": "499d84dce286a75a006c141bdc49a06316aa51f6f7d9965dee32e7455d6893cf"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd761a49c67cba51e2b7ac951f26ee90",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12881,
+        "upload_time": "2021-04-16T20:25:17",
+        "upload_time_iso_8601": "2021-04-16T20:25:17.288951Z",
+        "url": "https://files.pythonhosted.org/packages/24/95/3f6404cb86a584767b327229470b0310d2e73e68fb4137ed921905289e39/storm_tuner-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "691bb78f4de1d214c2061b22eae1833eac67be8db50625829969f60ad0d30e89",
+          "md5": "22e95cf7323332044e2a277de2ca4433",
+          "sha256": "fb5113e087bd0154b41430329770aae5cae748a3f205cf369c34d9dc2e1c67c7"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22e95cf7323332044e2a277de2ca4433",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16724,
+        "upload_time": "2021-04-16T20:25:18",
+        "upload_time_iso_8601": "2021-04-16T20:25:18.484985Z",
+        "url": "https://files.pythonhosted.org/packages/69/1b/b78f4de1d214c2061b22eae1833eac67be8db50625829969f60ad0d30e89/storm-tuner-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7fb61c07aa6ad2697bfdaec359945bd51143552f94a6d2ed2dfa2f7b388b9491",
+          "md5": "f11c8cdf536bf9137dd4a635167cb884",
+          "sha256": "f9ad04b34da7814d6aa24f8f1b3535eed69e71972f1f6b49e978bad6e44bcb9e"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f11c8cdf536bf9137dd4a635167cb884",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12879,
+        "upload_time": "2021-04-19T14:13:10",
+        "upload_time_iso_8601": "2021-04-19T14:13:10.848667Z",
+        "url": "https://files.pythonhosted.org/packages/7f/b6/1c07aa6ad2697bfdaec359945bd51143552f94a6d2ed2dfa2f7b388b9491/storm_tuner-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "916590166fc01276fad8cff9c640bfd2f9a7aeb37e27103ea367535cb5387397",
+          "md5": "1624c6b84baae0aae3aabbe266bc33ca",
+          "sha256": "35f5fa6d3071fee04fffe8cb9001b60ab11b8fcc0c7f220127af67e21506d60f"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1624c6b84baae0aae3aabbe266bc33ca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16707,
+        "upload_time": "2021-04-19T14:13:12",
+        "upload_time_iso_8601": "2021-04-19T14:13:12.846986Z",
+        "url": "https://files.pythonhosted.org/packages/91/65/90166fc01276fad8cff9c640bfd2f9a7aeb37e27103ea367535cb5387397/storm-tuner-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8c72bef2c1066e2c11fc7e89d7ebefd70f371d80d76af7fc33e703f634be1617",
+          "md5": "01d3e27e3979f2813ccc966a4f4eb979",
+          "sha256": "1eba9f13d422de208b030b5cc8fb797b77755f293572d65ff6e1a0b2baab8a61"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "01d3e27e3979f2813ccc966a4f4eb979",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12446,
+        "upload_time": "2021-04-19T16:37:03",
+        "upload_time_iso_8601": "2021-04-19T16:37:03.522189Z",
+        "url": "https://files.pythonhosted.org/packages/8c/72/bef2c1066e2c11fc7e89d7ebefd70f371d80d76af7fc33e703f634be1617/storm_tuner-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60f57dd19c2f152d4c32231b35052d7c10fd6567e3e8f64104127b7e92d6961d",
+          "md5": "5c4486f97374dd0355278b8e3ef589b5",
+          "sha256": "8d0738859710485f380052f0fb329f235e01e3f295178dd4b19f65a7150e00d7"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5c4486f97374dd0355278b8e3ef589b5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16401,
+        "upload_time": "2021-04-19T16:37:04",
+        "upload_time_iso_8601": "2021-04-19T16:37:04.853380Z",
+        "url": "https://files.pythonhosted.org/packages/60/f5/7dd19c2f152d4c32231b35052d7c10fd6567e3e8f64104127b7e92d6961d/storm-tuner-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "637325f144901a1782d4df99970bc598a6280cccd23c3280ba6e4fdd45554b36",
+          "md5": "7bae040e11283c5ff8feb432fd56e9a4",
+          "sha256": "fdcf66c9c1e5a5cbe934e38a99cb3c1de41ce1d00b9843e60dbaba6099503eaf"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7bae040e11283c5ff8feb432fd56e9a4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12818,
+        "upload_time": "2021-04-27T16:16:39",
+        "upload_time_iso_8601": "2021-04-27T16:16:39.266870Z",
+        "url": "https://files.pythonhosted.org/packages/63/73/25f144901a1782d4df99970bc598a6280cccd23c3280ba6e4fdd45554b36/storm_tuner-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0923988e017c9cf77189f0707416f8d87a57ed5ec91c0249f25d228517240154",
+          "md5": "96623aeef363551cf0bd55e915207040",
+          "sha256": "f168dbce53612894207a581f9c8e86581c40fc840cfe78feb1e153ec7c723222"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "96623aeef363551cf0bd55e915207040",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17187,
+        "upload_time": "2021-04-27T16:16:40",
+        "upload_time_iso_8601": "2021-04-27T16:16:40.460250Z",
+        "url": "https://files.pythonhosted.org/packages/09/23/988e017c9cf77189f0707416f8d87a57ed5ec91c0249f25d228517240154/storm-tuner-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b328f72430826a5ac8b15d6c36f8b265a81dc2f5135c10b2f884de44e9896639",
+          "md5": "4b8d9d547b491164c9c46f4e1db32436",
+          "sha256": "5ad0a59c8e12fd891ce6880f5204e40dc056a52820685b78115737ecccade3b8"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4b8d9d547b491164c9c46f4e1db32436",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12875,
+        "upload_time": "2021-04-28T14:59:34",
+        "upload_time_iso_8601": "2021-04-28T14:59:34.026035Z",
+        "url": "https://files.pythonhosted.org/packages/b3/28/f72430826a5ac8b15d6c36f8b265a81dc2f5135c10b2f884de44e9896639/storm_tuner-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "29cc7eb4c2979b5307734643fe491e3bbb76e5f0ee3c02f3647d68d5e7926220",
+          "md5": "a127ad794949d6007165c04125ba87a1",
+          "sha256": "8bdc6b8d9d5f0d46a53bc81a46b20273cc47cb3b045bb07edea037234e413883"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a127ad794949d6007165c04125ba87a1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17227,
+        "upload_time": "2021-04-28T14:59:35",
+        "upload_time_iso_8601": "2021-04-28T14:59:35.463199Z",
+        "url": "https://files.pythonhosted.org/packages/29/cc/7eb4c2979b5307734643fe491e3bbb76e5f0ee3c02f3647d68d5e7926220/storm-tuner-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "133a17c41775b444b09525ab5bd1e771462533a9d061e18002308dfbbfa26a9e",
+          "md5": "1f911a222ebec5e2c2a6aa2fb582f9e6",
+          "sha256": "0ac92dfaaae38c8ddf29aa467cb18d9024ddf5811cc7d92c8e1cf03fe4383744"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1f911a222ebec5e2c2a6aa2fb582f9e6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14963,
+        "upload_time": "2021-07-12T17:47:16",
+        "upload_time_iso_8601": "2021-07-12T17:47:16.149745Z",
+        "url": "https://files.pythonhosted.org/packages/13/3a/17c41775b444b09525ab5bd1e771462533a9d061e18002308dfbbfa26a9e/storm_tuner-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d96682f630bd1e10dff3248477c5391e710c92ca989e9e5d83a85f30c93ab8fb",
+          "md5": "901fcb2623a3319aa64ddf4bc8f9a8d2",
+          "sha256": "aeb8f656f2b9cd5e48fa581a39b9933e2122eb02f11117f73facd8b47949b3de"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "901fcb2623a3319aa64ddf4bc8f9a8d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17482,
+        "upload_time": "2021-07-12T17:47:17",
+        "upload_time_iso_8601": "2021-07-12T17:47:17.765966Z",
+        "url": "https://files.pythonhosted.org/packages/d9/66/82f630bd1e10dff3248477c5391e710c92ca989e9e5d83a85f30c93ab8fb/storm-tuner-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "350ac0098b7ecd401c7403cdf5a84067b5aa61b2fd0a7b0adf67cf237f35c3d2",
+          "md5": "071049f2622651af2358d41445905714",
+          "sha256": "7f68012c70722a61ae50692a78c18ea3247344e809e7aa0aaa5e11d38442408c"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "071049f2622651af2358d41445905714",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14975,
+        "upload_time": "2021-07-12T22:43:35",
+        "upload_time_iso_8601": "2021-07-12T22:43:35.057992Z",
+        "url": "https://files.pythonhosted.org/packages/35/0a/c0098b7ecd401c7403cdf5a84067b5aa61b2fd0a7b0adf67cf237f35c3d2/storm_tuner-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d2aba74ac1dcd21465e75220d5ce72136e8bafe4f4eabb494171081da5647ad",
+          "md5": "14a8bfce0470e731b99e3883145f806d",
+          "sha256": "6c09e57047f032e70cfbb4cdecd2b010bf50de043ec6d0e5fa5ae8a1fcbca220"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14a8bfce0470e731b99e3883145f806d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17497,
+        "upload_time": "2021-07-12T22:43:36",
+        "upload_time_iso_8601": "2021-07-12T22:43:36.409733Z",
+        "url": "https://files.pythonhosted.org/packages/2d/2a/ba74ac1dcd21465e75220d5ce72136e8bafe4f4eabb494171081da5647ad/storm-tuner-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b576bfe13df121c2e138acc2b299aecf0de6cc5b5713af50fa539722740e1c4",
+          "md5": "2b36acc72a88643c52a88527677f4edf",
+          "sha256": "80de4b10f6ffb40c1c0b76c987da9a3573b6d8e06959be905c189f05b30a13c8"
+        },
+        "downloads": -1,
+        "filename": "storm_tuner-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2b36acc72a88643c52a88527677f4edf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 14974,
+        "upload_time": "2021-07-13T20:20:06",
+        "upload_time_iso_8601": "2021-07-13T20:20:06.146073Z",
+        "url": "https://files.pythonhosted.org/packages/3b/57/6bfe13df121c2e138acc2b299aecf0de6cc5b5713af50fa539722740e1c4/storm_tuner-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fefc648541eea1edc8551c9b443db48757d37eb084c79e8655dc9b414808a798",
+          "md5": "a9e034c36d1aee7bc291edb6ac642b8c",
+          "sha256": "ba4ab721594550dd4413ec25062eb4278367de79bd83f5870273d8e00baba82e"
+        },
+        "downloads": -1,
+        "filename": "storm-tuner-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a9e034c36d1aee7bc291edb6ac642b8c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17512,
+        "upload_time": "2021-07-13T20:20:08",
+        "upload_time_iso_8601": "2021-07-13T20:20:08.192353Z",
+        "url": "https://files.pythonhosted.org/packages/fe/fc/648541eea1edc8551c9b443db48757d37eb084c79e8655dc9b414808a798/storm-tuner-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3b576bfe13df121c2e138acc2b299aecf0de6cc5b5713af50fa539722740e1c4",
+        "md5": "2b36acc72a88643c52a88527677f4edf",
+        "sha256": "80de4b10f6ffb40c1c0b76c987da9a3573b6d8e06959be905c189f05b30a13c8"
+      },
+      "downloads": -1,
+      "filename": "storm_tuner-0.0.9-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "2b36acc72a88643c52a88527677f4edf",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 14974,
+      "upload_time": "2021-07-13T20:20:06",
+      "upload_time_iso_8601": "2021-07-13T20:20:06.146073Z",
+      "url": "https://files.pythonhosted.org/packages/3b/57/6bfe13df121c2e138acc2b299aecf0de6cc5b5713af50fa539722740e1c4/storm_tuner-0.0.9-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fefc648541eea1edc8551c9b443db48757d37eb084c79e8655dc9b414808a798",
+        "md5": "a9e034c36d1aee7bc291edb6ac642b8c",
+        "sha256": "ba4ab721594550dd4413ec25062eb4278367de79bd83f5870273d8e00baba82e"
+      },
+      "downloads": -1,
+      "filename": "storm-tuner-0.0.9.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a9e034c36d1aee7bc291edb6ac642b8c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 17512,
+      "upload_time": "2021-07-13T20:20:08",
+      "upload_time_iso_8601": "2021-07-13T20:20:08.192353Z",
+      "url": "https://files.pythonhosted.org/packages/fe/fc/648541eea1edc8551c9b443db48757d37eb084c79e8655dc9b414808a798/storm-tuner-0.0.9.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

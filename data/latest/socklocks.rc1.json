@@ -1,0 +1,134 @@
+{
+  "info": {
+    "author": "Justin Turner Arthur",
+    "author_email": "justinarthur@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Environment :: Web Environment",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# socklocks\nThis is a proof of concept of inter-process synchronization using sockets to\ncoordinate the pausing and resuming of code across multiple processes.\n\nIt's implemented in Python 3 using only the standard libraries. The code can\nserve as reference for a faster implementation such as one written in C or Rust.\n\nIt's written by Justin Turner Arthur and is licensed under the Apache License\n2.0.\n\n## Usage\nThe primary lock classes are `SocketLock` and `SocketLockThreadSafe`. Like most\nlocks in Python, instances can be used as context managers using the `with`\nstatement.\n\n```python\nfrom socklocks import SocketLock\n\n\nlock = SocketLock()\nwith lock:\n    print('This code will run once lock is acquired.')\n    print('It will release the lock afterwards')\n```\n\nThe locks are purpose built for use in multiprocessing. They can be initialized\nbefore a process is forked then acquired and released from the sub-processes.\n```python\nfile_lock = SocketLock()\ndef hard_maths(increment):\n    # Only one invocation should read/write from the file at a time\n    with file_lock:\n        with open('number.txt', 'r') as f:\n            number = int(f.read())\n        number = math.factorial(number) + increment\n        with open('number.txt', 'w') as f:\n            f.write(str(number))\n\nmultiprocessing.Pool().map(hard_maths, range(5))\n```\n\nThey don't require forking. Multiple scripts could be run\nindependently that initialize the same effective lock by supplying the same\nname.\n```python\n# script1.py\nwith SocketLock('critical_resource1'):\n    do_stuff_to_res1()\n```\n```python\n# script2.py\nwith SocketLock('critical_resource1'):\n    do_other_stuff_to_res1()\n```\n\nIf multiple threads within a process will need to acquire the same lock, use\nthe thread-safe `SocketLockThreadSafe`.\n\n### Using it to work around AWS Lambda's missing SHM bug\nAWS Lambda execution environments have an operating system that requires a SHM\nfilesystem mount (RAM disk), but such a filesystem is never mounted. This bug\ndoesn't usually show itself until you need to do something that would use this\nmount, like use POSIX semaphores for inter-process synchronization.\n\nCPython's multiprocessing and concurrent.futures modules use POSIX semaphores in\nthis way and when the OS tries to use SHM files to power POSIX sempahores it\nfails:\n```python-traceback\nTraceback (most recent call last):\n  File \"/var/task/lambda_function.py\", line 15, in process_things\n    with ProcessPoolExecutor() as executor:\n  File \"/var/lang/lib/python3.6/concurrent/futures/process.py\", line 390, in __init__\n    EXTRA_QUEUED_CALLS)\n  File \"/var/lang/lib/python3.6/multiprocessing/context.py\", line 102, in Queue\n    return Queue(maxsize, ctx=self.get_context())\n  File \"/var/lang/lib/python3.6/multiprocessing/queues.py\", line 42, in __init__\n    self._rlock = ctx.Lock()\n  File \"/var/lang/lib/python3.6/multiprocessing/context.py\", line 67, in Lock\n    return Lock(ctx=self.get_context())\n  File \"/var/lang/lib/python3.6/multiprocessing/synchronize.py\", line 163, in __init__\n    SemLock.__init__(self, SEMAPHORE, 1, 1, ctx=ctx)\n  File \"/var/lang/lib/python3.6/multiprocessing/synchronize.py\", line 60, in __init__\n    unlink_now)\nOSError: [Errno 38] Function not implemented\n```\n\nTo get around this, you'd theoretically replace lock factories in your\nmultiprocessing context with corresponding socklocks constructors:\n```python\nimport socklocks\n\n# Raw multiprocessing:\nwith socklocks.replace_mp_context_locks(mp):\n    mp.Pool.map(do_work, work_items)\n\n# concurrent.futures in Python 3.7+:\nwith socklocks.replace_mp_context_locks(mp):\n    with concurrent.futures.ProcessPoolExecutor(mp_context=mp) as executor:\n        executor.map(do_work, work_items)\n```\n…however, the multiprocessing queues and pools also use\n`multiprocessing.BoundedSemaphore`, which this library doesn't provide a\nreplacement for yet, so pools will not work—only basic locking will.\n\n### Tests\nIn a local clone of the repo in a Python 3 env with socklocks installed:\n\n        pip install pytest\n        pytest\n\n## How it works\nAny attempt to acquire a lock starts with trying to bind a listening socket\nto an address determined by the lock's name/id. If some other candidate has\nalready bound to that address, we assume they have the lock and connect to the\ncurrent acquirer's listening socket. If it's our turn to acquire the lock, the\ncurrent acquirer passes a socket handle of the listening socket to us. Once\nwe're done with the lock, we pass a handle of the listening socket to the next\nconnection waiting or close the listening socket if no one else is waiting.\n\nBased on what's available in the Python implementation and operating system, the\nfollowing address types are used, in order of highest to lowest performance:\n* Linux Abstract Socket Name\n* Unix Domain Socket Path\n* IPv4 address 127.0.0.1 on a determined IP port\n\nSocket handles or file descriptors are passed using\n[sendmsg](http://pubs.opengroup.org/onlinepubs/9699919799/functions/sendmsg.html)\nin POSIX-compliant systems that support the `SCM_RIGHTS` control message type.\nOtherwise, acquirers pass the listener their process ID and a handle is prepared\nfor the new acquirer using other means like\n[Winsock shared sockets](https://docs.microsoft.com/en-us/windows/desktop/winsock/shared-sockets-2).\n\n### Race Conditions that Result in Retried Operations\n* A lock-holder might see no incoming connections and start shutting down the\nlistening socket only to have a new requester connect before the listening\nsocket is closed.\n* An attempt to connect to a unix socket path might happen in between a\nlistening socket shutdown and the deletion of the file.\n* A new requester might try to connect to the current acquirer's listening\nsocket before the socket has been put in listening mode, resulting in\nconnection refusal.\n\nWhen Linux abstract sockets are used, many race conditions are mitigated\nbecause there is no file to clean up. \n\n### Known Issues\n* Currently only bytes or ASCII-compatible strings can be used as lock names.\n* Windows socket descriptor sharing is untested. Let me know how it goes.\n* When IP networking is the only infrastructure available, there is a higher\nchance of lock names colliding because the system's port range is used\nas a name space.\n* Only basic locks are implemented. Re-entrant locks and semaphores are not\n(yet?) part of this library.\n\n## Comparison to other lock Mechanisms\n### threading.Lock and _thread locks\nThe locks found in the Python standard library's `threading` and `_thread`\nmodules will generally perform better than the socket lock for synchronizing\ncode that only has multiple threads running from the same process. The point of\nusing sockets is to take advantage of the fact that they can be used for\ninter-process synchronization.\n\n### multiprocessing.Lock\n`SocketLockThreadSafe` can be used as a drop-in replacement for\n`multiprocessing.Lock`. This is useful if there are issues using the\n`multiprocessing.Lock` supplied by your Python platform. The non-threadsafe\n`SocketLock` will provide better performance where multi-threaded lock\nacquisition isn't going to happen. If unsure, go with the thread-safe option.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/JustinTArthur/socklocks",
+    "keywords": "query string,querystring,URL,parser",
+    "license": "Apache License 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "socklocks",
+    "package_url": "https://pypi.org/project/socklocks/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/socklocks/",
+    "project_urls": {
+      "Homepage": "https://github.com/JustinTArthur/socklocks"
+    },
+    "release_url": "https://pypi.org/project/socklocks/0.1.0/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Library of Python locks that use sockets to keep processes synchronized.",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 4758503,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f1c39a5aeaf0e31badb561e0753372f17163a3907b25c0db9da9604bd418dbda",
+          "md5": "3c9dd02f3d562730e274695965a14e4c",
+          "sha256": "b645b0f3713ae8d628ab339c1aa2982fae28efd7a5d5de4d52db7be931d2da6e"
+        },
+        "downloads": -1,
+        "filename": "socklocks-0.1.0-py3-none-any.whl",
+        "has_sig": true,
+        "md5_digest": "3c9dd02f3d562730e274695965a14e4c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11383,
+        "upload_time": "2019-01-30T07:47:47",
+        "upload_time_iso_8601": "2019-01-30T07:47:47.358606Z",
+        "url": "https://files.pythonhosted.org/packages/f1/c3/9a5aeaf0e31badb561e0753372f17163a3907b25c0db9da9604bd418dbda/socklocks-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "330721d808f751fe39fa1992457dd1aa3fec7947c5a666dde5e46815d311a197",
+          "md5": "e50932322093920be207edea8b8335ec",
+          "sha256": "d9c7ac83a7adb85247db37a34180456ae975844c756acac7f82adf6934651a1b"
+        },
+        "downloads": -1,
+        "filename": "socklocks-0.1.0.tar.gz",
+        "has_sig": true,
+        "md5_digest": "e50932322093920be207edea8b8335ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7441,
+        "upload_time": "2019-01-30T07:47:58",
+        "upload_time_iso_8601": "2019-01-30T07:47:58.995191Z",
+        "url": "https://files.pythonhosted.org/packages/33/07/21d808f751fe39fa1992457dd1aa3fec7947c5a666dde5e46815d311a197/socklocks-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f1c39a5aeaf0e31badb561e0753372f17163a3907b25c0db9da9604bd418dbda",
+        "md5": "3c9dd02f3d562730e274695965a14e4c",
+        "sha256": "b645b0f3713ae8d628ab339c1aa2982fae28efd7a5d5de4d52db7be931d2da6e"
+      },
+      "downloads": -1,
+      "filename": "socklocks-0.1.0-py3-none-any.whl",
+      "has_sig": true,
+      "md5_digest": "3c9dd02f3d562730e274695965a14e4c",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 11383,
+      "upload_time": "2019-01-30T07:47:47",
+      "upload_time_iso_8601": "2019-01-30T07:47:47.358606Z",
+      "url": "https://files.pythonhosted.org/packages/f1/c3/9a5aeaf0e31badb561e0753372f17163a3907b25c0db9da9604bd418dbda/socklocks-0.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "330721d808f751fe39fa1992457dd1aa3fec7947c5a666dde5e46815d311a197",
+        "md5": "e50932322093920be207edea8b8335ec",
+        "sha256": "d9c7ac83a7adb85247db37a34180456ae975844c756acac7f82adf6934651a1b"
+      },
+      "downloads": -1,
+      "filename": "socklocks-0.1.0.tar.gz",
+      "has_sig": true,
+      "md5_digest": "e50932322093920be207edea8b8335ec",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 7441,
+      "upload_time": "2019-01-30T07:47:58",
+      "upload_time_iso_8601": "2019-01-30T07:47:58.995191Z",
+      "url": "https://files.pythonhosted.org/packages/33/07/21d808f751fe39fa1992457dd1aa3fec7947c5a666dde5e46815d311a197/socklocks-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

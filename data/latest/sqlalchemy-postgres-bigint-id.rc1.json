@@ -1,0 +1,135 @@
+{
+  "info": {
+    "author": "Alvin Chow",
+    "author_email": "alvinchow86@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "# SQLAlchemy Postgres BigInt ID\n\nThis is a library for making it easy to generate 64-bit BIGINT ids for Postgres tables in SQLAlchemy and Alembic. Note that this documentation is targeted for  SQLAlchemy ORM users, but it should also work for general usage.\n\nInstall this library once, and never worry about running out of IDs or painful ID type migrations ever again in your application!\n\nThis is a convenience layer - you could do this yourself manually in the Postgres shell, but it is a lot more reliable to let a library automate it.\n\n## Features\n- Automatically takes care of generating the Postgres function, and sets up columns to use the function as the default value\n- Works with both SQLAlchemy table reset functions (for testing/development) and Alembic (migration files are inserted with the appropriate commands to do all the necessary changes)\n- Fully tested with 100% unit test coverage\n\n## Background\nInstagram published a blog post on how they generate 64-bit database primary keys a while back (https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c). It is based on the Twitter Snowflake scheme, but without requiing a central server, instead we can just use Postgres functions.\n\nHere are the advantages of this over normal incrementing 32-bit IDs\n- Much larger namespace (you will not run out for many many years)\n- Does not leak information about the size of your tables\n\nAdvantages compared to 128-bit UUID\n- Half the space of space compared to UUID. (Note that larger IDs also increase the sizes of indexes and foreign keys)\n- Easier to work with and copy-paste/etc, shorter URLS\n- Preserve order information (larger IDs are created after small ones)\n\nThis scheme also allows for future-proofing in case your application requires sharding later on, as some bits can be dedicated to the shard id.\n\n\n## How to Use\n```\npip install sqlalchemy-postgres-bigint-id\n```\n\n### 1. Set up custom epoch time\nYou will need to decide on some \"epoch\" time. Just choose some time that is earlier than any tables have been created in your system or your organization has been formed. I would choose something at the beginning of the year or something for simplicy. Then run `sqlalchemy_bigint_id.configure()` early in your application. You don't need to define it earlier than you need to, so you can maximize the number of usable years.\n\nThis epoch time should be set and defined once, and never changed again.\n\nAdd this code something in your application initial setup.\n```python\nBIG_INTEGER_ID_EPOCH_SECONDS = 1589674264    # this is 1/1/2020 <-- this is just a sample, choose your own time\n\nsqlalchemy_bigint_id.configure(epoch_seconds=BIG_INTEGER_ID_EPOCH_SECONDS)\n```\n\n### 2. Register postgres functions\nCall `sqlalchemy_bigint_id.register_postgres_functions()` with your `Base.metadata`. A good place to do this is whereever you are doing your initial SQLAlchemy database setup and engine/session creation.\n```python\nfrom sqlalchemy_bigint_id import register_next_bigint_id_function\n\nBase = declarative_base()\nregister_next_bigint_id_function(metadata=Base.metadata)\n```\n\nNote that this really only matters when you are doing something like `Base.metadata.create_all(engine)`, which you likely will only do for local dev and testing\n\n### 3. Set up Alembic\nIn your `alembic/env.py` file add these lines\n\nSomewhere at the top add this, we need this import just to make sure some code is registered\n```python\nfrom sqlalchemy_bigint_id import migration    # noqa make sure custom hooks are registered\n```\n\nEdit your `run_migrations_online()` function to something like this\n\n```\ndef run_migrations_online():\n    \"\"\"Run migrations in 'online' mode.\n\n    In this scenario we need to create an Engine\n    and associate a connection with the context.\n\n    \"\"\"\n    from sqlalchemy_bigint_id.migration import writer\n    engine = get_engine()\n\n    with engine.connect() as connection:\n        context.configure(\n            connection=connection,\n            target_metadata=target_metadata,\n            process_revision_directives=writer,\n        )\n\n        with context.begin_transaction():\n            context.run_migrations()\n```\n\nThat's it for the one-time setup!\n\nNow in your SQLAlchemy ORM definitions, just use the custom BigIntegerID type. It is identical to the `BigInteger` type, but doing this allows this library to detect cases where you want to register it with the Big ID postgres generation function.\n\n```\nfrom sqlalchemy_bigint_id import BigIntegerID\n\nclass Foo(Base):\n    __tablename__ = 'foo'\n    id = Column(BigIntegerID, primary_key=True)\n    ...\n```\n\n## How it Works\nThis section is optional reading, but worth looking at if you'd like to know what's going on underneath the hood. Ultimately it's not really that much, at the end of day it's purely a convenience layer.\n\nThe library first create a Postgres function, called `next_bigint_id()`. It's generated in this Python script. Note that one hardcoded value is the epoch time, which must be set to something.\n\nThe function itself takes one argument, which is the name of the sequence for your table. This is an improvement over the function in existing articles I've seen, in that we can reuse one Postgres function instead of writing a new one for every table.\n\n```\n create_next_bigint_id_function_text = f\"\"\"\n     CREATE OR REPLACE FUNCTION next_bigint_id(seq_name text, OUT result bigint) AS $$\n     DECLARE\n         our_epoch bigint := {epoch_milliseconds};\n         seq_id bigint;\n         now_millis bigint;\n         shard_id int := 0;\n     BEGIN\n         SELECT nextval(seq_name) %% 1024 INTO seq_id;\n\n         SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) INTO now_millis;\n         result := (now_millis - our_epoch) << 20;\n         result := result | (shard_id << 10);\n         result := result | (seq_id);\n     END;\n     $$ LANGUAGE PLPGSQL;\n \"\"\"\n```\n\nYour \"initial\" migration will have this at the top, which generates the \"next_bigint_id\" function via a custom Alembic hook\n```python\ndef upgrade():\n   op.create_next_bigint_id_function()\n   ...\n```\n\nFor any new tables, the library adds a custom `op.execute()` statement that alters the column to use the next_bigint_id() postgres function for thr default value.\n\n```python\ndef upgrade():\n   op.create_table('foo',\n     ...\n   )\n   op.execute(\"ALTER TABLE foo ALTER COLUMN id set default next_bigint_id('foo_id_seq')\")\n```\n\n## Future Improvements\n- Make the bit allocations customizable (right now I chose 10 bits for sequence, 10 bits for shard, and the rest for timestamp), which is similar to the Instagram scheme but with slight modification.\n- This library doesn't take into account sharding, right now it's intended more to bootstrap your tables with the possibility of future sharding. Will rethink this more later, but it's possible that by time you get to that point you may need to do things more manually.\n\n[![CircleCI](https://circleci.com/gh/alvinchow86/sqlalchemy-postgres-bigint-id.svg?style=svg)](https://circleci.com/gh/alvinchow86/sqlalchemy-postgres-bigint-id)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/alvinchow86/sqlalchemy-postgres-bigint-id",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "sqlalchemy-postgres-bigint-id",
+    "package_url": "https://pypi.org/project/sqlalchemy-postgres-bigint-id/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/sqlalchemy-postgres-bigint-id/",
+    "project_urls": {
+      "Homepage": "https://github.com/alvinchow86/sqlalchemy-postgres-bigint-id"
+    },
+    "release_url": "https://pypi.org/project/sqlalchemy-postgres-bigint-id/0.2.0/",
+    "requires_dist": [
+      "sqlalchemy (>=1.2)",
+      "python-dateutil (>=2.7)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "SQLAlchemy-Postgres-BigInt-ID",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8966446,
+  "releases": {
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "26f2b85c594208ce0ba47af9483268e481982d9301be1c389ff557a6698d656c",
+          "md5": "4ebb6d7e1a4d10dba40900337f40f9f3",
+          "sha256": "03aba33a8455550e793577afa493d1c277be0cbaab4e175e8448bcdb9d18971a"
+        },
+        "downloads": -1,
+        "filename": "sqlalchemy_postgres_bigint_id-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4ebb6d7e1a4d10dba40900337f40f9f3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 9206,
+        "upload_time": "2020-12-23T02:10:04",
+        "upload_time_iso_8601": "2020-12-23T02:10:04.434305Z",
+        "url": "https://files.pythonhosted.org/packages/26/f2/b85c594208ce0ba47af9483268e481982d9301be1c389ff557a6698d656c/sqlalchemy_postgres_bigint_id-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "335375fc4284fe096bf28f9b98ac32494694fa6fb1bce579197ed91c26cc8029",
+          "md5": "fe20d964bff92220ac2a1bc4da4ff447",
+          "sha256": "4f863829209cc86348dea14e883d5cd128612882031752d846d3d29e3822ef06"
+        },
+        "downloads": -1,
+        "filename": "sqlalchemy-postgres-bigint-id-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fe20d964bff92220ac2a1bc4da4ff447",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 10063,
+        "upload_time": "2020-12-23T02:10:06",
+        "upload_time_iso_8601": "2020-12-23T02:10:06.430900Z",
+        "url": "https://files.pythonhosted.org/packages/33/53/75fc4284fe096bf28f9b98ac32494694fa6fb1bce579197ed91c26cc8029/sqlalchemy-postgres-bigint-id-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "26f2b85c594208ce0ba47af9483268e481982d9301be1c389ff557a6698d656c",
+        "md5": "4ebb6d7e1a4d10dba40900337f40f9f3",
+        "sha256": "03aba33a8455550e793577afa493d1c277be0cbaab4e175e8448bcdb9d18971a"
+      },
+      "downloads": -1,
+      "filename": "sqlalchemy_postgres_bigint_id-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4ebb6d7e1a4d10dba40900337f40f9f3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 9206,
+      "upload_time": "2020-12-23T02:10:04",
+      "upload_time_iso_8601": "2020-12-23T02:10:04.434305Z",
+      "url": "https://files.pythonhosted.org/packages/26/f2/b85c594208ce0ba47af9483268e481982d9301be1c389ff557a6698d656c/sqlalchemy_postgres_bigint_id-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "335375fc4284fe096bf28f9b98ac32494694fa6fb1bce579197ed91c26cc8029",
+        "md5": "fe20d964bff92220ac2a1bc4da4ff447",
+        "sha256": "4f863829209cc86348dea14e883d5cd128612882031752d846d3d29e3822ef06"
+      },
+      "downloads": -1,
+      "filename": "sqlalchemy-postgres-bigint-id-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "fe20d964bff92220ac2a1bc4da4ff447",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 10063,
+      "upload_time": "2020-12-23T02:10:06",
+      "upload_time_iso_8601": "2020-12-23T02:10:06.430900Z",
+      "url": "https://files.pythonhosted.org/packages/33/53/75fc4284fe096bf28f9b98ac32494694fa6fb1bce579197ed91c26cc8029/sqlalchemy-postgres-bigint-id-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

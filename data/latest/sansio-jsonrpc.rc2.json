@@ -1,0 +1,180 @@
+{
+  "info": {
+    "author": "Mark E. Haase",
+    "author_email": "mehaase@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Internet"
+    ],
+    "description": "# JSON-RPC v2.0 Sans I/O\n\n[![PyPI](https://img.shields.io/pypi/v/sansio-jsonrpc.svg?style=flat-square)](https://pypi.org/project/sansio-jsonrpc/)\n![Python Versions](https://img.shields.io/pypi/pyversions/sansio-jsonrpc.svg?style=flat-square)\n![MIT License](https://img.shields.io/github/license/HyperionGray/sansio-jsonrpc.svg?style=flat-square)\n[![Build Status](https://img.shields.io/travis/com/HyperionGray/sansio-jsonrpc.svg?style=flat-square&branch=master)](https://travis-ci.com/HyperionGray/sansio-jsonrpc)\n[![codecov](https://codecov.io/gh/HyperionGray/sansio-jsonrpc/branch/master/graph/badge.svg)](https://codecov.io/gh/HyperionGray/sansio-jsonrpc)\n\nThis project provides [a Sans I/O](https://sans-io.readthedocs.io/) implementation of\n[JSON-RPC v 2.0](https://www.jsonrpc.org/specification). This means that the library\nhandles all of the encoding, decoding, framing, and logic required by the protocol\nspecification, but it does not implement any I/O (input or output). In order to use this\nlibrary, you need to either to use a downstream project that wraps I/O around this\nproject or else write your own I/O wrapper.\n\n## Client Example\n\nThis example illustrates what the library does and how it needs to be integrated into\nan I/O framework of your choosing.\n\n```python\nfrom sansio_jsonrpc import JsonRpcPeer, JsonRpcParseError, JsonRpcException\n\nclient = JsonRpcPeer()\nrequest_id, bytes_to_send = client.request(\n    method='open_vault_door',\n    args={'employee': 'Mark', 'pin': 1234},\n)\n```\n\nFirst, we instantiate the client. We call the `request` method to create a new JSON-RPC\nrequest and convert it into a `bytes` representation that is suitable for sending to the\nserver. The method also returns a `request_id`, which is a hashable value that can be\nused to correlate any future response back to the request that initiated it.\n\n```python\nconnection.send(bytes_to_send)\nreceived_bytes = connection.recv()\n```\n\nRemember, this is a Sans I/O library, so it does not do any networking itself. It is the\ncaller's responsibility to transfer data to and from the remote machine. This block\nshows a hypothetical I/O framework being used to send the pending request and receive\nthe response as `bytes`, but this can be implemented with any I/O framework of your\nchoosing.\n\n```python\ntry:\n    messages = client.parse(received_bytes)\nexcept JsonRpcParseError as pe:\n    print('Exception while parsing response', pe)\n```\n\nIn this block, we feed the data received from the remote machine into the client\nobject's `parse()` method. This method parses the incoming data and returns an iterable\ncontaining messages sent by the server. (In the current implementation, the iterable\nalways contains exactly 1 message, but the API is designed this way to allow for future\nenhancements such as a streaming JSON parser that can return 0-n messages after parsing\neach chunk of data.)\n\n```python\nfor response in messages:\n    assert isinstance(response, JsonRpcResponse)\n    print('received a response:', response.id)\n    if response.is_success:\n        print('success:', response.result)\n    else:\n        print('error:', response.error)\n        exc = JsonRpcException.exc_from_error(response.error)\n```\n\nFinally, we iterate over the messages. In the case of a client, these messages will\nalways be `JsonRpcReponse` objects, which contain either result or error information.\nThe `response.id` field should match the `request_id` obtained earlier.\n\nIf you want an error response to raise an exception, you can call\n`JsonRpcException.exc_from_error(...)` and it will construct an exception for you. The\nexception system is described in a separate section below. Of course, be careful where\nyou throw the exception, since throwing an exception while reading multiple responses\nwill result in the rest of the responses being ignored. In a concurrent system, you\nprobably want to raise the exception to the code path that called `request()`.\n\nIn a concurrent system, you will also want to multiplex requests and responses on the\nsame connection. This library does not implement multiplexing itself because\nmultiplexing with appropriate flow control (see \"Back Pressure\" below) is going to\ndepend on the transport and I/O framework you are using.\n\n## Server Example\n\nThis example shows how to receive a JSON-RPC request and dispatch a response.\n\n```python\nfrom sansio_jsonrpc import (\n    JsonRpcPeer,\n    JsonRpcException,\n    JsonRpcParseError,\n    JsonRpcMethodNotFoundError,\n)\n\nserver = JsonRpcPeer()\n```\n\nThis example starts out the same way as the client: instantiating a `JsonRpcPeer`\nobject. Note that the client and server implementation are actually in the same class!\n\nThis might be surprising at first but it is the most flexible way to implement JSON-RPC.\nFor example, the specification says that a notification is a special type of request,\nand a request can only be sent from client to server. But there are scenarios where it\nwould be useful to have the server send notifications to the client, e.g. a\npublish/subscribe system. The specification says that:\n\n> One implementation of this specification could easily fill both of those roles, even\n> at the same time, to other different clients or the same client.\n\nThis is why the library implements both roles in a single class. The choice to name the\nobject `server` is just a convention to help us remember what's going on.\n\n```python\nreceived_bytes = connection.recv()\n```\n\nThis block shows the hypothetical I/O framework again. As a server, we just want to wait\nfor a client to send us something.\n\n```python\ntry:\n    messages = server.parse(received_bytes)\nexcept JsonRpcParseError as pe:\n    bytes_to_send = server.respond_with_error(request=None, error=pe.get_error())\n    connection.send(bytes_to_send)\n    return\n```\n\nNext, we want to parse the incoming data. If a parse error is raised here, then we\nshould send back a response and we should not iterate over the messages, because\n`messages` was not actually returned!. Because we were unable to parse a request, we set\n`request=None` in the response.\n\n```\nfor request in messages:\n    assert isinstance(request, JsonRpcRequest)\n\n    try:\n        # Handle request here and send a response.\n        result = handle_request(request)\n        bytes_to_send = server.respond_with_result(request=request, result=result)\n    except JsonRpcException as jre:\n        bytes_to_send = server.respond_with_error(request=request, error=pe.get_error())\n\n    connection.send(bytes_to_send)\n```\n\nNext, we iterate over the received messages. For a server, each message should be a\n`JsonRpcRequest`. The implementation of `handle_request(...)` is up to you! You should\nhandle each request by returning a result. The `respond_with_result(...)` method\nproduces an appropriate JSON-RPC response, which you should then send to the client.\n\nIf an error occurs in your handler, you should raise one of the built-in exceptions or a\ncustom subclass of `JsonRpcApplicationError`. For example, if you don't have a handler\nfor a given method, you should raise `JsonRpcMethodNotFoundError`. Exceptions are\ndescribed more fully below.\n\n## Exceptions\n\nThe exception system in this library is designed to make error-handling as Pythonic as\npossible, abstracting over the details of the JSON-RPC protocol as much as possible. All\nexceptions in this module inherit from `JsonRpcException`, so this is a good choice for\na catch-all exception handler. All exceptions have an error code and a message.\nExceptions can also optionally have a `data` field which can be set to any valid JSON\ndata type.\n\nThere are also specialized errors in the library that correspond to specific JSON-RPC\nerror codes in the specification. For example, if you receive data that cannot be\ndecoded into a valid JSON-RPC request, the specification calls for a -32700 error, and\nthis library raises a `JsonRpcParseError` to make it easy to catch this specific\ncondition. If the server sends\n\nThe specification also allows you to define your own error codes. There are\n\nExceptions are used in two ways in this library. First of all, the library itself can\nraise exceptions. For example in `recv()`, it can raise `JsonRpcParseError` as described\nabove. The second usage is that the remote peer might send you a response that contains\nan error object. In this case, you may want to convert that error into an exception so\nyou can raise it.\n\nThe static method `JsonRpcException.exc_from_error(...)` converts an error into an\nexception. This method automatically selects the appropriate subclass of\n`JsonRpcException`. For example, if the remote peer sent you error code -32700, this\nmethod converts that into a `JsonRpcParseError`. Some error codes are reserved for\nimplementations to define their own error codes, e.g. -32099 is reserved in the\nspecification but not assigned any meaning. If the remote peer sends this error code,\nthen this method will raise `JsonRpcReservedError`.\n\nThe specification also has unreserved error codes that are available for defining\napplication-specific errors. You can use these in your own code in two different ways.\nThe first approach is to catch/raise `JsonRpcApplicationError` and set/check the error\ncode to your application-defined value. The second approach is to create your own\nsubclass of `JsonRpcApplicationError`. Here's an example:\n\n```python\nfrom sansio_jsonrpc import JsonRpcApplicationError\n\n\nclass MyApplicationError1(JsonRpcApplicationError):\n    ERROR_CODE = 1\n    ERROR_MESSAGE = \"My application error type 1\"\n\n\nclass MyApplicationError2(JsonRpcApplicationError):\n    ERROR_CODE = 2\n    ERROR_MESSAGE = \"My application error type 2\"\n```\n\nThe `JsonRpcException.exc_from_error(...)` method will automatically select the\nappropriate subclass. For example if the server sends error code 1, then the method will\nreturn a `MyApplicationError1` instance, even though that class is defined in _your\ncode_! The library uses some metaclass black magic to make this work.\n\n## Back Pressure\n\nAs a SANS I/O library, this package does not implement any sort of flow control. If the\npeer is sending you data faster than you can handle it, and you keep reading it, then\nyour process's memory usage will continually grow until it runs out of memory or the\nkernel terminates it. Back pressure means signalling to the peer that it should stop\nsending data for a bit until your process can catch up. The specifics of back pressure\nreally depend on what transport protocol and I/O framework you are using. For example,\nTCP has flow control capabilities, and most implementations will automatically apply\nback pressure if you simply stop reading from the socket. Therefore, if you use TCP with\nthis library, you should be careful to read from the socket only when you are ready to\nprocess another message. If you eagerly read from the socket into an unbounded user\nspace buffer (such as a queue), then your code will not benefit from TCP's flow control,\nbecause the kernel will see an empty buffer and it will keep filling it up.\n\n## Developing\n\nThe project uses MyPy for type checking and Black for code formatting. Poetry is used to\nmanage dependencies and to build releases.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/hyperiongray/sansio-jsonrpc",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "sansio-jsonrpc",
+    "package_url": "https://pypi.org/project/sansio-jsonrpc/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/sansio-jsonrpc/",
+    "project_urls": {
+      "Homepage": "https://github.com/hyperiongray/sansio-jsonrpc"
+    },
+    "release_url": "https://pypi.org/project/sansio-jsonrpc/0.2.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.7,<4.0",
+    "summary": "JSON-RPC v2.0 Sans I/O",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7026019,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6976c63e5e3f2d0078cb4bc8737435e64730fa85f89f167f9dab596c11789901",
+          "md5": "89f3e1b7e998ab7f5852dce7a5928897",
+          "sha256": "d6263a6a90e55657b7f9cc1e40e7de27d4056a17903c2ffd076e59d9600e761b"
+        },
+        "downloads": -1,
+        "filename": "sansio_jsonrpc-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "89f3e1b7e998ab7f5852dce7a5928897",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6579,
+        "upload_time": "2020-04-13T17:12:53",
+        "upload_time_iso_8601": "2020-04-13T17:12:53.112448Z",
+        "url": "https://files.pythonhosted.org/packages/69/76/c63e5e3f2d0078cb4bc8737435e64730fa85f89f167f9dab596c11789901/sansio_jsonrpc-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07d8ca8efe0098798ef216407e823ac2957e1b5f4fbecfe99f10e3d7ea923e88",
+          "md5": "a390df1130f1e9e31678a4d8904b4c58",
+          "sha256": "5f32b1452a248aa5243c6bad40a9af6060fb0b2fd466def600b5149454c0ba79"
+        },
+        "downloads": -1,
+        "filename": "sansio-jsonrpc-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a390df1130f1e9e31678a4d8904b4c58",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5622,
+        "upload_time": "2020-04-13T17:12:50",
+        "upload_time_iso_8601": "2020-04-13T17:12:50.917491Z",
+        "url": "https://files.pythonhosted.org/packages/07/d8/ca8efe0098798ef216407e823ac2957e1b5f4fbecfe99f10e3d7ea923e88/sansio-jsonrpc-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1af3a7d39f4c8e655074eda7a07401d83b56b8f808b4dc44c00d6a90fd58cbf7",
+          "md5": "5570c6aae5b3ffaaa17114935ece34cd",
+          "sha256": "3924ed21650aef938d09a04d32b1771c0d37014c09685959dfce3b8b1db24763"
+        },
+        "downloads": -1,
+        "filename": "sansio_jsonrpc-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5570c6aae5b3ffaaa17114935ece34cd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 10713,
+        "upload_time": "2020-04-15T17:09:12",
+        "upload_time_iso_8601": "2020-04-15T17:09:12.608897Z",
+        "url": "https://files.pythonhosted.org/packages/1a/f3/a7d39f4c8e655074eda7a07401d83b56b8f808b4dc44c00d6a90fd58cbf7/sansio_jsonrpc-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "72f88a0bc25a087d97d0e4e774c0b4b2cec14bfba42fa5a1b4c507ce4ab6c536",
+          "md5": "4010a62a8b12a648977d74a4d4e67ecc",
+          "sha256": "022159b658116cbd239a110e4841be8250fc052a0cbcd7f24fc9cec88add071f"
+        },
+        "downloads": -1,
+        "filename": "sansio-jsonrpc-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4010a62a8b12a648977d74a4d4e67ecc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 14084,
+        "upload_time": "2020-04-15T17:09:11",
+        "upload_time_iso_8601": "2020-04-15T17:09:11.313578Z",
+        "url": "https://files.pythonhosted.org/packages/72/f8/8a0bc25a087d97d0e4e774c0b4b2cec14bfba42fa5a1b4c507ce4ab6c536/sansio-jsonrpc-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1af3a7d39f4c8e655074eda7a07401d83b56b8f808b4dc44c00d6a90fd58cbf7",
+        "md5": "5570c6aae5b3ffaaa17114935ece34cd",
+        "sha256": "3924ed21650aef938d09a04d32b1771c0d37014c09685959dfce3b8b1db24763"
+      },
+      "downloads": -1,
+      "filename": "sansio_jsonrpc-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5570c6aae5b3ffaaa17114935ece34cd",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 10713,
+      "upload_time": "2020-04-15T17:09:12",
+      "upload_time_iso_8601": "2020-04-15T17:09:12.608897Z",
+      "url": "https://files.pythonhosted.org/packages/1a/f3/a7d39f4c8e655074eda7a07401d83b56b8f808b4dc44c00d6a90fd58cbf7/sansio_jsonrpc-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "72f88a0bc25a087d97d0e4e774c0b4b2cec14bfba42fa5a1b4c507ce4ab6c536",
+        "md5": "4010a62a8b12a648977d74a4d4e67ecc",
+        "sha256": "022159b658116cbd239a110e4841be8250fc052a0cbcd7f24fc9cec88add071f"
+      },
+      "downloads": -1,
+      "filename": "sansio-jsonrpc-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "4010a62a8b12a648977d74a4d4e67ecc",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 14084,
+      "upload_time": "2020-04-15T17:09:11",
+      "upload_time_iso_8601": "2020-04-15T17:09:11.313578Z",
+      "url": "https://files.pythonhosted.org/packages/72/f8/8a0bc25a087d97d0e4e774c0b4b2cec14bfba42fa5a1b4c507ce4ab6c536/sansio-jsonrpc-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

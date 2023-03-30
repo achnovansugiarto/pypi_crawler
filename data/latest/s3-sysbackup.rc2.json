@@ -1,0 +1,181 @@
+{
+  "info": {
+    "author": "Richard T. Weeks",
+    "author_email": "rtweeks21@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3",
+      "Topic :: System :: Archiving :: Backup"
+    ],
+    "description": "# s3-sysbackup Package\n\nA very flexible, Unix-style facility for backing content up to **AWS S3** with time/space folding, using the S3 **Object Lock** system for *write-once-read-many* (WORM) storage, which can help provide additional security or compliance around backup requirements.\n\nS3 charges not only for storage, but also for management operations on data in S3.  `s3-sysbackup` works to minimize both kinds of charges, including a limited ability to amortize backup content storage over multiple machines.\n\n## The Command Line\n\nThis package provides a console entry point named `s3-sysbackup`, a program which takes a subcommand as its first argument.  Help is available from the program by using the `-h` or `--help` option, either with or without a subcommand.\n\n### The `create-resources` Subcommand\n\nThis subcommand creates the resources in AWS necessary for storage and retrieval of backup data.  These resources include not only an S3 bucket, but also IAM roles, groups, and policies to best manage the S3 bucket it creates.\n\nThe created resources are organized into a \"package,\" which by default has the name `s3-sysbackup`.  Multiple instance can be created with different package names.  Package names must be globally unique within your account.  Each package exports the bucket name from CloudFormation within the region used for the CloudFormation stack, meaning that either a non-default name is needed when a second package is created in the same region, or the package stacks need to be created in separate regions.\n\n### The `write-config` Subcommand\n\nThis writes a configuration file (and possibly a credentials file) for use by `s3-sysbackup archive`.  It also writes unit files for `systemd` so the archiver will run on a daily basis.  This command can create an IAM user for the backup system to authenticate to AWS as, using the IAM resources created by `s3-sysbackup create-resources` to strictly limit the capabilities of the account.\n\nWhen this subcommand is used to create an IAM account for uploading backup data, it can save those credentials in an encrypted file for transfer to and use on another system.  Creating this encrypted file requires the presence of the `ccrypt` program on the system.  Since this encryption only supports a single password, if you need to share the encrypted credentials with another user, *do not* use your own account password (either system password or AWS password).\n\n### The `archive` Subcommand\n\nThe `archive` subcommand is the workhorse of this backup system: it evaluates which data needs to be sent up to S3, manages object retention periods, and builds the backup manifests for each run.  This subcommand is typically invoked by a `systemd` \"timer\" unit on a daily basis.\n\n## Configuration\n\n`s3-sysbackup` configuration lives in a directory structure on disk, with the default location being `/etc/backup`.  Within the directory there must be a `conf` file, which is in Python [*configparser*][configparser] format.  Backup strategies, as detailed below, each have their own subdirectory of the configuration directory.\n\nThe sections of the `conf` file are detailed in the subsections below.\n\n### `conf` File: `[aws]` Section\n\nThis section gives configuration information for access to the AWS API.  The available settings are:\n\n| Setting | Value Description     |\n| :------------- | :-------------------------------------------------------- |\n| `profile` | Sets the profile to use -- may be from the standard profile system or from a custom credentials file specified with the `credentials_file` setting |\n| `credentials_file` | Path to an AWS credentials file to use |\n| `role_arn` | Used only in conjunction with the `credentials_file` setting, gives the ARN of an IAM Role to assume for authorizing AWS actions |\n\nPlease note that, if `credentials_file` is *not* used, `profile` can be used to identify a standardly configured AWS profile that uses an assumed IAM Role, which is why the `role_arn` setting only works if a `credentials_file` is given.\n\n### `conf` File: `[s3]` Section\n\nThis section configures usage of S3.  The available settings are:\n\n| Setting | Value Description |\n| :------------- | :-------------------------------------------------------- |\n| `bucket` | Explicitly sets the name of the bucket into which the backup should be made; if not given (or explicitly set on the `Saver` before `load_config` is called), CloudFormation is used to identify the bucket |\n\n### `conf` File: `[cloudformation]` Section\n\nWhen an S3 bucket is not explicitly configured either on the `Saver` object or through the `bucket` setting in the `[s3]` section, the `Saver` will attempt to query CloudFormation for an export – named `backup-bucket`, unless otherwise specified as indicated below – giving the name of the destination bucket.\n\n| Setting | Value Description |\n| :------------- | :-------------------------------------------------------- |\n| `region` | AWS region in which the CloudFormation stack to be queried resides; if the profile in use does not configure a default region, this is necessary for use of CloudFormation |\n| `export` | The name of the export to read for the bucket name |\n\n### `conf` File: `[content]` Section\n\n| Setting | Value Description |\n| :------------- | :-------------------------------------------------------- |\n| `lock_timeout` | The number of seconds to wait for an advisory read lock on a \"picked\" file |\n| `days_retained` | The number of days for which content should be retained via S3's Object Lock |\n\n## Backup Strategies\n\n`s3-sysbackup` employs two different strategies for backup: a file-based strategy called *quilting* and a dynamic data strategy called *snapshotting*.  Information from both strategies is included in the *manifest file* uploaded to S3 for each backup run on each machine.\n\n### Quilting\n\nQuilting, like the Git version control system, is content based: it keys the objects in which it stores content on S3 by the content found within the file.  The keys for these objects are then \"patched together\" (i.e. *quilted*) by the information this strategy incorporates into the manifest file uploaded for each backup.  When a file's content hasn't changed since the last backup, that file content need not be uploaded again.  And when multiple machines are backing up copies of the same file, the file content only needs to be uploaded by the first machine to back it up.\n\nThe manifest, like a recursive version of Git's *trees*, has entries referencing a file's content, path on the system, and permissions, but also its ownership.  It also contains information about symbolic links and directories, so as much as possible of the backed-up system can be restored.  Where possible, ownership uses symbolic names and permissions are captured as ACLs, but fallbacks to numeric representations can occur.\n\nSelection of files for the quilting strategy is done by executables placed in (or symlinked into) the `pickers.d` subdirectory of the configuration directory.  Each executable file in that directory is run and the lines it prints to STDOUT are interpreted as file paths; one typical usage is to put one or more executable shell scripts that call `find` with the desired parameters.\n\nTo save on transfer and storage costs with S3, each file selected by a *picker* will be evaluated as to whether gzipping will improve storage efficiency.  If the test indicates that the file compresses well, the GZip algorithm will be applied before the file is transferred to S3; the application of GZip will be noted on the S3 object's metadata.\n\n### Snapshotting\n\nNot all data to be backed up resides conveniently in a file that can be assumed unchanging or reasonably readable at a given moment, with databases as a good example.  For these data, it is typically necessary to invoke a tool both to retrieve the backup data and also to restore it.  `s3-sysbackup` accommodates this need through its *snapshotting* strategy.\n\nExecutable files in the `snapshots.d` subdirectory of the configuration directory provide both the snapshot content and commentary about the snapshot.  Each of these executables will be invoked with a single argument: a decimal string giving the file descriptor to which it should write the snapshot data.  Text sent to STDOUT is captured as a description of the snapshot included in the S3 object's metadata.  A line sent to STDOUT starting with `::restore-through::` is interpreted as giving a (shell formatted) command for restoring the snapshot data (piped to STDIN) onto a system, which is additionally saved in a separate metadata entry.\n\nWith each run of the backup system, each snapshot will be taken and uploaded to S3.  It is the responsibility of the snapshotter executables to implement any beneficial compression.  The object keys of all uploaded snapshot content are collected within the uploaded manifest file for the backup run.\n\nAs a note, if writing a snapshotter executable as a `bash` script, the construct `>&${1:-1}` can be useful: it redirects output to the file descriptor passed as the first argument, defaulting to STDOUT (file descriptor 1) if not specified.  This will not, of course, work within a function, though it could be adapted by copying the target descriptor number into a less general variable name:\n\n```shell\n# At top level of script\nCONTENT_FD=${1:-1}\n\n# Defining a function\nfunction some_func() {\n  # ...\n  some-pipeline-producing-content >&$CONTENT_FD\n  # ...\n}\n```\n\n---\n[configparser]: https://docs.python.org/3.6/library/configparser.html\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/rtweeks/s3-sysbackup",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "s3-sysbackup",
+    "package_url": "https://pypi.org/project/s3-sysbackup/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/s3-sysbackup/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/rtweeks/s3-sysbackup/issues",
+      "Homepage": "https://github.com/rtweeks/s3-sysbackup"
+    },
+    "release_url": "https://pypi.org/project/s3-sysbackup/0.2.0/",
+    "requires_dist": [
+      "boto3",
+      "ansicolors (~=1.1)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A flexible, Unix-philosophy backup utility saving to AWS S3 WORM storage",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11165434,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "516e6ce84a1062d904808880198bff52b6e17297ce0e356343cd2465da1d305e",
+          "md5": "f0e97cffb1dd8796606cc6640192efd0",
+          "sha256": "f261491dfb404c1d199607034f10fed960e2c5815716608b969a7f262ede3a31"
+        },
+        "downloads": -1,
+        "filename": "s3_sysbackup-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f0e97cffb1dd8796606cc6640192efd0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 55311,
+        "upload_time": "2021-03-22T00:12:49",
+        "upload_time_iso_8601": "2021-03-22T00:12:49.355532Z",
+        "url": "https://files.pythonhosted.org/packages/51/6e/6ce84a1062d904808880198bff52b6e17297ce0e356343cd2465da1d305e/s3_sysbackup-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "613106ea4138ea128c6a427f7240d8e3bb125298efb3a8d1d4e0153fd0222283",
+          "md5": "cb06f07ca95aa40151cc495992dc7a16",
+          "sha256": "f2273b698e7c53fe8314ed59e24024f8551b9f97394d82fd4709a8bb9bc4ab28"
+        },
+        "downloads": -1,
+        "filename": "s3-sysbackup-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb06f07ca95aa40151cc495992dc7a16",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35164,
+        "upload_time": "2021-03-22T00:12:51",
+        "upload_time_iso_8601": "2021-03-22T00:12:51.036564Z",
+        "url": "https://files.pythonhosted.org/packages/61/31/06ea4138ea128c6a427f7240d8e3bb125298efb3a8d1d4e0153fd0222283/s3-sysbackup-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ffb71aa88d4de16ba9714b29bf788471f1c27314fdea0d102bb4e755ba981722",
+          "md5": "25badbca15fcf1cc2e17f6f3823dc9ca",
+          "sha256": "e82c6282d537edc9b95a46390f7ad311485691720e4277e674cac6c4ae8b0d55"
+        },
+        "downloads": -1,
+        "filename": "s3_sysbackup-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "25badbca15fcf1cc2e17f6f3823dc9ca",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 60579,
+        "upload_time": "2021-08-12T21:03:56",
+        "upload_time_iso_8601": "2021-08-12T21:03:56.379247Z",
+        "url": "https://files.pythonhosted.org/packages/ff/b7/1aa88d4de16ba9714b29bf788471f1c27314fdea0d102bb4e755ba981722/s3_sysbackup-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a68dfd1f3534a6a0129ab2f26b9847e68840a0521dc3929e9c6ee5cf83bcfb4",
+          "md5": "c4789abfee5998c8a64245749f64525d",
+          "sha256": "a5a0a400569a6faae661bc363af6b2b406cb8db828ec14fb03b6e4b98f4d287e"
+        },
+        "downloads": -1,
+        "filename": "s3-sysbackup-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c4789abfee5998c8a64245749f64525d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 50302,
+        "upload_time": "2021-08-12T21:03:59",
+        "upload_time_iso_8601": "2021-08-12T21:03:59.342323Z",
+        "url": "https://files.pythonhosted.org/packages/7a/68/dfd1f3534a6a0129ab2f26b9847e68840a0521dc3929e9c6ee5cf83bcfb4/s3-sysbackup-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ffb71aa88d4de16ba9714b29bf788471f1c27314fdea0d102bb4e755ba981722",
+        "md5": "25badbca15fcf1cc2e17f6f3823dc9ca",
+        "sha256": "e82c6282d537edc9b95a46390f7ad311485691720e4277e674cac6c4ae8b0d55"
+      },
+      "downloads": -1,
+      "filename": "s3_sysbackup-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "25badbca15fcf1cc2e17f6f3823dc9ca",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 60579,
+      "upload_time": "2021-08-12T21:03:56",
+      "upload_time_iso_8601": "2021-08-12T21:03:56.379247Z",
+      "url": "https://files.pythonhosted.org/packages/ff/b7/1aa88d4de16ba9714b29bf788471f1c27314fdea0d102bb4e755ba981722/s3_sysbackup-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7a68dfd1f3534a6a0129ab2f26b9847e68840a0521dc3929e9c6ee5cf83bcfb4",
+        "md5": "c4789abfee5998c8a64245749f64525d",
+        "sha256": "a5a0a400569a6faae661bc363af6b2b406cb8db828ec14fb03b6e4b98f4d287e"
+      },
+      "downloads": -1,
+      "filename": "s3-sysbackup-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c4789abfee5998c8a64245749f64525d",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 50302,
+      "upload_time": "2021-08-12T21:03:59",
+      "upload_time_iso_8601": "2021-08-12T21:03:59.342323Z",
+      "url": "https://files.pythonhosted.org/packages/7a/68/dfd1f3534a6a0129ab2f26b9847e68840a0521dc3929e9c6ee5cf83bcfb4/s3-sysbackup-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

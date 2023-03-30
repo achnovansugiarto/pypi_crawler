@@ -1,0 +1,137 @@
+{
+  "info": {
+    "author": "Intel Corporation, CVAT.ai Corporation, Roman Donchenko",
+    "author_email": "Maxim Zhiltsov <zhiltsov.max35@gmail.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python"
+    ],
+    "description": "# Scoped\n\nThe Python library to run code at function exit.\n\n<a id=\"contents\"></a>\n## Contents\n\n- [Background](#background)\n- [Overview](#overview)\n- [Installation](#installation)\n- [API Reference](#api-reference)\n\n<a id=\"background\"></a>\n## Motivation and background\n\n[Go to the top](#contents)\n\nThis library is inspired by the common and natural C++ idiom called \n[Resource Acquisition Is Initialization (RAII)](https://en.cppreference.com/w/cpp/language/raii),\nwhich supposes that the lifetime of an object is equal to its visibility in the scope.\n\nIt is a composite idiom, relying on several core language properties, such as \nstrict object scoping rules, order of initialization, stack unwinding etc. \nIn Python, however, scoping rules for objects are not that strict. For instance, \nthe following code is totally valid, as conditional blocks and other controlling \nstructures do not introduce new scopes:\n\n```python\ndef foo():\n    if True:\n        x = 10\n\n    print(x)\n```\n\nUnlike C++, when local objects go out of scope in Python, they are\nnot guaranteed to be removed immediately or in the order of creation. Instead, the object lifetime\nin Python is managed by its built-in [Garbage Collector](https://docs.python.org/3/library/gc.html#module-gc),\nwhich relies on reference counting mechanism.\nThere is the [`__del__`](](https://docs.python.org/3/reference/datamodel.html#object.__del__))\nmagic method, which can be used to display this behavior:\n\n```python\nclass MyObj:\n    def __init__(self, name, ref=None):\n        self.name = name\n        self.ref = ref\n\n    def __del__(self):\n        print(\"deleted\", self.name)\n\ndef foo():\n    obj1 = MyObj(\"1\")\n    obj2 = MyObj(\"2\", obj1)\n    obj3 = MyObj(\"3\", obj2)\n    obj1.ref = obj2 # add a non-trivial reference cycle\n\nfoo()\nprint(\"after return\")\n```\n\nThe sample above produces the following output (`Python 3.10.6`, standard package on Ubuntu):\n\n```\ndeleted 3\nafter return\ndeleted 1\ndeleted 2\n```\n\nmeaning only the 3rd object was removed at function exit, while objects\n1 and 2 were removed at the interpreter exit. The garbage collector is capable\nof detecting simple reference cycles, but the time and order of object removal is\nnot specified. Additionally, garbage collection can be turned off.\n\nTo allow scope-dependent object lifetime, Python offers\n[Context managers](https://docs.python.org/3/library/contextlib.html), the `with` statement,\nand the built-in `contextlib` library. There is also the\n[`ExitStack`](https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack)\nutility that allows to write simpler code and control stack \"unwinding\".\n\n```python\nfrom contextlib import ExitStack, closing\n\nclass MyObj:\n    def __init__(self, name, ref=None):\n        self.name = name\n        self.ref = ref\n\n    def close(self):\n        print(\"deleted\", self.name)\n\n    def __enter__(self):\n        return self\n\n    def __exit__(self, *args, **kwargs):\n        self.close()\n\ndef foo():\n    with ExitStack() as es:\n        obj1 = MyObj(\"1\")\n        # register an exit function\n        es.callback(obj1.close)\n\n        obj2 = MyObj(\"2\", obj1)\n        # register an exit context manager\n        es.enter_context(closing(obj2))\n\n        # acquire resource and register exit cm\n        obj3 = es.enter_context(MyObj(\"3\", obj2))\n\n        obj1.ref = obj2 # add a non-trivial reference cycle\n    print(\"after es\")\n\nfoo()\nprint(\"after return\")\n```\n\nNow, the example produces the desired output:\n\n```\ndeleted 3\ndeleted 2\ndeleted 1\nafter es\nafter return\n```\n\nThis approach follows Python design principles and idioms, such as\n\"Explicit is better than implicit\". It allows both invasive and non-invasive uses\nwith `ContextManager` protocol and `ExitStack.callback()`. In practice, however,\nthe use of such constructs is often intermixed with try-except blocks,\nwhich may reduce readability of the code (mostly because of the extra indentation levels added).\nWith some classes, almost every function needs to begin with exit stack initialization.\nIt often happens when there are some cleanup or rollback procedures supposed\nto be executed on an error:\n\n```python\nimport os\nimport os.path\nimport shutil\nfrom contextlib import ExitStack\n\n\nclass SomeClass:\n    ...\n\n    def foo(self, dst_dir):\n        dir_existed = os.path.isdir(dst_dir)\n        if not dir_existed:\n            os.makedirs(dst_dir)\n\n        try:\n            with open(\"bar.txt\", \"w\") as input_file:\n                self._write_file_contents(input_file)\n        except Exception as exc:\n            if not dir_existed:\n                shutil.rmtree(dst_dir)\n```\n\nIf there are multiple resources to control in a single function, the code becomes a mess.\nThis code can be made a little bit more readable and maintainable with `ExitStack` -\nnow we don't need to remember the original resource states, but we need to cleanup the stack\non success:\n\n```python\nclass SomeClass:\n    ...\n\n    def foo_with_es(self, dst_dir):\n        with ExitStack() as es:\n            if not os.path.isdir(dst_dir):\n                os.makedirs(dst_dir)\n                es.callback(shutil.rmtree, dst_dir)\n\n            with open(\"bar.txt\", \"w\") as input_file:\n                self._write_file_contents(input_file)\n\n            es.pop_all()\n```\n\nThis library tries to go a step further and improve this situation a little bit more:\n\n```python\nfrom scoped import scoped, on_error_do\n\nclass SomeClass:\n    ...\n\n    @scoped\n    def foo_scoped(self, dst_dir):\n        if not os.path.isdir(dst_dir):\n            os.makedirs(dst_dir)\n            on_error_do(shutil.rmtree, dst_dir)\n\n        with open(\"bar.txt\", \"w\") as input_file:\n            self._write_file_contents(input_file)\n```\n\n<a id=\"overview\"></a>\n## Overview\n\n[Go to the top](#contents)\n\nThe main interface of the library is the `@scoped` function decorator. It allows to use\nhelper functions such as `scope_add()`, `on_error_do()` and `on_exit_do()` inside the\nfunction to define resource-managing variables and set up actions performed on error\nand on exit.\n- The `scope_add()` function provides a readable way to declare variables,\nthat implement the `ContextManager` protocol.\n- The `on_error_do()` and `on_exit_do()` functions provide a way to add custom callbacks\n(including lambdas) to the list of the actions performed on error and on the function exit\n\nExample:\n\n```python\nimport os\nimport os.path\nimport shutil\nfrom scoped import scoped, on_error_do, scope_add\n\n@scoped\ndef write_directory(dst_dir):\n    \"\"\"\n    Creates a directory, if needed, and writes data inside.\n    Cleans everything extra in the case of error.\n    \"\"\"\n\n    if not os.path.isdir(dst_dir):\n        os.makedirs(dst_dir)\n        on_error_do(shutil.rmtree, dst_dir)\n\n    db_connection = scope_add(open_db_conn())\n\n    on_exit_do(extra_cleanup)\n\n    with open(\"bar.txt\", \"w\") as input_file:\n        _write_file_contents(input_file, db_connection)\n\n    # Calls on the normal exit:\n    #\n    # extra_cleanup()\n    # open_db_conn().__enter__().__exit__()\n    #\n    #\n    # Calls on an error:\n    #\n    # extra_cleanup()\n    # open_db_conn().__enter__().__exit__()\n    # shutil.rmtree(dst_dir)\n```\n\n<a id=\"installation\"></a>\n## Installation\n\n```python\npip install scoped-functions\n```\n\nIf you want to install from the repository:\n```python\npip install \"git+https://github.com/zhiltsov-max/scoped\"\n```\n\n<a id=\"api-reference\"></a>\n## API Reference\n\n[Go to the top](#contents)\n\n- `@scoped(arg_name: str = None)`\n\n    A function decorator that allows to register context managers and exit callbacks\n    with `scope_add()`, `on_error_do()` and `on_exit_do()` inside the decorated function.\n\n    Can be used 2 ways:\n\n    - Implicit:\n\n    ```python\n    @scoped\n    def foo():\n        ...\n    ```\n\n    - Explicit: adds an additional kw-parameter with specified name to the function calls.\n    This can be useful if you want to be more explicit and if you want to use extra\n    functionality.\n\n    ```python\n    @scoped(arg_name='scope')\n    def foo(*, scope: Scope):\n        scope.add(...)\n    ```\n\n    > Note that this decorator will not work with generators, because they implemented\n    > differently from normal functions. Please use the \"traditional\" approach with `Scope`\n    > or `ExitStack` instead in these cases:\n\n    ```python\n    @scoped\n    def generator():\n        on_exit_do(print, \"finished\")\n        yield\n\n    next(gen()) # error: no Scope object\n\n    def generator2():\n        with Scope() as scope:\n            scope.on_exit_do(print, \"finished\")\n            yield\n\n    next(gen()) # ok\n    ```\n\n- `scope_add(cm: ContextManager[T]) -> T`\n\n    Enters the context manager and adds it to the exit stack. If called\n    multiple times, exit callbacks will be called on exit in the reversed order.\n\n    Returns: cm.__enter__() result\n\n- `on_error_do(callback, *args, ignore_errors: bool = False, kwargs=None) -> None`\n\n    Registers a function to be called on scope exit because of an error. The primary use\n    is for error rollback functions. If called multiple times, callbacks will be called\n    on exit in the reversed order.\n\n    If `ignore_errors` is `True`, the errors from this function call will be ignored.\n    Allows to pass function args with the `*args` and `kwargs` parameters.\n\n    ```python\n    def bar(*args, **kwargs):\n        ...\n\n    @scoped\n    def foo(x):\n        on_error_do(bar, x, ignore_errors=True, kwargs={'y': 42})\n\n        # bar(x, y=42) will be called prior to foo() exit on error\n        raise Exception(\"error\")\n    ```\n\n- `on_exit_do(callback, *args, ignore_errors: bool = False, kwargs=None) -> None`\n\n    Registers a function to be called on scope exit. The callback is called unconditionally,\n    equivalently to the `finally` block in the `try-except` clause. If called\n    multiple times, callbacks will be called on exit in the reversed order.\n\n    ```python\n    def bar(*args, **kwargs):\n        ...\n\n    def baz():\n        ...\n\n    @scoped\n    def foo(x, y):\n        on_error_do(bar, x)\n        on_exit_do(bar, y)\n\n        baz()\n\n        # Called on an error:\n        #\n        # bar(y)\n        # bar(x)\n        #\n        #\n        # Called on the normal exit:\n        #\n        # bar(y)\n    ```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "context managers,RAII,rollback,cleanup,function exit,object lifetime,utility,library",
+    "license": "MIT License  Copyright (C) 2019-2022 Intel Corporation Copyright (C) 2023 Maxim Zhiltsov  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. ",
+    "maintainer": "",
+    "maintainer_email": "Maxim Zhiltsov <zhiltsov.max35@gmail.com>",
+    "name": "scoped-functions",
+    "package_url": "https://pypi.org/project/scoped-functions/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/scoped-functions/",
+    "project_urls": {
+      "repository": "https://github.com/zhiltsov-max/scoped"
+    },
+    "release_url": "https://pypi.org/project/scoped-functions/1.0.0/",
+    "requires_dist": [
+      "attrs (>=21.2)",
+      "black ; extra == 'dev'",
+      "isort ; extra == 'dev'"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Utility to run code at function exit",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17353817,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0ddfdf7c5dd5b7cd878641d73d7840454c6cfdedbe3fcbcfdef1b7d00d90b3e5",
+          "md5": "b5a80d31af0f35d1388123ebffebcd52",
+          "sha256": "fdfe99e1151d9374ff3491b9c7b301f404b373befa51c945ffa81d1a96801fbc"
+        },
+        "downloads": -1,
+        "filename": "scoped_functions-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b5a80d31af0f35d1388123ebffebcd52",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 8747,
+        "upload_time": "2023-03-19T13:58:47",
+        "upload_time_iso_8601": "2023-03-19T13:58:47.770639Z",
+        "url": "https://files.pythonhosted.org/packages/0d/df/df7c5dd5b7cd878641d73d7840454c6cfdedbe3fcbcfdef1b7d00d90b3e5/scoped_functions-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88866b81e4b4ed90b2b2726635559f50e1b17c12a580518da18c0462158849e1",
+          "md5": "03fe94d3af66a39f77e1846613595de1",
+          "sha256": "01c17f8e636b55376c01d8b91a0de0ac1ef2b08bf4dd496f800ddeeeabe849c3"
+        },
+        "downloads": -1,
+        "filename": "scoped-functions-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03fe94d3af66a39f77e1846613595de1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 11908,
+        "upload_time": "2023-03-19T13:58:49",
+        "upload_time_iso_8601": "2023-03-19T13:58:49.887005Z",
+        "url": "https://files.pythonhosted.org/packages/88/86/6b81e4b4ed90b2b2726635559f50e1b17c12a580518da18c0462158849e1/scoped-functions-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0ddfdf7c5dd5b7cd878641d73d7840454c6cfdedbe3fcbcfdef1b7d00d90b3e5",
+        "md5": "b5a80d31af0f35d1388123ebffebcd52",
+        "sha256": "fdfe99e1151d9374ff3491b9c7b301f404b373befa51c945ffa81d1a96801fbc"
+      },
+      "downloads": -1,
+      "filename": "scoped_functions-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b5a80d31af0f35d1388123ebffebcd52",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 8747,
+      "upload_time": "2023-03-19T13:58:47",
+      "upload_time_iso_8601": "2023-03-19T13:58:47.770639Z",
+      "url": "https://files.pythonhosted.org/packages/0d/df/df7c5dd5b7cd878641d73d7840454c6cfdedbe3fcbcfdef1b7d00d90b3e5/scoped_functions-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "88866b81e4b4ed90b2b2726635559f50e1b17c12a580518da18c0462158849e1",
+        "md5": "03fe94d3af66a39f77e1846613595de1",
+        "sha256": "01c17f8e636b55376c01d8b91a0de0ac1ef2b08bf4dd496f800ddeeeabe849c3"
+      },
+      "downloads": -1,
+      "filename": "scoped-functions-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "03fe94d3af66a39f77e1846613595de1",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 11908,
+      "upload_time": "2023-03-19T13:58:49",
+      "upload_time_iso_8601": "2023-03-19T13:58:49.887005Z",
+      "url": "https://files.pythonhosted.org/packages/88/86/6b81e4b4ed90b2b2726635559f50e1b17c12a580518da18c0462158849e1/scoped-functions-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

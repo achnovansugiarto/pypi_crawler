@@ -1,0 +1,141 @@
+{
+  "info": {
+    "author": "Erik Drysdale",
+    "author_email": "erikinwest@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# SurvSet: An open-source time-to-event dataset respository\n\n[`SurvSet`](https://arxiv.org/pdf/2203.03094.pdf) is the first ever open-source time-to-event dataset repository. The goal of `SurvSet` is to allow researchers and practioneeres to benchmark machine learning models and assess statistical methods. All datasets in this repository are consisently formatted to enable rapid prototyping and inference. The origins of this dataset were for testing regularity conditions of the [False Positive Control Lasso](https://arxiv.org/abs/1903.12584).\n\nWhile `SurvSet` is designed for `python`, the formatted datasets can found in a comma-separated format within [this folder](https://github.com/ErikinBC/SurvSet/tree/main/SurvSet/_datagen/output). `SurvSet` currently has 76 datasets which vary in dimensionality (see figure below). This includes high-dimensional genomics datasets (p >> n) like `gse1992`, and long and skinny datasets like `hdfail` (n >> p). \n\n## Installation\n\n`SurvSet` can be installed using `pip` for `python3`: `pip install SurvSet`. You can run `python3 -m SurvSet` to make sure the package has compiled without errors. Please note that `pandas` and `numpy` will be installed as dependencies (see [PyPI](https://pypi.org/project/SurvSet/) for more details).   \n\n## Dataset structure and origin\n\nMost of `SurvSet`'s datasets come from existing `R` packages. The accompanying [arXiv paper](https://arxiv.org/pdf/2203.03094.pdf) provides a full list of package sources and references. Datasets can be called in from the main class `SurvLoader` with the `load_dataset` method. This will return a `pandas` DataFrame with the following columns structure:\n\n1. `pid`: the unique observation identifier (especially relevant for time-varying datasets)\n2. `event`: a binary event indicator (1==event has happened) \n3. `time`: time to event/censoring (or start time if `time2` exists)\n4. `time2`: end time [`time`, `time2`) if there are time-varying features\n5. `num_{}`: prefix implies a continuous feature\n6. `fac_{}`: prefix implies a categorical feature\n\nCurrently 7 datasets have time-varying features. Some datasets will have the same feature a both a continuous and categorical feature. This was done for those features that are plausibly ordinal.\n\n### Figure: Dataset dimensionality\n\n![gg_ds](SurvSet/_datagen/figures/gg_ds.png)\n\n# Usage (simple)\n\nPrint the list of datasets that can be loaded and load the `ova` dataset.\n\n```python\nfrom SurvSet.data import SurvLoader\nloader = SurvLoader()\n# List of available datasets and meta-info\nprint(loader.df_ds.head())\n# Load dataset and its reference\ndf, ref = loader.load_dataset(ds_name='ova').values()\nprint(df.head())\n```\n\n# Usage (complex)\n\nThe example below shows a simple machine learning pipeline that fits a series of ElasticNet CoxPH models to each of the (non-time-varying) datasets. To make run the code, please install the appropriate packages: `conda install -c bcg_gamma -c conda-forge scikit-learn=1.0.2 sklearndf=2.0 scikit-survival=0.17.0 plotnine=0.8.0`.\n\n\n```python\nimport os\nimport numpy as np\nimport pandas as pd\nimport plotnine as pn\nfrom SurvSet.data import SurvLoader\nfrom sksurv.util import Surv\nfrom sksurv.metrics import concordance_index_censored as concordance\nfrom sksurv.linear_model import CoxnetSurvivalAnalysis\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.compose import make_column_selector\nfrom sklearndf.pipeline import PipelineDF\nfrom sklearndf.transformation import OneHotEncoderDF, ColumnTransformerDF, SimpleImputerDF, StandardScalerDF\n\n# (i) Set up feature transformer pipeline\nenc_fac = PipelineDF(steps=[('ohe', OneHotEncoderDF(sparse=False, drop=None, handle_unknown='ignore'))])\nsel_fac = make_column_selector(pattern='^fac\\\\_')\nenc_num = PipelineDF(steps=[('impute', SimpleImputerDF(strategy='median')), ('scale', StandardScalerDF())])\nsel_num = make_column_selector(pattern='^num\\\\_')\n# Combine both\nenc_df = ColumnTransformerDF(transformers=[('ohe', enc_fac, sel_fac),('s', enc_num, sel_num)])\n\n# (ii) Run on datasets\nalpha = 0.1\nsenc = Surv()\nloader = SurvLoader()\nds_lst = loader.df_ds[~loader.df_ds['is_td']]['ds'].to_list()  # Remove datasets with time-varying covariates\nn_ds = len(ds_lst)\nholder_cindex = np.zeros([n_ds, 3])\nfor i, ds in enumerate(ds_lst):\n    print('Dataset %s (%i of %i)' % (ds, i+1, n_ds))\n    anno = loader.df_ds.query('ds == @ds').T.to_dict()\n    anno = anno[list(anno)[0]]\n    df, ref = loader.load_dataset(ds).values()\n    # Random stratified split\n    df_train, df_test = train_test_split(df, stratify=df['event'], random_state=1, test_size=0.3)\n    # Fit encoder\n    enc_df.fit(df_train)\n    # Sanity check\n    cn_prefix = enc_df.feature_names_original_.str.split('_',1,True)[0].unique()\n    assert all([cn in ['fac', 'num'] for cn in cn_prefix])\n    # Prepare numpy arrays\n    X_train = enc_df.transform(df_train)\n    So_train = senc.from_arrays(df_train['event'].astype(bool), df_train['time'])\n    X_test = enc_df.transform(df_test)\n    # Fit model\n    mdl = CoxnetSurvivalAnalysis(normalize=True)\n    mdl.fit(X=X_train, y=So_train)\n    scores_test = mdl.predict(X_test)\n    res_test = df_test[['event','time']].assign(scores=scores_test)\n    So_test = senc.from_arrays(res_test['event'].astype(bool), res_test['time'])\n    conc_test = concordance(So_test['event'], So_test['time'], res_test['scores'])[0]\n    # Get concordance and 90% CI\n    n_bs = 250\n    holder_bs = np.zeros(n_bs)\n    for j in range(n_bs):\n        res_bs = res_test.groupby(['event']).sample(frac=1,replace=True,random_state=j)\n        So_bs = senc.from_arrays(res_bs['event'].astype(bool), res_bs['time'])\n        conc_bs = concordance(So_bs['event'], So_bs['time'], res_bs['scores'])[0]\n        holder_bs[j] = conc_bs\n    lb, ub = np.quantile(holder_bs, [alpha,1-alpha])\n    holder_cindex[i] = [conc_test, lb, ub]\n\n# (iii) Merge results & plot\ndf_cindex = pd.DataFrame(holder_cindex, columns=['cindex', 'lb', 'ub'])\ndf_cindex.insert(0, 'ds', ds_lst)\nds_ord = df_cindex.sort_values('cindex')['ds'].values\ndf_cindex['ds'] = pd.Categorical(df_cindex['ds'], ds_ord)\n\ngg_cindex = (pn.ggplot(df_cindex, pn.aes(y='cindex',x='ds')) + \n    pn.theme_bw() + pn.coord_flip() + \n    pn.geom_point(size=2) + \n    pn.geom_linerange(pn.aes(ymin='lb', ymax='ub')) + \n    pn.labs(y='Concordance') + \n    pn.geom_hline(yintercept=0.5,linetype='--', color='red') + \n    pn.theme(axis_title_y=pn.element_blank()))\ngg_cindex\n```\n\n![gg_cindex](tests/gg_cindex.png)\n\n\n## Adding new datasets\n\nIf you are interested in contributing to `SurvSet` or know of other open-source time-to-event datasets you think would be useful additions, please contact me. If you would like to see these datasets adopted quickly, please directly modify the data generating process found in `SurvSet/_datagen/pipeline.sh` and create a pull request. \n\n## How to cite\n\nIf you use `SurvSet` in your research or project please cite the following: \n\n```\n@article{drysdale2022,\n  title={{SurvSet}: An open-source time-to-event dataset repository},\n  author={Drysdale, Erik},\n  journal={arXiv preprint arXiv:2203.03094},\n  year={2022}\n}\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ErikinBC/SurvSet",
+    "keywords": "",
+    "license": "GPLv3",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "SurvSet",
+    "package_url": "https://pypi.org/project/SurvSet/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/SurvSet/",
+    "project_urls": {
+      "Homepage": "https://github.com/ErikinBC/SurvSet"
+    },
+    "release_url": "https://pypi.org/project/SurvSet/0.2.6/",
+    "requires_dist": [
+      "numpy",
+      "pandas"
+    ],
+    "requires_python": "",
+    "summary": "SurvSet package",
+    "version": "0.2.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13127030,
+  "releases": {
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0da9870b814b14b3a03329d35c3647c40879bac84042c93f0aabeea2eafd8dd0",
+          "md5": "b6549312dfc946f94bfed5789a0fcd79",
+          "sha256": "f2b7f755f84d22948dc298a8c75102053f6539fcf944b918a8fcc985ac8339d8"
+        },
+        "downloads": -1,
+        "filename": "SurvSet-0.2.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b6549312dfc946f94bfed5789a0fcd79",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 42385054,
+        "upload_time": "2022-03-06T00:01:32",
+        "upload_time_iso_8601": "2022-03-06T00:01:32.296899Z",
+        "url": "https://files.pythonhosted.org/packages/0d/a9/870b814b14b3a03329d35c3647c40879bac84042c93f0aabeea2eafd8dd0/SurvSet-0.2.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f72dcda501fb40f6dab2bd4aac6c227cc0556e926e9a016709afa9f29939aaa",
+          "md5": "f18c09e8a34ba13ace65461e5f13d9ed",
+          "sha256": "0f14ed66fdafc89887e9de8e07407e806e9f5e9d3da3b8475edd3b8fee2274e1"
+        },
+        "downloads": -1,
+        "filename": "SurvSet-0.2.5-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f18c09e8a34ba13ace65461e5f13d9ed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 42385348,
+        "upload_time": "2022-03-08T14:25:03",
+        "upload_time_iso_8601": "2022-03-08T14:25:03.223167Z",
+        "url": "https://files.pythonhosted.org/packages/5f/72/dcda501fb40f6dab2bd4aac6c227cc0556e926e9a016709afa9f29939aaa/SurvSet-0.2.5-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ae874c4ee386bf2d32a34b1a3e8a411d201f465c32ee2fba7534035a64fcee2d",
+          "md5": "b0d39f1221bedbc0d7b6a8be02ef7667",
+          "sha256": "f2be0ac9853dae1f3642f6072989dda2bca45fe4d986fe224ced7261811e2c58"
+        },
+        "downloads": -1,
+        "filename": "SurvSet-0.2.6-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0d39f1221bedbc0d7b6a8be02ef7667",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 42397680,
+        "upload_time": "2022-03-09T15:57:02",
+        "upload_time_iso_8601": "2022-03-09T15:57:02.902399Z",
+        "url": "https://files.pythonhosted.org/packages/ae/87/4c4ee386bf2d32a34b1a3e8a411d201f465c32ee2fba7534035a64fcee2d/SurvSet-0.2.6-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ae874c4ee386bf2d32a34b1a3e8a411d201f465c32ee2fba7534035a64fcee2d",
+        "md5": "b0d39f1221bedbc0d7b6a8be02ef7667",
+        "sha256": "f2be0ac9853dae1f3642f6072989dda2bca45fe4d986fe224ced7261811e2c58"
+      },
+      "downloads": -1,
+      "filename": "SurvSet-0.2.6-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b0d39f1221bedbc0d7b6a8be02ef7667",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 42397680,
+      "upload_time": "2022-03-09T15:57:02",
+      "upload_time_iso_8601": "2022-03-09T15:57:02.902399Z",
+      "url": "https://files.pythonhosted.org/packages/ae/87/4c4ee386bf2d32a34b1a3e8a411d201f465c32ee2fba7534035a64fcee2d/SurvSet-0.2.6-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

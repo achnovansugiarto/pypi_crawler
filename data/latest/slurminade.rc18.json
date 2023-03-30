@@ -1,0 +1,481 @@
+{
+  "info": {
+    "author": "Dominik Krupke",
+    "author_email": "krupke@ibr.cs.tu-bs.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# slurminade\n\n*slurminade* makes using the workload manager [slurm](https://slurm.schedmd.com/documentation.html) with Python beautiful.\nIt is based on [simple_slurm](https://github.com/amq92/simple_slurm), but instead of just allowing to comfortably execute shell commands in slurm, it allows to directly distribute Python-functions.\nA function decorated with `@slurminade.slurmify(partition=\"alg\")` will automatically be executed by a node of the partition `alg` by just calling `.distribute(yes_also_args_are_allowed)`.\nThe general idea is that the corresponding Python-code exists on both machines, thus, the slurm-node can also call the functions of the original code if you tell if which one and what arguments to use.\nThis is similar to [celery](https://github.com/celery/celery) but you do not need to install anything, just make sure the same Python-environment is available the nodes (usually the case in a proper slurm setup).\n\nPlease check the documentation of [simple_slurm](https://github.com/amq92/simple_slurm) to get to know more about the\npossible parameters. You can also call simple_slurm directly by `srun` and `sbatch` (automatically with the \nconfiguration specified with slurminade).\n\n*slurminade* has two design goals:\n1. Pythonic slurm: Allowing to use slurm in a Pythonic-way, without any shell commands etc.\n2. Compatibility: Scripts can also run without slurm. You can share a script and also people without slurm can execute it without any changes.\n\nA simple script could look like this:\n```python\nimport slurminade\n\nslurminade.update_default_configuration(partition=\"alg\")  # global options for slurm\n\n# If no slurm environment is found, the functions are called directly to make scripts\n# compatible with any environment.\n# You can enforce slurm with `slurminade.set_dispatcher(slurminade.SlurmDispatcher())`\n\n# use this decorator to make a function distributable with slurm\n@slurminade.slurmify(constraint=\"alggen02\")  # function specific options can be specified\ndef prepare():\n    print(\"Prepare\")\n\n@slurminade.slurmify()\ndef f(foobar):\n    print(f\"f({foobar})\")\n\n@slurminade.slurmify()\ndef clean_up():\n    print(\"Clean up\")\n\n\nif __name__ == \"__main__\":\n    jid = prepare.distribute()\n\n    with slurminade.Batch(max_size=20) as batch:  # automatically bundles up to 20 tasks\n        # run 100x f after `prepare` has finished\n        for i in range(100):\n            f.wait_for(jid).distribute(i)  # no job id while in batch!\n\n        # clean up after the previous jobs have finished\n        jids = batch.flush()  # flush returns a list with all job ids.\n        clean_up.wait_for(jids).distribute()\n```\n\n> :warning: Always use `Batch` when distributing many tasks. Otherwise, you DDoS your slurm.\n\nWe recommend to use *slurminade* with [conda](https://docs.conda.io/en/latest/).\nWe have not tested it with other virtual environments.\n\nThe code is super simple and open source, don't be afraid to create a fork that fits your own needs.\n\nIf slurm is not available, `distribute` results in a local function call.\nAnalogous for `srun` and `sbatch` (giving some extra value on top of just forwarding to\n*simple_slurm*).\n\n> :warning: Talk with you system administrator or supervisor to get the proper slurm configuration.\n\n## Installation\n\nYou can install *slurminade* with `pip install slurminade`.\n\n## Usage\n\nYou can set task specific slurm arguments within the decorator, e.g., `@slurminade.slurmify(constraint=\"alggen03\")`.\nThese arguments are directly passed to *simple_slurm*, such that all its arguments are supported.\n\nIn order for *slurminade* to work, the code needs to be in a Python file/project shared by all slurm-nodes.\nOtherwise, *slurminade* will not find the corresponding function.\nThe slurmified functions also must be importable, i.e., on the top level.\nCurrently, all function names must be unique as *slurminade* will only transmit the function's name.\n\n## Don't do:\n\n### Bad: System calls\n```python\nimport slurminade\nimport os\n@slurminade.slurmify()\ndef run_shell_command():\n    os.system(\"complex call\")\n    # BAD! The system call will run outside of slurm! The slurm task directly terminates.\n```\ninstead use\n```python\nimport slurminade\n\nif __name__==\"__main__\":\n    slurminade.sbatch(\"complex call\")  # forwards your call to simple_slurm that is better used for such things.\n```\n\n### Bad: Global variables\n\n```python\nimport slurminade\n\nFLAG = True\n\n@slurminade.slurmify()\ndef bad_global(args):\n    if FLAG:  # BAD! Will be True because the __main__ Part is not executed on the node.\n        pass\n    else:\n        pass\n\nif __name__ == \"__main__\":\n    FLAG = False\n    bad_global.distribute(\"args\")\n```\ninstead do\n```python\nimport slurminade\n@slurminade.slurmify()\ndef bad_global(args, FLAG):  # Now the flag is passed correctly as an argument. Note that only json-compatible arguments are possible.\n    if FLAG: \n        pass\n    else:\n        pass\n\n# Without the `if`, the node would also execute this part (*slurminade* will abort automatically)\nif __name__ == \"__main__\":\n    FLAG = False\n    bad_global.distribute(\"args\", FLAG)\n```\n> :warning The same is true for any global state such as file or database connections.\n\n### Error: Complex objects as arguments\n\n```python\nimport slurminade\n\n@slurminade.slurmify()\ndef sec_order_func(func):  \n    func()  \n    \ndef f():\n    print(\"hello\")\n    \ndef g():\n    print(\"world!\")\n    \nif __name__==\"__main__\":\n    sec_order_func.distribute(f)  # will throw an exception \n    sec_order_func.distribute(g)\n```\nInstead, create individual slurmified functions for each call or pass a simple identifier that lets the function\ndeduce, what to do, e.g., a switch-case.\nIf you really need to pass complex objects, you could also pickle the object and only pass the file name.\n\n## Default configuration\n\nYou can set up a default configuration in `~/.slurminade_default.json`.\nThis should simply be a dictionary of arguments for *simple_slurm*.\nFor example\n```json\n{\n  \"partition\": \"alg\"\n}\n```\n\n## Debugging\n\nYou can use\n```python\nimport slurminade\n\nslurminade.set_dispatcher(slurminade.TestDispatcher())\n```\nto see the serialization or\n```python\nimport slurminade\nslurminade.set_dispatcher(slurminade.SubprocessDispatcher())\n```\nto distribute the tasks without slurm using subprocesses.\n\nIf there is a bug, you will directly see it in the output (at least for most bugs).\n\n\n## Project structure\n\nThe project is reasonably easy:\n\n- batch.py: Contains code for bundling tasks, so we don't spam slurm with too many.\n- conf.py: Contains code for managing the configuration of slurm.\n- dispatcher.py: Contains code for actually dispatching tasks to slurm.\n- execute.py: Contains code to execute the task on the slurm node.\n- function.py: Contains the code for making a function slurm-compatible.\n- function_map.py: Saves all the slurified functions.\n- guard.py: Contains code to prevent you accidentally DDoSing your infrastructure.\n- options.py: Contains a simple data structure to save slurm options.\n\n## Changes\n\n* 0.5.2: Added pyproject.toml for PEP compliance\n* 0.5.1: `Batch` will now flush on delete, in case you forgot.\n* 0.5.0:\n  * Functions now have a `wait_for`-option and return job ids. \n  * Braking changes: Batches have a new API.\n    * `add` is no longer needed.\n    * `AutoBatch` is now called `Batch`.\n  * Fundamental code changes under the hood.\n* <0.5.0:\n  * Lots of experiments on finding the right interface.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/d-krupke/slurminade",
+    "keywords": "slurm",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "slurminade",
+    "package_url": "https://pypi.org/project/slurminade/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/slurminade/",
+    "project_urls": {
+      "Homepage": "https://github.com/d-krupke/slurminade"
+    },
+    "release_url": "https://pypi.org/project/slurminade/0.5.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "A decorator-based slurm runner",
+    "version": "0.5.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15555508,
+  "releases": {
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47338e52ba4b6a720df7a969d74f30e1f6305db8efe79a2a25c12b37ed36a7a1",
+          "md5": "1ecccbd6b5871cd82d11b1311e3ca1a3",
+          "sha256": "97d212b8ff751cf56d38fda535b2291ae438349d089d063dd51af417f8320cbb"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1ecccbd6b5871cd82d11b1311e3ca1a3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 3839,
+        "upload_time": "2022-03-28T14:14:39",
+        "upload_time_iso_8601": "2022-03-28T14:14:39.630376Z",
+        "url": "https://files.pythonhosted.org/packages/47/33/8e52ba4b6a720df7a969d74f30e1f6305db8efe79a2a25c12b37ed36a7a1/slurminade-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6855444f26833fc9b9e0d0198b590e81d77225db376215889a9f81896d5ac651",
+          "md5": "7e04e07b4a51e5013c3cca44917a6451",
+          "sha256": "31ed1be6a52644e2cb6d4f3c4ceb926afcbd521fe067371abb5d7d752f8a052f"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7e04e07b4a51e5013c3cca44917a6451",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 4394,
+        "upload_time": "2022-03-28T14:31:01",
+        "upload_time_iso_8601": "2022-03-28T14:31:01.880314Z",
+        "url": "https://files.pythonhosted.org/packages/68/55/444f26833fc9b9e0d0198b590e81d77225db376215889a9f81896d5ac651/slurminade-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5be65fd7519e87855b8d744d3ca54f3719261a51ad4a61691a2e64355da4c4d",
+          "md5": "87f6699dbe683e23f8c27bc8dd34bff4",
+          "sha256": "73f253cb417435b1f6d97a78b3e90b7141f2123519345aa9a4ba389c5195a10f"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "87f6699dbe683e23f8c27bc8dd34bff4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 4636,
+        "upload_time": "2022-03-28T14:33:57",
+        "upload_time_iso_8601": "2022-03-28T14:33:57.979360Z",
+        "url": "https://files.pythonhosted.org/packages/b5/be/65fd7519e87855b8d744d3ca54f3719261a51ad4a61691a2e64355da4c4d/slurminade-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "680aa50729952e4d40486298b0ff8cf60da876878f224554fb27a7325ca9f3ea",
+          "md5": "c0f10e858aeb53432cf32c05d77ea927",
+          "sha256": "b40a212d02e98d4a6790dd18f9f385433546b2008ba09a81db53d9176c5ae10e"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c0f10e858aeb53432cf32c05d77ea927",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 4865,
+        "upload_time": "2022-03-28T15:10:52",
+        "upload_time_iso_8601": "2022-03-28T15:10:52.934491Z",
+        "url": "https://files.pythonhosted.org/packages/68/0a/a50729952e4d40486298b0ff8cf60da876878f224554fb27a7325ca9f3ea/slurminade-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "817349de612f1b549e74a23eb15a668dc7980afd894d950c148a13a8d3d6f4a2",
+          "md5": "5a64f97e3cc5a78afe8e93ecb8516c9c",
+          "sha256": "8212fabbdfe65f98bdd6b4ffb09851f78454e320921c0ccebded127efe5bcf1f"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5a64f97e3cc5a78afe8e93ecb8516c9c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6972,
+        "upload_time": "2022-03-29T16:29:33",
+        "upload_time_iso_8601": "2022-03-29T16:29:33.262962Z",
+        "url": "https://files.pythonhosted.org/packages/81/73/49de612f1b549e74a23eb15a668dc7980afd894d950c148a13a8d3d6f4a2/slurminade-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5987907206ac1e115ad7aed31036163eda8b7982319625d23b069a42d8ea1a9",
+          "md5": "980c66e32b9c8c03d30c5c0a0e59d214",
+          "sha256": "a22ea48f6cbe02d6c58dce6ac63125e6e139d90159f503e36c17e53efbe44191"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "980c66e32b9c8c03d30c5c0a0e59d214",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6981,
+        "upload_time": "2022-03-30T16:53:23",
+        "upload_time_iso_8601": "2022-03-30T16:53:23.839907Z",
+        "url": "https://files.pythonhosted.org/packages/c5/98/7907206ac1e115ad7aed31036163eda8b7982319625d23b069a42d8ea1a9/slurminade-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca590c7fe0b049dce3cba063024221cbd83e502d8f004618feddf455fe8037b5",
+          "md5": "5f71231aad1e0e57d4248debb30c4b9b",
+          "sha256": "72032eb113b167ceaa8d633cd8500eec04a83f188c33daea38bd7c5f989f0bce"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5f71231aad1e0e57d4248debb30c4b9b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 7138,
+        "upload_time": "2022-03-31T10:58:44",
+        "upload_time_iso_8601": "2022-03-31T10:58:44.914690Z",
+        "url": "https://files.pythonhosted.org/packages/ca/59/0c7fe0b049dce3cba063024221cbd83e502d8f004618feddf455fe8037b5/slurminade-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7a43ed60f45cc937536c1a12200cae7cbfc3b8d159bb8b6558c12584988f21b",
+          "md5": "86cbddcdd1211406b49264bfe58558d7",
+          "sha256": "21426e0541bbbcc0a11d3462126cc4d954d4356bcd9941d8c4b9c3b20010fc02"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "86cbddcdd1211406b49264bfe58558d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 7298,
+        "upload_time": "2022-03-31T11:18:16",
+        "upload_time_iso_8601": "2022-03-31T11:18:16.980886Z",
+        "url": "https://files.pythonhosted.org/packages/a7/a4/3ed60f45cc937536c1a12200cae7cbfc3b8d159bb8b6558c12584988f21b/slurminade-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2431e9d4c01889ae81d7db3541c2cdf1f8766d29f54df04f4cf2f5e0d1964504",
+          "md5": "7693ced527d348c6770092c29356dce4",
+          "sha256": "342a330199bc402dc75a850e5a5aa512aa8712fbeb9de9214493651436ec1bfc"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7693ced527d348c6770092c29356dce4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 7409,
+        "upload_time": "2022-03-31T11:25:06",
+        "upload_time_iso_8601": "2022-03-31T11:25:06.682953Z",
+        "url": "https://files.pythonhosted.org/packages/24/31/e9d4c01889ae81d7db3541c2cdf1f8766d29f54df04f4cf2f5e0d1964504/slurminade-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f00fd5b465e0fdeca0a78eb122f5f8fcccefeaaac2b2417510fc5c697a287ebe",
+          "md5": "9cbcdeb35f66365830d4296e1f021bb5",
+          "sha256": "e9f258e8d8d864c08df6abfd56a5a1f9a843cc817d3c866344367524bbb63d37"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9cbcdeb35f66365830d4296e1f021bb5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 7406,
+        "upload_time": "2022-03-31T14:31:34",
+        "upload_time_iso_8601": "2022-03-31T14:31:34.526021Z",
+        "url": "https://files.pythonhosted.org/packages/f0/0f/d5b465e0fdeca0a78eb122f5f8fcccefeaaac2b2417510fc5c697a287ebe/slurminade-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f5c3e0669e8c9d1d9029130d55c0fc8e60b02a4d37117f5e0b47729dd826a52",
+          "md5": "c9ab135ead2bfff3faa327b6fd3c77cd",
+          "sha256": "71859a210a067776ec6b4232867bef48fbdee4c00636417661cf2c09142298d1"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c9ab135ead2bfff3faa327b6fd3c77cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10238,
+        "upload_time": "2022-05-08T10:35:08",
+        "upload_time_iso_8601": "2022-05-08T10:35:08.999419Z",
+        "url": "https://files.pythonhosted.org/packages/2f/5c/3e0669e8c9d1d9029130d55c0fc8e60b02a4d37117f5e0b47729dd826a52/slurminade-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7695fc01de0cc81ccb447deca8d964921659b2b4cabb21447046052a76d7e1c4",
+          "md5": "8ba55c3015fd89245341f0b5e60659ba",
+          "sha256": "dcf80a00957cef676a100731373d1e2bf80290470917dea40ca18aa452693df5"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ba55c3015fd89245341f0b5e60659ba",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10206,
+        "upload_time": "2022-05-08T18:23:30",
+        "upload_time_iso_8601": "2022-05-08T18:23:30.209303Z",
+        "url": "https://files.pythonhosted.org/packages/76/95/fc01de0cc81ccb447deca8d964921659b2b4cabb21447046052a76d7e1c4/slurminade-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9c00a61594f6a69382ae5bedca14a7b26ef531c153bbcb33df24784b2ef4f2c5",
+          "md5": "dc224aa0e6e7c3d0c686745859ce5591",
+          "sha256": "8a6c5bf1fc0efbd5f2a98f3d8c6a1f8268d854b15d6e91b83742a0dc59bbbb40"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dc224aa0e6e7c3d0c686745859ce5591",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10225,
+        "upload_time": "2022-07-03T08:42:23",
+        "upload_time_iso_8601": "2022-07-03T08:42:23.329582Z",
+        "url": "https://files.pythonhosted.org/packages/9c/00/a61594f6a69382ae5bedca14a7b26ef531c153bbcb33df24784b2ef4f2c5/slurminade-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3d53f8528b6b7b9c7a67f502b93a45115db64c11e6264d108d8cd6fedb810031",
+          "md5": "c82cf4d9154917d6ecfd4126558e2a4b",
+          "sha256": "3fbdcce58d0466953937b8b4c117db9ce789ca9ec54b33294bb1ddad2477d7d9"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c82cf4d9154917d6ecfd4126558e2a4b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10560,
+        "upload_time": "2022-07-03T17:17:09",
+        "upload_time_iso_8601": "2022-07-03T17:17:09.388672Z",
+        "url": "https://files.pythonhosted.org/packages/3d/53/f8528b6b7b9c7a67f502b93a45115db64c11e6264d108d8cd6fedb810031/slurminade-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "678a86906232f79a66746db6e408abe9d5031dc27f23b596d1166566891dcc5f",
+          "md5": "feac973bede55c682b97d4e0458c3c0d",
+          "sha256": "52ccac3e594dc0b2c62bcd03c699974c6b277e7468b104476704e79c07b1205f"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "feac973bede55c682b97d4e0458c3c0d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 11891,
+        "upload_time": "2022-07-04T14:52:23",
+        "upload_time_iso_8601": "2022-07-04T14:52:23.401730Z",
+        "url": "https://files.pythonhosted.org/packages/67/8a/86906232f79a66746db6e408abe9d5031dc27f23b596d1166566891dcc5f/slurminade-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dfb51702aa3a0b9f254c633a1e6df8eb46d4d1834363c187d29ced6b8dea8599",
+          "md5": "106bd308aa08d14f424ad067c66428a3",
+          "sha256": "39c86c6143b00f172b2a0fdb34905ca9beb5b7c86001debd4c5606e5939ddd5c"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "106bd308aa08d14f424ad067c66428a3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15293,
+        "upload_time": "2022-08-13T07:52:40",
+        "upload_time_iso_8601": "2022-08-13T07:52:40.938997Z",
+        "url": "https://files.pythonhosted.org/packages/df/b5/1702aa3a0b9f254c633a1e6df8eb46d4d1834363c187d29ced6b8dea8599/slurminade-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e585977bd9746f1a326fd9528ac541e8afefc213035c86e7c6dd708c1e083b0",
+          "md5": "a20638c06bd71e2665b57cf39f923032",
+          "sha256": "073c2bbf434e495c1733ef62d60c6dd6ec1e0151cd3ff27740bf7a532f8863fa"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a20638c06bd71e2665b57cf39f923032",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15364,
+        "upload_time": "2022-08-14T08:08:16",
+        "upload_time_iso_8601": "2022-08-14T08:08:16.285944Z",
+        "url": "https://files.pythonhosted.org/packages/3e/58/5977bd9746f1a326fd9528ac541e8afefc213035c86e7c6dd708c1e083b0/slurminade-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "19c70f056e8b794aa8f910a3e03e74394b1cfb339a9e956ec835ddd0a8ca7b2c",
+          "md5": "9927f84ec553145fe89ecf413f16887f",
+          "sha256": "cee2d00bc17d69bc0ef431f35a61ecb72a99bdcd55e7b4f016c76dcaa1503be8"
+        },
+        "downloads": -1,
+        "filename": "slurminade-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9927f84ec553145fe89ecf413f16887f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15503,
+        "upload_time": "2022-10-27T16:52:21",
+        "upload_time_iso_8601": "2022-10-27T16:52:21.199032Z",
+        "url": "https://files.pythonhosted.org/packages/19/c7/0f056e8b794aa8f910a3e03e74394b1cfb339a9e956ec835ddd0a8ca7b2c/slurminade-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "19c70f056e8b794aa8f910a3e03e74394b1cfb339a9e956ec835ddd0a8ca7b2c",
+        "md5": "9927f84ec553145fe89ecf413f16887f",
+        "sha256": "cee2d00bc17d69bc0ef431f35a61ecb72a99bdcd55e7b4f016c76dcaa1503be8"
+      },
+      "downloads": -1,
+      "filename": "slurminade-0.5.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9927f84ec553145fe89ecf413f16887f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 15503,
+      "upload_time": "2022-10-27T16:52:21",
+      "upload_time_iso_8601": "2022-10-27T16:52:21.199032Z",
+      "url": "https://files.pythonhosted.org/packages/19/c7/0f056e8b794aa8f910a3e03e74394b1cfb339a9e956ec835ddd0a8ca7b2c/slurminade-0.5.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
