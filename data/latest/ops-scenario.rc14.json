@@ -1,0 +1,688 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Pietro Pasotti <pietro.pasotti@canonical.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: Apache Software License",
+      "Topic :: Utilities"
+    ],
+    "description": "Scenario\n============\n\nThis is a state transition testing framework for Operator Framework charms.\n\nWhere the Harness enables you to procedurally mock pieces of the state the charm needs to function, Scenario tests allow\nyou to declaratively define the state all at once, and use it as a sort of context against which you can fire a single\nevent on the charm and execute its logic.\n\nThis puts scenario tests somewhere in between unit and integration tests.\n\nScenario tests nudge you into thinking of charms as an input->output function. Input is what we call a `Scene`: the\nunion of an `Event` (why am I being executed) and a `State` (am I leader? what is my relation data? what is my\nconfig?...).\nThe output is another context instance: the context after the charm has had a chance to interact with the mocked juju\nmodel.\n\n![state transition model depiction](resources/state-transition-model.png)\n\nScenario-testing a charm, then, means verifying that:\n\n- the charm does not raise uncaught exceptions while handling the scene\n- the output state (or the diff with the input state) is as expected.\n\n\n# Core concepts as a metaphor\nI like metaphors, so here we go:\n- There is a theatre stage.\n- You pick an actor (a Charm) to put on the stage. Not just any actor: an improv one.\n- You arrange the stage with content that the actor will have to interact with. This consists of selecting:\n    - An initial situation (State) in which the actor is, e.g. is the actor the main role or an NPC (is_leader), or what other actors are there around it, what is written in those pebble-shaped books on the table?\n    - Something that has just happened (an Event) and to which the actor has to react (e.g. one of the NPCs leaves the stage (relation-departed), or the content of one of the books changes).\n- How the actor will react to the event will have an impact on the context: e.g. the actor might knock over a table (a container), or write something down into one of the books.\n\n\n# Core concepts not as a metaphor\nScenario tests are about running assertions on atomic state transitions treating the charm being tested like a black box.\nAn initial state goes in, an event occurs (say, `'start'`) and a new state comes out.\nScenario tests are about validating the transition, that is, consistency-checking the delta between the two states, and verifying the charm author's expectations.\n\nComparing scenario tests with `Harness` tests:\n- Harness exposes an imperative API: the user is expected to call methods on the Harness driving it to the desired state, then verify its validity by calling charm methods or inspecting the raw data.\n- Harness instantiates the charm once, then allows you to fire multiple events on the charm, which is breeding ground for subtle bugs. Scenario tests are centered around testing single state transitions, that is, one event at a time. This ensures that the execution environment is as clean as possible (for a unit test).\n- Harness maintains a model of the juju Model, which is a maintenance burden and adds complexity. Scenario mocks at the level of hook tools and stores all mocking data in a monolithic data structure (the State), which makes it more lightweight and portable.\n- TODO: Scenario can mock at the level of hook tools. Decoupling charm and context allows us to swap out easily any part of this flow, and even share context data across charms, codebases, teams...\n\n# Writing scenario tests\nA scenario test consists of three broad steps:\n\n- Arrange:\n    - declare the input state\n    - select an event to fire\n- Act:\n    - run the state (i.e. obtain the output state)\n- Assert:\n    - verify that the output state is how you expect it to be\n    - verify that the delta with the input state is what you expect it to be\n\nThe most basic scenario is the so-called `null scenario`: one in which all is defaulted and barely any data is\navailable. The charm has no config, no relations, no networks, and no leadership.\n\nWith that, we can write the simplest possible scenario test:\n\n```python\nfrom scenario.state import State\nfrom ops.charm import CharmBase\nfrom ops.model import UnknownStatus\n\nclass MyCharm(CharmBase):\n    pass\n\n\ndef test_scenario_base():\n    out = State().trigger(\n        'start', \n        MyCharm, meta={\"name\": \"foo\"})\n    assert out.status.unit == UnknownStatus()\n```\n\nNow let's start making it more complicated.\nOur charm sets a special state if it has leadership on 'start':\n\n```python\nimport pytest\nfrom scenario.state import State\nfrom ops.charm import CharmBase\nfrom ops.model import ActiveStatus\n\n\nclass MyCharm(CharmBase):\n    def __init__(self, ...):\n        self.framework.observe(self.on.start, self._on_start)\n\n    def _on_start(self, _):\n        if self.unit.is_leader():\n            self.unit.status = ActiveStatus('I rule')\n        else:\n            self.unit.status = ActiveStatus('I am ruled')\n\n\n@pytest.mark.parametrize('leader', (True, False))\ndef test_status_leader(leader):\n    out = State(leader=leader).trigger(\n        'start', \n        MyCharm,\n        meta={\"name\": \"foo\"})\n    assert out.status.unit == ActiveStatus('I rule' if leader else 'I am ruled')\n```\n\nBy defining the right state we can programmatically define what answers will the charm get to all the questions it can ask the juju model: am I leader? What are my relations? What is the remote unit I'm talking to? etc...\n\n\n## Statuses\n\nOne of the simplest types of black-box testing available to charmers is to execute the charm and verify that the charm sets the expected unit/application status.\nWe have seen a simple example above including leadership.\nBut what if the charm transitions through a sequence of statuses?\n\n```python\nfrom ops.model import MaintenanceStatus, ActiveStatus, WaitingStatus, BlockedStatus\n\n# charm code:\ndef _on_event(self, _event):\n    self.unit.status = MaintenanceStatus('determining who the ruler is...')\n    try:\n        if self._call_that_takes_a_few_seconds_and_only_passes_on_leadership:\n            self.unit.status = ActiveStatus('I rule')\n        else:\n            self.unit.status = WaitingStatus('checking this is right...')\n            self._check_that_takes_some_more_time()\n            self.unit.status = ActiveStatus('I am ruled')\n    except:\n        self.unit.status = BlockedStatus('something went wrong')\n```\n\nYou can verify that the charm has followed the expected path by checking the **unit status history** like so:\n\n```python\nfrom ops.model import MaintenanceStatus, ActiveStatus, WaitingStatus, UnknownStatus\nfrom scenario import State\n\ndef test_statuses():\n    out = State(leader=False).trigger(\n        'start',\n        MyCharm,\n        meta={\"name\": \"foo\"})\n    assert out.status.unit_history == [\n      UnknownStatus(),\n      MaintenanceStatus('determining who the ruler is...'),\n      WaitingStatus('checking this is right...'),\n    ]\n```\n\nNote that the current status is not in the **unit status history**.\n\nAlso note that, unless you initialize the State with a preexisting status, the first status in the history will always be `unknown`. That is because, so far as scenario is concerned, each event is \"the first event this charm has ever seen\".\n\nIf you want to simulate a situation in which the charm already has seen some event, and is in a status other than Unknown (the default status every charm is born with), you will have to pass the 'initial status' in State.\n\n```python\nfrom ops.model import ActiveStatus\nfrom scenario import State, Status\nState(leader=False, status=Status(unit=ActiveStatus('foo')))\n```\n\n\n## Relations\n\nYou can write scenario tests to verify the shape of relation data:\n\n```python\nfrom ops.charm import CharmBase\n\nfrom scenario.state import Relation, State\n\n\n# This charm copies over remote app data to local unit data\nclass MyCharm(CharmBase):\n    ...\n\n    def _on_event(self, e):\n        rel = e.relation\n        assert rel.app.name == 'remote'\n        assert rel.data[self.unit]['abc'] == 'foo'\n        rel.data[self.unit]['abc'] = rel.data[e.app]['cde']\n\n\ndef test_relation_data():\n    out = State(relations=[\n        Relation(\n            endpoint=\"foo\",\n            interface=\"bar\",\n            remote_app_name=\"remote\",\n            local_unit_data={\"abc\": \"foo\"},\n            remote_app_data={\"cde\": \"baz!\"},\n        ),\n    ]\n    ).trigger(\"start\", MyCharm, meta={\"name\": \"foo\"})\n\n    assert out.relations[0].local_unit_data == {\"abc\": \"baz!\"}\n    # you can do this to check that there are no other differences:\n    assert out.relations == [\n        Relation(\n            endpoint=\"foo\",\n            interface=\"bar\",\n            remote_app_name=\"remote\",\n            local_unit_data={\"abc\": \"baz!\"},\n            remote_app_data={\"cde\": \"baz!\"},\n        ),\n    ]\n\n# which is very idiomatic and superbly explicit. Noice.\n```\n\n## Containers\n\nWhen testing a kubernetes charm, you can mock container interactions.\nWhen using the null state (`State()`), there will be no containers. So if the charm were to `self.unit.containers`, it would get back an empty dict.\n\nTo give the charm access to some containers, you need to pass them to the input state, like so:\n`State(containers=[...])`\n\nAn example of a scene including some containers:\n```python\nfrom scenario.state import Container, State\nstate = State(containers=[\n    Container(name=\"foo\", can_connect=True),\n    Container(name=\"bar\", can_connect=False)\n])\n```\n\nIn this case, `self.unit.get_container('foo').can_connect()` would return `True`, while for 'bar' it would give `False`.\n\nYou can configure a container to have some files in it:\n\n```python\nfrom pathlib import Path\n\nfrom scenario.state import Container, State, Mount\n\nlocal_file = Path('/path/to/local/real/file.txt')\n\nstate = State(containers=[\n    Container(name=\"foo\",\n              can_connect=True,\n              mounts={'local': Mount('/local/share/config.yaml', local_file)})\n]\n)\n```\n\nIn this case, if the charm were to:\n```python\ndef _on_start(self, _):\n    foo = self.unit.get_container('foo')\n    content = foo.pull('/local/share/config.yaml').read()\n```\n\nthen `content` would be the contents of our locally-supplied `file.txt`. You can use `tempdir` for nicely wrapping strings and passing them to the charm via the container.\n\n`container.push` works similarly, so you can write a test like:\n\n```python\nimport tempfile\nfrom ops.charm import CharmBase\nfrom scenario.state import State, Container, Mount\n\n\nclass MyCharm(CharmBase):\n    def __init__(self, *args):\n        super().__init__(*args)\n        self.framework.observe(self.on.foo_pebble_ready, self._on_pebble_ready)\n\n    def _on_pebble_ready(self, _):\n        foo = self.unit.get_container('foo')\n        foo.push('/local/share/config.yaml', \"TEST\", make_dirs=True)\n\n\ndef test_pebble_push():\n    with tempfile.NamedTemporaryFile() as local_file:\n        container = Container(name='foo',\n                              can_connect=True,\n                              mounts={'local': Mount('/local/share/config.yaml', local_file.name)})\n        out = State(\n            containers=[container]\n        ).trigger(\n            container.pebble_ready_event,\n            MyCharm,\n            meta={\"name\": \"foo\", \"containers\": {\"foo\": {}}},\n        )\n        assert local_file.read().decode() == \"TEST\"\n```\n\n`container.pebble_ready_event` is syntactic sugar for: `Event(\"foo-pebble-ready\", container=container)`. The reason we need to associate the container with the event is that the Framework uses an envvar to determine which container the pebble-ready event is about (it does not use the event name). Scenario needs that information, similarly, for injecting that envvar into the charm's runtime.\n\n`container.exec` is a tad more complicated, but if you get to this low a level of simulation, you probably will have far worse issues to deal with.\nYou need to specify, for each possible command the charm might run on the container, what the result of that would be: its return code, what will be written to stdout/stderr.\n\n```python\nfrom ops.charm import CharmBase\n\nfrom scenario.state import State, Container, ExecOutput\n\nLS_LL = \"\"\"\n.rw-rw-r--  228 ubuntu ubuntu 18 jan 12:05 -- charmcraft.yaml    \n.rw-rw-r--  497 ubuntu ubuntu 18 jan 12:05 -- config.yaml        \n.rw-rw-r--  900 ubuntu ubuntu 18 jan 12:05 -- CONTRIBUTING.md    \ndrwxrwxr-x    - ubuntu ubuntu 18 jan 12:06 -- lib                \n\"\"\"\n\n\nclass MyCharm(CharmBase):\n    def _on_start(self, _):\n        foo = self.unit.get_container('foo')\n        proc = foo.exec(['ls', '-ll'])\n        stdout, _ = proc.wait_output()\n        assert stdout == LS_LL\n\n\ndef test_pebble_exec():\n    container = Container(\n        name='foo',\n        exec_mock={\n            ('ls', '-ll'):  # this is the command we're mocking\n                ExecOutput(return_code=0,  # this data structure contains all we need to mock the call.\n                           stdout=LS_LL)\n        }\n    )\n    out = State(\n        containers=[container]\n    ).trigger(\n        container.pebble_ready_event,\n        MyCharm,\n        meta={\"name\": \"foo\", \"containers\": {\"foo\": {}}},\n    )\n```\n\n\n# Deferred events\nScenario allows you to accurately simulate the Operator Framework's event queue. The event queue is responsible for keeping track of the deferred events.\nOn the input side, you can verify that if the charm triggers with this and that event in its queue (they would be there because they had been deferred in the previous run), then the output state is valid.\n\n```python\nfrom scenario import State, deferred\n\n\nclass MyCharm(...):\n    ...\n    def _on_update_status(self, e):\n        e.defer()\n    def _on_start(self, e):\n        e.defer()\n\n        \ndef test_start_on_deferred_update_status(MyCharm):\n    \"\"\"Test charm execution if a 'start' is dispatched when in the previous run an update-status had been deferred.\"\"\"\n    out = State(\n      deferred=[\n            deferred('update_status', \n                     handler=MyCharm._on_update_status)\n        ]\n    ).trigger('start', MyCharm)\n    assert len(out.deferred) == 1\n    assert out.deferred[0].name == 'start'\n```\n\nYou can also generate the 'deferred' data structure (called a DeferredEvent) from the corresponding Event (and the handler):\n\n```python\nfrom scenario import Event, Relation\n\nclass MyCharm(...):\n    ...\n\ndeferred_start = Event('start').deferred(MyCharm._on_start)\ndeferred_install = Event('install').deferred(MyCharm._on_start)\n```\n\n## relation events:\n```python   \nfoo_relation = Relation('foo') \ndeferred_relation_changed_evt = foo_relation.changed_event.deferred(handler=MyCharm._on_foo_relation_changed)\n```\nOn the output side, you can verify that an event that you expect to have been deferred during this trigger, has indeed been deferred.\n\n```python\nfrom scenario import State\n\n\nclass MyCharm(...):\n    ...\n    def _on_start(self, e):\n        e.defer()\n\n        \ndef test_defer(MyCharm):\n    out = State().trigger('start', MyCharm)\n    assert len(out.deferred) == 1\n    assert out.deferred[0].name == 'start'\n```\n    \n## Deferring relation events\nIf you want to test relation event deferrals, some extra care needs to be taken. RelationEvents hold references to the Relation instance they are about. So do they in Scenario. You can use the deferred helper to generate the data structure:\n\n```python\nfrom scenario import State, Relation, deferred\n\n\nclass MyCharm(...):\n    ...\n    def _on_foo_relation_changed(self, e):\n        e.defer()\n\n        \ndef test_start_on_deferred_update_status(MyCharm):\n    foo_relation = Relation('foo') \n    State(\n      relations=[foo_relation],\n      deferred=[\n            deferred('foo_relation_changed', \n                     handler=MyCharm._on_foo_relation_changed,\n                     relation=foo_relation)\n        ]\n    )\n```\nbut you can also use a shortcut from the relation event itself, as mentioned above:\n\n```python\n\nfrom scenario import Relation\n\nclass MyCharm(...):\n    ...\n\nfoo_relation = Relation('foo') \nfoo_relation.changed_event.deferred(handler=MyCharm._on_foo_relation_changed)\n```\n\n### Fine-tuning\n\nThe deferred helper Scenario provides will not support out of the box all custom event subclasses, or events emitted by charm libraries or objects other than the main charm class.\n\nFor general-purpose usage, you will need to instantiate DeferredEvent directly.\n\n```python\nfrom scenario import DeferredEvent\n\nmy_deferred_event = DeferredEvent(\n   handle_path='MyCharm/MyCharmLib/on/database_ready[1]',\n   owner='MyCharmLib',  # the object observing the event. Could also be MyCharm.\n   observer='_on_database_ready'\n)\n```\n\n\n# StoredState\n\nScenario can simulate StoredState.\nYou can define it on the input side as:\n\n```python\nfrom ops.charm import CharmBase\nfrom ops.framework import StoredState as Ops_StoredState, Framework\nfrom scenario import State, StoredState\n\n\nclass MyCharmType(CharmBase):\n    my_stored_state = Ops_StoredState()\n\n    def __init__(self, framework: Framework):\n        super().__init__(framework)\n        assert self.my_stored_state.foo == 'bar'  # this will pass!\n\n\nstate = State(stored_state=[\n  StoredState(\n    owner_path=\"MyCharmType\",\n    name=\"my_stored_state\",\n    content={\n      'foo': 'bar',\n      'baz': {42: 42},\n    })\n])\n```\n\nAnd the charm's runtime will see `self.stored_State.foo` and `.baz` as expected.\nAlso, you can run assertions on it on the output side the same as any other bit of state.\n\n\n# Emitted events\nIf your charm deals with deferred events, custom events, and charm libs that in turn emit their own custom events, it can be hard to examine the resulting control flow.\nIn these situations it can be useful to verify that, as a result of a given juju event triggering (say, 'start'), a specific chain of deferred and custom events is emitted on the charm. The resulting state, black-box as it is, gives little insight into how exactly it was obtained. `scenario.capture_events` allows you to open a peephole and intercept any events emitted by the framework. \n\nUsage: \n\n```python\nfrom ops.charm import StartEvent, UpdateStatusEvent\nfrom scenario import State, DeferredEvent\nfrom scenario import capture_events\nwith capture_events() as emitted:\n    state_out = State(deferred=[DeferredEvent('start', ...)]).trigger('update-status', ...)\n\n# deferred events get reemitted first\nassert isinstance(emitted[0], StartEvent)\n# the main juju event gets emitted next\nassert isinstance(emitted[1], UpdateStatusEvent)\n# possibly followed by a tail of all custom events that the main juju event triggered in turn\n# assert isinstance(emitted[2], MyFooEvent)\n# ... \n```\n\n\nYou can filter events by type like so:\n\n```python\nfrom ops.charm import StartEvent, RelationEvent\nfrom scenario import capture_events\nwith capture_events(StartEvent, RelationEvent) as emitted:\n    # capture all `start` and `*-relation-*` events.\n    pass  \n```\n\nPassing no event types, like: `capture_events()`, is equivalent to `capture_events(EventBase)`.\n\nBy default, **framework events** (`PreCommit`, `Commit`) are not considered for inclusion in the output list even if they match the instance check. You can toggle that by passing: `capture_events(include_framework=True)`.\n\nBy default, **deferred events** are included in the listing if they match the instance check. You can toggle that by passing:\n`capture_events(include_deferred=True)`.\n\n\n# The virtual charm root\nBefore executing the charm, Scenario writes the metadata, config, and actions `yaml`s to a temporary directory. \nThe charm will see that tempdir as its 'root'. This allows us to keep things simple when dealing with metadata that can \nbe either inferred from the charm type being passed to `trigger()` or be passed to it as an argument, thereby overriding\nthe inferred one. This also allows you to test with charms defined on the fly, as in:\n\n```python\nfrom ops.charm import CharmBase\nfrom scenario import State\n\nclass MyCharmType(CharmBase):\n    pass\n\nstate = State().trigger(charm_type=MyCharmType, meta={'name': 'my-charm-name'}, event='start')\n```\n\nA consequence of this fact is that you have no direct control over the tempdir that we are\ncreating to put the metadata you are passing to trigger (because `ops` expects it to be a file...).\nThat is, unless you pass your own:\n\n```python\nfrom ops.charm import CharmBase\nfrom scenario import State\nimport tempfile\n\n\nclass MyCharmType(CharmBase):\n  pass\n\n\ntd = tempfile.TemporaryDirectory()\nstate = State().trigger(charm_type=MyCharmType, meta={'name': 'my-charm-name'}, event='start',\n                        charm_root=td.name)\n```\n\nDo this, and you will be able to set up said directory as you like before the charm is run, as well \nas verify its contents after the charm has run. Do keep in mind that the metadata files will \nbe overwritten by Scenario, and therefore ignored.\n\n\n# Consistency checks\n\nA Scenario, that is, the combination of an event, a state, and a charm, is consistent if it's plausible in JujuLand.\nFor example, Juju can't emit a `foo-relation-changed` event on your charm unless your charm has declared a `foo` relation\nendpoint in its `metadata.yaml`. If that happens, that's a juju bug.\nScenario however assumes that Juju is bug-free, therefore, so far as we're concerned, that can't happen, and therefore we \nhelp you verify that the scenarios you create are consistent and raise an exception if that isn't so.\n\nThat happens automatically behind the scenes whenever you trigger an event; `scenario.consistency_checker.check_consistency`\nis called and verifies that the scenario makes sense.\n\n## Caveats:\n- False positives: not all checks are implemented yet; more will come.\n- False negatives: it is possible that a scenario you know to be consistent is seen as inconsistent. That is probably a bug in the consistency checker itself, please report it.\n- Inherent limitations: if you have a custom event whose name conflicts with a builtin one, the consistency constraints of the builtin one will apply. For example: if you decide to name your custom event `bar-pebble-ready`, but you are working on a machine charm or don't have either way a `bar` container in your `metadata.yaml`, Scenario will flag that as inconsistent. \n\n## Bypassing the checker\nIf you have a clear false negative, are explicitly testing 'edge', inconsistent situations, or for whatever reason the checker is in your way, you can set the `SCENARIO_SKIP_CONSISTENCY_CHECKS` envvar and skip it altogether. Hopefully you don't need that.\n\n\n# Snapshot\n\nScenario comes with a cli tool called `snapshot`. Assuming you've pip-installed `ops-scenario`, you should be able to reach the entry point by typing `scenario snapshot` in a shell.\n\nSnapshot's purpose is to gather the State data structure from a real, live charm running in some cloud your local juju client has access to. This is handy in case:\n- you want to write a test about the state the charm you're developing is currently in\n- your charm is bork or in some inconsistent state, and you want to write a test to check the charm will handle it correctly the next time around (aka regression testing)\n- you are new to Scenario and want to quickly get started with a real-life example.\n\nSuppose you have a Juju model with a `prometheus-k8s` unit deployed as `prometheus-k8s/0`. If you type `scenario snapshot prometheus-k8s/0`, you will get a printout of the State object. Copy-paste that in some file, import all you need from `scenario`, and you have a working `State` that you can `.trigger()` events from.\n\nYou can also pass a `--format json | pytest | state (default=state)` flag to obtain\n- jsonified `State` data structure, for portability\n- a full-fledged pytest test case (with imports and all), where you only have to fill in the charm type and the event that you wish to trigger. \n\n# TODOS:\n- Recorder\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "juju,test",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ops-scenario",
+    "package_url": "https://pypi.org/project/ops-scenario/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/ops-scenario/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/PietroPasotti/ops-scenario/issues",
+      "Homepage": "https://github.com/PietroPasotti/ops-scenario"
+    },
+    "release_url": "https://pypi.org/project/ops-scenario/2.1.3.3/",
+    "requires_dist": [
+      "ops (>=2.0)",
+      "PyYAML (==6.0)",
+      "typer (==0.7.0)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Python library providing a Scenario-based testing API for Operator Framework charms.",
+    "version": "2.1.3.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17474468,
+  "releases": {
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d60f988a17df49a4407f010f87e36c0bc61c1eb6e3279367064b1b0fdf5987d",
+          "md5": "216ad99861147310c647ab5eec8126b9",
+          "sha256": "d28bc1db74a2bd179b1057e3e445023942d9e8a4a689a7b7edbc644ebe4634a3"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "216ad99861147310c647ab5eec8126b9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22434,
+        "upload_time": "2023-02-02T09:06:20",
+        "upload_time_iso_8601": "2023-02-02T09:06:20.571464Z",
+        "url": "https://files.pythonhosted.org/packages/4d/60/f988a17df49a4407f010f87e36c0bc61c1eb6e3279367064b1b0fdf5987d/ops_scenario-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb44520944ccb39359e8c6d7a46c7ce44e7e2e6f73a5ee02aedab597eed2a83e",
+          "md5": "5e29e902afdb5104f7d95653e99d8538",
+          "sha256": "2972ccb42d04f7904b12319adaa66db36529402b38b94477f48f0c3290abfe16"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5e29e902afdb5104f7d95653e99d8538",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22428,
+        "upload_time": "2023-02-02T09:58:40",
+        "upload_time_iso_8601": "2023-02-02T09:58:40.828631Z",
+        "url": "https://files.pythonhosted.org/packages/cb/44/520944ccb39359e8c6d7a46c7ce44e7e2e6f73a5ee02aedab597eed2a83e/ops_scenario-2.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "346f102481e8ff7391bc39a46167e0793ebaaab8adabcf9c158341f9b84ed38a",
+          "md5": "06d0e5d7260c2561bab2103e86a57dfd",
+          "sha256": "52f84de222010a7b358617045941c74bc895b3ffd6b3835cf865b9d0bfa41340"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06d0e5d7260c2561bab2103e86a57dfd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 19744,
+        "upload_time": "2023-02-02T09:58:42",
+        "upload_time_iso_8601": "2023-02-02T09:58:42.389094Z",
+        "url": "https://files.pythonhosted.org/packages/34/6f/102481e8ff7391bc39a46167e0793ebaaab8adabcf9c158341f9b84ed38a/ops-scenario-2.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e46a8cdb41ac5968d265b671a639fd3038a80d3b847f2ef80c4f21cd6e8f58a",
+          "md5": "307718aa02f2e1d5ef4a61980ee53910",
+          "sha256": "79ff31cd07664506c9b0c3d28fb163580323908826fbc7e8ad12aba4aa8ea91d"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "307718aa02f2e1d5ef4a61980ee53910",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23348,
+        "upload_time": "2023-02-07T16:12:33",
+        "upload_time_iso_8601": "2023-02-07T16:12:33.907332Z",
+        "url": "https://files.pythonhosted.org/packages/6e/46/a8cdb41ac5968d265b671a639fd3038a80d3b847f2ef80c4f21cd6e8f58a/ops_scenario-2.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3c7a9fac4e3df4412052e2df30357ed592842aa8ecac65c00a447be0a0f4908",
+          "md5": "272175de02a8d8843de52e7a532c6fe3",
+          "sha256": "11dc728a83072355b739c77d945df0946d5f7f7e1d3c301538df88b073a33b3d"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "272175de02a8d8843de52e7a532c6fe3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 21250,
+        "upload_time": "2023-02-07T16:12:35",
+        "upload_time_iso_8601": "2023-02-07T16:12:35.021929Z",
+        "url": "https://files.pythonhosted.org/packages/f3/c7/a9fac4e3df4412052e2df30357ed592842aa8ecac65c00a447be0a0f4908/ops-scenario-2.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cdd11d1892022aa29f3ac3e521b1e15a22df0096377a245b9567cbcb501a93c5",
+          "md5": "c19c68ac1f0af476508a743445d2d980",
+          "sha256": "871cfc9d9d197b8d679949a38ff46666396784f2a4b936714159a2e088b13857"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c19c68ac1f0af476508a743445d2d980",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 23385,
+        "upload_time": "2023-02-08T09:43:04",
+        "upload_time_iso_8601": "2023-02-08T09:43:04.372613Z",
+        "url": "https://files.pythonhosted.org/packages/cd/d1/1d1892022aa29f3ac3e521b1e15a22df0096377a245b9567cbcb501a93c5/ops_scenario-2.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c464617828803b482bcf7433589e64b548c9c70f275d72e383d9fb9a060d713c",
+          "md5": "88c46fc471f467020a3814a17b3b0c13",
+          "sha256": "4f4b0de154d6307c24affab5f764cc86508cba840c865b692f7f4768c744bc0e"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "88c46fc471f467020a3814a17b3b0c13",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 21224,
+        "upload_time": "2023-02-08T09:43:05",
+        "upload_time_iso_8601": "2023-02-08T09:43:05.694132Z",
+        "url": "https://files.pythonhosted.org/packages/c4/64/617828803b482bcf7433589e64b548c9c70f275d72e383d9fb9a060d713c/ops-scenario-2.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ef7455570f6445e0803ca100e67e57e2041b785a8ea02f0ad2550685d43e368",
+          "md5": "c7c66fd9780ab1104c9c4ca4d43a610c",
+          "sha256": "bff276ea65edced1c9ec676aa64e0ed1dadba5cc0f947b3d55915cd69ca4fc51"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c7c66fd9780ab1104c9c4ca4d43a610c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 24489,
+        "upload_time": "2023-02-13T15:14:13",
+        "upload_time_iso_8601": "2023-02-13T15:14:13.863105Z",
+        "url": "https://files.pythonhosted.org/packages/9e/f7/455570f6445e0803ca100e67e57e2041b785a8ea02f0ad2550685d43e368/ops_scenario-2.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30f1072e3191f29fe17772e0387250ed6c887c46542064fca2d97304ff6da81d",
+          "md5": "89484ef931ffe0a95180e9e32b085ca2",
+          "sha256": "e0d2ff9780db1487f8f4c3bb979c53535e5869bad9b75a990823ff873c6df9ce"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89484ef931ffe0a95180e9e32b085ca2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 22334,
+        "upload_time": "2023-02-13T15:14:15",
+        "upload_time_iso_8601": "2023-02-13T15:14:15.005774Z",
+        "url": "https://files.pythonhosted.org/packages/30/f1/072e3191f29fe17772e0387250ed6c887c46542064fca2d97304ff6da81d/ops-scenario-2.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9829cc7e9cb163ef5558e5ab535315e1ac09e2c6ff680182de1a73570b671855",
+          "md5": "b44d88999c12b18c0c1c87e5ea209f1f",
+          "sha256": "f69b2075e5b6867161f8ee34abc9b1253338099a049432be56ff20908a910734"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b44d88999c12b18c0c1c87e5ea209f1f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 22326,
+        "upload_time": "2023-02-15T10:06:40",
+        "upload_time_iso_8601": "2023-02-15T10:06:40.262966Z",
+        "url": "https://files.pythonhosted.org/packages/98/29/cc7e9cb163ef5558e5ab535315e1ac09e2c6ff680182de1a73570b671855/ops_scenario-2.1.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dcd2386903d836142e387abc1b0b209c8a6496152b12a2e6987744b5fb64dc83",
+          "md5": "1ee61181d922c226e73c9263840e8d6a",
+          "sha256": "c73fdc3d3bfd77083a1290f0f67d452b77215abf3feccfd442979abc3b5b8fcf"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ee61181d922c226e73c9263840e8d6a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 20049,
+        "upload_time": "2023-02-15T10:06:41",
+        "upload_time_iso_8601": "2023-02-15T10:06:41.611221Z",
+        "url": "https://files.pythonhosted.org/packages/dc/d2/386903d836142e387abc1b0b209c8a6496152b12a2e6987744b5fb64dc83/ops-scenario-2.1.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8199ffafc14ac2b2ff86bca06182e3d6d7e00ba4e49837a48a235f4aa471abf2",
+          "md5": "ccd756641ed1c09aee3cdc83988dca3c",
+          "sha256": "932c00e158518b96a5c077dba14aad81d41912666bdd0796bb51ba3cd06c9f7a"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ccd756641ed1c09aee3cdc83988dca3c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 27330,
+        "upload_time": "2023-02-17T09:11:38",
+        "upload_time_iso_8601": "2023-02-17T09:11:38.084757Z",
+        "url": "https://files.pythonhosted.org/packages/81/99/ffafc14ac2b2ff86bca06182e3d6d7e00ba4e49837a48a235f4aa471abf2/ops_scenario-2.1.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5612b0c48d3ceb23d7ce39978226987dda34ff4af50d3f1e6cd98ad78be0f367",
+          "md5": "5bb97450b959fa72b523dcc74a537569",
+          "sha256": "2ab344e149bd10988b2139b9d5fc86a17bf65e21a03bc6d648b3c46473ebe120"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5bb97450b959fa72b523dcc74a537569",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 25509,
+        "upload_time": "2023-02-17T09:11:39",
+        "upload_time_iso_8601": "2023-02-17T09:11:39.886382Z",
+        "url": "https://files.pythonhosted.org/packages/56/12/b0c48d3ceb23d7ce39978226987dda34ff4af50d3f1e6cd98ad78be0f367/ops-scenario-2.1.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7fc49eae0bbe4e881e19d52e4935ff0daabdb25830e29755dd94a41059f8ab17",
+          "md5": "281128717d72205cbcd0ba910b0a4785",
+          "sha256": "1ec7ba7b51158f0541e4f5d281cf62886252df0016506406726850f4e02d0a60"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "281128717d72205cbcd0ba910b0a4785",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 28045,
+        "upload_time": "2023-02-22T15:25:29",
+        "upload_time_iso_8601": "2023-02-22T15:25:29.630416Z",
+        "url": "https://files.pythonhosted.org/packages/7f/c4/9eae0bbe4e881e19d52e4935ff0daabdb25830e29755dd94a41059f8ab17/ops_scenario-2.1.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42f7a6b8e9d3da5e668f23a14b697e1002b8e25807f6bfef2627da4f1a981998",
+          "md5": "2d94d6180d26b0806157281cecb0d91a",
+          "sha256": "369543f635633243861573e98b06ec412d4f139f8f22185f57bf8fdf63fb307e"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2d94d6180d26b0806157281cecb0d91a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 26228,
+        "upload_time": "2023-02-22T15:25:31",
+        "upload_time_iso_8601": "2023-02-22T15:25:31.019864Z",
+        "url": "https://files.pythonhosted.org/packages/42/f7/a6b8e9d3da5e668f23a14b697e1002b8e25807f6bfef2627da4f1a981998/ops-scenario-2.1.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "871992998b07ee43339cc29370ed4970081a18dc90c974768f2348cabd158863",
+          "md5": "eefaeb22a61239287600775772efe642",
+          "sha256": "dcb94260d0fa0dc8eedbb472eaeb6eecda566f36e8ead33d6b0777db14ed479b"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eefaeb22a61239287600775772efe642",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 30533,
+        "upload_time": "2023-03-10T10:00:45",
+        "upload_time_iso_8601": "2023-03-10T10:00:45.728140Z",
+        "url": "https://files.pythonhosted.org/packages/87/19/92998b07ee43339cc29370ed4970081a18dc90c974768f2348cabd158863/ops_scenario-2.1.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d145925d0826b95bf8e263d26811ba1e3c942a492b55ca2ffd26d3d295498ce0",
+          "md5": "1f9c719e8d3c453eba929eed4ef7303b",
+          "sha256": "d8b8c2a033eccc730e4b9298edc754031afe3057f4847ecf8ac1cb10f1578f07"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1f9c719e8d3c453eba929eed4ef7303b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 28668,
+        "upload_time": "2023-03-10T10:00:47",
+        "upload_time_iso_8601": "2023-03-10T10:00:47.094050Z",
+        "url": "https://files.pythonhosted.org/packages/d1/45/925d0826b95bf8e263d26811ba1e3c942a492b55ca2ffd26d3d295498ce0/ops-scenario-2.1.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f4f0577648aedd38a9d27de4b49a7ae30a9d03eb981b0cd71729756848f283c",
+          "md5": "a49fc2ac624d22140b056ed9a74534a8",
+          "sha256": "caa1ebf33243090dedc2c920b8caf5e96df2660d9f077493bccd13b4c1015159"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a49fc2ac624d22140b056ed9a74534a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 35648,
+        "upload_time": "2023-03-15T10:43:41",
+        "upload_time_iso_8601": "2023-03-15T10:43:41.001003Z",
+        "url": "https://files.pythonhosted.org/packages/7f/4f/0577648aedd38a9d27de4b49a7ae30a9d03eb981b0cd71729756848f283c/ops_scenario-2.1.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c14aedeaab92831931aa4d891c5532e8085eaffca74a172bfc0371ef22be405a",
+          "md5": "6c9265e5eef634573721f6841e20b0fe",
+          "sha256": "abb604407ea27f308815fa162f3863ce0f93c257fdf8a1c4bc8f7408764af993"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6c9265e5eef634573721f6841e20b0fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 34047,
+        "upload_time": "2023-03-15T10:43:43",
+        "upload_time_iso_8601": "2023-03-15T10:43:43.633588Z",
+        "url": "https://files.pythonhosted.org/packages/c1/4a/edeaab92831931aa4d891c5532e8085eaffca74a172bfc0371ef22be405a/ops-scenario-2.1.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f2e7aed29af81bd40cfb59b0bf9935437d56d8b1bcf54c22cc257dc453d0e65",
+          "md5": "06c0f7ed4d8dd16116eacb2194c0c2ad",
+          "sha256": "b5899f8a6227922df9dce6fd05eed9dc9d2efa221a0267b4c3f563ac59e63d29"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06c0f7ed4d8dd16116eacb2194c0c2ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 45871,
+        "upload_time": "2023-03-16T15:32:14",
+        "upload_time_iso_8601": "2023-03-16T15:32:14.658427Z",
+        "url": "https://files.pythonhosted.org/packages/0f/2e/7aed29af81bd40cfb59b0bf9935437d56d8b1bcf54c22cc257dc453d0e65/ops_scenario-2.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49be0848eae09b59b4a4cebca61d47db3d61089e0b6ce65b14704c08b307ae6d",
+          "md5": "92d09be34501b5dc1850daf8fbaafa9b",
+          "sha256": "76d9d214251821c666779d6be5d1ef4b3e00d20e1ca0cdac00402f7ab103edf5"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "92d09be34501b5dc1850daf8fbaafa9b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 43156,
+        "upload_time": "2023-03-16T15:32:16",
+        "upload_time_iso_8601": "2023-03-16T15:32:16.557236Z",
+        "url": "https://files.pythonhosted.org/packages/49/be/0848eae09b59b4a4cebca61d47db3d61089e0b6ce65b14704c08b307ae6d/ops-scenario-2.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb80d2c33ca4137143809d9d942532fe4fbb623677cd1c22a16f0f89e0c13cba",
+          "md5": "ec800ec5ddcb03ad6e63259988795abb",
+          "sha256": "72bec3a2eab740ad5ed5af1c58fb5806cec7dffda718698d85afd459fd8716f7"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ec800ec5ddcb03ad6e63259988795abb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 45900,
+        "upload_time": "2023-03-16T16:18:18",
+        "upload_time_iso_8601": "2023-03-16T16:18:18.665665Z",
+        "url": "https://files.pythonhosted.org/packages/fb/80/d2c33ca4137143809d9d942532fe4fbb623677cd1c22a16f0f89e0c13cba/ops_scenario-2.1.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f27257208a849f235988aadb3b8fa582db5db87269c48685898c5fe92f60f96",
+          "md5": "853701588fe3b3f720c935c827dfe5d6",
+          "sha256": "f01f418cd2a91c203a7004d8eb68466ddc69fb3bf85a59512a747e41024c950f"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "853701588fe3b3f720c935c827dfe5d6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 43166,
+        "upload_time": "2023-03-16T16:18:20",
+        "upload_time_iso_8601": "2023-03-16T16:18:20.518920Z",
+        "url": "https://files.pythonhosted.org/packages/7f/27/257208a849f235988aadb3b8fa582db5db87269c48685898c5fe92f60f96/ops-scenario-2.1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "324925ba2302e8027c31c75b5de83d37716ecd34ea24c2232fe513efbacbea60",
+          "md5": "9890b3f812d7cb09ede4fb8785466716",
+          "sha256": "ea10d7871c90ab5571f4cc5fa81a6892d8ef3d42f11c30b4a2b0b0cdfabc2582"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9890b3f812d7cb09ede4fb8785466716",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 45859,
+        "upload_time": "2023-03-16T16:35:50",
+        "upload_time_iso_8601": "2023-03-16T16:35:50.928735Z",
+        "url": "https://files.pythonhosted.org/packages/32/49/25ba2302e8027c31c75b5de83d37716ecd34ea24c2232fe513efbacbea60/ops_scenario-2.1.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7517992de70711f83717eba85b41541665702f1de61f14882fe7202a6bf5d5c5",
+          "md5": "1ad4053a8ef974473f4b98d72ca4bdb1",
+          "sha256": "77966cb58138173d75c42fee61ed1705ee569b6582046d6e61278792f6c64133"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ad4053a8ef974473f4b98d72ca4bdb1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 43148,
+        "upload_time": "2023-03-16T16:35:52",
+        "upload_time_iso_8601": "2023-03-16T16:35:52.855416Z",
+        "url": "https://files.pythonhosted.org/packages/75/17/992de70711f83717eba85b41541665702f1de61f14882fe7202a6bf5d5c5/ops-scenario-2.1.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69c8289b9a1045f9018fcaff4ef9327af144adf0e3e7580d715c0ba3a7e2a342",
+          "md5": "d17e8a59c847bb1535d85b27a31ba44c",
+          "sha256": "a623079313bf05a80f37a4d6ded0c73abf2143337537a1c9060fbf8108a5646e"
+        },
+        "downloads": -1,
+        "filename": "ops_scenario-2.1.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d17e8a59c847bb1535d85b27a31ba44c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 47761,
+        "upload_time": "2023-03-28T07:43:38",
+        "upload_time_iso_8601": "2023-03-28T07:43:38.979498Z",
+        "url": "https://files.pythonhosted.org/packages/69/c8/289b9a1045f9018fcaff4ef9327af144adf0e3e7580d715c0ba3a7e2a342/ops_scenario-2.1.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09e12042711e5d8799888f01e660b24c3f0bf668d8ee53e52ce6e5f39cff9976",
+          "md5": "33a2b0798ee5998219a00c3df92e4494",
+          "sha256": "38910ef2022b8a95e312a81e8bba64b55e61bb30f149ba99a31385f6bb75f47b"
+        },
+        "downloads": -1,
+        "filename": "ops-scenario-2.1.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33a2b0798ee5998219a00c3df92e4494",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 76421,
+        "upload_time": "2023-03-28T07:43:41",
+        "upload_time_iso_8601": "2023-03-28T07:43:41.821015Z",
+        "url": "https://files.pythonhosted.org/packages/09/e1/2042711e5d8799888f01e660b24c3f0bf668d8ee53e52ce6e5f39cff9976/ops-scenario-2.1.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "69c8289b9a1045f9018fcaff4ef9327af144adf0e3e7580d715c0ba3a7e2a342",
+        "md5": "d17e8a59c847bb1535d85b27a31ba44c",
+        "sha256": "a623079313bf05a80f37a4d6ded0c73abf2143337537a1c9060fbf8108a5646e"
+      },
+      "downloads": -1,
+      "filename": "ops_scenario-2.1.3.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d17e8a59c847bb1535d85b27a31ba44c",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 47761,
+      "upload_time": "2023-03-28T07:43:38",
+      "upload_time_iso_8601": "2023-03-28T07:43:38.979498Z",
+      "url": "https://files.pythonhosted.org/packages/69/c8/289b9a1045f9018fcaff4ef9327af144adf0e3e7580d715c0ba3a7e2a342/ops_scenario-2.1.3.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "09e12042711e5d8799888f01e660b24c3f0bf668d8ee53e52ce6e5f39cff9976",
+        "md5": "33a2b0798ee5998219a00c3df92e4494",
+        "sha256": "38910ef2022b8a95e312a81e8bba64b55e61bb30f149ba99a31385f6bb75f47b"
+      },
+      "downloads": -1,
+      "filename": "ops-scenario-2.1.3.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "33a2b0798ee5998219a00c3df92e4494",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 76421,
+      "upload_time": "2023-03-28T07:43:41",
+      "upload_time_iso_8601": "2023-03-28T07:43:41.821015Z",
+      "url": "https://files.pythonhosted.org/packages/09/e1/2042711e5d8799888f01e660b24c3f0bf668d8ee53e52ce6e5f39cff9976/ops-scenario-2.1.3.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

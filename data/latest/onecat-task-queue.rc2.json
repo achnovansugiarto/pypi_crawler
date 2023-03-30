@@ -1,0 +1,113 @@
+{
+  "info": {
+    "author": "DealiAxy",
+    "author_email": "dealiaxy@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.6"
+    ],
+    "description": "又是造轮子系列咯，Python上有很多成熟完善的异步任务队列框架可以用，比如Celery，或者RQ，不过这些都不自带消息队列服务，都需要使用Redis、RabbitMQ之类的消息队列才行，我用到小项目中又不需要附带这么多东西，于是自己动手来实现咯。\n\n## 思路\n1. 将需要异步执行的任务添加到队列\n2. 自动从队列中取出任务，创建新线程执行\n3. 保存任务的执行结果和输出\n4. 任务完成，调用回调函数，处理返回的数据\n5. 使用输出重定向处理任务的输出\n\n\n\n## Demo\n附上使用任务队列的demo代码：\n```python\nif __name__ == '__main__':\n    task_queue = TaskQueue(output_redirect=True)\n\n\n    def fun1():\n        time.sleep(2)\n        return 1\n\n\n    def fun2():\n        time.sleep(3)\n        return 2\n\n\n    task_queue.put(Task(\n        func=fun1,\n        callback=lambda task, result: print(f'task1 result: {result}'),\n    ))\n    task_queue.put(Task(\n        func=fun2,\n        callback=lambda task, result: print(f'task2 result: {result}'),\n    ))\n\n\n    def custom_output(msg):\n        print(f'[custom] {msg}')\n\n\n    def fun3(num1, num2):\n        print(f'num1={num1}')\n        print(f'num2={num2}')\n        return num1 + num2\n\n\n    def callback(task_obj, result):\n        print(f'task3 result={result}')\n        output = task_obj.outputs\n        output.custom = custom_output\n        output.reset()\n        output.to_custom()\n\n\n    task_queue.put(Task(func=fun3, callback=callback, args=[2, 3]))\n\n    print('task queue run')\n    task_queue.run()\n    print('do other things...')\n\n    for i in range(0, 100):\n        print(i * i)\n```\n\n\n## wheel构建\n\n```bash\npython3.6 setup.py sdist bdist_wheel\ntwine upload dist/* -u \"用户名\" -p \"密码\"\n```\n\n\n\n下面分析一下几个关键部分的代码实现\n\n\n## 优先级队列\nPython标准库已经有实现好的优先级队列了，但是当在相同优先级下传入同样的对象时，他会自动比较这些对象，不过我们的Task类没有实现相关的运算符重载，所以无法比较。\n\n要解决这个问题，要不就在Task里面实现运算符重载，要不就是自己实现一个优先级队列，我选择后者。\n\n```python\nclass PriorityQueue:\n    \"\"\"\n    自己实现的优先级队列，使用了Python的堆\n    \"\"\"\n    def __init__(self):\n        self._index = 0\n        self.queue = []\n\n    def push(self, priority, val):\n        heapq.heappush(self.queue, (priority, self._index, val))\n        self._index += 1\n\n    def pop(self):\n        return heapq.heappop(self.queue)[-1]\n\n    @property\n    def empty(self):\n        return len(self.queue) == 0\n```\n\n## 输出重定向\n其实这个挺坑的了，毕竟是异步任务队列，难免涉及到线程的竞争问题，又没办法单独控制每个任务的输出，不过我还是做了，小项目的话还是可以用的（其实就是懒得移植一下已有代码）\n\n代码如下，同样是使用队列来实现输出缓冲区，大小可以自己调整，默认支持输出到控制台、文件或者返回列表。\n\n一般重定向输出的话需要自己实现可以输出处理函数，直接给Redirection类的custom 属性赋值即可。\n\n```python\nclass Redirection:\n    def __init__(self, buffer_size=512):\n        self.buffer = Queue(maxsize=512)\n        self._console = sys.stdout\n        # 自定义的输出端\n        self.custom = None\n\n    def write(self, output_stream):\n        # 加入缓冲区队列\n        self.buffer.put(output_stream)\n\n    def to_console(self):\n        sys.stdout = self._console\n        # 出列\n        while not self.buffer.empty():\n            print(self.buffer.get())\n\n    def to_file(self, file_path):\n        with open(file_path, 'w+') as f:\n            sys.stdout = f\n            while not self.buffer.empty():\n                print(self.buffer.get())\n            f.close()\n\n    def to_custom(self):\n        while not self.buffer.empty():\n            self.custom(self.buffer.get())\n\n    def to_list(self):\n        data = []\n        while not self.buffer.empty():\n            data.append(self.buffer.get())\n        return data\n\n    def flush(self):\n        self.buffer.empty()\n\n    def reset(self):\n        sys.stdout = self._console\n```\n\n## Task类\n没什么好说的，定义任务类，Task，代码如下：\n\n```python\nclass Task:\n    def __init__(self, func, callback=None, priority=Priority.MIDDLE, args=(), kwargs={}):\n        \"\"\"\n        Args:\n            func: 需要执行的函数\n            callback:  执行完的回调函数\n            priority: 优先级\n            *args:\n            **kwargs:\n        \"\"\"\n        self._id = uuid.uuid4().hex\n        self.function = func\n        self.callback = callback\n        self.priority = priority\n        self.args = args\n        self.kwargs = kwargs\n        # 任务运行过程的输出，stdout的输出\n        self._outputs: Redirection = None\n\n    @property\n    def id(self):\n        return self._id\n\n    @property\n    def outputs(self) -> Redirection:\n        return self._outputs\n\n    @outputs.setter\n    def outputs(self, value: Redirection):\n        self._outputs = value\n\n    def run(self):\n        try:\n            if self.callback:\n                # 回调函数原型 callback(task_obj, result)\n                result = self.callback(self, self.function(*self.args, **self.kwargs))\n            else:\n                result = self.function(*self.args, **self.kwargs)\n            return result\n        except Exception as e:\n            if self.callback:\n                result = self.callback(self, e)\n            else:\n                result = e\n            return result\n```\n\n使用起来很简单，如下：\n\n```python\ndef fun1(num1, num2):\n    print(f'num1={num1}')\n    print(f'num2={num2}')\n    return num1 + num2\n\nTask(\n    func=fun1,\n    callback=lambda task, result: print(f'task result: {result}'),\n)\n\n# 也可以写成这样\nTask(\n    func=lambda num1, num2: num1 + num2,\n    callback=lambda task, result: print(f'task result: {result}'),\n    args=[2, 3]\n)\n```\n\n## 任务队列\n最后是实现任务队列，也很简单，根据任务的优先级进行调度即可。\n\n```python\nclass TaskQueue:\n    \"\"\"\n    基于线程的异步任务队列\n    todo 下次做一个基于进程的队列，充分利用多核CPU性能\n    \"\"\"\n\n    def __init__(self, output_redirect=False):\n        self.queue = PriorityQueue()\n        self.output_redirect = output_redirect\n        self._redirect_objs = {}\n        self._results = {}\n\n    def put(self, task: Task):\n        \"\"\"\n        将task加入任务列表\n        Args:\n            task:\n        Returns:返回task id\n        \"\"\"\n        self.queue.push(task.priority, task)\n        return task.id\n\n    def get(self):\n        return self.queue.pop()\n\n    def run(self):\n        while not self.queue.empty:\n            task = self.get()\n            # 开启新线程\n            t = threading.Thread(target=self._task_wrapper, name=task.id, args=[task])\n            self._log(f'Start thread {task.id}')\n            t.start()\n\n    def get_output(self, task_id: str) -> Redirection:\n        return self._redirect_objs.get(task_id, None)\n\n    def get_result(self, task_id: str):\n        return self._results.get(task_id, None)\n\n    @staticmethod\n    def _log(msg: str):\n        \"\"\"日志输出接口，可以替换为日志组件\"\"\"\n        print(f'[TaskQueue] {msg}')\n\n    def _task_wrapper(self, task: Task):\n        if self.output_redirect:\n            if task.id in self._redirect_objs:\n                redirect_obj = self._redirect_objs[task.id]\n            else:\n                redirect_obj = Redirection(2048)\n                self._redirect_objs[task.id] = redirect_obj\n            # 重定向输出\n            sys.stdout = redirect_obj\n            task.outputs = redirect_obj\n            result = task.run()\n            # 恢复默认输出\n            redirect_obj.reset()\n            self._log(f'Task finished. {task.id}')\n        else:\n            result = task.run()\n\n        # 保存结果\n        self._results[task.id] = result\n```\n\n整个项目代码就在这了，很简单，也有很多不足的地方，不过小项目用用勉强还可以吧~\n\n过几天发布到pip，有需要的同学直接pip安装就可以使用，请关注博客更新。\n\n\n## 参考资料\n- 运算符重载 [https://blog.csdn.net/goodlixueyong/article/details/52589979](https://blog.csdn.net/goodlixueyong/article/details/52589979)\n- [https://www.open-open.com/code/view/1433410658322](https://www.open-open.com/code/view/1433410658322)\n- Celery异步任务队列 [https://www.cnblogs.com/StitchSun/p/8552488.html](https://www.cnblogs.com/StitchSun/p/8552488.html)\n- https://zhuanlan.zhihu.com/p/37637660\n\n\n## 欢迎交流\n我整理了一系列的技术文章和资料，在公众号「程序设计实验室」后台回复 linux、flutter、c#、netcore、android、kotlin、java、python 等可获取相关技术文章和资料，同时有任何问题都可以在公众号后台留言~",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitee.com/deali/OneCat-TaskQueue",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "onecat-task-queue",
+    "package_url": "https://pypi.org/project/onecat-task-queue/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/onecat-task-queue/",
+    "project_urls": {
+      "Homepage": "https://gitee.com/deali/OneCat-TaskQueue"
+    },
+    "release_url": "https://pypi.org/project/onecat-task-queue/1.0.1/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "简单异步任务队列。版本[1.0.1] 更新内容：又是造轮子系列咯，Python上有很多成熟完善的异步任务队列框架可以用，比如Celery，或者RQ，不过这些都不自带消息队列服务，都需要使用Redis、RabbitMQ之类的消息队列才行，我用到小项目中又不需要附带这么多东西，于是自己动手来实现咯。",
+    "version": "1.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7758523,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4eea45c297491e8871a0a504716f1d16de00a4a1a380b8b772e0d1e90d303834",
+          "md5": "53e742744cf6ebf972c5a69ef749e2fb",
+          "sha256": "35ca22a5f4ca051a41c3e6f61624a90a20bc17783aa215a0dca504826847b8db"
+        },
+        "downloads": -1,
+        "filename": "onecat_task_queue-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "53e742744cf6ebf972c5a69ef749e2fb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6731,
+        "upload_time": "2020-07-22T15:27:12",
+        "upload_time_iso_8601": "2020-07-22T15:27:12.473063Z",
+        "url": "https://files.pythonhosted.org/packages/4e/ea/45c297491e8871a0a504716f1d16de00a4a1a380b8b772e0d1e90d303834/onecat_task_queue-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2697e7ab87ab4964fa6c614f7a5a2aa36d73ed73da0c7b26bcf0fb14b7dd4c4b",
+          "md5": "6b0e69cdc50fe90b1983f4a0f655d694",
+          "sha256": "61b55def064f1919e343cb827208aa07debc9cfba3aeabab0981733d7c344115"
+        },
+        "downloads": -1,
+        "filename": "onecat_task_queue-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6b0e69cdc50fe90b1983f4a0f655d694",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6859,
+        "upload_time": "2020-07-22T15:38:20",
+        "upload_time_iso_8601": "2020-07-22T15:38:20.389820Z",
+        "url": "https://files.pythonhosted.org/packages/26/97/e7ab87ab4964fa6c614f7a5a2aa36d73ed73da0c7b26bcf0fb14b7dd4c4b/onecat_task_queue-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2697e7ab87ab4964fa6c614f7a5a2aa36d73ed73da0c7b26bcf0fb14b7dd4c4b",
+        "md5": "6b0e69cdc50fe90b1983f4a0f655d694",
+        "sha256": "61b55def064f1919e343cb827208aa07debc9cfba3aeabab0981733d7c344115"
+      },
+      "downloads": -1,
+      "filename": "onecat_task_queue-1.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6b0e69cdc50fe90b1983f4a0f655d694",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 6859,
+      "upload_time": "2020-07-22T15:38:20",
+      "upload_time_iso_8601": "2020-07-22T15:38:20.389820Z",
+      "url": "https://files.pythonhosted.org/packages/26/97/e7ab87ab4964fa6c614f7a5a2aa36d73ed73da0c7b26bcf0fb14b7dd4c4b/onecat_task_queue-1.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

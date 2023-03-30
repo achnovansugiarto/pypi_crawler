@@ -1,0 +1,407 @@
+{
+  "info": {
+    "author": "Matthias Mohr",
+    "author_email": "m.mohr@uni-muenster.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# openeo-udf-python-to-r / openeo-r-udf\n\nThis is an experimental engine for openEO to run R UDFs from an R environment.\n\nThis currently is limited to R UDFs that are running without any other processes in the following processes:\n- `apply`\n- `apply_dimension`\n- `reduce_dimension`\n\nThis repository contains the following content:\n- The scripts to run for testing: `tests/test.py` (single core) and `tests/test_parallel.py` (parallelized).\n- The folder `tests/udfs` contains UDF examples as users could provide them.\n- `udf_lib.py` is a Python library with the Python code required to run R UDFs from Python\n- `executor.R` is the R script that is run from R and executes the R UDF in the Python environment.\n\nThe following image shows how the implementation roughly works:\n![Workflow](docs/workflow.png)\n\n## UDF integration\n\nThis section is for back-end developers who want to add R UDF capabilities to their back-end \nor for end-users who want to test their UDFs locally.\n\n### Install from pypi\n\nYou may want to install all dependencies as a new conda environment first:\n\n`conda env create -f environment.yml`\n\nYou can install this library from pypi then:\n\n`pip install openeo-r-udf`\n\n### Run UDFs\n\nIn the folloowing chapter we'll give examples on how to use the UDF library from a Python environment.\n\nThe following variables should be defined:\n- `udf` (string - The content of the parameter `udf` from `run_udf`, i.e. UDF code or a path/URL to a UDF)\n- `udf_folder` (string - The folder where the UDFs reside or should be written to)\n- `process` (string - The parent process, i.e. `apply`, `apply_dimension` or `reduce_dimension`)\n- `data` (xarray.DataArray - The data to process)\n- `dimension` (string, defaults to `None` - The dimension to work on if applicable, doesn't apply for `apply`)\n- `context` (Any, defaults to `None` - The data that has been passed in the `context` parameter)\n\nAdditionally, if your back-end keeps track of it, you can pass `spatial_dims` and `temporal_dims` to `execute_udf`\nwhere each is a list of dimension names (as strings) for the corresponding dimension types spatial (x,y,z) and temporal.\n\n### Without Parallelization *or* With Parallelization through Dask\n\nIf your back-end parallelizes already, you can directly run the following code:\n\n```python\n# import the UDF library\nfrom openeo_r_udf.udf_lib import prepare_udf, execute_udf\n\n# Define variables as documented above\n\n# Load UDF file (this should not be paralelized)\nudf_path = prepare_udf(udf, udf_folder)\n\n# Execute UDF file (this can be parallelized)\nresult = execute_udf(process, udf_path, data, dimension=dimension, context=context)\n```\n\nIf you parallelize with Dask, the xarray.DataArray must consist of Dask arrays, i.e. the `chunks` attribute of the DataArray MUST NOT be `None`.\n\n### With Parallelization through joblib\n\nIf your back-end is not parallelizing at all, you can run the following:\n\n```python\n# import the UDF library - make sure to install joblib before\nfrom openeo_r_udf.udf_lib import prepare_udf, execute_udf, chunk_cube, combine_cubes\nfrom joblib import Parallel, delayed as joblibDelayed\n\n# Parallelization config\nchunk_size = 1000\nnum_jobs = -1\n\n# Define variables as documented above\n\n# Load UDF file (this should not be paralelized)\nudf_path = prepare_udf(udf, udf_folder)\n\n# Define callback function\ndef compute_udf(data):\n    return execute_udf(process, udf_path, data.compute(), dimension=dimension, context=context)\n\n# Run UDF in parallel\ninput_data_chunked = chunk_cube(data, size=chunk_size)\nresults = Parallel(n_jobs=num_jobs, verbose=51)(joblibDelayed(compute_udf)(data) for data in input_data_chunked)\nresult = combine_cubes(results)\n```\n\nThe `result` variable holds the processed data as an `xarray.DataArray` again.\n\n## Writing a UDF\n\n*This is for end-users*\n\nA UDF must be written differently depending on where it is executed.\nThe underlying library used for data handling is always [`stars`](https://r-spatial.github.io/stars/).\n\n### apply\n\nA UDF that is executed inside the process `apply` manipulates the values on a per-pixel basis.\nYou **can't** add or remove labels or dimensions.\n\nThe UDF function must be named `udf` and receives two parameters:\n\n- `x` is a multi-dimensional stars object and you can run vectorized functions on a per pixel basis, e.g. `abs`.\n- `context` passes through the data that has been passed to the `context` parameter of the parent process (here: `apply`). If nothing has been provided explicitly, the parameter is set to `NULL`.\n  \n  This can be used to pass through configurable options, parameters or some additional data.\n  For example, if you would execute `apply(process = run_udf(...), context = list(m = -1, max = -100))` then you could access the corresponding values in the UDF below as `context$m` and `context$max` (see example below).\n\nThe UDF must return a stars object with exactly the same shape.\n\n**Example:**\n\n```r\nudf = function(x, context) {\n  max(abs(x) * context$a, context$max)\n}\n```\n\n### apply_dimension\n\nA UDF that is executed inside the process `apply_dimension` takes all values along a dimension and computes new values based on them.\nThis could for example compute a moving average over a timeseries.\n\nThere are two different variants of UDFs that can be used as processes for `apply_dimension`.\nA reducer can be executed either \"vectorized\" or \"per chunk\".\nThis is the same behavior as defined for `reduce_dimension`. \nPlease see below for more details.\n\n### reduce_dimension\n\nA UDF that is executed inside the process `reduce_dimension` takes all values along a dimension and computes a single value for it.\nThis could for example compute an average for a timeseries.\n\nThere are two different forms of UDFs that can be used as reducers\nfor `reduce_dimension`: a reducer can be executed either \"vectorized\"\nor \"per chunk\".\n\n#### vectorized\n\nThe vectorized variant is usually the more efficient variant as it's executed once on a larger chunk of the data cube.\n\nThe UDF function must be named `udf` and receives two parameters:\n\n- `data` is a matrix. Each row contains the values for a \"pixel\" and the columns are the values along the given dimension.\n  So if you reduce along the temporal dimension, the columns are the individual timestamps.\n- `context` -> see the description of `context` for `apply`.\n\nThe UDF must return a list of values.\n\n**Example:**\n\nPlease note that you may need to use `do.call` to execute functions in a vectorized way. We also need to use `pmax` for this, instead of `max`.\n\n```r\nudf = function(data, context) {\n  # To get the labels for the values once:\n  # labels = names(data)\n  do.call(pmax, data) * context\n}\n```\n\nThe input data may look like this if you reduce along a band dimension with three bands `r`, `g` and `b`:\n\n- `data` could be `list(r = c(1, 2, 6), g = c(3, 4, 5), b = c(7, 1, 0))`\n- `names(data)` would be `c(\"r\", \"g\", \"b\")`\n- Executing the example above would return `c(7, 4, 6)`\n\n#### per chunk\n\nThis variant is usually slower, but might be required for certain use cases. It is executed multiple times on the smallest chunk possible for the dimension given, e.g. a single time series.\n\nThe UDF function must be named `udf_chunked` and receives two parameters:\n\n- `data` is a list of values, e.g. a single time series which you could pass to `max` or `mean`.\n- `context` -> see the description of `context` for `apply`.\n\nThe UDF must return a single value.\n\n**Example:**\n\n```r\nudf_chunked = function(data, context) {\n  # To get the labels for the values:\n  # labels = names(data)\n  max(data)\n}\n```\n\nThe input data may look like this if you reduce along a band dimension with three bands `r`, `g` and `b`:\n\n- `data` could be `c(1, 2, 3)`\n- `names(data)` would be `c(\"r\", \"g\", \"b\")`\n- Exeucting the example above would return `3`\n\n##### Setup and Teardown\n\nAs `udf_chunked` is usually executed many times in a row, you can optionally define two additional functions that are executed once before and once after the execution.\nThese functions must be named `udf_setup` and `udf_teardown` and be placed in the same file as `udf_chunked`.\n`udf_setup` could be useful to initially load some data, e.g. a machine learning (ML) model.\n`udf_teardown` could be used to clean-up stuff that has been opened in `udf_setup`.\n\n**Note:** `udf_setup` and `udf_teardown` are only available if you implement `udf_chunked`.\nIf you implement `udf`, the two additional functions are not available as you can execute them directly in the `udf` function, which is only executed once (for each worker).\n\nBoth functions receive a single parameter, which is the `context` parameter explained above.\nHere the context parameter could contain the path to a ML model file, for example.\nBy using the context parameter, you can avoid hard-coding information, which helps to make UDFs reusable.\n\n**Example:**\n\n```r\nudf_setup = function(context) {\n  # e.g. load a ML model from a file\n}\n\nudf_chunked = function(data, context) {\n  max(data)\n}\n\nudf_teardown = function(context) {\n  # e.g. clean-up tasks\n}\n```\n\n**Note:** `udf_teardown` is only executed if none of the `udf_chunked` calls has resulted in an error.\n\nIf you'd like to make some data available in `udf_chunked` and/or `udf_teardown` that you have prepared in `udf_setup` (or `udf_chunked`), you can use a global variable\nand the [special assignment operator](https://cran.r-project.org/doc/manuals/R-intro.html#Scope) `<<-` to assign to variables in the outer environments.\n\n**Example:**\n\nThis loads a trained ML model object from an URL in `udf_setup` and makes it available for prediction in `udf_chunked`.\nThis is important as loading the ML model in udf_chunked may download the model very often, usually thousands of times and as such the computation gets very slow.\n\n```r\nmodel <- NULL\n\nudf_setup = function(context) {\n  model <<- load_model(\"https://example.com/model\")\n}\n\nudf_chunked = function(data, context) {\n  return(predict(data, model))\n}\n```\n\n## Examples\n### Dockerimage for running on a backend\nHere's an example of an Dockerimage that is used to run the R-UDF service on an openEO platform backend.\nhttps://github.com/Open-EO/r4openeo-usecases/tree/main/vito-docker\n\n### Implementation at Eurac\nHere is an example how the R-UDF service is integrated in the Eurac openEO backend based on Open Data Cube.\nhttps://github.com/SARScripts/openeo_odc_driver/blob/f34cd35107e4fb137fc1d23cae246ed362517c75/openeo_odc_driver.py#L289\n\n### R4openEO use cases\nHere are use cases that use the R-UDF service.\nhttps://github.com/Open-EO/r4openeo-usecases \n\n\n## Development\n\nClone this repository and switch into the corresponding folder.\n\n1. Install environment via conda: `conda env create -f environment.yml`\n2. Install package for development: `pip install -e .`\n3. Now you can run one of the tests for example: `python3 tests/test.py`\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Open-EO/openeo-udf-python-to-r",
+    "keywords": "openeo,r,udf,python",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "openeo-r-udf",
+    "package_url": "https://pypi.org/project/openeo-r-udf/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/openeo-r-udf/",
+    "project_urls": {
+      "Homepage": "https://github.com/Open-EO/openeo-udf-python-to-r",
+      "Issues": "https://github.com/Open-EO/openeo-udf-python-to-r/issues"
+    },
+    "release_url": "https://pypi.org/project/openeo-r-udf/0.5.0/",
+    "requires_dist": [
+      "requests",
+      "numpy",
+      "xarray",
+      "rpy2",
+      "joblib ; extra == 'parallel'"
+    ],
+    "requires_python": "",
+    "summary": "Run openEO R UDFs from Python",
+    "version": "0.5.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15644997,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf64460b70e6ea527932b5d56ec3a38f73988df32a37f8c48f7411b87db1904d",
+          "md5": "2f700cae8ba884af26454ac7c0d817e1",
+          "sha256": "66c177872657f31b778626654e520d766ade708ab9900df64a156e4515e325e5"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f700cae8ba884af26454ac7c0d817e1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 5205,
+        "upload_time": "2022-07-07T12:59:12",
+        "upload_time_iso_8601": "2022-07-07T12:59:12.035934Z",
+        "url": "https://files.pythonhosted.org/packages/cf/64/460b70e6ea527932b5d56ec3a38f73988df32a37f8c48f7411b87db1904d/openeo_r_udf-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a087508d9a8bafca321bc47d0a5d7c6ed2645d91fad3c9ebcda98d9ca33ce2d",
+          "md5": "24ebb0a618199d53247a80ea4ea68791",
+          "sha256": "ca2ef0062bef90109461cead5cce3b26ef8eee8a5ea2fda2111b36b564663592"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24ebb0a618199d53247a80ea4ea68791",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5135,
+        "upload_time": "2022-07-07T12:59:14",
+        "upload_time_iso_8601": "2022-07-07T12:59:14.562953Z",
+        "url": "https://files.pythonhosted.org/packages/7a/08/7508d9a8bafca321bc47d0a5d7c6ed2645d91fad3c9ebcda98d9ca33ce2d/openeo_r_udf-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e41fc8d026295c4631df184a10b258bb6e0f6d22bddba82777294efcfddb9b1",
+          "md5": "0f41f36c41a996656ccf7d29dcad028b",
+          "sha256": "6d762029e93c4813558c43157e2155038860064e342d898bc74cab6aa3f24327"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0f41f36c41a996656ccf7d29dcad028b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6565,
+        "upload_time": "2022-07-13T12:59:23",
+        "upload_time_iso_8601": "2022-07-13T12:59:23.497614Z",
+        "url": "https://files.pythonhosted.org/packages/8e/41/fc8d026295c4631df184a10b258bb6e0f6d22bddba82777294efcfddb9b1/openeo_r_udf-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b94e5185a39ac83e86e2a3fe654b3b5d4e30073119cab97478bb272829d14836",
+          "md5": "275398e579ef22a497b3294d4e6e97c4",
+          "sha256": "ed1c108a826df3ff7f67eb370089b4b428eeb99b10ece92989996ccf24d5c7c9"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "275398e579ef22a497b3294d4e6e97c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6438,
+        "upload_time": "2022-07-13T12:59:27",
+        "upload_time_iso_8601": "2022-07-13T12:59:27.820264Z",
+        "url": "https://files.pythonhosted.org/packages/b9/4e/5185a39ac83e86e2a3fe654b3b5d4e30073119cab97478bb272829d14836/openeo_r_udf-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d321b945d977b42b890d439159cc326c1ff93fb24b74e2c156a36425b9e28b1",
+          "md5": "1914d4449ca4af6fad2dffadf7da3048",
+          "sha256": "895b9b47800e2c0ec1e0bfa223cb430c5d5f09504ea44a9a4559cd35b7f61e2d"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1914d4449ca4af6fad2dffadf7da3048",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6750,
+        "upload_time": "2022-08-04T09:41:30",
+        "upload_time_iso_8601": "2022-08-04T09:41:30.858350Z",
+        "url": "https://files.pythonhosted.org/packages/4d/32/1b945d977b42b890d439159cc326c1ff93fb24b74e2c156a36425b9e28b1/openeo_r_udf-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12a69013b976318c2a2ae11ad351aaddb52a71a08ff8a69b78205267257279f6",
+          "md5": "1d6277ac2f009dce31e0589f19d1c043",
+          "sha256": "9d8036e41876a90630aa65be6bddc5427fb93cfe9002df30c937ead378f3144e"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1d6277ac2f009dce31e0589f19d1c043",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6746,
+        "upload_time": "2022-08-04T09:41:32",
+        "upload_time_iso_8601": "2022-08-04T09:41:32.673451Z",
+        "url": "https://files.pythonhosted.org/packages/12/a6/9013b976318c2a2ae11ad351aaddb52a71a08ff8a69b78205267257279f6/openeo_r_udf-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b0ba7beedf0b048e63c56bd70592d7753cb533a79411066ed5c1699f4f6992ab",
+          "md5": "bc825f6e11738c64c0d981acf362c228",
+          "sha256": "e94fdac373ed1361d9190c19a792bf6a462182e644d366ef8259d43ae8efb09a"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc825f6e11738c64c0d981acf362c228",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6826,
+        "upload_time": "2022-09-09T13:42:13",
+        "upload_time_iso_8601": "2022-09-09T13:42:13.582984Z",
+        "url": "https://files.pythonhosted.org/packages/b0/ba/7beedf0b048e63c56bd70592d7753cb533a79411066ed5c1699f4f6992ab/openeo_r_udf-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "edb4b662f9ab5f0dc3bd6a19bb62385dac5fe78267f1c18809117f2769fcc6a5",
+          "md5": "116e157ceced835ef17d08f08c12ecfe",
+          "sha256": "20b2f1e32b266018d930ba1a54348660de9046f91f2f7bb00a29ed3a34ee7f84"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "116e157ceced835ef17d08f08c12ecfe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6816,
+        "upload_time": "2022-09-09T13:42:17",
+        "upload_time_iso_8601": "2022-09-09T13:42:17.235339Z",
+        "url": "https://files.pythonhosted.org/packages/ed/b4/b662f9ab5f0dc3bd6a19bb62385dac5fe78267f1c18809117f2769fcc6a5/openeo_r_udf-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3506845a3b533dd5985256987e69be952057dbd66540261766beab3ce58599eb",
+          "md5": "be2d3c2cfa0d9ee447696fcbd07cf66c",
+          "sha256": "4c22f582bc828441a0edae74484b0ca83cbffb456243d9589035c03e03c3e178"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "be2d3c2cfa0d9ee447696fcbd07cf66c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7405,
+        "upload_time": "2022-10-12T17:15:57",
+        "upload_time_iso_8601": "2022-10-12T17:15:57.932558Z",
+        "url": "https://files.pythonhosted.org/packages/35/06/845a3b533dd5985256987e69be952057dbd66540261766beab3ce58599eb/openeo_r_udf-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a5fd4dbd25b7398d2c70ae7eaa74e23cd85eb8bf9696d3ac9184c5b048214d7",
+          "md5": "a72d21270a3ff4b931e87d6d725589ee",
+          "sha256": "8eab014af7b439bd7cf84caa4f761aa7ac7020fde59c11b5c0149c4182cd8a15"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a72d21270a3ff4b931e87d6d725589ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7920,
+        "upload_time": "2022-10-12T17:15:59",
+        "upload_time_iso_8601": "2022-10-12T17:15:59.888658Z",
+        "url": "https://files.pythonhosted.org/packages/5a/5f/d4dbd25b7398d2c70ae7eaa74e23cd85eb8bf9696d3ac9184c5b048214d7/openeo_r_udf-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd953bf7c8713cbec9950e0e37ebeb98f3a2864f61901fdf25141d818d730890",
+          "md5": "e23c53f375bb78fbe1cc46e530fe1444",
+          "sha256": "d63d16e4e5713d53ace2d71bdc5b742c87dfce7a1df8c129e0955add0a814f12"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e23c53f375bb78fbe1cc46e530fe1444",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8075,
+        "upload_time": "2022-10-27T14:26:09",
+        "upload_time_iso_8601": "2022-10-27T14:26:09.836490Z",
+        "url": "https://files.pythonhosted.org/packages/bd/95/3bf7c8713cbec9950e0e37ebeb98f3a2864f61901fdf25141d818d730890/openeo_r_udf-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d8873aa68d68bc6833db24e2979e14069f5ff4a96f20d3542ccc864d88d5597",
+          "md5": "d07a25aa6bd03a39de2cdc3310ea12d9",
+          "sha256": "413812d85012991bacc151e38434b13c39df698751d7838f62f9226bc542e896"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d07a25aa6bd03a39de2cdc3310ea12d9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11018,
+        "upload_time": "2022-10-27T14:26:14",
+        "upload_time_iso_8601": "2022-10-27T14:26:14.752572Z",
+        "url": "https://files.pythonhosted.org/packages/8d/88/73aa68d68bc6833db24e2979e14069f5ff4a96f20d3542ccc864d88d5597/openeo_r_udf-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b1e651a9418bba18d1039f776054c5a29145dff82e44484f3c31cc5d68bb982c",
+          "md5": "bdb2381a461ce35ee36e9086d2f51c78",
+          "sha256": "941e5cd368ec110bd3856a2db1bebf2f08df8e6c942d6d12400f7c05f8607d69"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bdb2381a461ce35ee36e9086d2f51c78",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8975,
+        "upload_time": "2022-11-03T18:23:17",
+        "upload_time_iso_8601": "2022-11-03T18:23:17.463199Z",
+        "url": "https://files.pythonhosted.org/packages/b1/e6/51a9418bba18d1039f776054c5a29145dff82e44484f3c31cc5d68bb982c/openeo_r_udf-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24b67c142bc892babc0791727fbbc7499b4db77e13373dd3bbb0cc8730821e38",
+          "md5": "c7832d1009274f414ffcf8c68d7eeed8",
+          "sha256": "8d819f7327e0968fafc607262d1c2e5322a4e6215cea6d4745b099726df9ab52"
+        },
+        "downloads": -1,
+        "filename": "openeo_r_udf-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c7832d1009274f414ffcf8c68d7eeed8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9742,
+        "upload_time": "2022-11-03T18:23:19",
+        "upload_time_iso_8601": "2022-11-03T18:23:19.806051Z",
+        "url": "https://files.pythonhosted.org/packages/24/b6/7c142bc892babc0791727fbbc7499b4db77e13373dd3bbb0cc8730821e38/openeo_r_udf-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b1e651a9418bba18d1039f776054c5a29145dff82e44484f3c31cc5d68bb982c",
+        "md5": "bdb2381a461ce35ee36e9086d2f51c78",
+        "sha256": "941e5cd368ec110bd3856a2db1bebf2f08df8e6c942d6d12400f7c05f8607d69"
+      },
+      "downloads": -1,
+      "filename": "openeo_r_udf-0.5.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "bdb2381a461ce35ee36e9086d2f51c78",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 8975,
+      "upload_time": "2022-11-03T18:23:17",
+      "upload_time_iso_8601": "2022-11-03T18:23:17.463199Z",
+      "url": "https://files.pythonhosted.org/packages/b1/e6/51a9418bba18d1039f776054c5a29145dff82e44484f3c31cc5d68bb982c/openeo_r_udf-0.5.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "24b67c142bc892babc0791727fbbc7499b4db77e13373dd3bbb0cc8730821e38",
+        "md5": "c7832d1009274f414ffcf8c68d7eeed8",
+        "sha256": "8d819f7327e0968fafc607262d1c2e5322a4e6215cea6d4745b099726df9ab52"
+      },
+      "downloads": -1,
+      "filename": "openeo_r_udf-0.5.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c7832d1009274f414ffcf8c68d7eeed8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 9742,
+      "upload_time": "2022-11-03T18:23:19",
+      "upload_time_iso_8601": "2022-11-03T18:23:19.806051Z",
+      "url": "https://files.pythonhosted.org/packages/24/b6/7c142bc892babc0791727fbbc7499b4db77e13373dd3bbb0cc8730821e38/openeo_r_udf-0.5.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

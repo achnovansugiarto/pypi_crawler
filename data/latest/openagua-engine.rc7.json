@@ -1,0 +1,402 @@
+{
+  "info": {
+    "author": "David Rheinheimer",
+    "author_email": "david.rheinheimer@tec.mx",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "[![DOI](https://zenodo.org/badge/334736504.svg)](https://zenodo.org/badge/latestdoi/334736504)\n\n# Overview\n\n**openagua-engine** is a Python package to help connect a model engine to OpenAgua, so that it can be controlled from and communicate with OpenAgua. It includes\n1. a task queue subscriber to process model tasks instantiated in the OpenAgua app\n2. functions to report progress to the OpenAgua app \n3. functions to read from/write to the OpenAgua database\n\nOpenAgua uses [RabbitMQ](www.rabbitmq.com) to manage model run tasks and, for the time being, [PubNub](www.pubnub.com) for realtime communication (for updating model progress in and stopping the model from OpenAgua). This package uses [Celery](docs.celeryproject.org) to listen for tasks in RabbitMQ queues. Access to the OpenAgua database is via the [OpenAgua API](www.openagua.org/api/v1)\n\n# Installation\n\n## From pip\n\nThis package is availabe via PyPI (see [project page](https://pypi.org/project/openagua-engine/)):\n\n`pip install openagua-engine`\n\n## From source\n\n`python setup.py install` should do the trick.\n\n# Getting started\n\nThe following should help you get going. In addition, see examples of OpenAgua Engine in action at https://github.com/openagua/engine-examples\n\n## Configuration\n\nOpenAgua Engine requires several configuration keys to work. These may be provided directly as arguments to classes/functions, and/or as system environment variables. The possible configuration keys are as follows, listed by their recognized environment variable and respective argument name:\n\n* `OA_API_KEY` (`api_key`) - This is used to access the OpenAgua API. Get this from your account settings in OpenAgua. \n* `OA_MODEL_KEY` (`model_key`) - This is used to route model runs started in OpenAgua to the model engine you want to set up. Get this from the model configuration page in OpenAgua.\n* `OA_RUN_KEY` (`run_key`) (OPTIONAL) - This is a key associated with a particular run configuration that can isolate an engine instance from other engines connected to the same model. If this is omitted, the engine will accept any run associated with the model key (if no run key is assigned in the run configuration). Get this from the run configuration.\n* `OA_RABBITMQ_HOST` (variable only) - The RabbitMQ server IP address.\n\nThese may be provided in a number of ways. One common and easy way is to use a file called `.env` with your keys (and maybe some others as needed for your application):\n\n```dotenv\nOA_API_KEY=APIKEY123\nOA_SECRET_KEY=SECRETKEY123\nOA_MODEL_KEY=MODELKEY456\nOA_RABBITMQ_HOST=1.2.3.4\nOA_PUBNUB_PUBLISH_KEY=pubnubpublishkey123\nOA_PUBNUB_SUBSCRIBE_KEY=pubnubsubscribekey123\n```\nThis can be loaded into your main *tasks.py* script as:\n```python\nfrom dotenv import load_dotenv\nload_dotenv()\n```\n\n## Usage\n\nAn app engine will generally consist of five major steps/functions:\n1. listen to a task queue to process model run requests,\n2. read data from OpenAgua once a task is received,\n3. run the model using the data,\n4. publish model run progress and subscribe to user interventions, and\n5. save data back to OpenAgua.\n\nThese are described along with code snippets below. See the [examples](https://github.com/openagua/engine-examples) for more complete script examples.\n\n### 1. Listen to a task queue\n\nA basic model engine requires a file called *tasks.py* that contains an entry function wrapped in a decorator \"app\", which is a Celery app created by openagua-engine. This app is then run in one of two ways.\n\n#### 1a. Create the entry function\n\n```python\nfrom openagua_engine import create_app\n\napp = create_app()\n\n@app.task(name='model.run')\ndef run(**kwargs):\n    # Do something great!\n    return\n```\n**IMPORTANT**: The `name='model.run'` bit above is critical. When a model is run in OpenAgua, the `model.run` function is called.\n\n#### 1b. Start the app\nThe app above is a Celery app, and can be run as:\n`celery -A tasks worker -l INFO`\n\nAlternatively, the app may be called from within the script, for example by appending *tasks.py* with:\n```python\nif __name__=='__main__':\n    app.start(['-A', 'tasks', 'worker', '-l', 'INFO'])\n```\n\n**WINDOWS USERS**: Celery does not officially support Windows. While there are several fixes, one that seems to work is to use the \"solo\" process when running this app:\n`celery -A tasks worker -l INFO -P solo`\nUnfortunately, this means you cannot do concurrent (parallel) runs. Further work is needed to identify workarounds. In the meantime, if the app can be run on Linux, either a dedicated Linux server or Windows Subsystem for Linux (WSL) are options if concurrency is needed.\n\n### 2. Read data from OpenAgua\n\nHere is an example to instantiate the OpenAgua API and get a network:\n```python\nfrom openagua_engine import OpenAguaEngine as OA\noa = OA()\napi = oa.Client\nnetwork = api.get_network(77)\n```\n\n### 3. Run the model\n\nThe sky is the limit here, especially considering parallel processing needs.\n\nOne easy way to parallel process is as follows. Among other arguments sent by OpenAgua to the task queue (the \"kwargs\" in the run function above) are the scenario ID combinations to be run. Because openagua-engine uses Celery, the app created with `create_app()` can be used to decorate a scenario-centric function, which can then be run in asynchronous mode, as follows:\n\n```python\n@app.task(name='model.run')\ndef run(**kwargs):\n    network = oa.get_network(123)\n    \n    scenario_id_combinations = kwargs.pop('scenario_ids', [])\n    for scen_ids in scenario_id_combinations:\n        \n        # Run a single scenario model asynchronously\n        run_scenario.apply_async(args=(scen_ids, network,), kwargs=kwargs)\n\n@app.task\ndef run_scenario(scen_ids, **kwargs):\n    # Run model here...\n    return\n```\n\n### 4a. Publish progress\n\nopenagua-engine includes methods to report (publish) progress. First, import an OpenAgua class (`from openagua-engine import OpenAgua`). Then, use it as follows:\n\n```python\ntotal_steps = 60  # This would normally be queried from a scenario     \nguid = kwargs.get('guid')\nrun_name = kwargs.get('run_name')\nnetwork_id=kwargs.get('network_id')\noa = OpenAgua(guid, run_name, network_id, scen_ids, total_steps)\n\n# Tell OpenAgua / the user that the model has started\noa.start()\n\nfor step in range(total_steps):\n    my_model.step()  # Assume a model with method \"step\" to do some computation\n    datetime = my_model.datetime\n    oa.step(datetime)\n\n# Tell OpenAgua / the user that the model has finished\noa.finish()\n```\n\n### 4b. Subscribe to user interactions\nThe OpenAgua class above also monitors for user interactions, namely pause and stop. These are set as boolean (True/False) attributes of the OpenAgua object. We can include this in the above script as:\n```python\nfor i in range(total_steps):\n    # Check if the user has paused or stopped the run\n    # Note that pause is not currently implemented in the app\n    if oa.paused:\n        pause_start_time = dt.datetime.now()\n        while oa.paused and (dt.datetime.now() - pause_start_time).seconds < 86400:\n            sleep(0.5) # check every 1/2 second\n            \n    if oa.stopped:  # this should be after pause is checked, to stop during a pause\n        oa.stop()  # This will report back to OA that the model has stopped\n        break\n```\n\n### 5. Save data\n\n[forthcoming]\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/openagua/openagua-engine",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "openagua-engine",
+    "package_url": "https://pypi.org/project/openagua-engine/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/openagua-engine/",
+    "project_urls": {
+      "Homepage": "https://github.com/openagua/openagua-engine"
+    },
+    "release_url": "https://pypi.org/project/openagua-engine/0.2.18/",
+    "requires_dist": [
+      "celery",
+      "pubnub",
+      "requests",
+      "openagua-client",
+      "loguru"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Tools to connect a model engine to OpenAgua",
+    "version": "0.2.18",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12533075,
+  "releases": {
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "361127e4bc4c5766d9f5396f5fdac5e612a15033714b5e3cd82855eae9e9dd24",
+          "md5": "b7c7cf41283431730ff207e760856811",
+          "sha256": "529f7407ae39030015f810b035f323bdc9fffbefa97c47c21d3ae70e2f3a8d15"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7c7cf41283431730ff207e760856811",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12811,
+        "upload_time": "2021-03-17T14:37:03",
+        "upload_time_iso_8601": "2021-03-17T14:37:03.942591Z",
+        "url": "https://files.pythonhosted.org/packages/36/11/27e4bc4c5766d9f5396f5fdac5e612a15033714b5e3cd82855eae9e9dd24/openagua_engine-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2494eeeebe49f29150e3d45c04190b8ab923c3c9581a9fe69a37042770cd5149",
+          "md5": "ed0588933e39a2af8f6f3b2350943e19",
+          "sha256": "b5e471a6e476103a7091f4adaa004335144aef03f8e1df4593aa2b66f3263537"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed0588933e39a2af8f6f3b2350943e19",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11561,
+        "upload_time": "2021-03-17T14:37:04",
+        "upload_time_iso_8601": "2021-03-17T14:37:04.855184Z",
+        "url": "https://files.pythonhosted.org/packages/24/94/eeeebe49f29150e3d45c04190b8ab923c3c9581a9fe69a37042770cd5149/openagua-engine-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87a78a9a9044e9a294ca05a90d34ac0fd42833455b76056ada225487d1e645be",
+          "md5": "f84057d742cf4232a97c4b6874b44cc3",
+          "sha256": "e41344a29057d01f0082cb302500c1516460f837b864eba4302fbdd10bf75493"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f84057d742cf4232a97c4b6874b44cc3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12872,
+        "upload_time": "2021-03-17T15:38:33",
+        "upload_time_iso_8601": "2021-03-17T15:38:33.001998Z",
+        "url": "https://files.pythonhosted.org/packages/87/a7/8a9a9044e9a294ca05a90d34ac0fd42833455b76056ada225487d1e645be/openagua_engine-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "190f0a1124311c00c3e6ca2075dea91b77cf3a1d2c5f3ab03d141077f44e4ba3",
+          "md5": "42bfda07e293f0536b2d1f23259e2452",
+          "sha256": "74bb7ca30c4234dfb9e3469c112222c0afb6d3a564734e36738468b5cf47543a"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "42bfda07e293f0536b2d1f23259e2452",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11626,
+        "upload_time": "2021-03-17T15:38:33",
+        "upload_time_iso_8601": "2021-03-17T15:38:33.945811Z",
+        "url": "https://files.pythonhosted.org/packages/19/0f/0a1124311c00c3e6ca2075dea91b77cf3a1d2c5f3ab03d141077f44e4ba3/openagua-engine-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a1f1fab24a8dbda35544ed9746e31fc396d9d08c81502fcd662abca17d826a6",
+          "md5": "8d61a6ce999344f0e616211d6cee7b2f",
+          "sha256": "405543b7d2382afba5b7fb1c0ab15c5164fd63a0ca839da7e8074a72f335fd64"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8d61a6ce999344f0e616211d6cee7b2f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 13708,
+        "upload_time": "2022-01-10T22:28:47",
+        "upload_time_iso_8601": "2022-01-10T22:28:47.335406Z",
+        "url": "https://files.pythonhosted.org/packages/8a/1f/1fab24a8dbda35544ed9746e31fc396d9d08c81502fcd662abca17d826a6/openagua_engine-0.2.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c73c30fdc632e55869fdba0e696cc7f18c57de1e1a19c51f84dbb64331e63413",
+          "md5": "715d7682406fdb3512b53f08f664fb13",
+          "sha256": "6015a84bf0a0cc1c7477584b4d4befcbff3f579cbda7f1b6b1d4174fd5ed66f0"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "715d7682406fdb3512b53f08f664fb13",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12915,
+        "upload_time": "2022-01-10T22:28:48",
+        "upload_time_iso_8601": "2022-01-10T22:28:48.860532Z",
+        "url": "https://files.pythonhosted.org/packages/c7/3c/30fdc632e55869fdba0e696cc7f18c57de1e1a19c51f84dbb64331e63413/openagua-engine-0.2.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "543b0655a5fac5fa90a196b405a11aec2f423a0f55585f9c891efa93ff4747a2",
+          "md5": "74974b329630a06dbe4e5a726124c700",
+          "sha256": "f98e431d255af805919ad8438d45c0e92aff000a1d35846c2961b7aced8af7d5"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "74974b329630a06dbe4e5a726124c700",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12885,
+        "upload_time": "2021-03-17T15:39:07",
+        "upload_time_iso_8601": "2021-03-17T15:39:07.443761Z",
+        "url": "https://files.pythonhosted.org/packages/54/3b/0655a5fac5fa90a196b405a11aec2f423a0f55585f9c891efa93ff4747a2/openagua_engine-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ea06f64222ca3e86dfae6be90af94e61ed4e6992f0affede44f80fd0eda2370",
+          "md5": "a90aedb8906514285428e62fbc1132f3",
+          "sha256": "2d2c984cd82b6ce9a2e457d206c71696c92112170e25bc46c6bb2f419dd0d2b5"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a90aedb8906514285428e62fbc1132f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11642,
+        "upload_time": "2021-03-17T15:39:08",
+        "upload_time_iso_8601": "2021-03-17T15:39:08.649994Z",
+        "url": "https://files.pythonhosted.org/packages/2e/a0/6f64222ca3e86dfae6be90af94e61ed4e6992f0affede44f80fd0eda2370/openagua-engine-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9dae973473685aabf5b6cdea9b4b49e8cc801f3620a2a8d3c0e00d8b909210a6",
+          "md5": "95ea87b18d5d269d29769d91762f5f1b",
+          "sha256": "9dd07ffcb54320895595f9f561ca568415f5dae19a5efaacdd328db482ecb95b"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "95ea87b18d5d269d29769d91762f5f1b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12733,
+        "upload_time": "2021-03-17T22:45:56",
+        "upload_time_iso_8601": "2021-03-17T22:45:56.914756Z",
+        "url": "https://files.pythonhosted.org/packages/9d/ae/973473685aabf5b6cdea9b4b49e8cc801f3620a2a8d3c0e00d8b909210a6/openagua_engine-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e9ed89dcb5efdac438bd484333641b5aa0facca15c2e8e94ba4230450974c8b",
+          "md5": "6751592139537e58af5aaad4e35a477f",
+          "sha256": "4ef0f3627310856dc0fed5c8e90427097b83f478e9f55281773c788030615aca"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6751592139537e58af5aaad4e35a477f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11521,
+        "upload_time": "2021-03-17T22:45:58",
+        "upload_time_iso_8601": "2021-03-17T22:45:58.187234Z",
+        "url": "https://files.pythonhosted.org/packages/8e/9e/d89dcb5efdac438bd484333641b5aa0facca15c2e8e94ba4230450974c8b/openagua-engine-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d3b19e7dee50d204074a7b2928d2b2258820198233a1ce18247ef52f8072f49",
+          "md5": "272980e6bc27516f8837881d2992ebe2",
+          "sha256": "65206ae85332582becf5dd5e8d3e7d1ddbcb137585c07b1e662fc38953ceb44d"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "272980e6bc27516f8837881d2992ebe2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12740,
+        "upload_time": "2021-03-17T22:51:41",
+        "upload_time_iso_8601": "2021-03-17T22:51:41.815155Z",
+        "url": "https://files.pythonhosted.org/packages/6d/3b/19e7dee50d204074a7b2928d2b2258820198233a1ce18247ef52f8072f49/openagua_engine-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c532023e5c786997973dbe30f625c4dd54264e76d00f9f77c985e9b954bd7fb0",
+          "md5": "cdee672b5db9b383f1ce44bdc2c6c87b",
+          "sha256": "40ecf0723583e82435dd032f8125d2bacde3710861b15ccbb9105f265fe5bcef"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cdee672b5db9b383f1ce44bdc2c6c87b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11524,
+        "upload_time": "2021-03-17T22:51:43",
+        "upload_time_iso_8601": "2021-03-17T22:51:43.046231Z",
+        "url": "https://files.pythonhosted.org/packages/c5/32/023e5c786997973dbe30f625c4dd54264e76d00f9f77c985e9b954bd7fb0/openagua-engine-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5aad06da3756b8a9607b53e7a38b0087ebb7c12b9e275e0fb35cc8adac931d14",
+          "md5": "f80e1c08db7d9f4faecca7741b406b3c",
+          "sha256": "869146ff82b6739c8091b53e2bfb5b2cdd7db4e407e82566f468ab51680b35ea"
+        },
+        "downloads": -1,
+        "filename": "openagua_engine-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f80e1c08db7d9f4faecca7741b406b3c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12746,
+        "upload_time": "2021-03-17T22:55:37",
+        "upload_time_iso_8601": "2021-03-17T22:55:37.275813Z",
+        "url": "https://files.pythonhosted.org/packages/5a/ad/06da3756b8a9607b53e7a38b0087ebb7c12b9e275e0fb35cc8adac931d14/openagua_engine-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d85a6ed7d538e6d2a20cf69c9c27c90001db25ae1fa2649ede471d4b242b7a60",
+          "md5": "8fed9ff354df1b96d7abfad2361b68fd",
+          "sha256": "becb364ce92fe94c5567fc597bd54173f78c1ece309a39dcb7d6c24b7bef48c7"
+        },
+        "downloads": -1,
+        "filename": "openagua-engine-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8fed9ff354df1b96d7abfad2361b68fd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11529,
+        "upload_time": "2021-03-17T22:55:38",
+        "upload_time_iso_8601": "2021-03-17T22:55:38.292352Z",
+        "url": "https://files.pythonhosted.org/packages/d8/5a/6ed7d538e6d2a20cf69c9c27c90001db25ae1fa2649ede471d4b242b7a60/openagua-engine-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8a1f1fab24a8dbda35544ed9746e31fc396d9d08c81502fcd662abca17d826a6",
+        "md5": "8d61a6ce999344f0e616211d6cee7b2f",
+        "sha256": "405543b7d2382afba5b7fb1c0ab15c5164fd63a0ca839da7e8074a72f335fd64"
+      },
+      "downloads": -1,
+      "filename": "openagua_engine-0.2.18-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8d61a6ce999344f0e616211d6cee7b2f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 13708,
+      "upload_time": "2022-01-10T22:28:47",
+      "upload_time_iso_8601": "2022-01-10T22:28:47.335406Z",
+      "url": "https://files.pythonhosted.org/packages/8a/1f/1fab24a8dbda35544ed9746e31fc396d9d08c81502fcd662abca17d826a6/openagua_engine-0.2.18-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c73c30fdc632e55869fdba0e696cc7f18c57de1e1a19c51f84dbb64331e63413",
+        "md5": "715d7682406fdb3512b53f08f664fb13",
+        "sha256": "6015a84bf0a0cc1c7477584b4d4befcbff3f579cbda7f1b6b1d4174fd5ed66f0"
+      },
+      "downloads": -1,
+      "filename": "openagua-engine-0.2.18.tar.gz",
+      "has_sig": false,
+      "md5_digest": "715d7682406fdb3512b53f08f664fb13",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 12915,
+      "upload_time": "2022-01-10T22:28:48",
+      "upload_time_iso_8601": "2022-01-10T22:28:48.860532Z",
+      "url": "https://files.pythonhosted.org/packages/c7/3c/30fdc632e55869fdba0e696cc7f18c57de1e1a19c51f84dbb64331e63413/openagua-engine-0.2.18.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,229 @@
+{
+  "info": {
+    "author": "Adam Dyess",
+    "author_email": "adam.dyess@canonical.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# ops-lib-manifests\n\n## Rationale for this library\nMost kubernetes projects deploy with manifest files which promote suggested deployment\nparameters, but those manifests aren't consistent about which options are requirements\nand which options are variable. In some cases the project's distribution uses different\nmeans of indicating a need for replacement.\n\nFor example, the following reference from [vsphere-cloud-controller-manager](https://github.com/kubernetes/cloud-provider-vsphere/blob/master/releases/v1.23/vsphere-cloud-controller-manager.yaml#L11-L24)\ngives the consumer of this yaml an indication there should be usernames and passwords set\nin the Secret object.\n\n```yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: vsphere-cloud-secret\n  labels:\n    vsphere-cpi-infra: secret\n    component: cloud-controller-manager\n  namespace: kube-system\n  # NOTE: this is just an example configuration, update with real values based on your environment\nstringData:\n  10.0.0.1.username: \"<ENTER_YOUR_VCENTER_USERNAME>\"\n  10.0.0.1.password: \"<ENTER_YOUR_VCENTER_PASSWORD>\"\n  1.2.3.4.username: \"<ENTER_YOUR_VCENTER_USERNAME>\"\n  1.2.3.4.password: \"<ENTER_YOUR_VCENTER_PASSWORD>\"\n```\n\nAutomation tools like a juju charm will need to read these yaml manifest files, manipulate\nits content, and deploy those manifests when any of the **configurable** data is changed.\n\n\n## Supporting Multiple Releases\nLikewise, the projects which release reference manifest files, will also release versions\nof manifests. It's possible for a charm to load all the supported manifest files into a \nfolder structure such the charm supports multiple releases. This library supports this \nrequirements by having the charm store upstream manifest files unchanged in a folder \nstructure like this:\n\n```\n<base_path>\n├── version                  - a file containing the default version\n├── manifests                - a folder containing all the releases\n│   ├── v1.1.10              - a folder matching a configurable version\n│   │   ├── manifest-1.yaml  - any file with a `.yaml` file type\n│   │   └── manifest-2.yaml\n│   ├── v1.1.11\n│   │   ├── manifest-1.yaml\n│   │   └── manifest-2.yaml\n│   │   └── manifest-3.yaml\n```\n\nKey file-heirarchy requirements\n-------------------------------\n|  |  |\n| --- | --- |\n| **$base_path** | A single charm can support multiple manifest releases\n| **version**    | A text file indicating to the library which manifest version is the default when the 'release' config is unspecified |\n| **manifests**  | A folder containing the individual release manifest folders |\n| **$release**   | A folder containing the yaml files of the specific release |\n\n## Sample Usage\n\nOnce your charm includes the above manifest file hierarchy, your charm will need to define the\nmutations the library should make to the manifests. \n\n```python\nfrom ops.manifests import Collector, Manifests, ManifestLabel, ConfigRegistry\n\nclass ExampleApp(Manifests):\n    def __init__(self, charm, charm_config):\n        manipulations = [\n            ManifestLabel(self),\n            ConfigRegistry(self),\n            UpdateSecret(self),\n        ]\n        super().__init__(\"example\", charm.model, \"upstream/example\", manipulations)\n        self.charm_config = charm_config\n\n    @property\n    def config(self) -> Dict:\n        \"\"\"Returns config mapped from charm config and joined relations.\"\"\"\n        config = dict(**self.charm_config)\n\n        for key, value in dict(**config).items():\n            if value == \"\" or value is None:\n                del config[key]  # blank out keys not currently set to something\n\n        config[\"release\"] = config.pop(\"example-release\", None)\n        return config\n\n\nclass ExampleCharm(CharmBase):\n    def __init__(self, *args):\n        super().__init__(*args)\n\n        # collection of ManifestImpls\n        self.collector = Collector(ExampleApp(self, self.config))\n\n        # Register actions callbacks\n        self.framework.observe(self.on.list_versions_action, self._list_versions)\n        \n        # Register update status callbacks\n        self.framework.observe(self.on.update_status, self._update_status)\n    \n    def _list_versions(self, event):\n        self.collector.list_versions(event)\n\n    def _update_status(self, _):\n        unready = self.collector.unready\n        if unready:\n            self.unit.status = WaitingStatus(\", \".join(unready))\n        else:\n            self.unit.status = ActiveStatus(\"Ready\")\n            self.unit.set_workload_version(self.collector.short_version)\n            self.app.status = ActiveStatus(self.collector.long_version)\n        \n```\n\n## Manifests\n\nThis class provides the following functions:\n1) Integration with lightkube to create/read/update/delete resources into the cluster\n2) Provides a means to select a manifest release\n3) Loads manifest files from a known file hierarchy specific to a release\n4) Manipulates resource objects of a specific release\n5) Provides comparisons between the installed resources and expected resources\n6) Provides user listing of available releases\n\n### Creating a Manifest Impl\nIt's expected that the developer create a `Manifest` impl -- a derived class -- that implements\none property -- `config`.  This property provides some basic requirements to the\nManifest parent class and gives context for each custom `Manipulation` to act on \nrelation or config data.\n\n```python\n    @property\n    def config(self) -> Dict:\n        \"\"\"Returns config mapped from charm config and joined relations.\"\"\"\n```\n\n#### Expected `config` key mappings\n* `release` \n    * optional `str` which identifies which release of the manifest to choose.\n    * defaults to `None` which will select the `default_release` if available.\n    * if `default_release` isn't found, the latest release is chosen.\n* `image-registry`\n    * optional `str` which will be used by the `ConfigRegistry` manipulation\n    * defaults to `None` which uses the resources built-in registry location\n    * if specified, will replace the text up to the first `/` with its contents\n\n\n### Cluster CRUD methods\n* `status()` \n    * queries all in cluster resources associated with the current release which\n      has a `.status.conditions` attribute.\n* `installed_resources()`\n    * queries all in cluster resources associated with the current release which \n      is installed.\n* `labelled_resources()`\n    * queries all in cluster resources associated with the charm and manifest in general\n      which is installed.\n    * this can be compared with the `resources` property to look for extra resources \n      installed which are no longer necessary.\n* `apply_manifests()`\n    * applies all resources from the current release into the cluster.\n    * resources are force applied, overwriting existing resources.\n* `apply_resources(*resources)` and `apply_resource(...)`\n    * applies itemized resources into the cluster.\n    * resources are force applied, overwriting existing resources.\n* `delete_manifests(...)`\n    * will delete all current release resources from the cluster\n    * see `delete_resources` for keyword arguments\n* `delete_resources(...)`\n    * delete a specified set of resources from the cluster with options to \n      seamlessly handle certain failures.\n* `delete_resource(...)`\n    * alias to `delete_resources` for when reading clarity demands only deleting\n      one resource.\n\n## Collector\n\nThis class provides a native collection for operating collectively on\nthe manifests within a single charm.  It provides methods for responding to \n* action list-versions\n* action scrub-resources\n* action list-resources\n* action apply-missing-resources\n* querying the collective versions (short and long types)\n* listing which resources have a non-active status\n\nTo integrate into an [ops charm](https://juju.is/docs/sdk/ops), for each \nreleased application the charm manages, create a new `Manifests` impl, \nand add an instance of it to a `Collector`.\n\n```python\nclass AlternateApp(Manifests):\n    def __init__(self, charm, charm_config):\n        super().__init__(\"alternate\", charm.model, \"upstream/example\")\n        self.charm_config = charm_config\n\n\n    @property\n    def config(self) -> Dict:\n        \"\"\"Returns config mapped from charm config and joined relations.\"\"\"\n        config = dict(**self.charm_config)\n\n        for key, value in dict(**config).items():\n            if value == \"\" or value is None:\n                del config[key]  # blank out keys not currently set to something\n\n        config[\"release\"] = config.pop(\"alternate-release\", None)\n        return config\n\n\nclass ExampleCharm(CharmBase):\n    def __init__(self, *args):\n        ...\n        # collection of ManifestImpls\n        self.collector = Collector(\n            ExampleApp(self, self.config), \n            AlternateApp(self, self.config),\n        )\n```\n\n\n## Manipulations\n\n### Patching a manifest resource\nSome resources already exist within the manifest, and just need to be updated.\n\n#### Built in Patchers\n* `ManifestLabel` \n  * adds to each resource's `metadata.labels` the following:\n     1) `juju.io/application: manifests.app_name`\n     2) `juju.io/manifest: manifests.name`\n     3) `juju.io/manifest-version: <manifests.name>-<version>`\n\n* `ConfigRegistry`\n  * updates the image registry of every `Pod`, `DaemonSet`, `Deployment`, and\n    `StatefulSet` from the `image-registry` config item in the config\n    properties `Dict`.\n  * If the charm doesn't wish to alter the config, ensure nothing exists\n    in the `image-registry`.\n\n* `update_toleration` \n  * not officially a patcher, but can be used by a custom Patcher\n    to adjust tolerations on `Pod`, `DaemonSet`, `Deployment`, and `StatefulSet`\n    resources.\n\n### Adding a manifest resource\nSome resources do not exist in the release manifest and must be added. The `Addition` manipulations are added\nbefore the rest of the `Patch` manipulations are applied.\n\n#### Built in Adders\n* `CreateNamespace` - Creates a namespace resource using either the manifest's default namespace or \n                      an argument passed in to the constructor of this class. \n\n### Subtracting a manifest resource\nSome manifest resources are not needed and must be removed. The `Subtraction` manipulations are added\nbefore the rest of the `Patch` manipulations are applied.\n\n#### Built in Subtractors\n* `SubtractEq` - Subtracts a manifest resource equal to the resource passed in as an argument. Resources are considered \n                 equal if they have the same kind, name, and namespace.\n\n### Custom Manipulations\nOf course the built-ins will not be enough, so your charm may extend its own manipulations by defining\nnew objects which inherit from either `Patch` or `Addition`.\n.. _`changelog`:\n\n=========\nChangelog\n=========\n\nVersions follow `Semantic Versioning <https://semver.org/>`_ (``<major>.<minor>.<patch>``).\n\nBackward incompatible (breaking) changes will only be introduced in major versions\n\n\nops-lib-manifest 1.0.0 (2022-12-14)\n=========================\n\nIssues Resolved\n* [LP#1999427](https://launchpad.net/bugs/1999427)\n    - handles non-api errors from the client which are represented\n      as an http error response without json content.\n\nBreaking Changes\n----------------\n\n* no longer are `lightkube.core.exceptions.ApiError`s raised on the following methods:\n   * Manifest.status\n   * Manifest.installed_resources\n   * Manifest.apply_manifest\n   * Manifest.delete_manifest\n   * Manifest.apply_resources\n   * Manifest.delete_resources\n\n    instead a more generic exception `ManifestClientError` is raised.\n\n\n                                 Apache License\n                           Version 2.0, January 2004\n                        http://www.apache.org/licenses/\n\n   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION\n\n   1. Definitions.\n\n      \"License\" shall mean the terms and conditions for use, reproduction,\n      and distribution as defined by Sections 1 through 9 of this document.\n\n      \"Licensor\" shall mean the copyright owner or entity authorized by\n      the copyright owner that is granting the License.\n\n      \"Legal Entity\" shall mean the union of the acting entity and all\n      other entities that control, are controlled by, or are under common\n      control with that entity. For the purposes of this definition,\n      \"control\" means (i) the power, direct or indirect, to cause the\n      direction or management of such entity, whether by contract or\n      otherwise, or (ii) ownership of fifty percent (50%) or more of the\n      outstanding shares, or (iii) beneficial ownership of such entity.\n\n      \"You\" (or \"Your\") shall mean an individual or Legal Entity\n      exercising permissions granted by this License.\n\n      \"Source\" form shall mean the preferred form for making modifications,\n      including but not limited to software source code, documentation\n      source, and configuration files.\n\n      \"Object\" form shall mean any form resulting from mechanical\n      transformation or translation of a Source form, including but\n      not limited to compiled object code, generated documentation,\n      and conversions to other media types.\n\n      \"Work\" shall mean the work of authorship, whether in Source or\n      Object form, made available under the License, as indicated by a\n      copyright notice that is included in or attached to the work\n      (an example is provided in the Appendix below).\n\n      \"Derivative Works\" shall mean any work, whether in Source or Object\n      form, that is based on (or derived from) the Work and for which the\n      editorial revisions, annotations, elaborations, or other modifications\n      represent, as a whole, an original work of authorship. For the purposes\n      of this License, Derivative Works shall not include works that remain\n      separable from, or merely link (or bind by name) to the interfaces of,\n      the Work and Derivative Works thereof.\n\n      \"Contribution\" shall mean any work of authorship, including\n      the original version of the Work and any modifications or additions\n      to that Work or Derivative Works thereof, that is intentionally\n      submitted to Licensor for inclusion in the Work by the copyright owner\n      or by an individual or Legal Entity authorized to submit on behalf of\n      the copyright owner. For the purposes of this definition, \"submitted\"\n      means any form of electronic, verbal, or written communication sent\n      to the Licensor or its representatives, including but not limited to\n      communication on electronic mailing lists, source code control systems,\n      and issue tracking systems that are managed by, or on behalf of, the\n      Licensor for the purpose of discussing and improving the Work, but\n      excluding communication that is conspicuously marked or otherwise\n      designated in writing by the copyright owner as \"Not a Contribution.\"\n\n      \"Contributor\" shall mean Licensor and any individual or Legal Entity\n      on behalf of whom a Contribution has been received by Licensor and\n      subsequently incorporated within the Work.\n\n   2. Grant of Copyright License. Subject to the terms and conditions of\n      this License, each Contributor hereby grants to You a perpetual,\n      worldwide, non-exclusive, no-charge, royalty-free, irrevocable\n      copyright license to reproduce, prepare Derivative Works of,\n      publicly display, publicly perform, sublicense, and distribute the\n      Work and such Derivative Works in Source or Object form.\n\n   3. Grant of Patent License. Subject to the terms and conditions of\n      this License, each Contributor hereby grants to You a perpetual,\n      worldwide, non-exclusive, no-charge, royalty-free, irrevocable\n      (except as stated in this section) patent license to make, have made,\n      use, offer to sell, sell, import, and otherwise transfer the Work,\n      where such license applies only to those patent claims licensable\n      by such Contributor that are necessarily infringed by their\n      Contribution(s) alone or by combination of their Contribution(s)\n      with the Work to which such Contribution(s) was submitted. If You\n      institute patent litigation against any entity (including a\n      cross-claim or counterclaim in a lawsuit) alleging that the Work\n      or a Contribution incorporated within the Work constitutes direct\n      or contributory patent infringement, then any patent licenses\n      granted to You under this License for that Work shall terminate\n      as of the date such litigation is filed.\n\n   4. Redistribution. You may reproduce and distribute copies of the\n      Work or Derivative Works thereof in any medium, with or without\n      modifications, and in Source or Object form, provided that You\n      meet the following conditions:\n\n      (a) You must give any other recipients of the Work or\n          Derivative Works a copy of this License; and\n\n      (b) You must cause any modified files to carry prominent notices\n          stating that You changed the files; and\n\n      (c) You must retain, in the Source form of any Derivative Works\n          that You distribute, all copyright, patent, trademark, and\n          attribution notices from the Source form of the Work,\n          excluding those notices that do not pertain to any part of\n          the Derivative Works; and\n\n      (d) If the Work includes a \"NOTICE\" text file as part of its\n          distribution, then any Derivative Works that You distribute must\n          include a readable copy of the attribution notices contained\n          within such NOTICE file, excluding those notices that do not\n          pertain to any part of the Derivative Works, in at least one\n          of the following places: within a NOTICE text file distributed\n          as part of the Derivative Works; within the Source form or\n          documentation, if provided along with the Derivative Works; or,\n          within a display generated by the Derivative Works, if and\n          wherever such third-party notices normally appear. The contents\n          of the NOTICE file are for informational purposes only and\n          do not modify the License. You may add Your own attribution\n          notices within Derivative Works that You distribute, alongside\n          or as an addendum to the NOTICE text from the Work, provided\n          that such additional attribution notices cannot be construed\n          as modifying the License.\n\n      You may add Your own copyright statement to Your modifications and\n      may provide additional or different license terms and conditions\n      for use, reproduction, or distribution of Your modifications, or\n      for any such Derivative Works as a whole, provided Your use,\n      reproduction, and distribution of the Work otherwise complies with\n      the conditions stated in this License.\n\n   5. Submission of Contributions. Unless You explicitly state otherwise,\n      any Contribution intentionally submitted for inclusion in the Work\n      by You to the Licensor shall be under the terms and conditions of\n      this License, without any additional terms or conditions.\n      Notwithstanding the above, nothing herein shall supersede or modify\n      the terms of any separate license agreement you may have executed\n      with Licensor regarding such Contributions.\n\n   6. Trademarks. This License does not grant permission to use the trade\n      names, trademarks, service marks, or product names of the Licensor,\n      except as required for reasonable and customary use in describing the\n      origin of the Work and reproducing the content of the NOTICE file.\n\n   7. Disclaimer of Warranty. Unless required by applicable law or\n      agreed to in writing, Licensor provides the Work (and each\n      Contributor provides its Contributions) on an \"AS IS\" BASIS,\n      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n      implied, including, without limitation, any warranties or conditions\n      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A\n      PARTICULAR PURPOSE. You are solely responsible for determining the\n      appropriateness of using or redistributing the Work and assume any\n      risks associated with Your exercise of permissions under this License.\n\n   8. Limitation of Liability. In no event and under no legal theory,\n      whether in tort (including negligence), contract, or otherwise,\n      unless required by applicable law (such as deliberate and grossly\n      negligent acts) or agreed to in writing, shall any Contributor be\n      liable to You for damages, including any direct, indirect, special,\n      incidental, or consequential damages of any character arising as a\n      result of this License or out of the use or inability to use the\n      Work (including but not limited to damages for loss of goodwill,\n      work stoppage, computer failure or malfunction, or any and all\n      other commercial damages or losses), even if such Contributor\n      has been advised of the possibility of such damages.\n\n   9. Accepting Warranty or Additional Liability. While redistributing\n      the Work or Derivative Works thereof, You may choose to offer,\n      and charge a fee for, acceptance of support, warranty, indemnity,\n      or other liability obligations and/or rights consistent with this\n      License. However, in accepting such obligations, You may act only\n      on Your own behalf and on Your sole responsibility, not on behalf\n      of any other Contributor, and only if You agree to indemnify,\n      defend, and hold each Contributor harmless for any liability\n      incurred by, or claims asserted against, such Contributor by reason\n      of your accepting any such warranty or additional liability.\n\n   END OF TERMS AND CONDITIONS\n\n   APPENDIX: How to apply the Apache License to your work.\n\n      To apply the Apache License to your work, attach the following\n      boilerplate notice, with the fields enclosed by brackets \"[]\"\n      replaced with your own identifying information. (Don't include\n      the brackets!)  The text should be enclosed in the appropriate\n      comment syntax for the file format. We also recommend that a\n      file or class name and description of purpose be included on the\n      same \"printed page\" as the copyright notice for easier\n      identification within third-party archives.\n\n   Copyright [yyyy] [name of copyright owner]\n\n   Licensed under the Apache License, Version 2.0 (the \"License\");\n   you may not use this file except in compliance with the License.\n   You may obtain a copy of the License at\n\n       http://www.apache.org/licenses/LICENSE-2.0\n\n   Unless required by applicable law or agreed to in writing, software\n   distributed under the License is distributed on an \"AS IS\" BASIS,\n   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n   See the License for the specific language governing permissions and\n   limitations under the License.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/canonical/ops-lib-manifest",
+    "keywords": "juju,charming,kubernetes,operators,manifests,yaml",
+    "license": "Apache",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ops.manifest",
+    "package_url": "https://pypi.org/project/ops.manifest/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/ops.manifest/",
+    "project_urls": {
+      "Homepage": "https://github.com/canonical/ops-lib-manifest"
+    },
+    "release_url": "https://pypi.org/project/ops.manifest/1.1.0/",
+    "requires_dist": [
+      "backports.cached-property",
+      "ops",
+      "lightkube"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "\"Kubernetes manifests for Operators\"",
+    "version": "1.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16908258,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce991158a9b76c7bd2d327e7a17e772470dc8ad6ed5fd71a963ad7f013d1a2f5",
+          "md5": "96d8d6e865570c5528d03f66f0be52e2",
+          "sha256": "fb870387a2046bd79fa024f3bc642e2b9d8c2b500488d705e069f8fd9e145176"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "96d8d6e865570c5528d03f66f0be52e2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 14335,
+        "upload_time": "2023-02-06T18:06:13",
+        "upload_time_iso_8601": "2023-02-06T18:06:13.915363Z",
+        "url": "https://files.pythonhosted.org/packages/ce/99/1158a9b76c7bd2d327e7a17e772470dc8ad6ed5fd71a963ad7f013d1a2f5/ops.manifest-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac218bbffa5808b353847e1ce7696b16e4a4b7975e506dcfeb5a9480ed1b5b9e",
+          "md5": "6bd5cd7a9a171fd45315a85873d09154",
+          "sha256": "4dd9e1ebbddae13a762f0d6a178249811abf8485c7e9fcc04d8ca81db66f764e"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6bd5cd7a9a171fd45315a85873d09154",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 16237,
+        "upload_time": "2023-02-06T18:06:15",
+        "upload_time_iso_8601": "2023-02-06T18:06:15.244970Z",
+        "url": "https://files.pythonhosted.org/packages/ac/21/8bbffa5808b353847e1ce7696b16e4a4b7975e506dcfeb5a9480ed1b5b9e/ops.manifest-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42218a7bd4be7410744bfee9720e239889ead670b3d494feb4e435a95b846f30",
+          "md5": "41cb6dd479d89646f4430fb09dbf32e8",
+          "sha256": "5e34f14272a3cbe02ee94ac2344e3f964ea0bed2013d120c857a3260fb8672f2"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "41cb6dd479d89646f4430fb09dbf32e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 22358,
+        "upload_time": "2023-02-06T20:41:05",
+        "upload_time_iso_8601": "2023-02-06T20:41:05.077717Z",
+        "url": "https://files.pythonhosted.org/packages/42/21/8a7bd4be7410744bfee9720e239889ead670b3d494feb4e435a95b846f30/ops.manifest-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e67aaac721beb10a9c243795c6639d890dff3428b0f7fdc3902ccb232e14df1",
+          "md5": "e9c39b7caddd398b057724a80fd749ea",
+          "sha256": "3ffe9e08767168b70c54ecdda357599f9abc17f72c11086ac99e32e63629546b"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e9c39b7caddd398b057724a80fd749ea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 24256,
+        "upload_time": "2023-02-06T20:41:06",
+        "upload_time_iso_8601": "2023-02-06T20:41:06.434522Z",
+        "url": "https://files.pythonhosted.org/packages/2e/67/aaac721beb10a9c243795c6639d890dff3428b0f7fdc3902ccb232e14df1/ops.manifest-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "81acdf93badd4c82c6b6edf84f71ac43d8a7352ce3d18178ba1f38a322283e73",
+          "md5": "fe5b62cddbc6c22519a67b5cf9969297",
+          "sha256": "32047d756f3fc0266334019b0c3ed4d27dae7414ac66bce3391e96a99e6a3bdd"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fe5b62cddbc6c22519a67b5cf9969297",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 22501,
+        "upload_time": "2023-02-17T21:43:40",
+        "upload_time_iso_8601": "2023-02-17T21:43:40.905496Z",
+        "url": "https://files.pythonhosted.org/packages/81/ac/df93badd4c82c6b6edf84f71ac43d8a7352ce3d18178ba1f38a322283e73/ops.manifest-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9fc61c5f94be77e23a821a69ea057f0c4da55dec02bb183d388c202cecbe4a03",
+          "md5": "0e32741b2d7057e0f59ca5b79dfe0acd",
+          "sha256": "54603cb0ada1bd9277fa5c8d2a3191247189803ac32aff2617cd708c807d1c2f"
+        },
+        "downloads": -1,
+        "filename": "ops.manifest-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0e32741b2d7057e0f59ca5b79dfe0acd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 24416,
+        "upload_time": "2023-02-17T21:43:42",
+        "upload_time_iso_8601": "2023-02-17T21:43:42.864292Z",
+        "url": "https://files.pythonhosted.org/packages/9f/c6/1c5f94be77e23a821a69ea057f0c4da55dec02bb183d388c202cecbe4a03/ops.manifest-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "81acdf93badd4c82c6b6edf84f71ac43d8a7352ce3d18178ba1f38a322283e73",
+        "md5": "fe5b62cddbc6c22519a67b5cf9969297",
+        "sha256": "32047d756f3fc0266334019b0c3ed4d27dae7414ac66bce3391e96a99e6a3bdd"
+      },
+      "downloads": -1,
+      "filename": "ops.manifest-1.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "fe5b62cddbc6c22519a67b5cf9969297",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 22501,
+      "upload_time": "2023-02-17T21:43:40",
+      "upload_time_iso_8601": "2023-02-17T21:43:40.905496Z",
+      "url": "https://files.pythonhosted.org/packages/81/ac/df93badd4c82c6b6edf84f71ac43d8a7352ce3d18178ba1f38a322283e73/ops.manifest-1.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9fc61c5f94be77e23a821a69ea057f0c4da55dec02bb183d388c202cecbe4a03",
+        "md5": "0e32741b2d7057e0f59ca5b79dfe0acd",
+        "sha256": "54603cb0ada1bd9277fa5c8d2a3191247189803ac32aff2617cd708c807d1c2f"
+      },
+      "downloads": -1,
+      "filename": "ops.manifest-1.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0e32741b2d7057e0f59ca5b79dfe0acd",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 24416,
+      "upload_time": "2023-02-17T21:43:42",
+      "upload_time_iso_8601": "2023-02-17T21:43:42.864292Z",
+      "url": "https://files.pythonhosted.org/packages/9f/c6/1c5f94be77e23a821a69ea057f0c4da55dec02bb183d388c202cecbe4a03/ops.manifest-1.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

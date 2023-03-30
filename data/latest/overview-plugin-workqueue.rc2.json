@@ -1,0 +1,113 @@
+{
+  "info": {
+    "author": "Adam Hooper",
+    "author_email": "adam@adamhooper.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "overview-plugin-workqueue\n=========================\n\nIn-process work queue for use in Overview plugins.\n\nThe problem it solves\n---------------------\n\nYou're writing an `Overview plugin\n<https://github.com/overview/overview-server/wiki/Writing-a-Plugin>`_.\nIt's a web server. And when a user creates a View of your plugin, you want\nto kick off some long-running computation.\n\n``overview-plugin-workqueue`` will solve this problem in a \"prototype\"\nor lightweight situation. It's meant to be used on a single Python server.\n\nYour plugin's architecture\n--------------------------\n\nYour plugin should be a web server with four endpoints:\n\n* ``GET /metadata``: the usual metadata\n* ``GET /show``: present HTML with JavaScript web app. The JavaScript will call:\n* ``GET /search?server=...&documentSetId=...`` (or some-such): read ``Authorization`` header with ``api_token``; generates some JSON using a locally-stored \"database\".\n\nBut this \"database\" -- specific to the ``apiToken`` on this ``server`` -- must exist! So we need:\n\n* ``POST /generate``: accept form data with ``server`` and ``document_set_id``\n  parameters, plus an ``Authorization`` header (or ``api_token`` parameter);\n  generates the database for this view.\n\nThe Python side of things\n~~~~~~~~~~~~~~~~~~~~~~~~~\n\nYour plugin is a web server. Remember: Web servers are stateless.\n\nYour plugin should save and read a \"database\" file whose name is derived from\n``server``, ``document_set_id`` and ``api_token``. Don't worry -- ``workqueue``\nwill name the file for you.\n\nYou must anticipate spurious ``/generate`` calls, and you must give progress\nreports to your users or they'll assume something's wrong. You also want jobs\nto continue even if your users go away; and when they reconnect, progress\nshould resume where it left off.\n\nThis is where ``workqueue`` shines. It uses an in-process thread pool to limit\nthe number of concurrent calls, and it uses generators to keep the server\nresponsive even when serving long-polling progress-report requests.\n\nInstall it: ``pip3 install workqueue``\n\nNow create a database-building script *as a separate executable*. For instance,\n``process-docset.py`` (``chmod +x`` it, and make sure it begins with\n``#!/usr/bin/env python3``.) ``workqueue`` will invoke it like this::\n\n    ./process-docset.py SERVER DOCUMENT_SET_ID API_TOKEN OUTPUT_FILENAME\n\nAnd ``workqueue`` will provide these arguments:\n\n* ``SERVER``: Overview server -- e.g., ``https://www.overviewdocs.com``.\n* ``DOCUMENT_SET_ID``: String ID -- e.g., ``1234``.\n* ``API_TOKEN``: An alphanumeric API token.\n* ``OUTPUT_FILENAME``: An empty tempfile the script must overwrite.\n\nTest your script by running it on the command line.\n\nNow you're ready to use ``workqueue`` in your plugin web server. For example,\nhere it is in `Flask <https://flask.palletsprojects.com/en/1.1.x/>`_::\n\n    from pathlib import Path\n    from typing import Mapping\n\n    from werkzeug.wrappers import Response\n    from workqueue import WorkQueue, OverviewViewParams\n\n    # ... set `app` ... and then\n\n    WORK_QUEUE = WorkQueue(\n            Path(__file__).parent / \"process-docset.py\",\n            executor=ThreadPoolExecutor(2, \"process-docset-\"),\n            storage_dir=Path(__file__).parent / \"databases\",\n    )\n\n    def _extract_api_token(auth_header: str) -> str:\n        m = _AUTH_HEADER_REGEX.match(auth_header)\n        if not m:\n            raise ValueError(\n                'Authorization header must look like \"Basic [base64-encoded data]\"'\n            )\n        decoded = base64.b64decode(m.group(1))\n        m = _AUTH_TOKEN_STRING_REGEX.match(decoded)\n        if not m:\n            raise ValueError(\n                'base64-encoded Basic HTTP Auth value must look like \"[api_token]:x-api-token\"'\n            )\n        return m.group(1).decode(\"latin1\")\n\n\n    def _extract_params(\n        form: Mapping[str, str], headers: Mapping[str, str]\n    ) -> OverviewViewParams:\n        try:\n            return OverviewViewParams(\n                form[\"server\"],\n                form[\"documentSetId\"],\n                _extract_api_token(headers[\"Authorization\"]),\n            )\n        except (KeyError, ValueError) as err:\n            raise BadRequest(\n                \"Expected form data ?server=...&documentSetId=... and Authorization header. \"\n                \"Problem: %s\" % str(err)\n            )\n\n\n    @app.route(\"/generate\", methods=[\"POST\"])\n    def generate():\n        \"\"\"\n        Stream a JSON Array of \"progress\" events, as a long-polled response.\n\n        When the JSON stream is finished, the database is ready.\n\n        This method returns early, passing Flask a generator. Flask will consume\n        the chunks from the generator and send them to the client.\n        \"\"\"\n        overview_params = _extract_params(request.form, request.headers)\n\n        job = WORK_QUEUE.ensure_run(overview_params)\n        if job is None:\n            # The work is done; the model can be loaded now.\n            progress_stream = []\n        else:\n            progress_stream = WORK_QUEUE.report_job_progress_until_completed(job)\n\n        # Stream progress to the user, as a JSON Array. (Must not be buffered.)\n        json_stream = itertools.chain(\n            [\"[\"],\n            (\n                # JSON array: comma between elements, not before first or after last\n                (\"\" if i == 0 else \",\") + json.dumps(progress._asdict())\n                for i, progress in enumerate(progress_stream)\n            ),\n            [\"]\"],\n        )\n\n        return Response(json_stream, content_type=\"application/json\")\n\n\nThe JavaScript side of things\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\nOn app startup, ``POST`` to ``/generate`` using `Oboe <http://oboejs.com/api>`_.\nPass it ``server`` and ``documentSetId``, and pass an ``Authorization`` header\n(or ``apiToken`` form parameter) as well.\n\nUse Oboe, not a normal ``XMLHttpRequest`` or ``Fetch`` request, because Oboe\nwill notify about progress events before ``/generate`` completes. (And\n``/generate`` could take a very long time indeed to complete.)\n\nOnce ``/generate`` completes, you can invoke ``/query`` using the same\nserver, documentSetId and apiToken.\n\nScaling limits\n==============\n\n``workqueue`` is designed to be used in relatively-small deployments. It's a\ngreat place to start. Here are the parts that will limit you:\n\n* **storage**: ``workqueue`` is designed to read and write the local disk.\n  TODO read and write S3-compatible storage servers.\n* **single-server**: ``workqueue`` cannot distribute load across multiple\n  machines. Use a different process to achieve that.\n\nDeveloping This Package\n=======================\n\nInstall dependency: ``pip3 install --user tox``\n\nRun ``tox`` to make sure it works for you.\n\nThen the development loop:\n\n1. Write a test. Run ``tox`` and prove to yourself it fails.\n2. Write code. Run ``tox`` to prove it solves your problem.\n3. Submit a pull request.\n\nRelease Process\n---------------\n\n1. Edit the ``version=`` line in ``setup.py``. Adhere to semver.\n2. ``git commit setup.py -m \"vX.X.X\" && git push``\n3. ``python ./setup.py sdist && twine check dist/* && twine upload dist/*-X.X.X.tar.gz``\n\nLicense\n=======\n\nMIT. See ``LICENSE``.",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/overview/py-plugin-workqueue",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "overview-plugin-workqueue",
+    "package_url": "https://pypi.org/project/overview-plugin-workqueue/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/overview-plugin-workqueue/",
+    "project_urls": {
+      "Homepage": "https://github.com/overview/py-plugin-workqueue"
+    },
+    "release_url": "https://pypi.org/project/overview-plugin-workqueue/1.0.1/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "In-process work queue for use in Overview plugins",
+    "version": "1.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7200168,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "016fc6b74fe3256e985a062810d341c423371d63eb802dd4c6ecab1215ea97cd",
+          "md5": "c84891868f92c32ba177042eb134a102",
+          "sha256": "dde31ee26081dffb6088de7da0ca2783e6d57cbee8708a8de2fcd7e1cdb6d7ad"
+        },
+        "downloads": -1,
+        "filename": "overview-plugin-workqueue-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c84891868f92c32ba177042eb134a102",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9634,
+        "upload_time": "2020-03-20T20:24:04",
+        "upload_time_iso_8601": "2020-03-20T20:24:04.033587Z",
+        "url": "https://files.pythonhosted.org/packages/01/6f/c6b74fe3256e985a062810d341c423371d63eb802dd4c6ecab1215ea97cd/overview-plugin-workqueue-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d8a80857c2406f371b72dbf5bcf9bee57f5396c1ac7ef928644bc1f2a8512441",
+          "md5": "564d4f497cd166052b6bbf0e86f975fb",
+          "sha256": "fd481c5cf62cd469eff1a040eedf9510aabcb9467eb7d7533963639e58da1051"
+        },
+        "downloads": -1,
+        "filename": "overview-plugin-workqueue-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "564d4f497cd166052b6bbf0e86f975fb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10507,
+        "upload_time": "2020-05-08T20:22:25",
+        "upload_time_iso_8601": "2020-05-08T20:22:25.449312Z",
+        "url": "https://files.pythonhosted.org/packages/d8/a8/0857c2406f371b72dbf5bcf9bee57f5396c1ac7ef928644bc1f2a8512441/overview-plugin-workqueue-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d8a80857c2406f371b72dbf5bcf9bee57f5396c1ac7ef928644bc1f2a8512441",
+        "md5": "564d4f497cd166052b6bbf0e86f975fb",
+        "sha256": "fd481c5cf62cd469eff1a040eedf9510aabcb9467eb7d7533963639e58da1051"
+      },
+      "downloads": -1,
+      "filename": "overview-plugin-workqueue-1.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "564d4f497cd166052b6bbf0e86f975fb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 10507,
+      "upload_time": "2020-05-08T20:22:25",
+      "upload_time_iso_8601": "2020-05-08T20:22:25.449312Z",
+      "url": "https://files.pythonhosted.org/packages/d8/a8/0857c2406f371b72dbf5bcf9bee57f5396c1ac7ef928644bc1f2a8512441/overview-plugin-workqueue-1.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
