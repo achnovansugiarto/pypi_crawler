@@ -1,0 +1,315 @@
+{
+  "info": {
+    "author": "Vikram Patki, Aditya Vaderiyettil",
+    "author_email": "vpatki@wayfair.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "![CI pipeline status](https://github.com/wayfair-incubator/dagger/workflows/CI/badge.svg?branch=main)\n[![PyPI](https://img.shields.io/pypi/v/wf-dagger)](https://pypi.org/project/wf-dagger/)\n![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.0-4baaaa.svg)\n![Maintainer](https://img.shields.io/badge/Maintainer-Wayfair-7F187F)\n![codecov](https://codecov.io/gh/wayfair-incubator/dagger/branch/main/graph/badge.svg)\n![Checked with mypy](https://img.shields.io/badge/mypy-checked-blue)\n![Code style: black](https://img.shields.io/badge/code%20style-black-black.svg)\n\n# Dagger\n\n**Dagger** is a distributed, scalable, durable, and highly available orchestration engine to execute asynchronous and\nsynchronous long-running business logic in a scalable and resilient way.\nDagger requires Python 3.7 or later for the new `async/await`_ syntax, and variable type annotations.\n\n## Pizza Ordering and Delivery Workflow Example\nHere's an example of how to use the library to build and run a Pizza Ordering Workflow:\n\n![Pizza Workflow](docs/images/workflow.jpg)\n\nThe PizzaWorkflow consists of 2 Processes: \n\n* Order : Responsible for communicating with the order service to place a pizza order(CommandTask) and wait for the order\nto be ready(ListenerTask)\n* Delivery: Once the order is ready, this process communicates with the delivery service to start delivery of the pizza\norder(CommandTask)\n\n### Step 1 Instantiate Dagger\n\n```python\nworkflow_engine = Dagger(\n                    broker=KAFKA_ADMIN_CLIENT_URL,\n                    store=\"aerospike://\",\n                    consumer_auto_offset_reset=\"latest\",\n                    task_update_topic=\"task_update_topic\",\n                    trigger_interval=600,\n                    aerospike_config=aerospike_config,\n                    enable_changelog=False,\n                    web_port=6066,\n                    serializer=\"raw\",\n                )\n```\n\n### Step 2 Define Leaf Command and Listener Tasks For Order Process\n\nLet's assume that the Order Microservice processes incoming orders over a Kafka Topic - `pizza_order_topic` with the \nJSON schema\n\n```json\n{\n  \"order_id\": \"id\",\n  \"pizza_type\": \"1\",\n  \"customer_id\": \"customer_id\"\n}\n```\n\nUsing this information let's build out the OrderCommandTask by overriding the `execute` method that implements the \nbusiness logic on how to send the payload to the Order Service over a Kafka topic\n\n```python\nclass OrderCommandTask(KafkaCommandTask[str, str]):\n    async def execute(\n        self,\n        runtime_parameters: Dict[str, str],\n        workflow_instance: ITemplateDAGInstance,\n    ) -> None:\n        payload = {\n            \"order_id\": runtime_parameters[\"order_id\"],\n            \"customer_id\": runtime_parameters[\"customer_id\"],\n            \"pizza_type\": runtime_parameters[\"pizza_type\"],\n        }\n        await workflow_engine.topics[self.topic].send(\n            value=json.dumps(payload)\n        )\n```\n\nAfter executing the `OrderCommandTask`, the workflow should enter a `WAIT_STATE` until it receives a message from the \nOrderService about the status of the order. Let's assume that Order Service sends a message on a Kafka Topic: \norder_status_topic when the order is ready in the following JSON format\n\n```json\n{\n  \"order_id\": \"id\",\n  \"status\": \"READY\"\n}\n```\n\nLet's model the `OrderListenerTask` to process this message on the `order_status_topic` by implementing the \n`get_correlatable_keys_from_payload` and `on_message` methods on the Listener. It also needs to specify the `correletable_key`\nas `order_id` to look up the payload\n\n```python\nclass PizzaWaitForReadyListener(KafkaListenerTask[str, str]):\n    correlatable_key = \"order_id\"\n\n    async def get_correlatable_keys_from_payload(\n        self, payload: Any\n    ) -> List[TaskLookupKey]:\n        tpayload = json.loads(payload)\n        key = tpayload[self.correlatable_key]\n        return [(self.correlatable_key, key)]\n\n    async def on_message(\n            self, runtime_parameters: Dict[str, VT], *args: Any, **kwargs: Any\n    ) -> bool :\n        logger.info(f\"Pizza Order is Ready\")\n        return True\n```\n\nWhen the order service sends a status message on the `order_status_topic`, Dagger invokes the `get_correlatable_keys_from_payload`\nto determine which workflow instance that message belongs to. Once it determines the workflow instance, it invokes \n`on_message` on the corresponding ListenerTask\n\nNow that we have the LEAF tasks modeled, lets attach them to the parent `Order` Process\n\n```python\ndef pizza_ordering_process(\n    process_name: str = \"Order\"\n) -> IProcessTemplateDAGBuilder:\n    dag_builder = DAGBuilderHelper(dagger_app=workflow_engine)\n    root_task = dag_builder.build_and_link_tasks(\n        [\n           dag_builder.generic_command_task_builder(\n                topic=\"pizza_order_topic\",\n                task_type=OrderCommandTask,\n                process_name=process_name,\n            ),\n            dag_builder.generic_listener_task_builder(\n                topic=\"PizzaWaitForReadyListener\",\n                task_type=PizzaWaitForReadyListener,\n                process_name=process_name,\n            ),\n        ]\n    )\n    return dag_builder.generic_process_builder(process_name=process_name, root_task=root_task)\n```\n\nThe Order Process is in `COMPLETED` when both the CommandTask and the PizzaWaitForReadyListener are `COMPLETED` and then\nthe workflow transitions to execute the next Process `Delivery`\n\n### Step 3 Define Leaf Command Tasks For Delivery Process\n\nLet's assume that the delivery service just requires an HTTP POST request with the following schema\n\n```json\n{\n  \"order_id\": \"id\",\n  \"customer_id\": \"customer_id\"\n}\n```\n\nWe can model the DeliveryCommandTask to POST this payload by implementing the `execute` method as follows\n\n```python\nclass DeliveryCommandTask(ExecutorTask[str, str]):\n    async def execute(\n        self, runtime_parameters: Dict[str, VT], workflow_instance: ITask = None\n    ) -> None:\n        payload = {\n            \"order_id\": runtime_parameters[\"order_id\"],\n            \"customer_id\": runtime_parameters[\"customer_id\"],\n        }\n        async with aiohttp.ClientSession() as session:\n            async with session.post(url=\"http://www.deliverysvc.com\", json=payload):\n                pass\n```\n\nLet's attach this to the parent `Delivery` Process\n\n```python\ndef pizza_delivery_process(\n    process_name: str = \"Delivery\",\n) -> IProcessTemplateDAGBuilder:\n    dag_builder = DAGBuilderHelper(dagger_app=workflow_engine)\n    root_task = dag_builder.build_and_link_tasks(\n        [\n            dag_builder.generic_executor_task_builder(\n                task_type=DeliveryCommandTask,\n                name=process_name,\n            )\n        ]\n    )\n    return dag_builder.generic_process_builder(\n        process_name=process_name, root_task=root_task\n    )\n```\n\n### Step 4 Define the Sequence of Process Execution and register the workflow definition using `register_template`\n\nBased on the workflow, we want the `Order` Process to execute first before the `Delivery` Process. The workflow ensures\nthat the `Delivery` tasks are executed only after both the tasks in the `Order` process are in a terminal state\n\n```python\n@Dagger.register_template(\"PizzaWorkflow\")\ndef register_pizza_workflow(template_name: str) -> ITemplateDAG:\n    dag_builder_helper = DAGBuilderHelper(workflow_engine)\n    order_process = dag_builder_helper.build_and_link_processes(\n        [\n            pizza_ordering_process(process_name=\"Order\"),\n            pizza_delivery_process(process_name=\"Delivery\"),\n        ]\n    )\n    return dag_builder_helper.generic_template(\n        template_name=template_name, root_process=order_process\n    )\n```\n\n### Step 5 Define an API to instantiate and execute pizza order workflows\n\n```python\nasync def create_and_submit_pizza_delivery_workflow(\n    order_id: str, customer_id: str, pizza_type: int\n):\n    pizza_workflow_template = workflow_engine.template_dags[\"PizzaWorkflow\"]\n    pizza_workflow_instance = await pizza_workflow_template.create_instance(\n        uuid.uuid1(),\n        repartition=False,  # Create this instance on the current worker\n        order_id=order_id,\n        customer_id=customer_id,\n        pizza_type=pizza_type,\n    )\n    await workflow_engine.submit(pizza_workflow_instance, repartition=False)\n```\n\n### Step 6 Start the worker\n\n```python\nworkflow_engine.main()\n```\n\n## Dagger is\n\n### Simple\n\nDagger is extremely easy to use. To get started applications need to install this library, define a DAG using the\ndefault templates or extending them based on the use case, creating instances of these DAG's and scheduling them for\nexecution. The library hides all the complexity of producing and consuming from Kafka, maintaining Kafka Streams\ntopology processing and also persistence and recovery of created tasks\n\n### Highly Available\n\nDagger is highly available and can survive network problems and server crashes. In the case of node failure, it can\nautomatically recover the state store(representing task data)\nor failover to a standby node\n\n### Distributed\n\nStart more instances of your application as needed to distribute the load on the system\n\n### Fast\n\nA single-core worker instance can already process tens of thousands of tasks every second. Dagger uses a fast key-value\nlookup store based on rocksDB replicated to kafka topics for fault tolerance\n\n## Installation\n\nYou can install dagger via the Wayfair artifactory or from source.\n\nTo install using `pip`:\n\n```shell\npip install wf-dagger\n```\n\ndagger has a dependency on `faust-streaming` for kafka stream processing\n\n## FAQ\n\n### Which version of python is supported?\n\ndagger supports python version >= 3.7\n\n### What kafka versions are supported?\n\ndagger supports kafka with version >= 0.10.\n\n## Roadmap\n\nSee the [open issues](https://github.com/wayfair-incubator/dagger/issues) for a list of proposed features (and known\nissues).\n\n## Contributing\n\nContributions are what make the open source community such an amazing place to learn, inspire, and create. Any\ncontributions you make are **greatly appreciated**. For detailed contributing guidelines, please\nsee [CONTRIBUTING.md](CONTRIBUTING.md)\n\n## License\n\nDistributed under the `MIT LICENSE` License. See `LICENSE` for more information.\n\n## Contact\n\nVikram Patki - vpatki@wayfair.com\n\nProject Link: [https://github.com/wayfair-incubator/dagger](https://github.com/wayfair-incubator/dagger)\n\n## Acknowledgements\n\nThis template was adapted from\n[https://github.com/othneildrew/Best-README-Template](https://github.com/othneildrew/Best-README-Template).\n\n## Documentation\n\nCheck out the [project documentation][dagger-docs].\n\nFor an overview on the repository structure and how to work with the code base, read the\n[Development Guide][development-docs].\n\n[dagger-docs]: https://wayfair-incubator.github.io/dagger/latest/\n[development-docs]: https://wayfair-incubator.github.io/dagger/latest/development-guide/\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/wayfair-incubator/dagger",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "wf-dagger",
+    "package_url": "https://pypi.org/project/wf-dagger/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/wf-dagger/",
+    "project_urls": {
+      "Homepage": "https://github.com/wayfair-incubator/dagger"
+    },
+    "release_url": "https://pypi.org/project/wf-dagger/0.1.9/",
+    "requires_dist": [
+      "faust-streaming"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Workflow Engine.",
+    "version": "0.1.9",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17496520,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "10f114332e485c4ac71ad27f141fc1cdf49c160fd72664e840603e0284902be2",
+          "md5": "f2f32767d205fda90a9703f08e40b725",
+          "sha256": "76026c9076b0771e6af2a06bb2c893dec056c146a5c4582fbfe5c19f98222ae4"
+        },
+        "downloads": -1,
+        "filename": "wf_dagger-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f2f32767d205fda90a9703f08e40b725",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 60524,
+        "upload_time": "2022-10-19T17:09:44",
+        "upload_time_iso_8601": "2022-10-19T17:09:44.470918Z",
+        "url": "https://files.pythonhosted.org/packages/10/f1/14332e485c4ac71ad27f141fc1cdf49c160fd72664e840603e0284902be2/wf_dagger-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0494121e484c2369f0cee2e45a1fc0833b9a37c1f63c23f5e0125167156e0adc",
+          "md5": "cb8018686f4115aa1874e8e908db2a37",
+          "sha256": "294cad44f88ad04dc9c620eb6a1e971023728ed3f9a249f3650baaa2fd967793"
+        },
+        "downloads": -1,
+        "filename": "wf-dagger-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb8018686f4115aa1874e8e908db2a37",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55771,
+        "upload_time": "2022-10-19T17:09:46",
+        "upload_time_iso_8601": "2022-10-19T17:09:46.145114Z",
+        "url": "https://files.pythonhosted.org/packages/04/94/121e484c2369f0cee2e45a1fc0833b9a37c1f63c23f5e0125167156e0adc/wf-dagger-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a879c97806f56aa45d7d71e42871cd6bff1a8875e089a2947b662b3da937e45c",
+          "md5": "f40394b5c017e670c1f36edd32273837",
+          "sha256": "ae9958edeb2e18bbc1d966bcea8c35d196bcc8da8732334224c9846fe73c735e"
+        },
+        "downloads": -1,
+        "filename": "wf_dagger-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f40394b5c017e670c1f36edd32273837",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 65582,
+        "upload_time": "2022-10-26T15:14:28",
+        "upload_time_iso_8601": "2022-10-26T15:14:28.591451Z",
+        "url": "https://files.pythonhosted.org/packages/a8/79/c97806f56aa45d7d71e42871cd6bff1a8875e089a2947b662b3da937e45c/wf_dagger-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "13086208fcdedef6e5d97ff9f126e4b11aac2cd972db3791b40b2f9d5c15b26a",
+          "md5": "03f0d51b54103e6b0294b77a45b314e6",
+          "sha256": "08680dfc0996680205fc78ba51c7736a3533b8fa19d64ac46b605b51e14eeb49"
+        },
+        "downloads": -1,
+        "filename": "wf-dagger-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03f0d51b54103e6b0294b77a45b314e6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 60550,
+        "upload_time": "2022-10-26T15:14:30",
+        "upload_time_iso_8601": "2022-10-26T15:14:30.158085Z",
+        "url": "https://files.pythonhosted.org/packages/13/08/6208fcdedef6e5d97ff9f126e4b11aac2cd972db3791b40b2f9d5c15b26a/wf-dagger-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79a61b2f972eb475750dfa0cd79d8e3b69d634ec0fb597a3ce9fb99a80fb231d",
+          "md5": "4287bbf29e0e9c6ce11a16b45de320fd",
+          "sha256": "b550e40631a2d5a021cb7c4d96a01ec02327b6ad51c95fb42032d95e2b9e6b6d"
+        },
+        "downloads": -1,
+        "filename": "wf_dagger-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4287bbf29e0e9c6ce11a16b45de320fd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 65723,
+        "upload_time": "2023-02-14T15:29:24",
+        "upload_time_iso_8601": "2023-02-14T15:29:24.364196Z",
+        "url": "https://files.pythonhosted.org/packages/79/a6/1b2f972eb475750dfa0cd79d8e3b69d634ec0fb597a3ce9fb99a80fb231d/wf_dagger-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c8056d3658ac18d25a9d6e6b359f6299eef7f2e7bdabd2870eb799b236a06119",
+          "md5": "0393a625694c7b8988497f17c90316fd",
+          "sha256": "e70742a5f88d66f57c605520977544b394c20bc88a241184b7603e9fb0cfb171"
+        },
+        "downloads": -1,
+        "filename": "wf-dagger-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0393a625694c7b8988497f17c90316fd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 60647,
+        "upload_time": "2023-02-14T15:29:25",
+        "upload_time_iso_8601": "2023-02-14T15:29:25.689982Z",
+        "url": "https://files.pythonhosted.org/packages/c8/05/6d3658ac18d25a9d6e6b359f6299eef7f2e7bdabd2870eb799b236a06119/wf-dagger-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c84563ce7bac0ec27d54d7cc82e8e4566a7d714b5b7272cfcba38c85e72cfb7b",
+          "md5": "5ed2d725e805d37a001f2e64cceda01c",
+          "sha256": "0f75593e18e9c3876a21f3a3b37d7169a626f540612d2598282271c8b2628619"
+        },
+        "downloads": -1,
+        "filename": "wf_dagger-0.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5ed2d725e805d37a001f2e64cceda01c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 66040,
+        "upload_time": "2023-03-28T20:02:23",
+        "upload_time_iso_8601": "2023-03-28T20:02:23.692787Z",
+        "url": "https://files.pythonhosted.org/packages/c8/45/63ce7bac0ec27d54d7cc82e8e4566a7d714b5b7272cfcba38c85e72cfb7b/wf_dagger-0.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7656330ea59bd0565404ea9a5966e2bac818cb69cd5347bbc6005999f69d29b",
+          "md5": "75f22015ff3cf69a80334c5a7bbcf108",
+          "sha256": "2bb02487583f05343d51a89d441890bd606b506be28a29cb193f0022a753495a"
+        },
+        "downloads": -1,
+        "filename": "wf-dagger-0.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "75f22015ff3cf69a80334c5a7bbcf108",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 61006,
+        "upload_time": "2023-03-28T20:02:25",
+        "upload_time_iso_8601": "2023-03-28T20:02:25.400084Z",
+        "url": "https://files.pythonhosted.org/packages/e7/65/6330ea59bd0565404ea9a5966e2bac818cb69cd5347bbc6005999f69d29b/wf-dagger-0.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "886892b9456b6649250c1a6d8bbb8b4b288331d1924ed59d616e9459dd2c02fb",
+          "md5": "67a2daeec7e601a133f1a835fec6d910",
+          "sha256": "a91ffdc76725de9c1b1b744206fd45487c1de17f81e183bebc5577da347121ef"
+        },
+        "downloads": -1,
+        "filename": "wf_dagger-0.1.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "67a2daeec7e601a133f1a835fec6d910",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 66049,
+        "upload_time": "2023-03-29T16:59:48",
+        "upload_time_iso_8601": "2023-03-29T16:59:48.784210Z",
+        "url": "https://files.pythonhosted.org/packages/88/68/92b9456b6649250c1a6d8bbb8b4b288331d1924ed59d616e9459dd2c02fb/wf_dagger-0.1.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a5b3bb5f3038c49ab236f2f6014438d0e531f55695c3417b689a1355e9ca220",
+          "md5": "c3123f2b1a3d949955d512885eb9588f",
+          "sha256": "bac6d8bf51a762e9d5dddb112577b32f40d96debd34a1a62541e5c11083860a6"
+        },
+        "downloads": -1,
+        "filename": "wf-dagger-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c3123f2b1a3d949955d512885eb9588f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 60948,
+        "upload_time": "2023-03-29T16:59:50",
+        "upload_time_iso_8601": "2023-03-29T16:59:50.551907Z",
+        "url": "https://files.pythonhosted.org/packages/9a/5b/3bb5f3038c49ab236f2f6014438d0e531f55695c3417b689a1355e9ca220/wf-dagger-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "886892b9456b6649250c1a6d8bbb8b4b288331d1924ed59d616e9459dd2c02fb",
+        "md5": "67a2daeec7e601a133f1a835fec6d910",
+        "sha256": "a91ffdc76725de9c1b1b744206fd45487c1de17f81e183bebc5577da347121ef"
+      },
+      "downloads": -1,
+      "filename": "wf_dagger-0.1.9-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "67a2daeec7e601a133f1a835fec6d910",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 66049,
+      "upload_time": "2023-03-29T16:59:48",
+      "upload_time_iso_8601": "2023-03-29T16:59:48.784210Z",
+      "url": "https://files.pythonhosted.org/packages/88/68/92b9456b6649250c1a6d8bbb8b4b288331d1924ed59d616e9459dd2c02fb/wf_dagger-0.1.9-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9a5b3bb5f3038c49ab236f2f6014438d0e531f55695c3417b689a1355e9ca220",
+        "md5": "c3123f2b1a3d949955d512885eb9588f",
+        "sha256": "bac6d8bf51a762e9d5dddb112577b32f40d96debd34a1a62541e5c11083860a6"
+      },
+      "downloads": -1,
+      "filename": "wf-dagger-0.1.9.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c3123f2b1a3d949955d512885eb9588f",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 60948,
+      "upload_time": "2023-03-29T16:59:50",
+      "upload_time_iso_8601": "2023-03-29T16:59:50.551907Z",
+      "url": "https://files.pythonhosted.org/packages/9a/5b/3bb5f3038c49ab236f2f6014438d0e531f55695c3417b689a1355e9ca220/wf-dagger-0.1.9.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

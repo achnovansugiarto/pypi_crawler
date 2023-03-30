@@ -1,0 +1,749 @@
+{
+  "info": {
+    "author": "Stefan Peters",
+    "author_email": "stefan@derpydo.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# wsmsg Package\n\n## Overview\n**Websockets** are used, and the server will accept all authenticated connections to an endpoint root (default '/'). Authentication is via an HTTP bearer token on initial connection. Each node attaches to an **endpoint** specified in the connection URI. For example: `wss://<host>:<port>/<endpoint>`. **Channels** receive (and queue) **messages**. **Subscriptions** bind an endpoint to one or more channels. **Subjects** can be used to filter messages in a subscription. Message delivery is at most once, with flow control and no guaranteed persistence.\n## Flow Diagram\n```\nPublish Channel  Routing     Endpoint \n-------+--------+-----------+-------------\n      / Queue -> Forward \\ / Queue -> Node\nNode <  Queue -> Forward  X         / Node\n      \\ Queue -> Forward / \\ Queue <  Node\n                                    \\ Node\n```\n\n## Message Format\n_Messages are sent/received as a msgpack array_\n* **uid**: bytes  \n  _Binary-safe unique id of message - recommand ULID as bytes_\n* **channel**: str  \n  _Channel this message will be sent to_\n* **subject**: str  \n  _Subject of message_\n* **reference**: bytes  \n  _Binary-safe id of message that this references_\n* **data**: any  \n  _Subject-defined message data_\n\n### Python\n`Message = NamedTuple('Message', uid=bytes, channel=str, subject=str, reference=bytes, data=any)`  \n```\nclass Message(NamedTuple):\n    uid: bytes\n    channel: str\n    subject: str\n    reference: bytes\n    data: any\n    def __repr__(self):\n        elements = [\n            str(ulid.from_bytes(self.uid)),\n            self.channel,\n            self.subject,\n            str(ulid.from_bytes(self.reference)) if self.reference else None,\n            repr(self.data)\n        ]\n        return \"Message(%s)\" % ', '.join(elements)\n```\n\n## System Messages\n_The 'system' channel has ultimate priority (100) over all other channels._  \n_If there are any queued messages in the system queue, no other channels will forward._\n\n### Commands\n* **ack**  \n  _Acknowledge message receipt, not forwarded._  \n  _Ack'd message uid should be in the refercence field._  \n  _Next message for connection will not be dequeued or sent_  \n  _until previous message was ackowledged._ \n* **subcribe**\n    * **channel** (endpoint: str, channel_pattern: str, subject_pattern: str)  \n      _Subscribe endpoint to channel pattern with subject pattern filter._\n    * **message** (endpoint: str, message_uid: bytes, expires: int)  \n      _Subscribe endpoint to any messages that reference the message uid until the expiration (unix timestamp)._\n* **unsubscribe** (endpoint: str, channel_pattern: str)  \n    * **channel** (endpoint: str, channel_pattern: str)  \n      _Unsubscribe endpoint from patterns matching pattern._  \n      _Includes any subject filters._\n    * **message** (endpoint: str, message_uid: bytes)  \n      _Unsubscribe endpoint to any messages that reference the message uid._\n* **pause**  \n  _Pause all message transmissions._  \n  _Messages can still be received and system commands processed._\n* **resume**  \n  _Resume message transmissions._\n* **stop**  \n  _Cleanly stop and shutdown server._  \n  _Pending messages are persisted._ \n* **channel**\n    * **create** (channel: str)  \n      _Create channel queue._\n    * **size** (channel: str, size: int)  \n      _Set max size of channel queue. Old messages are dropped when full_\n    * **priority** (channel: str, priority: int)  \n      _Set channel priority. Higher is better, range 0-99. Default of zero._\n* **endpoint**\n    * **create** (endpoint: str)  \n      _Create endpoint queue_\n    * **size** (endpoint: str, size: int)  \n      _Set max size of endpoint queue. Old messages are dropped when full_\n\n### System Events\n* **stopping**\n  _Server is shutting down (in one second), no more messages will be delivered_\n* **node**\n    * **joined** (endpoint, uid)\n    * **left** (endpoint, uid)\n* **endpoint**\n    * **created** (endpoint)\n    * **sized** (channel: str)\n* **channel**\n    * **created** (channel: str)\n    * **sized** (channel: str)\n    * **prioritized** (channel: str)\n\n## Misc\n\n### Router\n* Until stop\n    * Wait for next message\n    * For each subscriber\n        * Push message to node Queue\n\n### Route Map?\n```\nclass Route NamedTuple('Route', router=Router, dest=set[UUID])\nRouteMap = dict[UUID, Route]\n\nroutes: RouteMap = \n{\n    <channel>: <route>, \n    ...\n}\n\nwhile True:\n    msg = channel.get()\n    for node in routes[channel].dest:\n      forward_message(msg, node)\n```\n    \n## Examples\n\n### Task Queue\n_By connecting all nodes to one endpoint, each node will get a fair shair of the messages in the 'order' channel with the subject 'submitted'._\n```\nAll nodes connects to ws://<host>:<port>/group1\nnode1 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, ('group1', 'orders', 'submitted'))\nnode2 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, ('group1', 'orders', 'submitted'))\nnode3 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, ('group1', 'orders', 'submitted'))\n```\n\n### Fanout\n_By using one endpoint per node, each node will get a copy of the messages in the 'order' channel with the subject 'submitted'._\n```\nEach node connects to ws://<host>:<port>/<node id>\nnode1 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'orders', 'submitted'))\nnode2 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'orders', 'submitted'))\nnode3 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'orders', 'submitted'))\n```\n\n### Direct Delivery\n_If each node subscribes to a unique addressable channel, messages can be routed to each node by the sender._  \n_To send a message to a single node, use channel 'node.<node id>' with any subject._  \n_To send a message to all nodes, additionally subscribe all nodes to a 'nodes' channel and send to that._\n```\nEach node connects to ws://<host>:<port>/<node id>\nnode1 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'node.<node id>', '*'))\nnode2 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'node.<node id>', '*'))\nnode3 -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<node id>, 'node.<node id>', '*'))\n```\n### RPC\n_Advantages: Less messages to send, supports heavy RPC traffic through server._  \n_Disadvantages: Need to know what reply channel and subjects will be used, large number of channel subscriptions can slow down message forwarding._  \n```\nConnect to ws://<host>:<port>/<id>\nnode -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<id>, 'order', 'created'))\nnode -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<id>, 'order', 'exception'))\n...\n# Generate uid\nRegister Queue with RX task/thread for reference=uid\nnode -> Message(uid, 'order', 'submitted', None, None, Check)\n...\nnode <- Message(<message uid>, 'order', 'created', uid, None, <check uid>)\nRX task/thread matches and puts message(s) in Queue\n...\nGet result(s) with timeout from Queue\nResend if needed or show error on exception\nUnregister Queue from RX task/thread\n```\n\n### RPC - Streamlined\n_Advantages: message subscription matching is much faster, RTT should be lower. No need to know what reply subject may be._  \n_Disadvantages: more messages to send, total throughput may be lower if heavy use of RPC._  \n_Notes: If you set the message subscription expiration, no need to unsubscribe._  \n```\nserver -> Message(ulid.new().bytes, 'system', 'subscribe.channel', None, (<endpoint>, 'rpc', 'order.*'))\nserver -> Message(ulid.new().bytes, 'system', 'channel.priority', None, ('rpc', 99))\nserver -> Message(ulid.new().bytes, 'system', 'endpoint.size', None, (<endpoint>, 10))\n...\nConnect to ws://<host>:<port>/<id>\n...\nGenerate uid\nRegister Queue with RX task/thread for reference=uid\nnode -> Message(ulid.new().bytes, 'system', 'subscribe.message', None, (<id>, uid, <timeout>))\nnode -> Message(uid, 'rpc', 'order.get.request', None, Check)\n...\nnode <- Message(<message uid>, 'rpc', 'order.get.reply', uid, None, <check uid>)\nRX task/thread matches and puts message(s) in Queue\n...\nGet result(s) with timeout from Queue\nResend if needed or show error on exception\nUnregister Queue from RX task/thread\n```\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "wsmsg",
+    "package_url": "https://pypi.org/project/wsmsg/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/wsmsg/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/wsmsg/0.17/",
+    "requires_dist": [
+      "websockets",
+      "msgpack"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "A simple websocket/msgpack messaging library that provides pub/sub and rpc patterns.",
+    "version": "0.17",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13166421,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f2c968787c46c9e58351d02a7d95c297790907add01e181d6ef4d9fa3e90240",
+          "md5": "5db289f1d65e67a2aa6bac7d60ef9a03",
+          "sha256": "e3571eae4c4faa3f5d3ed99be3efd6d5586b1c81bcfc2420e2f71e7c93114037"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5db289f1d65e67a2aa6bac7d60ef9a03",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 8502,
+        "upload_time": "2022-02-22T22:25:10",
+        "upload_time_iso_8601": "2022-02-22T22:25:10.764773Z",
+        "url": "https://files.pythonhosted.org/packages/8f/2c/968787c46c9e58351d02a7d95c297790907add01e181d6ef4d9fa3e90240/wsmsg-0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "886c8452d597c9763da264f57bffdfee1dd6e4cb1127a77572a69cf54caef54b",
+          "md5": "30b93cb90a25e0e7d97645445130a2d2",
+          "sha256": "1bfead9846ac8e58c0e197a31b18f52026bffcda4304ea41a8b07e2972accdeb"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30b93cb90a25e0e7d97645445130a2d2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 7692,
+        "upload_time": "2022-02-22T22:25:12",
+        "upload_time_iso_8601": "2022-02-22T22:25:12.421124Z",
+        "url": "https://files.pythonhosted.org/packages/88/6c/8452d597c9763da264f57bffdfee1dd6e4cb1127a77572a69cf54caef54b/wsmsg-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0abe9593f4a34fba0a3dfbe8b765a0725cd35eca109b3c615e1afe5875251c41",
+          "md5": "2b51b3b0e9950ece1839cdab3575c6f4",
+          "sha256": "3fa62946037219f4d1e1ac8408097c8d8a27b0d53e5f17eb8fefb9814066ac0c"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2b51b3b0e9950ece1839cdab3575c6f4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 11820,
+        "upload_time": "2022-03-06T01:26:22",
+        "upload_time_iso_8601": "2022-03-06T01:26:22.154939Z",
+        "url": "https://files.pythonhosted.org/packages/0a/be/9593f4a34fba0a3dfbe8b765a0725cd35eca109b3c615e1afe5875251c41/wsmsg-0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e573d3ad04fdf09faefbff63f471577e3fff68910fa1f02cb713ee3ad4188288",
+          "md5": "02bdc89b9eaf05ceff2126a9bda96bb2",
+          "sha256": "3c71f9b0212371d5d332388bba8da3119fc9004426eb73493f9d21792962bde5"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02bdc89b9eaf05ceff2126a9bda96bb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12990,
+        "upload_time": "2022-03-06T01:26:23",
+        "upload_time_iso_8601": "2022-03-06T01:26:23.737287Z",
+        "url": "https://files.pythonhosted.org/packages/e5/73/d3ad04fdf09faefbff63f471577e3fff68910fa1f02cb713ee3ad4188288/wsmsg-0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f78a1283973770651fa5ea410bd697e499678ab1a98db47649c9bf06faa52d4",
+          "md5": "cf94317967b54f3fb218a7bc038b3d30",
+          "sha256": "183789449eac20eea6772e30afe66028abbc7135ab56891da6a8ff284422ba1f"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cf94317967b54f3fb218a7bc038b3d30",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12732,
+        "upload_time": "2022-03-06T19:57:41",
+        "upload_time_iso_8601": "2022-03-06T19:57:41.909002Z",
+        "url": "https://files.pythonhosted.org/packages/6f/78/a1283973770651fa5ea410bd697e499678ab1a98db47649c9bf06faa52d4/wsmsg-0.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f51bdb76376c6c33a2ce79c4e33d3ee660b6e736758becd1b47a7235258d849f",
+          "md5": "24623dd17ee0fad16b667b75aab5336e",
+          "sha256": "c3662c6c5d7f2535906cba4e1639d7035df3f0c8d4f464841eda0a2a7c965911"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24623dd17ee0fad16b667b75aab5336e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13785,
+        "upload_time": "2022-03-06T19:57:44",
+        "upload_time_iso_8601": "2022-03-06T19:57:44.634701Z",
+        "url": "https://files.pythonhosted.org/packages/f5/1b/db76376c6c33a2ce79c4e33d3ee660b6e736758becd1b47a7235258d849f/wsmsg-0.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12eb47bf935b6c4a1f82280d4f22b46c43712c5afc14568eb54808c7226f3552",
+          "md5": "fd50b45bc81b6aa3721d18caf12152e7",
+          "sha256": "c7fbdbf02d958c4acd8569f12d40e5846563d64a3394c2c8889b5e6ce9d8dd46"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd50b45bc81b6aa3721d18caf12152e7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12733,
+        "upload_time": "2022-03-06T23:32:02",
+        "upload_time_iso_8601": "2022-03-06T23:32:02.685262Z",
+        "url": "https://files.pythonhosted.org/packages/12/eb/47bf935b6c4a1f82280d4f22b46c43712c5afc14568eb54808c7226f3552/wsmsg-0.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7362ca1681a3fbade4d25c90a89fe222c2a6f78a3dd7c0567c95964f85e295c6",
+          "md5": "2c6767c5275efa1eeab0771342e55964",
+          "sha256": "cf55aaed12d859d06a7fe70aff1400fdded3f745852be1ebe01cde0ba50e3e76"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c6767c5275efa1eeab0771342e55964",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13794,
+        "upload_time": "2022-03-06T23:32:04",
+        "upload_time_iso_8601": "2022-03-06T23:32:04.822724Z",
+        "url": "https://files.pythonhosted.org/packages/73/62/ca1681a3fbade4d25c90a89fe222c2a6f78a3dd7c0567c95964f85e295c6/wsmsg-0.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4975ff62dbfe9b0322288a9913264d3757c948249fd86c05a69fdb175b237250",
+          "md5": "997a322ee863321a81456056d434dd41",
+          "sha256": "fbf8b633e0661d5c4c115f59517a911dabbd832103eb6fad3c35d722bee928b3"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "997a322ee863321a81456056d434dd41",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12984,
+        "upload_time": "2022-03-13T22:20:47",
+        "upload_time_iso_8601": "2022-03-13T22:20:47.755719Z",
+        "url": "https://files.pythonhosted.org/packages/49/75/ff62dbfe9b0322288a9913264d3757c948249fd86c05a69fdb175b237250/wsmsg-0.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60c0498d6576915e1efa4b720e60f8671dfb31dc28f737f3c14069b1f4d1a82e",
+          "md5": "88e4a0cd5709c80c734c20c5c47ed5fa",
+          "sha256": "4c55e01426b4cd4cfb09669a1785e81006bc253ea5819d9676b2cd5a8bc2065b"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "88e4a0cd5709c80c734c20c5c47ed5fa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 14050,
+        "upload_time": "2022-03-13T22:20:50",
+        "upload_time_iso_8601": "2022-03-13T22:20:50.319020Z",
+        "url": "https://files.pythonhosted.org/packages/60/c0/498d6576915e1efa4b720e60f8671dfb31dc28f737f3c14069b1f4d1a82e/wsmsg-0.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "368234d697890761a4b9751c4f359183e65f0a506bb55295dcbb9ed94dde6446",
+          "md5": "44798b1f2457c617a2e5494a36073f46",
+          "sha256": "f67e6fac911703bab1406e826c8460aa868d1c3eba302d5a52540e9fd54c2a9a"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "44798b1f2457c617a2e5494a36073f46",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13045,
+        "upload_time": "2022-03-14T04:29:40",
+        "upload_time_iso_8601": "2022-03-14T04:29:40.346003Z",
+        "url": "https://files.pythonhosted.org/packages/36/82/34d697890761a4b9751c4f359183e65f0a506bb55295dcbb9ed94dde6446/wsmsg-0.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f56884959d138f4d4ade208a2965635478c32ba4241406a8786d7cb9ae6763a",
+          "md5": "8c5f6e4c0bf2a07d6515f701a2604fd2",
+          "sha256": "7f66b18cb33c92bfef0a4487a370270d6a805f1a4bf5ea02016387cab4982102"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8c5f6e4c0bf2a07d6515f701a2604fd2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 14095,
+        "upload_time": "2022-03-14T04:29:42",
+        "upload_time_iso_8601": "2022-03-14T04:29:42.080294Z",
+        "url": "https://files.pythonhosted.org/packages/0f/56/884959d138f4d4ade208a2965635478c32ba4241406a8786d7cb9ae6763a/wsmsg-0.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e54d298e7ac7c6507e7d9a1119242a9ba99323dbec7bf6d36b0bd2e362136f6",
+          "md5": "15e4322dd0e15cd1aa1e9b079557b103",
+          "sha256": "2f07d6b2f5cd16f25ee1b4a9b978d3cb14a9a67a86789e733a187be9ffb208df"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "15e4322dd0e15cd1aa1e9b079557b103",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 8519,
+        "upload_time": "2022-02-22T22:42:24",
+        "upload_time_iso_8601": "2022-02-22T22:42:24.932053Z",
+        "url": "https://files.pythonhosted.org/packages/9e/54/d298e7ac7c6507e7d9a1119242a9ba99323dbec7bf6d36b0bd2e362136f6/wsmsg-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "70188353d57e0a79425e7c99d7b14814b93ce37196f4a9ad0528394e3912337a",
+          "md5": "c47f60dd4eb6cb81c698f74232e753aa",
+          "sha256": "707d8649efb3f24cc884e8a2b0cb7a24f9a2180f01cb58b22e40588d94b6dd9d"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c47f60dd4eb6cb81c698f74232e753aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 7685,
+        "upload_time": "2022-02-22T22:42:27",
+        "upload_time_iso_8601": "2022-02-22T22:42:27.602897Z",
+        "url": "https://files.pythonhosted.org/packages/70/18/8353d57e0a79425e7c99d7b14814b93ce37196f4a9ad0528394e3912337a/wsmsg-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a74b79b43bcaf2c2ac852d53bf8bb9c9c8c33fd293627c9a38170b361067a92",
+          "md5": "0200bd29cfc26e48cd8bb2721324e920",
+          "sha256": "a3823079dc6c4b29f699311c3680acd28e5b148451e5ff0208760f83ed5f81ba"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0200bd29cfc26e48cd8bb2721324e920",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9080,
+        "upload_time": "2022-02-23T00:32:56",
+        "upload_time_iso_8601": "2022-02-23T00:32:56.201341Z",
+        "url": "https://files.pythonhosted.org/packages/9a/74/b79b43bcaf2c2ac852d53bf8bb9c9c8c33fd293627c9a38170b361067a92/wsmsg-0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8130d71ee088d8175b35a653b27185fdb57ea56ecd177ece716a594e85daf4dd",
+          "md5": "28bfe88c3b60c4279c6e642608366434",
+          "sha256": "1a45e4aec00c0a47d860e36040219fdc527ba81b2c8ce42292c0ec0f2beec654"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28bfe88c3b60c4279c6e642608366434",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8021,
+        "upload_time": "2022-02-23T00:32:58",
+        "upload_time_iso_8601": "2022-02-23T00:32:58.505647Z",
+        "url": "https://files.pythonhosted.org/packages/81/30/d71ee088d8175b35a653b27185fdb57ea56ecd177ece716a594e85daf4dd/wsmsg-0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d5307dc7d16ccbbe2f313342a5640c5557d547f6943d57e45b4b51a97c5de5bc",
+          "md5": "f4e631b5b0c700f6a60230980a85d361",
+          "sha256": "337da9208ab046187ec25ed0ba3948039e2511682b1bd766d6e2f3c4ef56a74c"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f4e631b5b0c700f6a60230980a85d361",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9090,
+        "upload_time": "2022-02-23T01:10:02",
+        "upload_time_iso_8601": "2022-02-23T01:10:02.726950Z",
+        "url": "https://files.pythonhosted.org/packages/d5/30/7dc7d16ccbbe2f313342a5640c5557d547f6943d57e45b4b51a97c5de5bc/wsmsg-0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5720aa08b51a8f62734c8173db510d83f69b15c5819343f0e4a5a0778f56d654",
+          "md5": "259e4d87722cd5c40009c4a73262b19b",
+          "sha256": "04f562eaa4aed4bfbc4f4c4e39211fc2447830fb6bb5eb3b1c3eefb73f631ade"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "259e4d87722cd5c40009c4a73262b19b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8034,
+        "upload_time": "2022-02-23T01:10:04",
+        "upload_time_iso_8601": "2022-02-23T01:10:04.978338Z",
+        "url": "https://files.pythonhosted.org/packages/57/20/aa08b51a8f62734c8173db510d83f69b15c5819343f0e4a5a0778f56d654/wsmsg-0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0686cebd0f1e569ce2e57e639b2abaf064287a7a9ac37dcfb41e65cdb9293c74",
+          "md5": "15b9617d054e114a81bf00dbffef2fff",
+          "sha256": "dd051c80670043dcdde4dc0f7ef8b8f3c5f3c98b60e4c5d82ac0022bdf232188"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "15b9617d054e114a81bf00dbffef2fff",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9075,
+        "upload_time": "2022-02-23T22:09:05",
+        "upload_time_iso_8601": "2022-02-23T22:09:05.942599Z",
+        "url": "https://files.pythonhosted.org/packages/06/86/cebd0f1e569ce2e57e639b2abaf064287a7a9ac37dcfb41e65cdb9293c74/wsmsg-0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63ac7779a5e9a469e02f4cdd6282a9321d686b9e84f5b5537132780682a95163",
+          "md5": "30af7b0f022bd377bead947be4095f91",
+          "sha256": "c83fb6d5a99215f499d2bee574ac845509742ce8860b3cc43e300b04bf0d80fd"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30af7b0f022bd377bead947be4095f91",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8033,
+        "upload_time": "2022-02-23T22:09:09",
+        "upload_time_iso_8601": "2022-02-23T22:09:09.074206Z",
+        "url": "https://files.pythonhosted.org/packages/63/ac/7779a5e9a469e02f4cdd6282a9321d686b9e84f5b5537132780682a95163/wsmsg-0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4ee2913894a6022eab44d1ecc3ec476f86e7ef47b72d12b8431178871246a1b",
+          "md5": "cd39ba78cd5cbbe05eb95bbfec994efa",
+          "sha256": "72af56c33f959dd6720e2a256739ceec856daa8d461748bf7a6448c2578a06da"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cd39ba78cd5cbbe05eb95bbfec994efa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9127,
+        "upload_time": "2022-02-25T01:37:59",
+        "upload_time_iso_8601": "2022-02-25T01:37:59.946034Z",
+        "url": "https://files.pythonhosted.org/packages/a4/ee/2913894a6022eab44d1ecc3ec476f86e7ef47b72d12b8431178871246a1b/wsmsg-0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "85c2fa6e51ee74798a14ea1197f4a9dae16bedb0f39423b116ec08a831397f53",
+          "md5": "64fa3a42bc634d0a64ed77a4dd920c33",
+          "sha256": "92e3b0fa2f555c342e7ed269d5f7ae472ed37c7262f713eff644535d2bbb7374"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "64fa3a42bc634d0a64ed77a4dd920c33",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8044,
+        "upload_time": "2022-02-25T01:38:02",
+        "upload_time_iso_8601": "2022-02-25T01:38:02.280838Z",
+        "url": "https://files.pythonhosted.org/packages/85/c2/fa6e51ee74798a14ea1197f4a9dae16bedb0f39423b116ec08a831397f53/wsmsg-0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5396a64155275dd8fa6ea10a3486f7ffbf667560e0a341c1896d32bc348a0c4f",
+          "md5": "112c343b468e3a405fa676f8f184a1fb",
+          "sha256": "04066002a65787a1aae790382662bfb2df21d9934e00c1dafd55abceaa56c104"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "112c343b468e3a405fa676f8f184a1fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9123,
+        "upload_time": "2022-02-25T02:10:07",
+        "upload_time_iso_8601": "2022-02-25T02:10:07.075471Z",
+        "url": "https://files.pythonhosted.org/packages/53/96/a64155275dd8fa6ea10a3486f7ffbf667560e0a341c1896d32bc348a0c4f/wsmsg-0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06901ff4dc5d8e94a36a4c91b4c9e9dfc886dd2e4f0fb7357f9a8dfd7a9518d0",
+          "md5": "0ce52a1a64f70efd117422a0bfe87d1c",
+          "sha256": "b491cc5ff6ec3c3e3f962431fc09fe9e07a69ee2231464c5bf692c062e38cc07"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0ce52a1a64f70efd117422a0bfe87d1c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8062,
+        "upload_time": "2022-02-25T02:10:09",
+        "upload_time_iso_8601": "2022-02-25T02:10:09.523096Z",
+        "url": "https://files.pythonhosted.org/packages/06/90/1ff4dc5d8e94a36a4c91b4c9e9dfc886dd2e4f0fb7357f9a8dfd7a9518d0/wsmsg-0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16317a77f978e2addab1eac95f1aca07855c835fde58c06b559d4814e5e191d3",
+          "md5": "8bf1a6b1215a3c277c2b23c9af4f307c",
+          "sha256": "dbd01e2333787e7cf760ac7902790b2b7665d6f22ad8e9924fdbb1bcc57be773"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8bf1a6b1215a3c277c2b23c9af4f307c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9129,
+        "upload_time": "2022-02-25T03:30:55",
+        "upload_time_iso_8601": "2022-02-25T03:30:55.213623Z",
+        "url": "https://files.pythonhosted.org/packages/16/31/7a77f978e2addab1eac95f1aca07855c835fde58c06b559d4814e5e191d3/wsmsg-0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f720e97d97ab3974bb8870f0bb7264cccb1d6827913d93d37f984789a68172ae",
+          "md5": "81119de1fac1b0aa7ea316c0f3aba479",
+          "sha256": "9f96d015e48e79180a2c91bee8e2a6f37a2ea292bd7fe8d61d019ca1a29e29b9"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81119de1fac1b0aa7ea316c0f3aba479",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8044,
+        "upload_time": "2022-02-25T03:30:57",
+        "upload_time_iso_8601": "2022-02-25T03:30:57.212356Z",
+        "url": "https://files.pythonhosted.org/packages/f7/20/e97d97ab3974bb8870f0bb7264cccb1d6827913d93d37f984789a68172ae/wsmsg-0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7cbc96eb4611ae6c38cadc74a0c6e48a3874775e26be95fe44902d83228bead",
+          "md5": "87e236c43762bae31909ba75b2b04b25",
+          "sha256": "e297062fdc2a20e912017a38a3954199d55ff757e6af9497339cd4614886a605"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "87e236c43762bae31909ba75b2b04b25",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9249,
+        "upload_time": "2022-02-26T01:30:19",
+        "upload_time_iso_8601": "2022-02-26T01:30:19.473420Z",
+        "url": "https://files.pythonhosted.org/packages/e7/cb/c96eb4611ae6c38cadc74a0c6e48a3874775e26be95fe44902d83228bead/wsmsg-0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "114713894b5f9678059059c0e2d45095339db4f7574921583df67f7ce5c30ae6",
+          "md5": "8f536d7067fc8380339cb5b69a56d469",
+          "sha256": "3610e250644b2adc9451bae6f1b04fc0765c10636288ee8e24cebc2e7f6548f8"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8f536d7067fc8380339cb5b69a56d469",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8152,
+        "upload_time": "2022-02-26T01:30:21",
+        "upload_time_iso_8601": "2022-02-26T01:30:21.511176Z",
+        "url": "https://files.pythonhosted.org/packages/11/47/13894b5f9678059059c0e2d45095339db4f7574921583df67f7ce5c30ae6/wsmsg-0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb56386a4393aecc64c63b231813a56cb58a9508114f789b991f8fa3ca418308",
+          "md5": "96657025ed4e564ee01b2ccf8f8772ff",
+          "sha256": "c74c582e0ac7a0c368cf40c17e2861d3ea6dbe681c222d5f6cb4072a2fe6ae78"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.9.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "96657025ed4e564ee01b2ccf8f8772ff",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9271,
+        "upload_time": "2022-02-26T01:31:52",
+        "upload_time_iso_8601": "2022-02-26T01:31:52.073480Z",
+        "url": "https://files.pythonhosted.org/packages/bb/56/386a4393aecc64c63b231813a56cb58a9508114f789b991f8fa3ca418308/wsmsg-0.9.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3aa8e00cb3dd5cf7bc0a348e3be9bb556f4f16a776c2cb4fbaeb3134184a2536",
+          "md5": "e6c5d5fca2e0a590d452ff607c850190",
+          "sha256": "fc3270463a2575099ff8eb8bfbba76e5c30b782d17274bb82177b21cdd8e51fa"
+        },
+        "downloads": -1,
+        "filename": "wsmsg-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e6c5d5fca2e0a590d452ff607c850190",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8150,
+        "upload_time": "2022-02-26T01:31:54",
+        "upload_time_iso_8601": "2022-02-26T01:31:54.794129Z",
+        "url": "https://files.pythonhosted.org/packages/3a/a8/e00cb3dd5cf7bc0a348e3be9bb556f4f16a776c2cb4fbaeb3134184a2536/wsmsg-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "368234d697890761a4b9751c4f359183e65f0a506bb55295dcbb9ed94dde6446",
+        "md5": "44798b1f2457c617a2e5494a36073f46",
+        "sha256": "f67e6fac911703bab1406e826c8460aa868d1c3eba302d5a52540e9fd54c2a9a"
+      },
+      "downloads": -1,
+      "filename": "wsmsg-0.17-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "44798b1f2457c617a2e5494a36073f46",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 13045,
+      "upload_time": "2022-03-14T04:29:40",
+      "upload_time_iso_8601": "2022-03-14T04:29:40.346003Z",
+      "url": "https://files.pythonhosted.org/packages/36/82/34d697890761a4b9751c4f359183e65f0a506bb55295dcbb9ed94dde6446/wsmsg-0.17-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0f56884959d138f4d4ade208a2965635478c32ba4241406a8786d7cb9ae6763a",
+        "md5": "8c5f6e4c0bf2a07d6515f701a2604fd2",
+        "sha256": "7f66b18cb33c92bfef0a4487a370270d6a805f1a4bf5ea02016387cab4982102"
+      },
+      "downloads": -1,
+      "filename": "wsmsg-0.17.tar.gz",
+      "has_sig": false,
+      "md5_digest": "8c5f6e4c0bf2a07d6515f701a2604fd2",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 14095,
+      "upload_time": "2022-03-14T04:29:42",
+      "upload_time_iso_8601": "2022-03-14T04:29:42.080294Z",
+      "url": "https://files.pythonhosted.org/packages/0f/56/884959d138f4d4ade208a2965635478c32ba4241406a8786d7cb9ae6763a/wsmsg-0.17.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
