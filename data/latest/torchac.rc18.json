@@ -1,0 +1,687 @@
+{
+  "info": {
+    "author": "fab-jul",
+    "author_email": "fabianjul@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "</div>\n\n\n# torchac: Fast Arithmetic Coding for PyTorch\n\n[![TestStatus](https://circleci.com/gh/fab-jul/torchac.svg?style=shield)](https://circleci.com/gh/fab-jul/torchac)\n[![PyPiVersion](https://badge.fury.io/py/torchac.svg)](https://pypi.org/project/torchac/)\n![PythonVersion](https://img.shields.io/badge/python-%3E%3D3.8-brightgreen)\n[![Downloads](https://pepy.tech/badge/torchac)](https://pepy.tech/project/torchac)\n![License](https://img.shields.io/pypi/l/torchac)\n\n\n## About\n\nThis is a stand-alone version of the arithmetic coder we used in the \nneural compression paper [Practical Full Resolution Learned Lossless Image \nCompression](https://github.com/fab-jul/L3C-PyTorch) by Mentzer et al.\n\nThe backend is written in C++, the API is for PyTorch tensors. Thanks to\non-the-fly compilation with ninja, the integration is seamless.\n\nThe implementation is based on [this blog post](https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html),\nmeaning that we implement _arithmetic coding_.\nWhile it could be further optimized, it is already much faster than doing the equivalent thing in pure-Python (because of all the\n bit-shifts etc.). In L3C, Encoding all pixels of a `512 x 512` image happens in 0.202s (see [Appendix A](https://arxiv.org/abs/1811.12817) in the paper).\n\n### What torchac is\n\n- A simple-to-use library to encode a stream of symbols into a bitstream given\n  the cumulative distribution (CDF) of the symbols.\nThe number of possible symbols must be finite.\n\n### What torchac is not\n\n- We do not provide classes to learn or represent probability/cumulative\n  distributions. These have to be provided by you.\n\n\n## HowTo\n\n### Set up conda environment\n\nThis library has been tested with\n- PyTorch 1.5, 1.6, 1.7\n- Python 3.8\n\nAnd that's all you need. Other versions of Python may also work,\nbut on-the-fly ninja compilation only works for PyTorch 1.5+.\n\nIn a supported environment, install `torchac` with `pip`:\n\n```bash\npip install torchac\n```\n\nIf you don't have an environment already set up, you can make one with `conda`,\nsee [pytorch.org](https://pytorch.org).\n\nTo (optionally) test your installation, you need `pytest`, and then you\ncan run `python -m pytest tests/test.py -s`. The output should contain\n`5 passed, 2 warnings`.\n\n### Example\n\nThe `examples/` folder contains [an example for training an auto-encoder on MNIST](https://github.com/fab-jul/torchac/tree/master/examples/mnist_autoencoder).\n\n</div>\n\nSnipped from that example:\n\n```python\nimport torchac\n\n# Encode to bytestream.\noutput_cdf = ...  # Get CDF from your model, shape B, C, H, W, Lp\nsym = ...  # Get the symbols to encode, shape B, C, H, W.\nbyte_stream = torchac.encode_float_cdf(output_cdf, sym, check_input_bounds=True)\n\n# Number of bits taken by the stream\nreal_bits = len(byte_stream) * 8\n\n# Write to a file.\nwith open('outfile.b', 'wb') as fout:\n    fout.write(byte_stream)\n\n# Read from a file.\nwith open('outfile.b', 'rb') as fin:\n    byte_stream = fin.read()\n\n# Decode from bytestream.\nsym_out = torchac.decode_float_cdf(output_cdf, byte_stream)\n\n# Output will be equal to the input.\nassert sym_out.equal(sym)\n```\n\n## FAQ\n\n#### 1. Output is not equal to the input\n\nEither normalization went wrong or you encoded a symbol that is `>Lp`,\nsee below for more details.\n\n## Important Implementation Details\n\n### How we represent probability distributions.\n\nThe probabilities are specified as [CDFs](https://en.wikipedia.org/wiki/Cumulative_distribution_function).\nFor each possible symbol,\nwe need 2 CDF values. This means that if there are `L` possible symbols\n`{0, ..., L-1}`, the CDF must specified the value for `L+1` symbols.\n\n**Example**:\n```\nLet's say we have L = 3 possible symbols. We need a CDF with 4 values\nto specify the symbols distribution:\n\nsymbol:        0     1     2\ncdf:       C_0   C_1   C_2   C_3\n\nThis corresponds to the 3 probabilities\n\nP(0) = C_1 - C_0\nP(1) = C_2 - C_1\nP(2) = C_3 - C_2\n\nNOTE: The arithmetic coder assumes that C_3 == 1. \n```\n\nImportant:\n\n- If you have `L` possible symbols, you need to pass a CDF that\n  specifies `L + 1` values. Since this is a common number, we call it \n  `Lp = L + 1` throught the code (the \"p\" stands for prime, i.e., `L'`).\n- The last value of the CDF should be `1`. Note that the arithmetic coder\n  in `torchac.cpp` will just assume it's `1` regardless of what is passed, so not having a CDF\n  that ends in `1` will mean you will estimate bitrates wrongly. More details below.\n- Note that even though the CDF specifies `Lp` values, symbols are only allowed\nto be in `{0, ..., Lp-2}`. In the above example, `Lp == 4`, but the \nmax symbols is `Lp-2 == 2`. Bigger values will yield **wrong outputs**\n\n### Expected input shapes\n\nWe allow any shapes for the inputs, but the spatial dimensions of the\ninput CDF and the input symbols must match. In particular, we expect:\n\n- CDF must have shape `(N1, ..., Nm, Lp)`, where `N1, ..., Nm` are the\n`m` spatial dimensions, and `Lp` is as described above.\n- Symbols must have shape `(N1, ..., Nm)`, i.e., same spatial dimensions\nas the CDF.\n\nFor example, in a typical CNN, you might have a CDF of shape \n`(batch, channels, height, width, Lp)`.\n\n\n### Normalized vs. Unnormalized / Floating Point vs. Integer CDFs\n\nThe library differentiates between \"normalized\" and \"unnormalized\" CDFs,\nand between \"floating point\" and \"integer\" CDFs. What do these mean?\n\n- A proper CDF is strictly monotonically increasing, and we call this a\n\"normalized\" CDF. \n- However, since we work with finite precision (16 bits to\nbe precise in this implementation), it may be that you have a CDF that\nis strictly monotonically increasing in `float32` space, but not when\nit is converted to 16 bit precision. An \"unnormalized\" CDF is what we call\na CDF that has the same value for at least two subsequent elements.\n- \"floating point\" CDFs are CDFs that are specified as `float32` and need\nto be converted to 16 bit precision.\n- \"integer\" CDFs are CDFs specified as `int16` - BUT are then interpreted\nas `uint16` on the C++ side. See \"int16 vs uint16\" below.\n\nExamples:\n\n```python\nfloat_unnormalized_cdf = [0.1, 0.2, 0.2, 0.3, ..., 1.]\nfloat_normalized_cdf = [0.1, 0.2, 0.20001, 0.3, ..., 1.]\ninteger_unnormalized_cdf = [10, 20, 20, 30, ..., 0]  # See below for why last is 0.\ninteger_normalized_cdf = [10, 20, 21, 30, ..., 0]    # See below for why last is 0.\n```\n\nThere are two APIs:\n\n- `encode_float_cdf` and `decode_float_cdf` is to be used for floating point \nCDFs. These functions have a flag `needs_normalization` that specifies\nwhether the input is assumed to be normalized. You can set\n`need_normalization=False` if you have CDFs that you know are normalized, e.g., \nGaussian distributions with a large enough sigma. This would then speedup\nencoding and decoding large tensors somewhat, and will make bitrate \nestimation from the CDF more precise.\n- `encode_int16_normalized_cdf` and `decode_int16_normalized_cdf` is to be \nused for integer CDFs **that are already normalized**.\n\n### int16 vs uint16 - it gets confusing!\n\nOne big source of confusion can be that PyTorch does not support `uint16`.\nYet, that's exactly what we need. So what we do is we just represent\ninteger CDFs with `int16` in the Python side, and interpret/cast them to `uint16`\non the C++ side. This means that if you were to look at the int16 CDFs\nyou would see confusing things:\n\n```python \n# Python\ncdf_float = [0., 1/3, 2/3, 1.]  # A uniform distribution for L=3 symbols.\ncdf_int = [0, 21845, -21845, 0]\n\n# C++\nuint16* cdf_int = [0, 21845, 43690, 0]\n```\n\nNote:\n1. In the python `cdf_int` numbers bigger than `2**16/2` are negative\n2. The final value is actually 0. This is then handled in `torchac.cpp` which\njust assums `cdf[..., -1] == 2**16`, which cannot be represented as a `uint16`.\n\nFun stuff!\n\n## Citation\n\nIf you use the work released here for your research, consider citing this paper:\n```\n@inproceedings{mentzer2019practical,\n    Author = {Mentzer, Fabian and Agustsson, Eirikur and Tschannen, Michael and Timofte, Radu and Van Gool, Luc},\n    Booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},\n    Title = {Practical Full Resolution Learned Lossless Image Compression},\n    Year = {2019}}\n```\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/fab-jul/torchac",
+    "keywords": "",
+    "license": "GNU General Public License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "torchac",
+    "package_url": "https://pypi.org/project/torchac/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/torchac/",
+    "project_urls": {
+      "Homepage": "https://github.com/fab-jul/torchac"
+    },
+    "release_url": "https://pypi.org/project/torchac/0.9.3/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "Fast Arithmetic Coding for PyTorch",
+    "version": "0.9.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8680130,
+  "releases": {
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "08708c39e79f692badd7bd2944051016c87f8cf0ec59c154f3f57b8084d7ea5f",
+          "md5": "70a90c1cbc7c6345dc5d2ee9e55532b3",
+          "sha256": "39d332764ab7628eb562217e27923ceb620d18710748ce83758f778a6ab4d700"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "70a90c1cbc7c6345dc5d2ee9e55532b3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18563,
+        "upload_time": "2020-11-14T08:43:15",
+        "upload_time_iso_8601": "2020-11-14T08:43:15.479863Z",
+        "url": "https://files.pythonhosted.org/packages/08/70/8c39e79f692badd7bd2944051016c87f8cf0ec59c154f3f57b8084d7ea5f/torchac-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4cadfae2624be9f00bfb3e37a0bbe6e7a019d3b49062d8668785d58cd8e8bb04",
+          "md5": "21ad458bd291842e50a118f57c3ec11d",
+          "sha256": "75b240290f91a31a20029ff06b93b641000d9a416face34c6af54ab768217290"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "21ad458bd291842e50a118f57c3ec11d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7339,
+        "upload_time": "2020-11-14T08:43:16",
+        "upload_time_iso_8601": "2020-11-14T08:43:16.846090Z",
+        "url": "https://files.pythonhosted.org/packages/4c/ad/fae2624be9f00bfb3e37a0bbe6e7a019d3b49062d8668785d58cd8e8bb04/torchac-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bbb4b64aebd9fdc2bd44987a4f6b57452af32ac3e970c918eac43c2d8ad6f6fd",
+          "md5": "b1405edbb621feaba45d5e5b09a7f8a7",
+          "sha256": "460027ecc435da0a11b693421a846e5d11237866c9ca7ddaa8880b85f138cdc8"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1405edbb621feaba45d5e5b09a7f8a7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21795,
+        "upload_time": "2020-11-14T08:55:19",
+        "upload_time_iso_8601": "2020-11-14T08:55:19.623277Z",
+        "url": "https://files.pythonhosted.org/packages/bb/b4/b64aebd9fdc2bd44987a4f6b57452af32ac3e970c918eac43c2d8ad6f6fd/torchac-0.8.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be4614a1036c4ffadb51170ac753e598e6e093cb706662b8005885749c2a95c2",
+          "md5": "1948720bfa11f408b6c8995d6d251f66",
+          "sha256": "a4f732846f2ee1963273bc1d7fe2c1f1fc93301d3b113c0455fdb8489656b719"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1948720bfa11f408b6c8995d6d251f66",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12365,
+        "upload_time": "2020-11-14T08:55:20",
+        "upload_time_iso_8601": "2020-11-14T08:55:20.912931Z",
+        "url": "https://files.pythonhosted.org/packages/be/46/14a1036c4ffadb51170ac753e598e6e093cb706662b8005885749c2a95c2/torchac-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56fd995bdb052e9a0d3cf5ab22f7fc405f839bc00ed4932b5b82ae187a2fe844",
+          "md5": "b7b4761cbbdc861b659e17ffe831001c",
+          "sha256": "15a0c9f695763196df48ffe6eef78d887a85359f0b1cef0a9f54bb39362014bc"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7b4761cbbdc861b659e17ffe831001c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21695,
+        "upload_time": "2020-11-14T10:42:30",
+        "upload_time_iso_8601": "2020-11-14T10:42:30.265490Z",
+        "url": "https://files.pythonhosted.org/packages/56/fd/995bdb052e9a0d3cf5ab22f7fc405f839bc00ed4932b5b82ae187a2fe844/torchac-0.8.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7a6b1e1e9841965054a208a9d53210fc388e17d18f3571fc243d5b8585f34bf",
+          "md5": "6800528d3ce3a20ada937a6a01bbcaa3",
+          "sha256": "b060f310a630765ccc67a1a0ce5d18fa8481271854d16fd415f03d726667104f"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6800528d3ce3a20ada937a6a01bbcaa3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21691,
+        "upload_time": "2020-11-14T10:44:56",
+        "upload_time_iso_8601": "2020-11-14T10:44:56.430247Z",
+        "url": "https://files.pythonhosted.org/packages/a7/a6/b1e1e9841965054a208a9d53210fc388e17d18f3571fc243d5b8585f34bf/torchac-0.8.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e0d8e3dde66c86e358a2d676fbb207d9c1cf79a2339e8ca98cae5f771ef631dc",
+          "md5": "429cd206b9f5eed795e993b63400f05b",
+          "sha256": "4ed68afb148e6648845f3121d2767fc22b1af0988879ff561ba8411aae8f29b1"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "429cd206b9f5eed795e993b63400f05b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21689,
+        "upload_time": "2020-11-14T11:03:28",
+        "upload_time_iso_8601": "2020-11-14T11:03:28.962294Z",
+        "url": "https://files.pythonhosted.org/packages/e0/d8/e3dde66c86e358a2d676fbb207d9c1cf79a2339e8ca98cae5f771ef631dc/torchac-0.8.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "34d5f0df8078bc033b1cf4c5c2f5a7c65c608f8f4d1b237dcd9f1c554365e536",
+          "md5": "7fc12c23495116d6c690b1931a68b30a",
+          "sha256": "d0ea6c9062d79773d399901271ce479f1b71f1be508906886b168118b6641be9"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7fc12c23495116d6c690b1931a68b30a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21712,
+        "upload_time": "2020-11-14T11:10:51",
+        "upload_time_iso_8601": "2020-11-14T11:10:51.579885Z",
+        "url": "https://files.pythonhosted.org/packages/34/d5/f0df8078bc033b1cf4c5c2f5a7c65c608f8f4d1b237dcd9f1c554365e536/torchac-0.8.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1956813ad392450a3a08d5978f4587e415711effacef839ce095333b57af0ba6",
+          "md5": "0f063038a22dacf63cc1766a6ca82847",
+          "sha256": "f953a1ea293d2e2ceaaeacb5d89762d4bff87496607568917fc67435cfa4691e"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0f063038a22dacf63cc1766a6ca82847",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21715,
+        "upload_time": "2020-11-14T11:13:24",
+        "upload_time_iso_8601": "2020-11-14T11:13:24.144398Z",
+        "url": "https://files.pythonhosted.org/packages/19/56/813ad392450a3a08d5978f4587e415711effacef839ce095333b57af0ba6/torchac-0.8.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47584c76f7c57600299a41d63cfbb83f2ba43940580256fcaa3a3ac3160d8ea6",
+          "md5": "9d8934362770d55a60c3164196c3ad34",
+          "sha256": "420040fd6b62b804fdfdb76ee5fe70db7fa62a356db29b0f97ebdf18fc93eee0"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9d8934362770d55a60c3164196c3ad34",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21843,
+        "upload_time": "2020-11-14T09:17:40",
+        "upload_time_iso_8601": "2020-11-14T09:17:40.283360Z",
+        "url": "https://files.pythonhosted.org/packages/47/58/4c76f7c57600299a41d63cfbb83f2ba43940580256fcaa3a3ac3160d8ea6/torchac-0.8.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb82a305a34e9eb053c31fee599d64bc4e8667c3637f6562c420a22f1bc78b00",
+          "md5": "7039140e158507f7047c71d14c9dd09d",
+          "sha256": "70ba0a3b50ccf26adafb06180e6412f0e94547379993f93a810fd521d6e9faf5"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7039140e158507f7047c71d14c9dd09d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12673,
+        "upload_time": "2020-11-14T09:17:41",
+        "upload_time_iso_8601": "2020-11-14T09:17:41.633661Z",
+        "url": "https://files.pythonhosted.org/packages/cb/82/a305a34e9eb053c31fee599d64bc4e8667c3637f6562c420a22f1bc78b00/torchac-0.8.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "70c356acf22183b43566ab3d151d145036656d9ac7d70753724b275317ce64ef",
+          "md5": "efed31a5b12311383a396e10dd689a87",
+          "sha256": "2d074c967fcc574ad2d69da8b6477bf7015f78e071c26d222b561b5ff33c9a63"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.3-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "efed31a5b12311383a396e10dd689a87",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": ">=3.6",
+        "size": 75591,
+        "upload_time": "2020-11-14T09:45:10",
+        "upload_time_iso_8601": "2020-11-14T09:45:10.029937Z",
+        "url": "https://files.pythonhosted.org/packages/70/c3/56acf22183b43566ab3d151d145036656d9ac7d70753724b275317ce64ef/torchac-0.8.3-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c7285d344e03242680077be2c21545dd190c392a75ad02b92d6160af9dd7e6a3",
+          "md5": "29f4b9902383fa30cb303de342b17e5a",
+          "sha256": "05dade1dac3b0efba9cf16024800aa15e1cffd65557d8069841e1be6961f58f8"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "29f4b9902383fa30cb303de342b17e5a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18611,
+        "upload_time": "2020-11-14T09:22:49",
+        "upload_time_iso_8601": "2020-11-14T09:22:49.234295Z",
+        "url": "https://files.pythonhosted.org/packages/c7/28/5d344e03242680077be2c21545dd190c392a75ad02b92d6160af9dd7e6a3/torchac-0.8.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "097f7ba9c74eb74ecd05c03a10ad54d84b1fea0fbce279ca61e6fa000cab9a04",
+          "md5": "3d79dc4d0fe587c43245f8a1e7ee7ad1",
+          "sha256": "6679e0357967c3921d4e6dfc941926722c6e4b69df4a72b7db1227aa83950375"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3d79dc4d0fe587c43245f8a1e7ee7ad1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12703,
+        "upload_time": "2020-11-14T09:22:52",
+        "upload_time_iso_8601": "2020-11-14T09:22:52.237783Z",
+        "url": "https://files.pythonhosted.org/packages/09/7f/7ba9c74eb74ecd05c03a10ad54d84b1fea0fbce279ca61e6fa000cab9a04/torchac-0.8.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "573db87f06ae18880c9f0ac1387528e61403a686471946d82ff5c3d7946083ce",
+          "md5": "fb46f5dbc22f77a6ad1d04aeb01e7e81",
+          "sha256": "1e01c3cde8bfe588132d2af6526b4e69584f6677f1b558b2f701beaacda4d04d"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.4-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "fb46f5dbc22f77a6ad1d04aeb01e7e81",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": ">=3.6",
+        "size": 75591,
+        "upload_time": "2020-11-14T09:45:29",
+        "upload_time_iso_8601": "2020-11-14T09:45:29.832824Z",
+        "url": "https://files.pythonhosted.org/packages/57/3d/b87f06ae18880c9f0ac1387528e61403a686471946d82ff5c3d7946083ce/torchac-0.8.4-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc0e841132b98525397d2af937863dcf7defad7f6a3b5322799c9d63aebfee52",
+          "md5": "0285bef639c260040ed0b02ce64b8544",
+          "sha256": "45c1e9daec7fd0bb8de5d1876ad3f85df637fbbd37eb251b92a8d8c4e81ca1a0"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0285bef639c260040ed0b02ce64b8544",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12783,
+        "upload_time": "2020-11-14T09:45:31",
+        "upload_time_iso_8601": "2020-11-14T09:45:31.477155Z",
+        "url": "https://files.pythonhosted.org/packages/bc/0e/841132b98525397d2af937863dcf7defad7f6a3b5322799c9d63aebfee52/torchac-0.8.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b770735dac4f002922a264f7f1e4893e8f9a4e0b418d4cb893c1de5c48b6d967",
+          "md5": "2ef7144e288173bc853f74271c58f3d2",
+          "sha256": "4decbf29974fa918339a1f473be6aa147a4cef434ae38a932738e6c68d5fc0f8"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2ef7144e288173bc853f74271c58f3d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18577,
+        "upload_time": "2020-11-14T10:09:14",
+        "upload_time_iso_8601": "2020-11-14T10:09:14.111773Z",
+        "url": "https://files.pythonhosted.org/packages/b7/70/735dac4f002922a264f7f1e4893e8f9a4e0b418d4cb893c1de5c48b6d967/torchac-0.8.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f6585929258c77b0ea777c9ac3d7eb928bfa3887b82b5ac1e92fb2b58f7597e",
+          "md5": "96c6d6ae7acfe842295b647d4387e41c",
+          "sha256": "d41b524d0258a4418ab9415ad49df5661b3518e6ae79b2e1bf72b361babc354b"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "96c6d6ae7acfe842295b647d4387e41c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12716,
+        "upload_time": "2020-11-14T10:09:17",
+        "upload_time_iso_8601": "2020-11-14T10:09:17.201924Z",
+        "url": "https://files.pythonhosted.org/packages/5f/65/85929258c77b0ea777c9ac3d7eb928bfa3887b82b5ac1e92fb2b58f7597e/torchac-0.8.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40a6672ab88d240c2da19315d6a41bd2fa19f2233d27dad78cd1641b456808b1",
+          "md5": "47941bab81cd1c0cbe3a66ffc484e86f",
+          "sha256": "1ca7113c8c7be68a8a3f1e93dbea2c56f3744d1b5e9eebd7e095f7858b274586"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "47941bab81cd1c0cbe3a66ffc484e86f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18578,
+        "upload_time": "2020-11-14T10:12:58",
+        "upload_time_iso_8601": "2020-11-14T10:12:58.466891Z",
+        "url": "https://files.pythonhosted.org/packages/40/a6/672ab88d240c2da19315d6a41bd2fa19f2233d27dad78cd1641b456808b1/torchac-0.8.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2aa39cc0190b64b89aec90a84ce88f809785c3d3f5728db2ce023f40d02875f9",
+          "md5": "25c57ca44204c80d89031817432b3b8b",
+          "sha256": "0ea04fea9c3a7b34562d1db5fc7dce3192786498f8cdf25fd1a370959f2ec481"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "25c57ca44204c80d89031817432b3b8b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12745,
+        "upload_time": "2020-11-14T10:13:00",
+        "upload_time_iso_8601": "2020-11-14T10:13:00.036644Z",
+        "url": "https://files.pythonhosted.org/packages/2a/a3/9cc0190b64b89aec90a84ce88f809785c3d3f5728db2ce023f40d02875f9/torchac-0.8.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49bbd279d080ce4d4b156d475eeccba3f9f4ebb856f1df86324ab229786ddbbe",
+          "md5": "3585dead76e4daa3a812fac557c8ed24",
+          "sha256": "1d41313e9b0ff38495f3ae63ad3aeb96fc563a67e2cdf4d4141e8051c0562fec"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3585dead76e4daa3a812fac557c8ed24",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 18579,
+        "upload_time": "2020-11-14T10:20:07",
+        "upload_time_iso_8601": "2020-11-14T10:20:07.067489Z",
+        "url": "https://files.pythonhosted.org/packages/49/bb/d279d080ce4d4b156d475eeccba3f9f4ebb856f1df86324ab229786ddbbe/torchac-0.8.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a10888f5b8fa661ddf324567c88faf4ca21c6588fd1ae13a95df3ef88b10251",
+          "md5": "7cd483538342ad135ecff3c39a169fe4",
+          "sha256": "81af6cd9cd6ce5db944b85d69fd921ae6049496bda432d917be8bf6a7a6a4a6f"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7cd483538342ad135ecff3c39a169fe4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7612,
+        "upload_time": "2020-11-14T10:20:08",
+        "upload_time_iso_8601": "2020-11-14T10:20:08.913468Z",
+        "url": "https://files.pythonhosted.org/packages/0a/10/888f5b8fa661ddf324567c88faf4ca21c6588fd1ae13a95df3ef88b10251/torchac-0.8.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16935bea589ee4f6dc5cad6dc15c174d48b626960b06b9d068e5f4d87ede9763",
+          "md5": "009eea4f061cfa052fea8fc62afd865f",
+          "sha256": "ad1d5e306bf153c77c2b88cc2c855df0aaea77ed3b1fd2db036853859b152aaa"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "009eea4f061cfa052fea8fc62afd865f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22057,
+        "upload_time": "2020-11-14T10:23:18",
+        "upload_time_iso_8601": "2020-11-14T10:23:18.415015Z",
+        "url": "https://files.pythonhosted.org/packages/16/93/5bea589ee4f6dc5cad6dc15c174d48b626960b06b9d068e5f4d87ede9763/torchac-0.8.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7712093bc5ef3927c0e8b94cba97dc0d5f530b2d7729ca1cc9480d51aaf58b72",
+          "md5": "0bddecbdc8b6feb28c8073cfe0e2f4c3",
+          "sha256": "71fa23c0c5f3dc028f7ded5d9dda01611f1f9a1cd8a08a8360d45a21104b67da"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.8.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0bddecbdc8b6feb28c8073cfe0e2f4c3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12706,
+        "upload_time": "2020-11-14T10:23:20",
+        "upload_time_iso_8601": "2020-11-14T10:23:20.014104Z",
+        "url": "https://files.pythonhosted.org/packages/77/12/093bc5ef3927c0e8b94cba97dc0d5f530b2d7729ca1cc9480d51aaf58b72/torchac-0.8.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20953ba76701d06fe47e817744fd9a0940b636722266f17811dde80bb47f511e",
+          "md5": "3b29ec201fb2f7d6838a1c78a31c952b",
+          "sha256": "f43ac4e15c936a2928620345b513f63ff85d85c5777ad5589785476836c3bab0"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3b29ec201fb2f7d6838a1c78a31c952b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21700,
+        "upload_time": "2020-11-14T11:19:17",
+        "upload_time_iso_8601": "2020-11-14T11:19:17.918346Z",
+        "url": "https://files.pythonhosted.org/packages/20/95/3ba76701d06fe47e817744fd9a0940b636722266f17811dde80bb47f511e/torchac-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2aa72905257e0ab1f99adf874cc9596d87948984e697b902ccec79cb7b19fb1",
+          "md5": "286cea892685dc719ebc4fd72b8d6f8f",
+          "sha256": "af06f50de735232ac3bdfcbbe35c602d87f07f4b4896e7d3a22c4c529e3c7268"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.9.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "286cea892685dc719ebc4fd72b8d6f8f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22160,
+        "upload_time": "2020-11-17T12:20:36",
+        "upload_time_iso_8601": "2020-11-17T12:20:36.330271Z",
+        "url": "https://files.pythonhosted.org/packages/f2/aa/72905257e0ab1f99adf874cc9596d87948984e697b902ccec79cb7b19fb1/torchac-0.9.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2990d00fbb7b6989b12907cb2cb916f259b644b622b5b205989ade0448547e8",
+          "md5": "bc7d5c5dc0abaed9237748218fdae4e2",
+          "sha256": "42a2c5f2ab958d94e35a815d6e0e172b3366d2f2fc08c16e9297364a5f88e7e5"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.9.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc7d5c5dc0abaed9237748218fdae4e2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22159,
+        "upload_time": "2020-11-17T12:21:59",
+        "upload_time_iso_8601": "2020-11-17T12:21:59.495216Z",
+        "url": "https://files.pythonhosted.org/packages/e2/99/0d00fbb7b6989b12907cb2cb916f259b644b622b5b205989ade0448547e8/torchac-0.9.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20e7a3be37b21dc79978901cbb1aa60327e4d973d195de8969c285aa4e57398a",
+          "md5": "ad7f1775f13ba61cfb7f8eb475f270b0",
+          "sha256": "ab4eedbe230c677ff076e07142ce611c6a76185723c0f41bd014e6893678f5c9"
+        },
+        "downloads": -1,
+        "filename": "torchac-0.9.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ad7f1775f13ba61cfb7f8eb475f270b0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22337,
+        "upload_time": "2020-11-17T14:07:35",
+        "upload_time_iso_8601": "2020-11-17T14:07:35.233584Z",
+        "url": "https://files.pythonhosted.org/packages/20/e7/a3be37b21dc79978901cbb1aa60327e4d973d195de8969c285aa4e57398a/torchac-0.9.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "20e7a3be37b21dc79978901cbb1aa60327e4d973d195de8969c285aa4e57398a",
+        "md5": "ad7f1775f13ba61cfb7f8eb475f270b0",
+        "sha256": "ab4eedbe230c677ff076e07142ce611c6a76185723c0f41bd014e6893678f5c9"
+      },
+      "downloads": -1,
+      "filename": "torchac-0.9.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ad7f1775f13ba61cfb7f8eb475f270b0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 22337,
+      "upload_time": "2020-11-17T14:07:35",
+      "upload_time_iso_8601": "2020-11-17T14:07:35.233584Z",
+      "url": "https://files.pythonhosted.org/packages/20/e7/a3be37b21dc79978901cbb1aa60327e4d973d195de8969c285aa4e57398a/torchac-0.9.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

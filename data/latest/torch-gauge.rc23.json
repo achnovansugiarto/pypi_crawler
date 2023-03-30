@@ -1,0 +1,590 @@
+{
+  "info": {
+    "author": "Zhuoran Qiao",
+    "author_email": "zqiao@caltech.edu",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Torch-Gauge\n\nA light-weight [PyTorch](https://pytorch.org/) extension for efficient gauge-equivariant learning.\n\n## About\n**Torch-Gauge** is a library to boost geometric learning on physical data structures\nwith Lie-group symmetry and beyond two-body interactions. The library is designed to be specifically \noptimized for training and inference on GPUs, with mini-batch training utilities natively supported.\n\n## Usage\nTorch-Gauge uses padded [Verlet list](https://en.wikipedia.org/wiki/Verlet_list) as the core for \nmanipulating relational data, which enables compact and highly customizable implementation of \ngeometric learning models.\n\nAs an illustration, check out our implementation of [SchNet](https://arxiv.org/abs/1706.08566) 's\n interaction module in just 20 lines of code:\n```python\nimport torch\nfrom torch.nn import Linear, Parameter\nfrom torch_gauge.verlet_list import VerletList\nfrom torch_gauge.nn import SSP\n\nclass SchNetLayer(torch.nn.Module):\n  def __init__(self, num_features):\n    super().__init__()\n    _nf = num_features\n    self.gamma = 10.0\n    self.rbf_centers = Parameter(torch.linspace(0.1, 30.1, 300), requires_grad=False)\n    self.cfconv = torch.nn.Sequential(\n        Linear(300, _nf, bias=False), SSP(), Linear(_nf, _nf, bias=False), SSP()\n    )\n    self.pre_conv = Linear(_nf, _nf)\n    self.post_conv = torch.nn.Sequential(Linear(_nf, _nf), SSP(), Linear(_nf, _nf))\n\n  def forward(self, vl: VerletList, l: int):\n    xyz = vl.ndata[\"xyz\"]\n    pre_conv = self.pre_conv(vl.ndata[f\"atomic_{l}\"])\n    d_ij = (vl.query_src(xyz) - xyz.unsqueeze(1)).norm(dim=2, keepdim=True)\n    filters = self.cfconv(\n      torch.exp(-self.gamma * (d_ij - self.rbf_centers.view(1, 1, -1)).pow(2))\n    )\n    conv_out = (filters * vl.query_src(pre_conv) * vl.edge_mask.unsqueeze(2)).sum(1)\n    vl.ndata[f\"atomic_{l+1}\"] = vl.ndata[f\"atomic_{l}\"] + self.post_conv(conv_out)\n    return vl.ndata[f\"atomic_{l+1}\"]\n```\nAnd that's it. With the `SphericalTensor` support we can even quickly extend it to SE(3) equivariant \nconvolutions without pain, similar to the building block of [NequIP](https://arxiv.org/abs/2101.03164):\n```python\nimport torch\nfrom torch_gauge.nn import SSP, IELin\nfrom torch.nn import Linear, Parameter\nfrom torch_gauge.verlet_list import VerletList\nfrom torch_gauge.o3.spherical import SphericalTensor\nfrom torch_gauge.o3.rsh import RSHxyz\nfrom torch_gauge.geometric import poly_env\nfrom torch_gauge.o3.clebsch_gordan import LeviCivitaCoupler\n\nclass SE3Layer(torch.nn.Module):\n  def __init__(self, num_features):\n    super().__init__()\n    _nf = num_features\n    self.rbf_freqs = Parameter(torch.arange(16), requires_grad=False)\n    self.rsh_mod = RSHxyz(max_l=1)\n    self.coupler = LeviCivitaCoupler(torch.LongTensor([_nf, _nf]))\n    self.filter_gen = torch.nn.Sequential(\n        Linear(16, _nf, bias=False), SSP(), Linear(_nf, _nf, bias=False)\n    )\n    self.pre_conv = IELin([_nf, _nf], [_nf, _nf])\n    self.post_conv = torch.nn.ModuleList(\n      [IELin([2*_nf, 3*_nf], [_nf, _nf]), SSP(), IELin([_nf, _nf], [_nf, _nf])]\n    )\n\n  def forward(self, vl: VerletList, l: int):\n    r_ij = vl.query_src(vl.ndata[\"xyz\"]) - vl.ndata[\"xyz\"].unsqueeze(1)\n    d_ij = r_ij.norm(dim=2, keepdim=True)\n    r_ij = r_ij / d_ij\n    feat_in: SphericalTensor = vl.ndata[f\"atomic_{l}\"]\n    pre_conv = vl.query_src(self.pre_conv(feat_in))\n    filters_radial = self.filter_gen(\n      torch.sin(d_ij / 5 * self.rbf_freqs.view(1, 1, -1)) / d_ij * poly_env(d_ij/5)\n    )\n    filters = pre_conv.self_like(self.rsh_mod(r_ij).ten.unsqueeze(-1).mul(filters_radial).flatten(2, 3))\n    coupling_out = self.post_conv[0](self.coupler(pre_conv, filters, overlap_out=False))\n    conv_out = feat_in.self_like(coupling_out.ten.mul(vl.edge_mask.unsqueeze(2)).sum(1))\n    conv_out = conv_out.scalar_mul(self.post_conv[1](conv_out.invariant()))\n    conv_out.ten = self.post_conv[2](conv_out).ten\n    vl.ndata[f\"atomic_{l+1}\"] = feat_in + conv_out\n    return vl.ndata[f\"atomic_{l+1}\"]\n```\n\nTorch-Gauge's Verlet list also supports generating higher-order views (triplets, quartets, etc.) to\n streamline implementing models with specialized non-2body message passing algorithms. \n\nConventional molecular descriptors that were commonly used in Kernel methods can also be revisited \nby Torch-Gauge, and examples will be provided in future versions.\n\n## Setups\n\n### From pip\n\n    pip install torch-gauge\n\n### From Source\nOnce PyTorch is installed, running \n\n    pip install versioneer && versioneer install\n    pip install -e .\n\n## Project Structure\n- `torch_gauge` High-level python functions\n    - `torch_gauge/o3` O(3) group algebra functionals\n    - `torch_gauge/nn.py` Tensorial neural network building blocks\n    - `torch_gauge/verlet_list.py` Verlet neighbor-list operations for representing relational data\n    - `torch_gauge/geometric.py` contains geometric and algebra operations with autograd\n    - `torch_gauge/models` contains exemplary implementations of GNN variants and descriptors \n    - `torch_gauge/tests` contains pytests\n- `src` contains C++/CUDA backend operations (under development)\n    \n## Test\n\n    make test\n\n## Questions?\n\nPlease submit a question/issue or [email me](mailto:zqiao@caltech.edu).\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "torch-gauge",
+    "package_url": "https://pypi.org/project/torch-gauge/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/torch-gauge/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/torch-gauge/0.2.3/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "A light-weight PyTorch extension for gauge-equivariant geometric learning",
+    "version": "0.2.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12332741,
+  "releases": {
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86931831340ba69d552efb3cf97a1bf3bd974597b8ec073e78bc97a32054a1f6",
+          "md5": "882275393778983e382d8be3d74b8cc7",
+          "sha256": "cf9b4ee2ccfd1ca3e8d082f1487a60ce34898916a50063c5cf2aef463e4654cc"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.3-1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "882275393778983e382d8be3d74b8cc7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 34902,
+        "upload_time": "2021-01-22T21:56:28",
+        "upload_time_iso_8601": "2021-01-22T21:56:28.422005Z",
+        "url": "https://files.pythonhosted.org/packages/86/93/1831340ba69d552efb3cf97a1bf3bd974597b8ec073e78bc97a32054a1f6/torch_gauge-0.0.3-1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc841f9521e9ccba4a12c539b37c85bf362a662e8c62e4f3c198a6b7a2341990",
+          "md5": "16f3605000ff1aaebf9741f165c838c4",
+          "sha256": "bd6a3004c30d9d39cb037cc872d03d2bfd377a1f3720edeb703720ea1491eaa1"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.3rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "16f3605000ff1aaebf9741f165c838c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 34922,
+        "upload_time": "2021-01-22T21:56:29",
+        "upload_time_iso_8601": "2021-01-22T21:56:29.770076Z",
+        "url": "https://files.pythonhosted.org/packages/bc/84/1f9521e9ccba4a12c539b37c85bf362a662e8c62e4f3c198a6b7a2341990/torch_gauge-0.0.3rc1.tar.gz",
+        "yanked": true,
+        "yanked_reason": "Deprecated"
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f78f50e74d7ea204d3c64f68732c50e304038ea38e0e72d60862de2f5b8f984a",
+          "md5": "41c829eb2cabbfd8cb3ee6cdfffa796e",
+          "sha256": "b1f5d3925f3f65d5615e3f2b11dd01943105ddaeee347f530fd7086d96aaf9c7"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.4-3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "41c829eb2cabbfd8cb3ee6cdfffa796e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 40841,
+        "upload_time": "2021-01-25T01:40:35",
+        "upload_time_iso_8601": "2021-01-25T01:40:35.664825Z",
+        "url": "https://files.pythonhosted.org/packages/f7/8f/50e74d7ea204d3c64f68732c50e304038ea38e0e72d60862de2f5b8f984a/torch_gauge-0.0.4-3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56b6c9922d8e83a3de38a9ed071762abca9b4f00eddecebd2aec78c2ae369b72",
+          "md5": "106500c38b4baee6cd0dc7d154f2e9f0",
+          "sha256": "82e2717570eb9a0f08e2e0826eeef408f0c760acccc60068bf8ed252022ca59e"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "106500c38b4baee6cd0dc7d154f2e9f0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 41233,
+        "upload_time": "2021-01-25T21:13:59",
+        "upload_time_iso_8601": "2021-01-25T21:13:59.605921Z",
+        "url": "https://files.pythonhosted.org/packages/56/b6/c9922d8e83a3de38a9ed071762abca9b4f00eddecebd2aec78c2ae369b72/torch_gauge-0.0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "767b2797c370fd3fa47fdd885613ef1cac7c806f87a495faea9750073a3b0c90",
+          "md5": "9ae91059770cdf26c41c94fda309a408",
+          "sha256": "8d0752540e890489ee435532193c504c46e1f72faa12ced13126f29757a2b6fb"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.4rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9ae91059770cdf26c41c94fda309a408",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 40812,
+        "upload_time": "2021-01-25T01:14:00",
+        "upload_time_iso_8601": "2021-01-25T01:14:00.885711Z",
+        "url": "https://files.pythonhosted.org/packages/76/7b/2797c370fd3fa47fdd885613ef1cac7c806f87a495faea9750073a3b0c90/torch_gauge-0.0.4rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4rc2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1a0e9616820204e41603c8ea1e9ccbe1e6d86f258adc6dc08c0217c50afa8d2",
+          "md5": "78869da8d306df62693dd66500ab3b23",
+          "sha256": "9ddf849096be8d6111a6cb09290da6e89658f8f30ae4b053b8cafce80b543327"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.4rc2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "78869da8d306df62693dd66500ab3b23",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 40847,
+        "upload_time": "2021-01-25T21:02:01",
+        "upload_time_iso_8601": "2021-01-25T21:02:01.725151Z",
+        "url": "https://files.pythonhosted.org/packages/e1/a0/e9616820204e41603c8ea1e9ccbe1e6d86f258adc6dc08c0217c50afa8d2/torch_gauge-0.0.4rc2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4rc3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f431a9352ac6d03b9da0ebd0574897db2b505754a2899b126151012582db6a95",
+          "md5": "fe9c115142ec2436deb21f1e4627109e",
+          "sha256": "a90fcf84e47de8e77d7aad6c103f346a544e7bffaf78393ab207208d86187b00"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.4rc3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fe9c115142ec2436deb21f1e4627109e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 41229,
+        "upload_time": "2021-01-25T21:12:04",
+        "upload_time_iso_8601": "2021-01-25T21:12:04.130351Z",
+        "url": "https://files.pythonhosted.org/packages/f4/31/a9352ac6d03b9da0ebd0574897db2b505754a2899b126151012582db6a95/torch_gauge-0.0.4rc3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8016354e0137a5b6dfd492242759c87b61a12a91e510a8c719ce3ca84a5a2475",
+          "md5": "73c046f92430c381de31562707db7dc1",
+          "sha256": "ab2c743b768266222664c8a98f4f2db394027536e02e7d67cc91e3ca10f52322"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "73c046f92430c381de31562707db7dc1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 45459,
+        "upload_time": "2021-02-03T01:58:42",
+        "upload_time_iso_8601": "2021-02-03T01:58:42.951189Z",
+        "url": "https://files.pythonhosted.org/packages/80/16/354e0137a5b6dfd492242759c87b61a12a91e510a8c719ce3ca84a5a2475/torch_gauge-0.0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5ded159a55fcb0ff85e9cf7a3019fe4271272e056a46ab81dec0ef7cb1544aa",
+          "md5": "d8ddb2a1044d58c556b3fb49e890db2d",
+          "sha256": "58f985a41d3a49247fcda2d03fdd1a088a2a96b7f4b0b45a560a55ad16d5944b"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d8ddb2a1044d58c556b3fb49e890db2d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48627,
+        "upload_time": "2021-02-09T23:23:22",
+        "upload_time_iso_8601": "2021-02-09T23:23:22.891089Z",
+        "url": "https://files.pythonhosted.org/packages/e5/de/d159a55fcb0ff85e9cf7a3019fe4271272e056a46ab81dec0ef7cb1544aa/torch_gauge-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec99ed5e58e783c60038e7f864b94f3731eaffd3c3500be8113b49171a4c1c20",
+          "md5": "a712066aafccb2e24254758c973d7166",
+          "sha256": "099885921eb5a74b28f657ea094cfc89c2332472b98d96bb8cf9d91fda713e9a"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a712066aafccb2e24254758c973d7166",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48645,
+        "upload_time": "2021-02-11T06:21:45",
+        "upload_time_iso_8601": "2021-02-11T06:21:45.876997Z",
+        "url": "https://files.pythonhosted.org/packages/ec/99/ed5e58e783c60038e7f864b94f3731eaffd3c3500be8113b49171a4c1c20/torch_gauge-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c11708a72bb4a11e9980fa41078f4d1842c911c95476d5fc8704b31056b5e62",
+          "md5": "b70173bb739f0d0ac076a5222cb086c0",
+          "sha256": "a4b5a6276800a6b5edabea6759ac285f8b4f4edbc208b2e982921f410fabb899"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b70173bb739f0d0ac076a5222cb086c0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48670,
+        "upload_time": "2021-02-11T23:13:27",
+        "upload_time_iso_8601": "2021-02-11T23:13:27.399301Z",
+        "url": "https://files.pythonhosted.org/packages/2c/11/708a72bb4a11e9980fa41078f4d1842c911c95476d5fc8704b31056b5e62/torch_gauge-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a48867856917d85ee5d40532b75335fc6517ada57195b8979e76f98ac49ee24",
+          "md5": "e3acce8067c1119f03742e07829443d8",
+          "sha256": "5993efb05d2ac82fab51abdf24cc419061e31f059d22cb83e3dd6f6aa3a98cca"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e3acce8067c1119f03742e07829443d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48783,
+        "upload_time": "2021-02-16T19:28:57",
+        "upload_time_iso_8601": "2021-02-16T19:28:57.326783Z",
+        "url": "https://files.pythonhosted.org/packages/9a/48/867856917d85ee5d40532b75335fc6517ada57195b8979e76f98ac49ee24/torch_gauge-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "429029d304d644db76830ebede183f495b0372d04763f5d493806edd98d76a4b",
+          "md5": "6dac9019aa650dab95a6fccfab8b2690",
+          "sha256": "b88ac5368252b863adf9e3bb4a2eba311d1d328f564dc39181ddd6ac8f964c2a"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6dac9019aa650dab95a6fccfab8b2690",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48920,
+        "upload_time": "2021-02-16T22:54:37",
+        "upload_time_iso_8601": "2021-02-16T22:54:37.197943Z",
+        "url": "https://files.pythonhosted.org/packages/42/90/29d304d644db76830ebede183f495b0372d04763f5d493806edd98d76a4b/torch_gauge-0.1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "494021a9e3157980bb53cadc48113e46f72b40356635ac599393ad31cf34f21c",
+          "md5": "29b69edd7c87330f9310bff335c6c56d",
+          "sha256": "8bd9af9ed47dfaeccef0d91d0f220d739040c5ff5b60323188ca5525d9751288"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "29b69edd7c87330f9310bff335c6c56d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 49017,
+        "upload_time": "2021-02-17T18:58:34",
+        "upload_time_iso_8601": "2021-02-17T18:58:34.849611Z",
+        "url": "https://files.pythonhosted.org/packages/49/40/21a9e3157980bb53cadc48113e46f72b40356635ac599393ad31cf34f21c/torch_gauge-0.1.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03b4dabb738071f073eb747192145c63e9d67ac75b5d584ee322a659dbfc3887",
+          "md5": "425057ccd2d84ed13e31148aa8a538e1",
+          "sha256": "291160e5da34ed2a2a22601029ca8e396ed0f42e96a42b3be95648bb2391a159"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "425057ccd2d84ed13e31148aa8a538e1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 49048,
+        "upload_time": "2021-02-26T22:31:00",
+        "upload_time_iso_8601": "2021-02-26T22:31:00.111597Z",
+        "url": "https://files.pythonhosted.org/packages/03/b4/dabb738071f073eb747192145c63e9d67ac75b5d584ee322a659dbfc3887/torch_gauge-0.1.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fd0b65488ae08d7680443be49e0e2de3c0de2bc0d0abb5dd3073dea3c25adf2c",
+          "md5": "8b8d8135234d8602ec0fa6054261f11c",
+          "sha256": "ce5d43e275c60f441d585705e722e17b2e917667377c6f5d4dc3e05f9ea6b113"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8b8d8135234d8602ec0fa6054261f11c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 50613,
+        "upload_time": "2021-03-09T23:53:14",
+        "upload_time_iso_8601": "2021-03-09T23:53:14.695640Z",
+        "url": "https://files.pythonhosted.org/packages/fd/0b/65488ae08d7680443be49e0e2de3c0de2bc0d0abb5dd3073dea3c25adf2c/torch_gauge-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be0cc1934a177632040026da7f5b2db7b350792e8af243d44341881a00c07bd6",
+          "md5": "65c292fa5d18cf64c8dde3e2723eef2c",
+          "sha256": "f81e4ad3ca0bdf2e813dc3a04a241406f9c6ba59b5562958239659f407f31084"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65c292fa5d18cf64c8dde3e2723eef2c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 50801,
+        "upload_time": "2021-03-17T00:00:53",
+        "upload_time_iso_8601": "2021-03-17T00:00:53.072083Z",
+        "url": "https://files.pythonhosted.org/packages/be/0c/c1934a177632040026da7f5b2db7b350792e8af243d44341881a00c07bd6/torch_gauge-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "17953b5f29c6c69f65c5df33f2d48012847c740ac7916f45b409ca27330b3e71",
+          "md5": "cf034a139cfd9d2895b382f3b5d33b87",
+          "sha256": "5e4301467a5e030d63aec34afa5bb568aea6afb1ab898d29cef9d0fa8b750538"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf034a139cfd9d2895b382f3b5d33b87",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 50812,
+        "upload_time": "2021-03-26T22:16:04",
+        "upload_time_iso_8601": "2021-03-26T22:16:04.615427Z",
+        "url": "https://files.pythonhosted.org/packages/17/95/3b5f29c6c69f65c5df33f2d48012847c740ac7916f45b409ca27330b3e71/torch_gauge-0.1.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "66bb7131607bb2cb145e3e4c05d6b1f93d4f29d740f817d03d2d16dccab6dc01",
+          "md5": "ff526bf49e51cd3a543bb41ad57fda60",
+          "sha256": "ccb68de581d31fe845e07e5466a6a24811828d057b5b06f002034d2c92e3bece"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ff526bf49e51cd3a543bb41ad57fda60",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 51654,
+        "upload_time": "2021-04-11T05:50:18",
+        "upload_time_iso_8601": "2021-04-11T05:50:18.175059Z",
+        "url": "https://files.pythonhosted.org/packages/66/bb/7131607bb2cb145e3e4c05d6b1f93d4f29d740f817d03d2d16dccab6dc01/torch_gauge-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "52f0a5e29219279092c580146dfcc5ceae5e37aa5cb53c34d487ac801afc365d",
+          "md5": "979e8555465a7d62d410e76542ade73e",
+          "sha256": "4a6c9ab4da03faff1d6c273c199bb52cc070c6da2db05563c2eea11785898e1c"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "979e8555465a7d62d410e76542ade73e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 51767,
+        "upload_time": "2021-06-01T00:58:46",
+        "upload_time_iso_8601": "2021-06-01T00:58:46.149111Z",
+        "url": "https://files.pythonhosted.org/packages/52/f0/a5e29219279092c580146dfcc5ceae5e37aa5cb53c34d487ac801afc365d/torch_gauge-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b17065e772003ac6792cbeccf32f5d4680809abc13cbbea25566988a81be60d2",
+          "md5": "9623c73307fc1ac1fd4a4a50a5837d12",
+          "sha256": "58c1d729acb0af45ffe85e588667f9c1d0efaa18508e18e2f143cb161066a591"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9623c73307fc1ac1fd4a4a50a5837d12",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53388,
+        "upload_time": "2021-11-12T08:19:51",
+        "upload_time_iso_8601": "2021-11-12T08:19:51.326360Z",
+        "url": "https://files.pythonhosted.org/packages/b1/70/65e772003ac6792cbeccf32f5d4680809abc13cbbea25566988a81be60d2/torch_gauge-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e800b9d16c1635ffe76c467a6ea4e5ea9a63ec4bf78872cd7f93145a81ddad6e",
+          "md5": "ad240bb626b6921febd4508229141910",
+          "sha256": "d314d93bf4354bc6d3467b43179b89f1ee42398df7ef4084acff0073794a900d"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ad240bb626b6921febd4508229141910",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53520,
+        "upload_time": "2021-12-16T06:02:53",
+        "upload_time_iso_8601": "2021-12-16T06:02:53.459791Z",
+        "url": "https://files.pythonhosted.org/packages/e8/00/b9d16c1635ffe76c467a6ea4e5ea9a63ec4bf78872cd7f93145a81ddad6e/torch_gauge-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5d6b75dfe73c4f6701445e62a42c9f83bbd134fd6c22ee660102ef689c21ff8",
+          "md5": "f406573a5af0c0405b50d564ef942fe8",
+          "sha256": "35a3d6c165a2a8739a91410fada77e3bd96a0e813e436655b1c4d966e29ca910"
+        },
+        "downloads": -1,
+        "filename": "torch_gauge-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f406573a5af0c0405b50d564ef942fe8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53523,
+        "upload_time": "2021-12-16T20:46:23",
+        "upload_time_iso_8601": "2021-12-16T20:46:23.419996Z",
+        "url": "https://files.pythonhosted.org/packages/c5/d6/b75dfe73c4f6701445e62a42c9f83bbd134fd6c22ee660102ef689c21ff8/torch_gauge-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c5d6b75dfe73c4f6701445e62a42c9f83bbd134fd6c22ee660102ef689c21ff8",
+        "md5": "f406573a5af0c0405b50d564ef942fe8",
+        "sha256": "35a3d6c165a2a8739a91410fada77e3bd96a0e813e436655b1c4d966e29ca910"
+      },
+      "downloads": -1,
+      "filename": "torch_gauge-0.2.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f406573a5af0c0405b50d564ef942fe8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 53523,
+      "upload_time": "2021-12-16T20:46:23",
+      "upload_time_iso_8601": "2021-12-16T20:46:23.419996Z",
+      "url": "https://files.pythonhosted.org/packages/c5/d6/b75dfe73c4f6701445e62a42c9f83bbd134fd6c22ee660102ef689c21ff8/torch_gauge-0.2.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,187 @@
+{
+  "info": {
+    "author": "CoreWeave",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Topic :: Internet",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: System :: Distributed Computing"
+    ],
+    "description": "# tensorizer\nModule, Model, and Tensor Serialization/Deserialization\n\n## TLDR\nExtremely fast model loads from HTTP/HTTPS and S3 endpoints. GPT-J\n(`20GB`) loads at wire-speed (`~5GB/s`) on a 40GbE network, and is\nonly bottlenecked by the Linux kernel TCP stack.\n\n## Rationale\nCoreWeave and our customers use KNative to deploy models as serverless\nfunctions. How long a model takes to load is a major factor in the latency\nof KNative scale-up. `tensorizer` is a tool to serialize models and their\nassociated tensors into a single file that can be loaded quickly and\nefficiently off an HTTP/HTTPS or S3 endpoint.\n\nBy not embedding the model in the container image, we can reduce the\ncontainer image size and the time it takes to load the model. This is\nespecially important for models that are large in size, such as\n[EleutherAI/gpt-neox-20B](https://huggingface.co/EleutherAI/gpt-neox-20B)\nthat weighs in at `~40GB`.\n\nThis decoupling of the model from the container image also allows us to\nupdate the model without having to rebuild the container image. This allows\nus to quickly iterate on the model and deploy new versions without having\nto wait for the container image to build or for the container image cache\nto be populated.\n\n`tensorizer` has S3 support, so we can store the serialized model in S3\nobject storage, and perform streaming loads from S3. This allows us to\nstream the model directly from S3 into the container without having to\ndownload the model to the container's local filesystem. This also\npertains to HTTP/HTTPS endpoints, as S3 is just an HTTP/HTTPS endpoint.\n\n`tensorizer` also has support for loading models from a local filesystem,\nso you can use it to serialize models locally and load them locally. This\nis extremely fast, as the same principles that make it fast for HTTP/HTTPS\nand S3 endpoints also apply to local filesystems.\n\n## Installation\n\n### From PyPI\n`tensorizer` can be installed from PyPI with `pip`:\n```bash\npython -m pip install tensorizer\n```\n\n### From Source\nYou can also install `tensorizer` from source using `pip`.\n\nTo clone the repository and install `tensorizer` in\n[editable mode](https://pip.pypa.io/en/stable/topics/local-project-installs/#editable-installs),\nrun:\n```bash\ngit clone https://github.com/coreweave/tensorizer\ncd tensorizer\npython -m pip install -e .\n```\n\nOr, run the following for `pip` to install `tensorizer`\n[directly from GitHub](https://pip.pypa.io/en/stable/topics/vcs-support/#git):\n```bash\npython -m pip install git+https://github.com/coreweave/tensorizer\n```\n\n## Basic Usage\nSerialization is done with the `TensorSerializer` class. It takes a\n`path_uri` argument that can be a local filesystem path, an HTTP/HTTPS\nendpoint, or an S3 endpoint.\n\n`write_module` is the main method of the `TensorSerializer` class. It\ntakes a `torch.nn.Module` and serializes the tensors to the `path_uri`\nendpoint.\n\nThe below example serializes the `EleutherAI/gpt-j-6B` model to an S3\nendpoint. It assumes that you have already configured your S3\ncredentials in `~/.s3cfg`.\n\n**NOTE:** Loading and serializing `gpt-j-6B` will take a lot of CPU RAM,\nup to `~20GB`. Additionally, when loading `gpt-j-6B` into a GPU, you\nwill need about `~16GB` of VRAM. If you don't have that much RAM or VRAM,\nyou can use the smaller `gpt-neo-125m` model instead.\n\n**NOTE2:** The below examples require the `transformers` and `accelerate`\nlibraries. You can install them with `pip`:\n```bash\npython -m pip install transformers accelerate\n```\n\n[serialize.py](examples/serialize.py)\n```python\nfrom transformers import AutoModelForCausalLM\nfrom tensorizer import TensorSerializer\nimport torch\n\nmodel_ref = \"EleutherAI/gpt-j-6B\"\n# For less intensive requirements, swap above with the line below:\n# model_ref = \"EleutherAI/gpt-neo-125m\"\nmodel_name = model_ref.split(\"/\")[-1]\n# Change this to your S3 bucket.\ns3_bucket = \"bucket\"\ns3_uri = f\"s3://{s3_bucket}/{model_name}.tensors\"\n\nmodel = AutoModelForCausalLM.from_pretrained(\n    model_ref,\n    revision=\"float16\",\n    torch_dtype=torch.float16,\n    low_cpu_mem_usage=True,\n)\n\nserializer = TensorSerializer(s3_uri)\nserializer.write_module(model)\nserializer.close()\n```\n\nConversely, deserialization is done with the `TensorDeserializer` class.\nIt takes a `path_uri` argument that can be a local filesystem path, an\nHTTP/HTTPS endpoint, or an S3 endpoint.\n\n`load_into_module` is the main method of the `TensorDeserializer` class.\nIt takes a `torch.nn.Module` and loads the tensors from the `path_uri`\nendpoint into the `torch.nn.Module`.\n\nThe below example loads the `EleutherAI/gpt-j-6B` model from an S3\nendpoint.\n\n[deserialize.py](examples/deserialize.py)\n```python\nimport torch\nimport os\nimport time\nfrom tensorizer import TensorDeserializer\nfrom tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage\nfrom collections import OrderedDict\n\n# disable missing keys and unexpected key warnings\nos.environ[\"TRANSFORMERS_VERBOSITY\"] = \"error\"\n\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig\n\nmodel_ref = \"EleutherAI/gpt-j-6B\"\n# To run this at home, swap this with the line below for a smaller example:\n# model_ref = \"EleutherAI/gpt-neo-125m\"\nmodel_name = model_ref.split(\"/\")[-1]\n# Change this to your S3 bucket.\ns3_bucket = \"bucket\"\ns3_uri = f\"s3://{s3_bucket}/{model_name}.tensors\"\n\nconfig = AutoConfig.from_pretrained(model_ref)\n\n# This ensures that the model is not initialized.\nmodel = no_init_or_tensor(\n    lambda: AutoModelForCausalLM.from_pretrained(\n        None, config=config, state_dict=OrderedDict()\n    )\n)\n\nbefore_mem = get_mem_usage()\n\n# Lazy load the tensors from S3 into the model.\nstart = time.time()\ndeserializer = TensorDeserializer(s3_uri, plaid_mode=True)\ndeserializer.load_into_module(model)\nend = time.time()\n\n# Brag about how fast we are.\ntotal_bytes_str = convert_bytes(deserializer.total_tensor_bytes)\nduration = end - start\nper_second = convert_bytes(deserializer.total_tensor_bytes / duration)\nafter_mem = get_mem_usage()\ndeserializer.close()\nprint(f\"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}\")\nprint(f\"Memory usage before: {before_mem}\")\nprint(f\"Memory usage after: {after_mem}\")\n\n# Tokenize and generate\nmodel.eval()\ntokenizer = AutoTokenizer.from_pretrained(model_ref)\ninput_ids = tokenizer.encode(\n    \"¡Hola! Encantado de conocerte. hoy voy a\", return_tensors=\"pt\"\n).to(\"cuda\")\n\nwith torch.no_grad():\n    output = model.generate(input_ids, max_new_tokens=50, do_sample=True)\n\nprint(f\"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}\")\n```\n\nIt should produce output similar to the following, with GPT-J-6B:\n```\nDeserialized model in 6.25 seconds\nTest Output: ¡Hola! Encantado de conocerte. hoy voy a comentar por primera\nvez una teoría de trineo, que quizá te parezca\nalgo desconocido, ya que en este mundo han\nllegado a dominar tantos\n```\n\nMore practical examples for the usage of `tensorizer` can be found in\n[examples/hf_serialization.py](examples/hf_serialization.py),\nwhere `df_main()` serializes models from\n[HuggingFace Diffusers](https://github.com/huggingface/diffusers)\nand `hf_main()` serializes\n[HuggingFace Transformers](https://github.com/huggingface/transformers) models.\n\n## Available Pre-Tensorized Models on the CoreWeave Cloud\n\nThe following models are available on the CoreWeave Cloud for free, and can be\nused with the `TensorDeserializer` class. The S3 support defaults to the\n`accel-object.ord1.coreweave.com` endpoint, and the bucket to use `tensorized`.\n\nWe name the keys in the S3 bucket after the HuggingFace model identifier, and\nappend the `/fp16` suffix for the half-precision version.\n\nFor example, the S3 URI for the `EleutherAI/gpt-j-6B` model is:\n`s3://tensorized/EleutherAI/gpt-j-6B/fp16/model.tensors`\n\nThe below table shows the available models and their S3 URIs.\n\n### Large Language Models\n\n| Model                                                                     | Precision | S3 URI  |\n|---------------------------------------------------------------------------|-----------|---------|\n| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-125M/model.tensors` |\n| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-125M/fp16/model.tensors` |\n| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/model.tensors` |\n| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/fp16/model.tensors` |\n| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/model.tensors` |\n| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/fp16/model.tensors` |\n| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)         | `fp32`    | `s3://tensorized/EleutherAI/gpt-j-6B/model.tensors` |\n| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)         | `fp16`    | `s3://tensorized/EleutherAI/gpt-j-6B/fp16/model.tensors` |\n| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neox-20b/model.tensors` |\n| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neox-20b/fp16/model.tensors` |\n| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)     | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m/model.tensors` |\n| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)     | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m/fp16/model.tensors` |\n| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b/model.tensors` |\n| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-1.4b/fp16/model.tensors` |\n| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b/model.tensors` |\n| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-2.8b/fp16/model.tensors` |\n| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b/model.tensors` |\n| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-6.9b/fp16/model.tensors` |\n| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)     | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b/model.tensors` |\n| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)     | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b/fp16/model.tensors` |\n| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/model.tensors` |\n| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/fp16/model.tensors` |\n| [EleutherAI/pythia-1.4b-deduped](https://huggingface.co/EleutherAI/pythia-1.4b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b-deduped/model.tensors` |\n| [EleutherAI/pythia-1.4b-deduped](https://huggingface.co/EleutherAI/pythia-1.4b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-1.4b-deduped/fp16/model.tensors` |\n| [EleutherAI/pythia-2.8b-deduped](https://huggingface.co/EleutherAI/pythia-2.8b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b-deduped/model.tensors` |\n| [EleutherAI/pythia-2.8b-deduped](https://huggingface.co/EleutherAI/pythia-2.8b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-2.8b-deduped/fp16/model.tensors` |\n| [EleutherAI/pythia-6.9b-deduped](https://huggingface.co/EleutherAI/pythia-6.9b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b-deduped/model.tensors` |\n| [EleutherAI/pythia-6.9b-deduped](https://huggingface.co/EleutherAI/pythia-6.9b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-6.9b-deduped/fp16/model.tensors` |\n| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/model.tensors` |\n| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/fp16/model.tensors` |\n| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/model.tensors` |\n| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/fp16/model.tensors` |\n| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/model.tensors` |\n| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/fp16/model.tensors` |\n| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/model.tensors` |\n| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/fp16/model.tensors` |\n| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/model.tensors` |\n| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/fp16/model.tensors` |\n| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/model.tensors` |\n| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/fp16/model.tensors` |\n| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono) | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-mono/model.tensors` |\n| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono) | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-mono/fp16/model.tensors` |\n| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-multi/model.tensors` |\n| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-multi/fp16/model.tensors` |\n| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-2B-multi/model.tensors` |\n| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-2B-multi/fp16/model.tensors` |\n| [Salesforce/codgen-6B-mono](https://huggingface.co/Salesforce/codgen-6B-mono) | `fp32`    | `s3://tensorized/Salesforce/codgen-6B-mono/model.tensors` |\n| [Salesforce/codgen-6B-mono](https://huggingface.co/Salesforce/codgen-6B-mono) | `fp16`    | `s3://tensorized/Salesforce/codgen-6B-mono/fp16/model.tensors` |\n| [Salesforce/codgen-6B-multi](https://huggingface.co/Salesforce/codgen-6B-multi) | `fp32`    | `s3://tensorized/Salesforce/codgen-6B-multi/model.tensors` |\n| [Salesforce/codgen-6B-multi](https://huggingface.co/Salesforce/codgen-6B-multi) | `fp16`    | `s3://tensorized/Salesforce/codgen-6B-multi/fp16/model.tensors` |\n| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono) | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-mono/model.tensors` |\n| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono) | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-mono/fp16/model.tensors` |\n| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-multi/model.tensors` |\n| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-multi/fp16/model.tensors` |\n\n## S3 Usage Notes\n`tensorizer` uses the `boto3` library to interact with S3. The easiest way\nto use `tensorizer` with S3 is to configure your S3 credentials in\n`~/.s3cfg`.\n\nIf you don't want to use `~/.s3cfg`, or wish to use a `.s3cfg` config file\nsaved at a nonstandard location (e.g. under `/var/run`), you can also specify\nyour S3 credentials using the `tensorizer.stream_io.open_stream()` function,\nand then pass that into the `TensorSerializer` or `TensorDeserializer`\nconstructor.\n\nThe `stream_io.open_stream()` function takes a `path_uri` argument, which can\nbe an `s3://` URI, and accepts the following keyword arguments:\n* `s3_access_key_id`: S3 access key ID\n* `s3_secret_access_key`: S3 secret access key\n* `s3_endpoint`: S3 endpoint\n\n*Or,*\n\n* `s3_config_path`: Alternative filesystem path to a `.s3cfg` config file\n\nFor example:\n```python\nTensorSerializer(\n    open_stream(s3_uri,\n                \"wb\",\n                s3_access_key_id=ACCESS_KEY,\n                s3_secret_access_key=SECRET_KEY,\n                s3_endpoint=\"object.ord1.coreweave.com\"))\n```\n\nand...\n\n```python\nTensorDeserializer(\n    open_stream(s3_uri,\n                \"rb\",\n                s3_access_key_id=ACCESS_KEY,\n                s3_secret_access_key=SECRET_KEY,\n                s3_endpoint=\"object.ord1.coreweave.com\"))\n```\n\n**NOTE:** For faster object downloads in the CoreWeave Cloud, you can use\nthe `accel-object.ord1.coreweave.com` endpoint. This endpoint is optimized\nfor object downloads, and will be faster than the `object.ord1.coreweave.com`\nendpoint once the object is cached.\n\n**NOTE2:** The cache above does not get invalidated when the object is updated\nin S3. If you update an object in S3, you will need to wait for the cache to\nexpire before you can download the updated object. This takes 24 hours since\nthe last download.\n\nFor this reason, it is recommended to use an unique S3 key for each version\nof a model if you use the `accel-object.ord1.coreweave.com` endpoint.\n\n## Additional Features\n`tensorizer` has a few additional features that make it more useful than\njust a serialization/deserialization tool.\n\n### Plaid Mode\n`tensorizer` has a `plaid_mode` argument that can be passed to the\n`TensorDeserializer` class. When `plaid_mode` is `True`, `tensorizer`\nwill load the tensors extremely fast. This is done by loading the tensors\ninto a `torch.nn.Module` that is not initialized, by overriding the\n`__init__` method of the `torch.nn.Module` to do nothing.\n\nThe tensors are them loaded into a buffer, and the buffer is zero-copied\ninto the uninitialized `torch.nn.Module`. This is unsafe, and should only\nbe used in inference cases where the model is not being trained.\n\n### `state_dict` Support\nThe `TensorDeserializer` object can be used as-is as a `state_dict` for\n`torch.nn.Module.load_state_dict`. This is useful for loading the tensors\ninto a `torch.nn.Module` that is already initialized, or for inspection.\n\nKeep in mind that `load_state_dict` is not a fast operation, and will\nlikely be much slower than `load_into_module`.\n\nThe `state_dict` can also be used to initialize a HuggingFace Transformers\nAutoModel. But HuggingFace Transformers performs three or more copies of\nthe data, so memory use will explode.\n\n## Running Tests\n`tensorizer` uses `unittest` for testing.\nThe tests have their own set of dependencies, which can be installed with\n`pip install -r tests/requirements.txt`.\n\nSome tests require a GPU, and will be skipped if no GPU is available.\nTo run the tests, run the following in the root of the repository:\n\n```bash\npython -m pip install -e .\npython -m pip install -r tests/requirements.txt\npython -m unittest discover tests/ --verbose\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "tensorizer,machine learning,serialization,tensor,pytorch",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tensorizer",
+    "package_url": "https://pypi.org/project/tensorizer/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tensorizer/",
+    "project_urls": {
+      "Homepage": "https://github.com/coreweave/tensorizer"
+    },
+    "release_url": "https://pypi.org/project/tensorizer/1.0.1/",
+    "requires_dist": [
+      "torch (>=1.9.0)",
+      "numpy (>=1.19.5)",
+      "protobuf (>=3.19.5)",
+      "psutil (>=5.9.4)",
+      "boto3 (>=1.26.0)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "A tool for fast PyTorch module, model, and tensor serialization + deserialization.",
+    "version": "1.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17392322,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0401645b83bf13769ce8588b8ecb18aed4323235075d97e94fe4584fec7eecc7",
+          "md5": "c1399c4c3b4bda5e4e0d1728800b3c29",
+          "sha256": "ed8d2ff04e6408cd29be96b79b002e33fb7a03df775087338bbcbaeaf1de4edb"
+        },
+        "downloads": -1,
+        "filename": "tensorizer-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c1399c4c3b4bda5e4e0d1728800b3c29",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 32015,
+        "upload_time": "2023-03-21T17:08:09",
+        "upload_time_iso_8601": "2023-03-21T17:08:09.922428Z",
+        "url": "https://files.pythonhosted.org/packages/04/01/645b83bf13769ce8588b8ecb18aed4323235075d97e94fe4584fec7eecc7/tensorizer-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f2a43de09863c65a04bb89dcc5cdc1448a111facee0f543421a8f19ac15cf43",
+          "md5": "37996678bfb7e19cf65a336436687835",
+          "sha256": "81d350018aa96116851c8eee1e6651493a7d912c95f3c9f09e8fe2a11349238f"
+        },
+        "downloads": -1,
+        "filename": "tensorizer-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "37996678bfb7e19cf65a336436687835",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 54698,
+        "upload_time": "2023-03-21T17:08:12",
+        "upload_time_iso_8601": "2023-03-21T17:08:12.423680Z",
+        "url": "https://files.pythonhosted.org/packages/4f/2a/43de09863c65a04bb89dcc5cdc1448a111facee0f543421a8f19ac15cf43/tensorizer-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ae19d8f13bd53687a23aaba458abd2c9a3405b49b5ed625fed55ab937eed177",
+          "md5": "e4e0bebcbf663287642af61012985eb3",
+          "sha256": "b471587a54c5eee7bcb375ee7c280556196e0c1af1d275df2dbf3c2619906aaa"
+        },
+        "downloads": -1,
+        "filename": "tensorizer-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e4e0bebcbf663287642af61012985eb3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 33438,
+        "upload_time": "2023-03-22T01:38:51",
+        "upload_time_iso_8601": "2023-03-22T01:38:51.765605Z",
+        "url": "https://files.pythonhosted.org/packages/7a/e1/9d8f13bd53687a23aaba458abd2c9a3405b49b5ed625fed55ab937eed177/tensorizer-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6909b05d09411a5d8497fc8b4e0d31e4e08d3e7a567e4dff13190065b0d8db5",
+          "md5": "702b5e716c30954266f50348a4a925d8",
+          "sha256": "e7ab717de7716bd6f6db5cc79a5f5e6d47c1db139ffa588553205681914c4951"
+        },
+        "downloads": -1,
+        "filename": "tensorizer-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "702b5e716c30954266f50348a4a925d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 56189,
+        "upload_time": "2023-03-22T01:38:53",
+        "upload_time_iso_8601": "2023-03-22T01:38:53.093105Z",
+        "url": "https://files.pythonhosted.org/packages/d6/90/9b05d09411a5d8497fc8b4e0d31e4e08d3e7a567e4dff13190065b0d8db5/tensorizer-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7ae19d8f13bd53687a23aaba458abd2c9a3405b49b5ed625fed55ab937eed177",
+        "md5": "e4e0bebcbf663287642af61012985eb3",
+        "sha256": "b471587a54c5eee7bcb375ee7c280556196e0c1af1d275df2dbf3c2619906aaa"
+      },
+      "downloads": -1,
+      "filename": "tensorizer-1.0.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e4e0bebcbf663287642af61012985eb3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 33438,
+      "upload_time": "2023-03-22T01:38:51",
+      "upload_time_iso_8601": "2023-03-22T01:38:51.765605Z",
+      "url": "https://files.pythonhosted.org/packages/7a/e1/9d8f13bd53687a23aaba458abd2c9a3405b49b5ed625fed55ab937eed177/tensorizer-1.0.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d6909b05d09411a5d8497fc8b4e0d31e4e08d3e7a567e4dff13190065b0d8db5",
+        "md5": "702b5e716c30954266f50348a4a925d8",
+        "sha256": "e7ab717de7716bd6f6db5cc79a5f5e6d47c1db139ffa588553205681914c4951"
+      },
+      "downloads": -1,
+      "filename": "tensorizer-1.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "702b5e716c30954266f50348a4a925d8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 56189,
+      "upload_time": "2023-03-22T01:38:53",
+      "upload_time_iso_8601": "2023-03-22T01:38:53.093105Z",
+      "url": "https://files.pythonhosted.org/packages/d6/90/9b05d09411a5d8497fc8b4e0d31e4e08d3e7a567e4dff13190065b0d8db5/tensorizer-1.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

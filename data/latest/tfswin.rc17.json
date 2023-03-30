@@ -1,0 +1,465 @@
+{
+  "info": {
+    "author": "Shkarupa Alex",
+    "author_email": "shkarupa.alex@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Education",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Topic :: Scientific/Engineering",
+      "Topic :: Software Development",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# tfswin\n\nKeras (TensorFlow v2) reimplementation of **Swin Transformer** and **Swin Transformer V2** models.\n\n+ Based on [Official Pytorch implementation](https://github.com/microsoft/Swin-Transformer).\n+ Supports variable-shape inference for downstream tasks.\n+ Contains pretrained weights converted from official ones.\n\n## Installation\n\n```bash\npip install tfswin\n```\n\n## Examples\n\nDefault usage (without preprocessing):\n\n```python\nfrom tfswin import SwinTransformerTiny224  # + 5 other variants and input preprocessing\n\n# or \n# from tfswin import SwinTransformerV2Tiny256  # + 5 other variants and input preprocessing\n\n\nmodel = SwinTransformerTiny224()  # by default will download imagenet[21k]-pretrained weights\nmodel.compile(...)\nmodel.fit(...)\n```\n\nCustom classification (with preprocessing):\n\n```python\nfrom keras import layers, models\nfrom tfswin import SwinTransformerTiny224, preprocess_input\n\ninputs = layers.Input(shape=(224, 224, 3), dtype='uint8')\noutputs = layers.Lambda(preprocess_input)(inputs)\noutputs = SwinTransformerTiny224(include_top=False)(outputs)\noutputs = layers.Dense(100, activation='softmax')(outputs)\n\nmodel = models.Model(inputs=inputs, outputs=outputs)\nmodel.compile(...)\nmodel.fit(...)\n```\n\n## Differences\n\nCode simplification:\n\n- Pretrain input height and width are always equal\n- Patch height and width are always equal\n- All input shapes automatically evaluated (not passed through a constructor like in PyTorch)\n- Downsampling have been moved out from basic layer to simplify feature extraction in downstream tasks.\n\nPerformance improvements:\n\n- Layer normalization epsilon fixed at `1.001e-5`, inputs are casted to `float32` to use fused op implementation.\n- Some layers have been refactored to use faster TF operations.\n- A lot of reshapes have been removed. Most of the time internal representation is 4D-tensor.\n- Attention mask and relative index estimations moved to basic layer level.\n\n## Variable shapes\n\nSwin Transformer receptive field is larger or equal to pretraining image size. Window reduction is used in image\nclassification [V1](https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py#L206)\nand [V2](https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer_v2.py#L228) pipelines. E.g.:\n\n- SwinTransformerTiny224: last stage size is 7x7 with window size 7, no shift for last stage.\n- SwinTransformerLarge384: last stage size is 12x12 with window size 12, no shift for last stage.\n- SwinTransformerV2Tiny256: last stages sizes are 16x16 and 8x8 with window size 16 and 16->6, no shift for 2 last\n  stages.\n- SwinTransformerV2Large384: last stages sizes are 24x24 and 12x12 with window size 24 and 24->12, no shift for 2 last\n  stages.\n\nBut there is no such trick in semantic segmentation\n[backbone](https://github.com/SwinTransformer/Swin-Transformer-Semantic-Segmentation/blob/main/mmseg/models/backbones/swin_transformer.py#L180).\nThis reimplementation always applies window reduction conditioned on dynamic input height and width.\n\nWhen using Swin models with input shapes different from pretraining one, try to make height and width to be multiple\nof `32 * window_size`. Otherwise a lot of tensors will be padded, resulting in speed degradation.\n\n## Evaluation\n\nFor correctness, `Tiny` and `Small` models (original and ported) tested\nwith [ImageNet-v2 test set](https://www.tensorflow.org/datasets/catalog/imagenet_v2).\n\nNote: Swin models are very sensitive to input preprocessing (bicubic resize in the original evaluation script).\n\n```python\nimport tensorflow as tf\nimport tensorflow_datasets as tfds\nfrom tfswin import SwinTransformerTiny224, preprocess_input\n\n\ndef _prepare(example, input_size=224, crop_pct=0.875):\n    scale_size = tf.math.floor(input_size / crop_pct)\n\n    image = example['image']\n\n    shape = tf.shape(image)[:2]\n    shape = tf.cast(shape, 'float32')\n    shape *= scale_size / tf.reduce_min(shape)\n    shape = tf.round(shape)\n    shape = tf.cast(shape, 'int32')\n\n    image = tf.image.resize(image, shape, method=tf.image.ResizeMethod.BICUBIC)\n    image = tf.round(image)\n    image = tf.clip_by_value(image, 0., 255.)\n    image = tf.cast(image, 'uint8')\n\n    pad_h, pad_w = tf.unstack((shape - input_size) // 2)\n    image = image[pad_h:pad_h + input_size, pad_w:pad_w + input_size]\n\n    image = preprocess_input(image)\n\n    return image, example['label']\n\n\nimagenet2 = tfds.load('imagenet_v2', split='test', shuffle_files=True)\nimagenet2 = imagenet2.map(_prepare, num_parallel_calls=tf.data.AUTOTUNE)\nimagenet2 = imagenet2.batch(8)\n\nmodel = SwinTransformerTiny224()\nmodel.compile('sgd', 'sparse_categorical_crossentropy', ['accuracy', 'sparse_top_k_categorical_accuracy'])\nhistory = model.evaluate(imagenet2)\n\nprint(history)\n```\n\n|   name    | original acc@1 | ported acc@1 | original acc@5 | ported acc@5 |\n|:---------:|:--------------:|:------------:|:--------------:|:------------:|\n| Swin-T V1 |     67.64      |  ~~67.81~~   |     87.84      |  ~~87.87~~   |\n| Swin-S V1 |     70.66      |  ~~70.80~~   |     89.34      |  ~~89.49~~   |\n| Swin-T V2 |     71.69      |    72.00     |     90.04      |    90.06     |\n| Swin-S V2 |     73.20      |    73.57     |     91.24      |    91.11     |\n\nNote: Swin V1 model were evaluated with wrong preprocessing (distorted aspect ratio) and ImageNet-1K weights which were\nreplaced with ImageNet-21K weights in 3.0.0 release.\n\nThe most metric differences comes from input data preprocessing (decoding, interpolation).\nAll layers outputs have been compared with original ones.\nMost of them have maximum absolute difference around `9.9e-5`.\nMaximum absolute difference among all layers is `3.5e-4`.\n\n## Citation\n\n```\n@inproceedings{liu2021Swin,\n  title={Swin Transformer: Hierarchical Vision Transformer using Shifted Windows},\n  author={Liu, Ze and Lin, Yutong and Cao, Yue and Hu, Han and Wei, Yixuan and Zhang, Zheng and Lin, Stephen and Guo, Baining},\n  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},\n  year={2021}\n}\n```\n\n```\n@inproceedings{liu2021swinv2,\n  title={Swin Transformer V2: Scaling Up Capacity and Resolution}, \n  author={Ze Liu and Han Hu and Yutong Lin and Zhuliang Yao and Zhenda Xie and Yixuan Wei and Jia Ning and Yue Cao and Zheng Zhang and Li Dong and Furu Wei and Baining Guo},\n  booktitle={International Conference on Computer Vision and Pattern Recognition (CVPR)},\n  year={2022}\n}\n```",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/shkarupa-alex/tfswin",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tfswin",
+    "package_url": "https://pypi.org/project/tfswin/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tfswin/",
+    "project_urls": {
+      "Homepage": "https://github.com/shkarupa-alex/tfswin"
+    },
+    "release_url": "https://pypi.org/project/tfswin/3.3.3/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Keras (TensorFlow v2) reimplementation of Swin Transformer V1 & V2 models.",
+    "version": "3.3.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16839055,
+  "releases": {
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3fbe87602b0c76c22dfee47a8b515d587d1d6acc77263645d336789fcaa45c5",
+          "md5": "330c1b3fe4dc86bdee7f53faba960972",
+          "sha256": "58d112be5ee2bc8d67a079e79deeca96628f9d894d8f5ba9cf7db923b4398710"
+        },
+        "downloads": -1,
+        "filename": "tfswin-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "330c1b3fe4dc86bdee7f53faba960972",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14282,
+        "upload_time": "2021-11-17T20:54:49",
+        "upload_time_iso_8601": "2021-11-17T20:54:49.943966Z",
+        "url": "https://files.pythonhosted.org/packages/a3/fb/e87602b0c76c22dfee47a8b515d587d1d6acc77263645d336789fcaa45c5/tfswin-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6b8e9107627981bde45b34c664cdf495433d8dce4a49b55052a88d8b1328bfb8",
+          "md5": "eb4f7e4fee10878282625d8ff2535f8f",
+          "sha256": "6945c8dfbc6aff2711e19e9588a5177f57e9018498746dab4eedd908de6021b7"
+        },
+        "downloads": -1,
+        "filename": "tfswin-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eb4f7e4fee10878282625d8ff2535f8f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14365,
+        "upload_time": "2021-11-19T08:16:18",
+        "upload_time_iso_8601": "2021-11-19T08:16:18.947929Z",
+        "url": "https://files.pythonhosted.org/packages/6b/8e/9107627981bde45b34c664cdf495433d8dce4a49b55052a88d8b1328bfb8/tfswin-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e0d6ed725587ee42fa1593dc234a0a4882fbad324fbc42be990d16e0ca6d717",
+          "md5": "9fdc21be9b8ff953934f6d0d4d3a4649",
+          "sha256": "16e2d9b168f580529f536e336ef33bc994092d39f605c3a694ca4db1e857a5ef"
+        },
+        "downloads": -1,
+        "filename": "tfswin-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9fdc21be9b8ff953934f6d0d4d3a4649",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15809,
+        "upload_time": "2021-11-23T09:09:12",
+        "upload_time_iso_8601": "2021-11-23T09:09:12.277137Z",
+        "url": "https://files.pythonhosted.org/packages/8e/0d/6ed725587ee42fa1593dc234a0a4882fbad324fbc42be990d16e0ca6d717/tfswin-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c767d71e74990bb594de5ede4c9ec2269cf4bb39388afca49e5b9342acc269d9",
+          "md5": "1bd129abf4dd1952bb90c56c0835c7c2",
+          "sha256": "3cf567d7c832f5ed28d781d625acc5220badf6d1f4b2c27efe25395dbd8138a7"
+        },
+        "downloads": -1,
+        "filename": "tfswin-1.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1bd129abf4dd1952bb90c56c0835c7c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15822,
+        "upload_time": "2021-11-23T10:06:15",
+        "upload_time_iso_8601": "2021-11-23T10:06:15.038697Z",
+        "url": "https://files.pythonhosted.org/packages/c7/67/d71e74990bb594de5ede4c9ec2269cf4bb39388afca49e5b9342acc269d9/tfswin-1.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4440c28856fd17880d63f9184237a680ea47f21dbe27583863b4dab92c66c20a",
+          "md5": "f219b8e02bbc9ff4eea0f5959e971860",
+          "sha256": "551eea2574aa3c1151445fc42a96cf1f011f71ed7aeb776d2c08467ff36e1e64"
+        },
+        "downloads": -1,
+        "filename": "tfswin-1.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f219b8e02bbc9ff4eea0f5959e971860",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15855,
+        "upload_time": "2021-11-23T10:36:00",
+        "upload_time_iso_8601": "2021-11-23T10:36:00.146131Z",
+        "url": "https://files.pythonhosted.org/packages/44/40/c28856fd17880d63f9184237a680ea47f21dbe27583863b4dab92c66c20a/tfswin-1.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11afa534ff7e74cf8c5b5b1e805c5226e24ee09c46d7ab97dac94d60e89adabe",
+          "md5": "2fdc3b5f2e200b05f22f3e9b445fd3c8",
+          "sha256": "22a0f9c00b73b5db0e7a5ff00135dc99a19069f9f128193e3520f4618245cf2a"
+        },
+        "downloads": -1,
+        "filename": "tfswin-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2fdc3b5f2e200b05f22f3e9b445fd3c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16646,
+        "upload_time": "2021-11-30T18:26:03",
+        "upload_time_iso_8601": "2021-11-30T18:26:03.661950Z",
+        "url": "https://files.pythonhosted.org/packages/11/af/a534ff7e74cf8c5b5b1e805c5226e24ee09c46d7ab97dac94d60e89adabe/tfswin-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "352c7db4191a17e03f4db02c6ff7932210107aa39342f8070cd5790b9f05b27f",
+          "md5": "c420faf06f9efdd8e3240700020b9069",
+          "sha256": "039ec2f3a0cff49216596c038bb79b41a7e1e6631257ea38dd7a4dd07b19d3d0"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c420faf06f9efdd8e3240700020b9069",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19322,
+        "upload_time": "2022-05-27T09:32:50",
+        "upload_time_iso_8601": "2022-05-27T09:32:50.741877Z",
+        "url": "https://files.pythonhosted.org/packages/35/2c/7db4191a17e03f4db02c6ff7932210107aa39342f8070cd5790b9f05b27f/tfswin-3.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8392ea0dc5d7e7efd3c4b58633341eafd5d0ff4b4fb21e471fde4e6e51eec68",
+          "md5": "37a726d92ed7f2c5c54b047beb8f4b91",
+          "sha256": "6111d66559eeed0c8e923ee9dfd68439d20c83231c35cefbeb2170de34ffb7dc"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "37a726d92ed7f2c5c54b047beb8f4b91",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19203,
+        "upload_time": "2022-08-11T16:48:52",
+        "upload_time_iso_8601": "2022-08-11T16:48:52.722913Z",
+        "url": "https://files.pythonhosted.org/packages/b8/39/2ea0dc5d7e7efd3c4b58633341eafd5d0ff4b4fb21e471fde4e6e51eec68/tfswin-3.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fafdc8942a06813a5a1cefdee488b7f92477426ca8bbad6486451c078cb9d6f8",
+          "md5": "f8acc64f8ca06d55473802953349619c",
+          "sha256": "c0386c7c592a8c1fcb9a50e2ff801ddc15e113cb7126f1810bfb936e7470bca0"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f8acc64f8ca06d55473802953349619c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19817,
+        "upload_time": "2022-08-12T12:33:54",
+        "upload_time_iso_8601": "2022-08-12T12:33:54.327328Z",
+        "url": "https://files.pythonhosted.org/packages/fa/fd/c8942a06813a5a1cefdee488b7f92477426ca8bbad6486451c078cb9d6f8/tfswin-3.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a7a5fe10e92ce80cf0b963b132572269909e2e84c4b0aa5f8fe10cc83645eb3",
+          "md5": "a64ee4bfe57ae49dcf1e1ca331eeaa6f",
+          "sha256": "6074d7b1b0e4e3869cc28b7e57f2279ce8dc88d5b09355ee7cb8a8f197785a71"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a64ee4bfe57ae49dcf1e1ca331eeaa6f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19820,
+        "upload_time": "2022-09-12T20:58:12",
+        "upload_time_iso_8601": "2022-09-12T20:58:12.473490Z",
+        "url": "https://files.pythonhosted.org/packages/8a/7a/5fe10e92ce80cf0b963b132572269909e2e84c4b0aa5f8fe10cc83645eb3/tfswin-3.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4c0df9d5c67939a782d3c50411c2ced0405fffba7bb6da46abd28b9370de9e7",
+          "md5": "1d8ca63b05916fd64aac814d3bef4f31",
+          "sha256": "9735b7cf736b5aba6eaa489d71363cbb40d95c166803b0e9c3f62fa8b84a75f7"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1d8ca63b05916fd64aac814d3bef4f31",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19792,
+        "upload_time": "2022-12-11T13:18:37",
+        "upload_time_iso_8601": "2022-12-11T13:18:37.760324Z",
+        "url": "https://files.pythonhosted.org/packages/e4/c0/df9d5c67939a782d3c50411c2ced0405fffba7bb6da46abd28b9370de9e7/tfswin-3.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4b616dce05f23f0f58570d67bcdf64ba84dde2e6ae0791eb955364a73597888",
+          "md5": "a104966e988384e169020d1ca563e0fe",
+          "sha256": "06df7406a473c22fe60b244a118009179a4f93ac70478143d84c0893505ba729"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a104966e988384e169020d1ca563e0fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20270,
+        "upload_time": "2022-12-28T19:42:43",
+        "upload_time_iso_8601": "2022-12-28T19:42:43.352207Z",
+        "url": "https://files.pythonhosted.org/packages/e4/b6/16dce05f23f0f58570d67bcdf64ba84dde2e6ae0791eb955364a73597888/tfswin-3.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3812d290ddfb7542ccab5e85aa9529991f3bf22b58618a4305fb58c19f7af2a4",
+          "md5": "6e18f5a5957211162df582f643a32e5d",
+          "sha256": "f34bf3549fad066566bce6c87833a42af8811b7b120d1963dc3ca5d9893acabf"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6e18f5a5957211162df582f643a32e5d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20198,
+        "upload_time": "2023-01-04T20:06:05",
+        "upload_time_iso_8601": "2023-01-04T20:06:05.613308Z",
+        "url": "https://files.pythonhosted.org/packages/38/12/d290ddfb7542ccab5e85aa9529991f3bf22b58618a4305fb58c19f7af2a4/tfswin-3.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff729252d87337eb4245bf5adf59cb388f365dba638cc408ee82d085b260a326",
+          "md5": "2c7d2022d516f68104160d592d469799",
+          "sha256": "12f7a695ef207f6b78c9b3ee1071d5beaec4b08b832f0d6a083580b8bf32f35c"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c7d2022d516f68104160d592d469799",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20839,
+        "upload_time": "2023-01-17T08:03:02",
+        "upload_time_iso_8601": "2023-01-17T08:03:02.134755Z",
+        "url": "https://files.pythonhosted.org/packages/ff/72/9252d87337eb4245bf5adf59cb388f365dba638cc408ee82d085b260a326/tfswin-3.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e6c406896fd21d84fbdb5d620a3a86ff7f8924a3f75db95d0bd4827c3d9c1b23",
+          "md5": "a1d1bf19c6ecc9fac04f3f1ed7c59dac",
+          "sha256": "055afc275c258a81fad605467f4d2b1e485f7ba06dfda2581c053d5fba6568a9"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a1d1bf19c6ecc9fac04f3f1ed7c59dac",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20832,
+        "upload_time": "2023-01-31T10:49:54",
+        "upload_time_iso_8601": "2023-01-31T10:49:54.899817Z",
+        "url": "https://files.pythonhosted.org/packages/e6/c4/06896fd21d84fbdb5d620a3a86ff7f8924a3f75db95d0bd4827c3d9c1b23/tfswin-3.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96af959184468a94c5241427209261c50f0e0355566b0c7f6b32df2927186c15",
+          "md5": "976f578c4ec6b201c6fe7d3e0ba96ce8",
+          "sha256": "5083312e4b6c1adab592ce604f657c29cfcaef43b495c9e7917d3b9f2bbc0324"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "976f578c4ec6b201c6fe7d3e0ba96ce8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20737,
+        "upload_time": "2023-02-10T10:07:04",
+        "upload_time_iso_8601": "2023-02-10T10:07:04.364677Z",
+        "url": "https://files.pythonhosted.org/packages/96/af/959184468a94c5241427209261c50f0e0355566b0c7f6b32df2927186c15/tfswin-3.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c8f952456be490730bfe0f7985789c8848c75a9aeb0aa1f3a2ac299a1cc3b83",
+          "md5": "c8fc5dd6f040c97d000205b4371ebad7",
+          "sha256": "67bfb845b0879dfd1afda2d49cd6df20fccb3554b735e0a8fc6a377d5ac7013d"
+        },
+        "downloads": -1,
+        "filename": "tfswin-3.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c8fc5dd6f040c97d000205b4371ebad7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20755,
+        "upload_time": "2023-02-13T14:51:25",
+        "upload_time_iso_8601": "2023-02-13T14:51:25.025133Z",
+        "url": "https://files.pythonhosted.org/packages/0c/8f/952456be490730bfe0f7985789c8848c75a9aeb0aa1f3a2ac299a1cc3b83/tfswin-3.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0c8f952456be490730bfe0f7985789c8848c75a9aeb0aa1f3a2ac299a1cc3b83",
+        "md5": "c8fc5dd6f040c97d000205b4371ebad7",
+        "sha256": "67bfb845b0879dfd1afda2d49cd6df20fccb3554b735e0a8fc6a377d5ac7013d"
+      },
+      "downloads": -1,
+      "filename": "tfswin-3.3.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c8fc5dd6f040c97d000205b4371ebad7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 20755,
+      "upload_time": "2023-02-13T14:51:25",
+      "upload_time_iso_8601": "2023-02-13T14:51:25.025133Z",
+      "url": "https://files.pythonhosted.org/packages/0c/8f/952456be490730bfe0f7985789c8848c75a9aeb0aa1f3a2ac299a1cc3b83/tfswin-3.3.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

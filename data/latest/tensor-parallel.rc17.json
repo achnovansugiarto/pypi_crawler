@@ -1,0 +1,859 @@
+{
+  "info": {
+    "author": "Andrei Panferov and Yaroslav Lisnyak",
+    "author_email": "yalisnyak@nes.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Mathematics",
+      "Topic :: Software Development",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# tensor_parallel\n[![PyPI version](https://img.shields.io/pypi/v/tensor-parallel.svg?color=blue)](https://pypi.org/project/tensor-parallel/)\n[![Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n[![CI status](https://github.com/BlackSamorez/tensor_parallel/actions/workflows/run-tests.yaml/badge.svg?branch=main)](https://github.com/BlackSamorez/tensor_parallel/actions)\n\n<p align=\"center\">\n    🚀 &nbsp;<b><a href=\"https://www.kaggle.com/code/blacksamorez/tensor-parallel-int8-llm/\">Try new 20B LLMs demo in Kaggle</a></b>\n</p>\n\nRun large PyTorch models on multiple GPUs in one line of code.\n\n```python\nimport transformers\nimport tensor_parallel as tp\ntokenizer = transformers.AutoTokenizer.from_pretrained(\"facebook/opt-13b\")\nmodel = transformers.AutoModelForCausalLM.from_pretrained(\"facebook/opt-13b\")  # use opt-125m for testing\n\nmodel = tp.tensor_parallel(model, [\"cuda:0\", \"cuda:1\"])  # <- each GPU has half the weights\n\ninputs = tokenizer(\"A cat sat\", return_tensors=\"pt\")[\"input_ids\"].to(\"cuda:0\")\noutputs = model.generate(inputs, num_beams=5)\nprint(tokenizer.decode(outputs[0])) # A cat sat on my lap for a few minutes ...\n\nmodel(input_ids=inputs, labels=inputs).loss.backward()  # training works as usual\n```\n\n## Installation\nLatest stable version (recommended):\n```\npip install tensor_parallel\n```\nBleeding edge version:\n```\npip install https://github.com/BlackSamorez/tensor_parallel/archive/main.zip\n```\n\n\n## Usage\n\n\nSimply wrap your PyTorch model with `tp.tensor_parallel` and use it normally.\nFor best memory efficiency, call `tp.tensor_parallel` while the model is still on CPU.  \n\nHere are a few use cases:\n- [`examples/training_flan-t5-xl.ipynb`](./examples/training_flan-t5-xl.ipynb) - fine-tune full FLAN-T5 model on text summarization\n- __TBA__ - inferencing a large language model with LLM.8bit + tensor_parallel\n- __TBA__ - defining custom parallelism strategy\n\n\nAdvanced parameters to `tensor_parallel`:\n- `device_ids: List[device]` - which devices to use; defaults to all available GPUs\n- `output_device: device` - model outputs will have this device\n- `config: tp.Config` - use custom parallelism strategy, see [`slicing_configs.py`](./tensor_parallel/slicing_configs.py)\n- `distributed: bool` - if True, use torch.distributed backend instead of threading (requires `torchrun`)\n- `sharded: bool` - if True, find all trainable parameters that weren't split by Tensor Parallelism and split them using [ZeRO-3 algorithm](https://deepspeed.readthedocs.io/en/latest/zero3.html).\n   - weights will be split between GPUs and re-assembled before each forward pass\n   - TL;DR use this when training to avoid duplicate parameters (enabled by default!) \n   - `sharded_param_names: List[str]` - parameter names that should be sharded this way, default = found automatically\n\n  \n### Saving the model\n\nTo save a model such that it could be used in a non `tensor_parallel` context, you should use a `save_tensor_parallel` context wrapper.\n\n```python\nimport torch\nimport transformers\nimport tensor_parallel as tp\n\nmodel = tp.tensor_parallel(\n    transformers.AutoModelForCausalLM.from_pretrained(\"facebook/opt-13b\"), \n)\n\n# A whole lot of trainig...\n\nwith tp.save_tensor_parallel(model):\n    torch.save(model.state_dict(), \"/tmp/\")\n    # or \n    model.save_pretrained(\"/tmp/\")\n```\n\nSuch code saves a model as if it was never split. It works by gathering model parts during `state_dict` creation.\n  \n### Memory efficient dispatch\n\nNormally, to normally create and dispatch a `tensor_parallel` model, one needs the whole model in memory. This can be troublesome, but there is another way.\n\nIt's possible to convert a `state_dict` of a basic model into the corresponding `tensor_parallel` `state_dict` using a helper function `convert_state_dict`. The state dict can then be dispatched and loaded into the model:\n\n```python\nimport transformers\nimport tensor_parallel as tp\n\nfrom accelerate import init_empty_weights, load_checkpoint_in_model\n\n# Initialize a weightless tensor_parallel model from MyModel\nwith init_empty_weights():\n    model = tp.TensorParallel(\n        MyModel(),\n        device_ids=[0, 1] # and prepare it to be put on GPUs 0 and 1\n    )\n\n# Load partial state_dict for MyModel\nstate_dict = torch.load(\"my_model_part_1_of_5.bin\")\n\n# Convert it into a tensor_parallel state_dict\ntensor_parallel_state_dict = tp.tensor_parallel(\n    state_dict,\n    tensor_parallel_config=model.tensor_parallel_config,\n    world_size=len(model.devices),\n)\n\n# Dispatch the partial state_dict\nmodel.load_state_dict(tensor_parallel_state_dict)\n```\n\nWith this no more than one part of the model needs to be loaded into memory at once. \n  \n## FAQ\n\n- __Q:__ I don't have a multi-GPU server. Can I use tensor_parallel in Google Colab?\n- __A:__ Colab has a single GPU, so there's no point in tensor parallelism. However, [Kaggle offers two T4 for free](https://www.kaggle.com/code/muellerzr/multi-gpu-and-accelerate) to all phone-verified accounts.\n\n\n- __Q:__ What is tensor parallelism?\n- __A:__ You split each layer's weights into parts, multiply each part on a separate GPU, then gather results. Read more [here](https://colossalai.org/docs/concepts/paradigms_of_parallelism/)\n \n\n- __Q:__ Should I use `TensorParallel` or `DataParallel`?\n- __A:__ TensorParallel for large models, DataParallel for smaller ones\n\n\n- __Q:__ How does it compare against FullyShardedDataParallel and ZeRO?\n- __A:__ ZeRO is better if you can fit a large batch, TensorParallel is better for small batches\n\n\nWhy use `tensor_parallel` ...\n- v.s. [DeepSpeed](https://github.com/microsoft/DeepSpeed) and [FairScale](https://github.com/facebookresearch/fairscale/)\n  - DeepSpeed has many parallelization strategies, but requires careful configuration\n  - tensor_parallel has one strategy that works with 1 line of code\n  - tensor_parallel works in a jupyter notebook\n- v.s. [MegatronLM](https://github.com/NVIDIA/Megatron-LM)?\n  - MegatronLM has _great_ tensor parallelism for one model architecture\n  - tensor_parallel has _good_ parallelism for any architecture\n  - tensor_parallel is way easier to install\n- v.s. [parallelformers](https://github.com/tunib-ai/parallelformers)?\n  - parallelformers implements a fixed [list of architectures](https://github.com/tunib-ai/parallelformers/tree/main/parallelformers/transformers)\n  - tensor_parallel works for any architecture automatically \n  - parallelformers is inference-only, tensor_parallel supports training\n- v.s. [`alpa`](https://github.com/alpa-projects/alpa)\n  - alpa is a powerful tool for automatic distributed training / inference in JAX\n  - tensor_parallel works with PyTorch\n- v.s. [`Model.parallelize()`](https://huggingface.co/docs/transformers/model_doc/gpt2#transformers.GPT2Model.parallelize)?\n  - both are easy to use, both fit large models\n  - in parallelize, one GPU works at a time\n  - in tensor_parallel, GPUs work in parallel\n\nIn short, use `tensor_parallel` for quick prototyping on a single machine.\nUse DeepSpeed+Megatron or alpa for million-dollar training runs.\n\n\n## Troubleshooting\n\nIf you experience NCCL errors, or random hanging, you may have some code errors that are not displayed properly. \nTo debug these errors, we recommend restarting with `export TENSOR_PARALLEL_USE_NATIVE=1` or on a single device. \n\nIf you found a bug or encountered a problem, please report it to [our issue tracker](https://github.com/BlackSamorez/tensor_parallel/issues).\nWe will do our best to help, but it may take some time before we get to it.\nPlease create issues only if your problem is specifically with `tensor_parallel`.\nFor example, if you need help installing `transformers` or optimizing your code, please seek it elsewhere.\n\n### Code style\n\nWe use [black](https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html) and [isort](https://pycqa.github.io/isort/) for all pull requests.\nBefore committing your code, simply run `black . && isort .` and you will be fine.\n\n--------------------------------------------------------------------------------\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/BlackSamorez/tensor_parallel",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tensor-parallel",
+    "package_url": "https://pypi.org/project/tensor-parallel/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tensor-parallel/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/BlackSamorez/tensor_parallel/issues",
+      "Homepage": "https://github.com/BlackSamorez/tensor_parallel"
+    },
+    "release_url": "https://pypi.org/project/tensor-parallel/1.1.4/",
+    "requires_dist": [
+      "torch (>=1.11)",
+      "transformers (>=4.20.1)",
+      "pytest (==6.2.5) ; extra == 'dev'",
+      "pytest-forked ; extra == 'dev'",
+      "pytest-asyncio (==0.16.0) ; extra == 'dev'",
+      "accelerate (==0.15.0) ; extra == 'dev'",
+      "black (==22.3.0) ; extra == 'dev'",
+      "isort (==5.10.1) ; extra == 'dev'",
+      "psutil ; extra == 'dev'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Automatically shard your large model between multiple GPUs, works without torch.distributed",
+    "version": "1.1.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17466615,
+  "releases": {
+    "1.0.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "570532726c66bd0017d4a225e5eb913a1ef6c853c3b594888e5a300c458dea5f",
+          "md5": "6201be66dd7845ccb8f6f5bb1363bca0",
+          "sha256": "46c7d48ddab4c7276656c8d8e7ed5f294c3c5a172359b2075b36de48afe14996"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6201be66dd7845ccb8f6f5bb1363bca0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 3313,
+        "upload_time": "2022-12-14T11:59:37",
+        "upload_time_iso_8601": "2022-12-14T11:59:37.846887Z",
+        "url": "https://files.pythonhosted.org/packages/57/05/32726c66bd0017d4a225e5eb913a1ef6c853c3b594888e5a300c458dea5f/tensor_parallel-1.0.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59618e200672ceab74eb33c2561ff06553d1d7a1948f0a984e591b4c26b0b8e7",
+          "md5": "ef933272e9297d2ab13a6b27356a1212",
+          "sha256": "a0a11a9d09afc9ba73dd70018d2f91bebf54ad15e247a4470bd3a70c6198a295"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ef933272e9297d2ab13a6b27356a1212",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 3359,
+        "upload_time": "2022-12-14T11:59:39",
+        "upload_time_iso_8601": "2022-12-14T11:59:39.780701Z",
+        "url": "https://files.pythonhosted.org/packages/59/61/8e200672ceab74eb33c2561ff06553d1d7a1948f0a984e591b4c26b0b8e7/tensor_parallel-1.0.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "985cea550efe9470ebc10964247d35b8cf3a7b7bb8c4dc46067bd1c1324e0e0a",
+          "md5": "9883851f0af734b74e36077b6d332e1a",
+          "sha256": "f0f0c5ba8f8ced9c1e3a370493ae1564fd140b68733186ec4abc48bdbc3c493c"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9883851f0af734b74e36077b6d332e1a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 16443,
+        "upload_time": "2022-12-14T12:26:38",
+        "upload_time_iso_8601": "2022-12-14T12:26:38.278460Z",
+        "url": "https://files.pythonhosted.org/packages/98/5c/ea550efe9470ebc10964247d35b8cf3a7b7bb8c4dc46067bd1c1324e0e0a/tensor_parallel-1.0.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "103becc48264cb10a0ac2925e46248cab4b1e462a4759b791e745edd9f86ace6",
+          "md5": "139f3c36fef3ac90fb9ea7f184473bf8",
+          "sha256": "f2af9fe39dc21028abb0357fc41d19619180b0a2c1545a4aa2a67961caaa943b"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "139f3c36fef3ac90fb9ea7f184473bf8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15418,
+        "upload_time": "2022-12-14T12:26:39",
+        "upload_time_iso_8601": "2022-12-14T12:26:39.777811Z",
+        "url": "https://files.pythonhosted.org/packages/10/3b/ecc48264cb10a0ac2925e46248cab4b1e462a4759b791e745edd9f86ace6/tensor_parallel-1.0.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7034ba6cc15c60aea0e0893c8b8fb8543c9895a2ce2191902caa8dbb5ec9d19b",
+          "md5": "990660e599c9e2ac0b6e67530f63e51a",
+          "sha256": "fc2609eadf277ee67681afbf1f3a07d7ad282966e9d1cae49a5237c26cf7bb7a"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "990660e599c9e2ac0b6e67530f63e51a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 16443,
+        "upload_time": "2022-12-14T12:36:00",
+        "upload_time_iso_8601": "2022-12-14T12:36:00.282905Z",
+        "url": "https://files.pythonhosted.org/packages/70/34/ba6cc15c60aea0e0893c8b8fb8543c9895a2ce2191902caa8dbb5ec9d19b/tensor_parallel-1.0.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb3f4dab757f8341defea80090bf26855365b3448d3a86780ebcd32717c3c45c",
+          "md5": "cab727c0bf12079f0ef7e4e8cfdbedad",
+          "sha256": "9267bc1923b6f83939260bcf30897904d6c30f64e18cae8aa3b040091e64297b"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cab727c0bf12079f0ef7e4e8cfdbedad",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15432,
+        "upload_time": "2022-12-14T12:36:01",
+        "upload_time_iso_8601": "2022-12-14T12:36:01.592935Z",
+        "url": "https://files.pythonhosted.org/packages/fb/3f/4dab757f8341defea80090bf26855365b3448d3a86780ebcd32717c3c45c/tensor_parallel-1.0.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "833423ccd71ddc3b23474dff65b4c17d841dfd7ba687902ced138df5fe1b40b3",
+          "md5": "bf31d423baaebf406df0abf2302c51b8",
+          "sha256": "a2197ecc12b79a83531241a0c3d94106ed0779755defccdf5422edae2d899326"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bf31d423baaebf406df0abf2302c51b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 14012,
+        "upload_time": "2022-12-14T19:46:39",
+        "upload_time_iso_8601": "2022-12-14T19:46:39.985560Z",
+        "url": "https://files.pythonhosted.org/packages/83/34/23ccd71ddc3b23474dff65b4c17d841dfd7ba687902ced138df5fe1b40b3/tensor_parallel-1.0.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "879097f3dfb1283b2e4d1f53868ebdaa03188f1d86e78ce57024df4844c0fd2a",
+          "md5": "4324304e0666f36802dbfb51efec7363",
+          "sha256": "3ef90ccfba9d2837f793a9e7b61cbf7c97fc5e8bc6f883d69d4cf3432bfa086c"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4324304e0666f36802dbfb51efec7363",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13343,
+        "upload_time": "2022-12-14T19:46:41",
+        "upload_time_iso_8601": "2022-12-14T19:46:41.815642Z",
+        "url": "https://files.pythonhosted.org/packages/87/90/97f3dfb1283b2e4d1f53868ebdaa03188f1d86e78ce57024df4844c0fd2a/tensor_parallel-1.0.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c3af18ca21db04cef37e4f56df78f677cf01022a4d924ac293ce18268bc757f",
+          "md5": "a6ae468b70ea46f0fac8cdd478ff6c92",
+          "sha256": "f448777ab46442ecc2a6fc5760ca8abf0448cde47a6ba4968c710992cbf4f65b"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a6ae468b70ea46f0fac8cdd478ff6c92",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 16733,
+        "upload_time": "2022-12-15T23:56:08",
+        "upload_time_iso_8601": "2022-12-15T23:56:08.955736Z",
+        "url": "https://files.pythonhosted.org/packages/6c/3a/f18ca21db04cef37e4f56df78f677cf01022a4d924ac293ce18268bc757f/tensor_parallel-1.0.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e79c8e1f5a15655971c275e6a5c83158701e8059e6e1af6875c37b39683f625",
+          "md5": "c26490103e15a67d9e52b8bc4acbaf34",
+          "sha256": "7eb1787905065c5f588d41d8577f3833be18b3e14bace82f74fbd84809022844"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c26490103e15a67d9e52b8bc4acbaf34",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 15604,
+        "upload_time": "2022-12-15T23:56:10",
+        "upload_time_iso_8601": "2022-12-15T23:56:10.156204Z",
+        "url": "https://files.pythonhosted.org/packages/1e/79/c8e1f5a15655971c275e6a5c83158701e8059e6e1af6875c37b39683f625/tensor_parallel-1.0.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c3dc56f9db66aafcba0e0f6f67f3cc192a28f0af0adc6feb09a3e9668228ea7",
+          "md5": "15f43abfe83cc49371cf133df7eb77f0",
+          "sha256": "0f0055f46f3d2787fae2cbf6300e770afa04b6c42b5e47c2ab131dd05119e2ba"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.19-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "15f43abfe83cc49371cf133df7eb77f0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 19092,
+        "upload_time": "2022-12-26T19:28:22",
+        "upload_time_iso_8601": "2022-12-26T19:28:22.434984Z",
+        "url": "https://files.pythonhosted.org/packages/0c/3d/c56f9db66aafcba0e0f6f67f3cc192a28f0af0adc6feb09a3e9668228ea7/tensor_parallel-1.0.19-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60f3ae2465aadd6a728d341dc9d59f61322a5b7147d9c8455a5d9ab2246c37dc",
+          "md5": "0a46c5ab177e633c663c797f0695f12b",
+          "sha256": "0b98f4dfe9e773fc07d435ffe676275735efdbc5044797912d0bf29a7795f9e9"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.19.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0a46c5ab177e633c663c797f0695f12b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 16673,
+        "upload_time": "2022-12-26T19:28:24",
+        "upload_time_iso_8601": "2022-12-26T19:28:24.030012Z",
+        "url": "https://files.pythonhosted.org/packages/60/f3/ae2465aadd6a728d341dc9d59f61322a5b7147d9c8455a5d9ab2246c37dc/tensor_parallel-1.0.19.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.21.dev0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93afa37a37e55444d86d51cc435c339d2d86cc91b23c9dda0b8eb4a8bfec8328",
+          "md5": "65d51988f3148d8d0f21be34230f5da5",
+          "sha256": "5473f2cc9f5f90dda0e2c65e852f512a39c6d3a873b7a201f686b3eb7764cbc0"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.21.dev0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "65d51988f3148d8d0f21be34230f5da5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 18712,
+        "upload_time": "2022-12-22T19:43:58",
+        "upload_time_iso_8601": "2022-12-22T19:43:58.025320Z",
+        "url": "https://files.pythonhosted.org/packages/93/af/a37a37e55444d86d51cc435c339d2d86cc91b23c9dda0b8eb4a8bfec8328/tensor_parallel-1.0.21.dev0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "790b30efe49399bef625e1b7df507f7c743e03f9bee9855d0bc9b97ee3894c4c",
+          "md5": "3b1475d504db15384e4e193dff49bbf2",
+          "sha256": "1a9a35455f4711f237daa96581ec154754449b0e684fd960d465be0f4a3dd5ba"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.21.dev0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b1475d504db15384e4e193dff49bbf2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 16577,
+        "upload_time": "2022-12-22T19:43:59",
+        "upload_time_iso_8601": "2022-12-22T19:43:59.300265Z",
+        "url": "https://files.pythonhosted.org/packages/79/0b/30efe49399bef625e1b7df507f7c743e03f9bee9855d0bc9b97ee3894c4c/tensor_parallel-1.0.21.dev0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "54b2c7b4683d8a8dc6b92fa6c72e299b011864c701427176e2bb7867fc079a5b",
+          "md5": "228c8f2fb7100db5bbd25fc2e8cd2bad",
+          "sha256": "7ff6d63e6490db3375b37205a247ba31b92ca2c50cd5f10b14cbd2e0f52debd9"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "228c8f2fb7100db5bbd25fc2e8cd2bad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 25480,
+        "upload_time": "2022-12-30T23:26:36",
+        "upload_time_iso_8601": "2022-12-30T23:26:36.340308Z",
+        "url": "https://files.pythonhosted.org/packages/54/b2/c7b4683d8a8dc6b92fa6c72e299b011864c701427176e2bb7867fc079a5b/tensor_parallel-1.0.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7ed635fefb6cc1030dff17be46a776cd2edbebd72067b784862ac7af376deef",
+          "md5": "a539312dab83f540d525f58bd95b6961",
+          "sha256": "c531a0f6f35454e497325ed8bd2c6c163e6a6ba92fa02edffda2998061cc2a17"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.22.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a539312dab83f540d525f58bd95b6961",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 24267,
+        "upload_time": "2022-12-30T23:26:37",
+        "upload_time_iso_8601": "2022-12-30T23:26:37.705044Z",
+        "url": "https://files.pythonhosted.org/packages/e7/ed/635fefb6cc1030dff17be46a776cd2edbebd72067b784862ac7af376deef/tensor_parallel-1.0.22.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.23": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7be5b05345d0620235045a5bdaf68c6fcf48a2f32b04a68ea534c0fd351e4fd",
+          "md5": "30f1d69a77d079109fc4ff04b6cd1d33",
+          "sha256": "62bd5182a13691d33c382d948a5af979a360fa0821919e487bb3ce5052138e15"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.23-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "30f1d69a77d079109fc4ff04b6cd1d33",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 25790,
+        "upload_time": "2023-01-03T10:22:54",
+        "upload_time_iso_8601": "2023-01-03T10:22:54.143247Z",
+        "url": "https://files.pythonhosted.org/packages/a7/be/5b05345d0620235045a5bdaf68c6fcf48a2f32b04a68ea534c0fd351e4fd/tensor_parallel-1.0.23-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3a87ba28769f4a4a460db8cf6bfb8edf81640ab45d9ac14b2618cb5bd6fad1e",
+          "md5": "9dfe09ca2eaac21205722cfc6b1bb082",
+          "sha256": "f6947c3eaaa52babd4371f5ffad7769edcc8981c82ce40c1d346971a72714a4b"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.23.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9dfe09ca2eaac21205722cfc6b1bb082",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 24505,
+        "upload_time": "2023-01-03T10:22:55",
+        "upload_time_iso_8601": "2023-01-03T10:22:55.363548Z",
+        "url": "https://files.pythonhosted.org/packages/f3/a8/7ba28769f4a4a460db8cf6bfb8edf81640ab45d9ac14b2618cb5bd6fad1e/tensor_parallel-1.0.23.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.24": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "031ed2a74f6d8704214958d8ef58c070db959361f3195bba98af1ac61cea5520",
+          "md5": "b1e679f23bfc5b87da080e6d8cf9130b",
+          "sha256": "86ae5f55347dfd431ffef9775b1d6e918cb831aec7f713d95941284d102a03f7"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.24-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1e679f23bfc5b87da080e6d8cf9130b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 26947,
+        "upload_time": "2023-01-12T19:57:42",
+        "upload_time_iso_8601": "2023-01-12T19:57:42.228354Z",
+        "url": "https://files.pythonhosted.org/packages/03/1e/d2a74f6d8704214958d8ef58c070db959361f3195bba98af1ac61cea5520/tensor_parallel-1.0.24-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b26b3e2b43ef5322eda121463e266b03e0dd9e628979eee3c20367d6b1003c5",
+          "md5": "997780546c91ba9ab4b516f041dcd89f",
+          "sha256": "8cb991a06b2e1b579a7616fc09e500299ec8ddf6a05005b01b93f39d8c575d87"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.24.tar.gz",
+        "has_sig": false,
+        "md5_digest": "997780546c91ba9ab4b516f041dcd89f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 25570,
+        "upload_time": "2023-01-12T19:57:43",
+        "upload_time_iso_8601": "2023-01-12T19:57:43.738812Z",
+        "url": "https://files.pythonhosted.org/packages/2b/26/b3e2b43ef5322eda121463e266b03e0dd9e628979eee3c20367d6b1003c5/tensor_parallel-1.0.24.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.25": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b775663e5c266ef0dd2d702017e02ccefa049805cc7c2e4ff4defd2c4d57e73",
+          "md5": "577ec7071c29bff8be6e0b5910554be5",
+          "sha256": "34aa4350984a6aad2fc4b14e364ce41682946683ea9cef7eef6623539247f728"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.25-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "577ec7071c29bff8be6e0b5910554be5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 27006,
+        "upload_time": "2023-02-21T19:43:34",
+        "upload_time_iso_8601": "2023-02-21T19:43:34.579904Z",
+        "url": "https://files.pythonhosted.org/packages/4b/77/5663e5c266ef0dd2d702017e02ccefa049805cc7c2e4ff4defd2c4d57e73/tensor_parallel-1.0.25-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9c8512bfa8f4eb40d825d82ebd85b948f382ad20fc7f3acfc3dc88ac01694afd",
+          "md5": "cf00ef47bfbfe4df31fed16faaf62d1a",
+          "sha256": "bd7ffc8d2b2d440b2996c292fc2f95651a9aec1db8a02297cea6e83b236e2e2b"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.25.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf00ef47bfbfe4df31fed16faaf62d1a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 28887,
+        "upload_time": "2023-02-21T19:43:36",
+        "upload_time_iso_8601": "2023-02-21T19:43:36.026940Z",
+        "url": "https://files.pythonhosted.org/packages/9c/85/12bfa8f4eb40d825d82ebd85b948f382ad20fc7f3acfc3dc88ac01694afd/tensor_parallel-1.0.25.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c62148e15b5b7b714247ec5e6d22740deee46aa3bbc648bae1c192c2db34e874",
+          "md5": "990bd2dec551f7260dc4a48a51ba2574",
+          "sha256": "b51501b773c4469acaa500bbf761313ee188be9883431a3844d9609b086c43c2"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "990bd2dec551f7260dc4a48a51ba2574",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 18642,
+        "upload_time": "2022-12-22T20:26:41",
+        "upload_time_iso_8601": "2022-12-22T20:26:41.015605Z",
+        "url": "https://files.pythonhosted.org/packages/c6/21/48e15b5b7b714247ec5e6d22740deee46aa3bbc648bae1c192c2db34e874/tensor_parallel-1.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c91a7c667bb831293f7dc0fe8fb22e385efd0a61106a4064a99f84009aa22f98",
+          "md5": "02ce22553096076aa2b97aa0d5587395",
+          "sha256": "a61c046a41cd54d2d26f15ab3cd17ea269ec6b6a9c6b072f25bf04bf1825edb0"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02ce22553096076aa2b97aa0d5587395",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 16559,
+        "upload_time": "2022-12-22T20:26:42",
+        "upload_time_iso_8601": "2022-12-22T20:26:42.241000Z",
+        "url": "https://files.pythonhosted.org/packages/c9/1a/7c667bb831293f7dc0fe8fb22e385efd0a61106a4064a99f84009aa22f98/tensor_parallel-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d96bdeddd126f4191d00120b8b9cff3a73d3a36bc086b3043ab4f1aab4c34a3",
+          "md5": "92f9f40a10a5fce7b09fc90a31a96821",
+          "sha256": "02ec64639e242893c8edc4ce628e3859c43a2ac48dd2038d3ea5399706cdd14e"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "92f9f40a10a5fce7b09fc90a31a96821",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 28734,
+        "upload_time": "2023-03-06T11:06:45",
+        "upload_time_iso_8601": "2023-03-06T11:06:45.866922Z",
+        "url": "https://files.pythonhosted.org/packages/8d/96/bdeddd126f4191d00120b8b9cff3a73d3a36bc086b3043ab4f1aab4c34a3/tensor_parallel-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0440e125a66c2b114d7539479791926d2a26fe1e858a6792fa10a73a26a7aaa2",
+          "md5": "bc9d1708e1ef4e18145903eda483231e",
+          "sha256": "ad08f7874d0771ec933ba8fe2da91b41f46c55c77387fcfb5eb3dbde6bfc35ec"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bc9d1708e1ef4e18145903eda483231e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31325,
+        "upload_time": "2023-03-06T11:06:47",
+        "upload_time_iso_8601": "2023-03-06T11:06:47.773767Z",
+        "url": "https://files.pythonhosted.org/packages/04/40/e125a66c2b114d7539479791926d2a26fe1e858a6792fa10a73a26a7aaa2/tensor_parallel-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9386b11403c05ebbe2566e201a009c0403baf37baf6194580764d525f7f72514",
+          "md5": "1a8eccd226470300e4f87c02ccf1e75a",
+          "sha256": "ca968bec9cf304387e56307d9723187798b3484183189742f16228f2481cb309"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1a8eccd226470300e4f87c02ccf1e75a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 31326,
+        "upload_time": "2023-03-15T08:32:27",
+        "upload_time_iso_8601": "2023-03-15T08:32:27.417328Z",
+        "url": "https://files.pythonhosted.org/packages/93/86/b11403c05ebbe2566e201a009c0403baf37baf6194580764d525f7f72514/tensor_parallel-1.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f7f05ae2e3bca176129368d90f88c38fd57203ae90c836f20321335dad7f9ac3",
+          "md5": "7365cd80405aa128fcddc721c00e87dd",
+          "sha256": "a07cd6822691c4c43391b9fbd5a6211b3d5f147e73154c7646040104a5ecf4fa"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7365cd80405aa128fcddc721c00e87dd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 34786,
+        "upload_time": "2023-03-15T08:32:29",
+        "upload_time_iso_8601": "2023-03-15T08:32:29.227941Z",
+        "url": "https://files.pythonhosted.org/packages/f7/f0/5ae2e3bca176129368d90f88c38fd57203ae90c836f20321335dad7f9ac3/tensor_parallel-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87291226e526aeb9eed03284beb733f75093a26e2e87f1267c7dc045f98688a0",
+          "md5": "b19130ac4b52e30ba4b0ff12d62187e0",
+          "sha256": "99bd0d124a1049e9bef49181171a847146a8da0f6386c78aef270be6f5424cfb"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b19130ac4b52e30ba4b0ff12d62187e0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 31318,
+        "upload_time": "2023-03-22T14:38:20",
+        "upload_time_iso_8601": "2023-03-22T14:38:20.416876Z",
+        "url": "https://files.pythonhosted.org/packages/87/29/1226e526aeb9eed03284beb733f75093a26e2e87f1267c7dc045f98688a0/tensor_parallel-1.1.2-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": "This version has broken dispatch"
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7380fc192d2d147f8360de0267c02f97c5d33092b2e4cd0ee4761efb71dbd0b",
+          "md5": "508a24e11d7816c2e39c2f811611f86d",
+          "sha256": "742d3226581d7f6d2fd944281f16d0d0c6f74bf4975228288692e0793935b99e"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "508a24e11d7816c2e39c2f811611f86d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 34829,
+        "upload_time": "2023-03-22T14:38:22",
+        "upload_time_iso_8601": "2023-03-22T14:38:22.213642Z",
+        "url": "https://files.pythonhosted.org/packages/a7/38/0fc192d2d147f8360de0267c02f97c5d33092b2e4cd0ee4761efb71dbd0b/tensor_parallel-1.1.2.tar.gz",
+        "yanked": true,
+        "yanked_reason": "This version has broken dispatch"
+      }
+    ],
+    "1.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2667246f64f35d71608da19ca16da7703af0ea13e19defb0954d3b69423bbe10",
+          "md5": "a8978fa608cfd7e06431e922d632762f",
+          "sha256": "d8a4ebab8d41ea08f80bfd7ca1c65c36ab2537a308b01964582654b7a02f2acf"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a8978fa608cfd7e06431e922d632762f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 31357,
+        "upload_time": "2023-03-23T12:06:26",
+        "upload_time_iso_8601": "2023-03-23T12:06:26.259962Z",
+        "url": "https://files.pythonhosted.org/packages/26/67/246f64f35d71608da19ca16da7703af0ea13e19defb0954d3b69423bbe10/tensor_parallel-1.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de1c58435e5ec2f27a05262c016a6f50978b1dfa26921c90d932b32c0877eb5c",
+          "md5": "fe94721bd5d6991966d71d00bd00e15d",
+          "sha256": "52426777f6ac34b07719baa996dbeae973746bc60f01c9f1a25d90b25268bc21"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fe94721bd5d6991966d71d00bd00e15d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 34877,
+        "upload_time": "2023-03-23T12:06:28",
+        "upload_time_iso_8601": "2023-03-23T12:06:28.264574Z",
+        "url": "https://files.pythonhosted.org/packages/de/1c/58435e5ec2f27a05262c016a6f50978b1dfa26921c90d932b32c0877eb5c/tensor_parallel-1.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b77108e020729f03c0dd9fe082e5d19c467f74842ff2f88efe253fb26ca04e7",
+          "md5": "16dc63ca940ca47ac7fd5a286d9e4772",
+          "sha256": "2566f972520fbf453f393651a3f10e25cc19d092e92d9d2f3fc988b9d1dc291d"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "16dc63ca940ca47ac7fd5a286d9e4772",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 32707,
+        "upload_time": "2023-03-27T19:47:52",
+        "upload_time_iso_8601": "2023-03-27T19:47:52.226518Z",
+        "url": "https://files.pythonhosted.org/packages/8b/77/108e020729f03c0dd9fe082e5d19c467f74842ff2f88efe253fb26ca04e7/tensor_parallel-1.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5af030b698f2b0822782f8df93af4055f402871381b636f239846abe04eeff3e",
+          "md5": "88e756eff2bbdccee0633298d67a9147",
+          "sha256": "839b11d67fe511b5321dc9fb46a1f3999298c612ee02002f8d07a64d2968f664"
+        },
+        "downloads": -1,
+        "filename": "tensor_parallel-1.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "88e756eff2bbdccee0633298d67a9147",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 36345,
+        "upload_time": "2023-03-27T19:47:53",
+        "upload_time_iso_8601": "2023-03-27T19:47:53.660695Z",
+        "url": "https://files.pythonhosted.org/packages/5a/f0/30b698f2b0822782f8df93af4055f402871381b636f239846abe04eeff3e/tensor_parallel-1.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8b77108e020729f03c0dd9fe082e5d19c467f74842ff2f88efe253fb26ca04e7",
+        "md5": "16dc63ca940ca47ac7fd5a286d9e4772",
+        "sha256": "2566f972520fbf453f393651a3f10e25cc19d092e92d9d2f3fc988b9d1dc291d"
+      },
+      "downloads": -1,
+      "filename": "tensor_parallel-1.1.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "16dc63ca940ca47ac7fd5a286d9e4772",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 32707,
+      "upload_time": "2023-03-27T19:47:52",
+      "upload_time_iso_8601": "2023-03-27T19:47:52.226518Z",
+      "url": "https://files.pythonhosted.org/packages/8b/77/108e020729f03c0dd9fe082e5d19c467f74842ff2f88efe253fb26ca04e7/tensor_parallel-1.1.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5af030b698f2b0822782f8df93af4055f402871381b636f239846abe04eeff3e",
+        "md5": "88e756eff2bbdccee0633298d67a9147",
+        "sha256": "839b11d67fe511b5321dc9fb46a1f3999298c612ee02002f8d07a64d2968f664"
+      },
+      "downloads": -1,
+      "filename": "tensor_parallel-1.1.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "88e756eff2bbdccee0633298d67a9147",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 36345,
+      "upload_time": "2023-03-27T19:47:53",
+      "upload_time_iso_8601": "2023-03-27T19:47:53.660695Z",
+      "url": "https://files.pythonhosted.org/packages/5a/f0/30b698f2b0822782f8df93af4055f402871381b636f239846abe04eeff3e/tensor_parallel-1.1.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

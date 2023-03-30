@@ -1,0 +1,398 @@
+{
+  "info": {
+    "author": "nostalgebraist",
+    "author_email": "nostalgebraist@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "## transformer-utils\n\nUtilities for the HuggingFace [transformers](https://github.com/huggingface/transformers/) library, focused on loading and using large pretrained autoregressive language models like GPT-2 and GPT-Neo.\n\nThis package is unofficial and not associated with HuggingFace.\n\nFeatures:\n\n- Load large (~2.7B) models in low-resource environments like Google Colab\n- Get activations from any part of the model, without running parts you don't need\n- Interpret models with the \"logit lens\"\n  - For background, see\n    - [\"interpreting GPT: the logit lens\"](https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens) by nostalgebraist\n    - [\"Finding the Words to Say: Hidden State Visualizations for Language Models\"](https://jalammar.github.io/hidden-states/) by Jay Alammar\n\n## Example usage\n\n### Load in a low-memory environment\n\nLoading a 2.7B model:\n\n```python\nfrom transformer_utils.low_memory import enable_low_memory_load\n\nenable_low_memory_load()\n\nmodel = transformers.AutoModelForCausalLM.from_pretrained('EleutherAI/gpt-neo-2.7B')\n```\n\nThis works fine in an ordinary (non-Pro) Google Colab notebook, with ~12 GB RAM and a T5 GPU.\n\nInference will work up to the full context window length of 2048 tokens without memory issues.\n\n### Logit lens\n\n```python\nimport torch\nimport transformers\nfrom transformer_utils.low_memory import enable_low_memory_load\n\nenable_low_memory_load()\n\ntokenizer = transformers.AutoTokenizer.from_pretrained(\"gpt2\")\nmodel = transformers.AutoModelForCausalLM.from_pretrained('gpt2-xl')\n\ndef text_to_input_ids(text):\n    toks = tokenizer.encode(text)\n    return torch.as_tensor(toks).view(1, -1).cuda()\n\ninput_ids = text_to_input_ids(\"This is an example. You can probably think of a more fun text to use than this one.\")\n\nplot_logit_lens(model, tokenizer, input_ids, start_ix=0, end_ix=45)  # logits\n\nplot_logit_lens(model, tokenizer, input_ids, start_ix=0, end_ix=45, probs=True)  # probabilities\n\nplot_logit_lens(model, tokenizer, input_ids, start_ix=0, end_ix=45, kl=True)  # K-L divergence\n```\n\nYou can do also some other things that aren't in the original blog posts.  This will break down the transformer blocks into their attention and MLP parts:\n\n```python\nplot_logit_lens(model, tokenizer, input_ids, start_ix=0, end_ix=45, include_subblocks=True)\n```\n\nYou can also change the definition of the \"decoder\" to include some of the later blocks/subblocks of the model.  This helps especially in interpreting GPT-Neo hidden states.\n\n```python\n# assume we have a 48-layer model\n# so 'h.47' is the final layer\n\n# include last layer in decoder\nplot_logit_lens(\n    model, tokenizer, input_ids, start_ix=0, end_ix=45,\n    decoder_layer_names=['h.47', 'final_layernorm', 'lm_head']\n)\n\n# include just the last MLP subblock in decoder\nplot_logit_lens(\n    model, tokenizer, input_ids, start_ix=0, end_ix=45,\n    decoder_layer_names=['h.47.mlp', 'final_layernorm', 'lm_head']\n)\n```\n\n### Get activations from any part of the model\n\n###### ...and without running parts you don't need\n\n```python\nfrom transformer_utils.partial_forward import partial_forward\n\noutput = partial_forward(\n    model=model,  # your `transformers` model\n    output_names=[\n        'h.0',  # output of the 1st layer\n        'h.2.attn.c_attn',  # query/key/value matrix from the 3rd layer\n        'h.5.mlp.c_proj',   #  feed-forward activations from the 6th layer\n    ],\n    input_ids  # the input to run\n)\n\n# each of these is a tensor\noutput['h.0']\noutput['h.2.attn.c_attn']\noutput['h.5.mlp.c_proj']\n```\n\nFor efficiency, `partial_forward` doesn't run any part of the model later than the ones you specify in `output_names`.\n\nFor example, suppose `model` above was GPT-2 XL.  Then it has 48 layers.  But the forward pass in the code above stops running after the 6th layer of 48 -- so the compute and memory cost is far lower than a full `model.forward`.\n\nThis makes it easy to write new \"heads\" that do further computation on the model's activations.\n\nSome examples:\n\n##### Using the first two layers of a model as features extractors for binary classification\n\n```python\noutput_names=['h.0', 'h.1',]\nclassifier_hidden_size=768\n\nfeature_vector_size = base_model.config.n_embd * len(output_names)\n\nclassifier = nn.Sequential(\n    nn.Linear(feature_vector_size, classifier_hidden_size),\n    nn.ReLU(),\n    nn.Linear(classifier_hidden_size, 2),\n)\n\nopt = torch.optim.Adam(classifier.parameters())\n\nfor input_ids, targets in dataset:  # `dataset` is your classification train data\n    with torch.no_grad():\n        hidden_states = partial_forward(\n            base_model,\n            output_names,\n            input_ids,\n        )\n\n    # shape (batch, sequence, len(output_names) * model's hidden size)\n    feature_vector = torch.cat(\n        [hidden_states[name] for name in output_names],\n        dim=-1\n    )\n\n    # shape (batch, sequence, 2)\n    classifier_out = classifier(feature_vector)\n\n    # simple avg pool over sequence dim -- in practice find attention works well for this step :)\n    # shape (batch, 2)\n    logits = classifier_out.mean(dim=1)\n\n    loss = F.cross_entropy(target=targets, input=logits)\n    loss.backward()\n    opt.step()\n    opt.zero_grad()\n```\n\n\n##### Finetuning the first two layers of a model\n\nThis is exactly the same as the above, with just two changes:\n\n- Remove the `with torch.no_grad()` wrapper around `partial_forward`\n- Optimize the base model's params too:\n  - `opt = torch.optim.Adam(list(classifier.parameters()) + list(base_model.parameters()))`\n\nIf you want to train a model like these ones for real use, I recommend writing a custom `nn.Module`.  [See here](https://github.com/nostalgebraist/nostalgebraist-autoresponder/blob/fd96e9482186f5dbeaa27bd6179087c892c577d6/selector_model/selector_nn_neo.py#L263) for an example.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/nostalgebraist/transformer-utils",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "transformer-utils",
+    "package_url": "https://pypi.org/project/transformer-utils/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/transformer-utils/",
+    "project_urls": {
+      "Homepage": "https://github.com/nostalgebraist/transformer-utils"
+    },
+    "release_url": "https://pypi.org/project/transformer-utils/0.1.1/",
+    "requires_dist": [
+      "torch",
+      "transformers",
+      "seaborn",
+      "tqdm",
+      "colorcet"
+    ],
+    "requires_python": "",
+    "summary": "Large autoregressive language modeling helpers",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14438421,
+  "releases": {
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b46635d1c5e702695ca8c48c6d1606bbfcce6c535fc2ece1b629cd65cb1f4128",
+          "md5": "09e030abe9e3c1a9378aaa2de7e0cf9c",
+          "sha256": "d3390782a23e66a57bcdae1e342458c28c19bcebf6aea4cc1f0941900b204ea5"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "09e030abe9e3c1a9378aaa2de7e0cf9c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9111,
+        "upload_time": "2021-05-11T03:09:22",
+        "upload_time_iso_8601": "2021-05-11T03:09:22.153411Z",
+        "url": "https://files.pythonhosted.org/packages/b4/66/35d1c5e702695ca8c48c6d1606bbfcce6c535fc2ece1b629cd65cb1f4128/transformer_utils-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f2561b7e2dc3f9933461f5a648a8fc58455412d8efa30fb81ac81af250cf2d3",
+          "md5": "20cff7f21f73a02a4be4d1c1d180719f",
+          "sha256": "73fd59dc505bb67bd6f45c2ca90149c12e29dc0f56d15015021c739953e7548e"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20cff7f21f73a02a4be4d1c1d180719f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5848,
+        "upload_time": "2021-05-11T03:09:23",
+        "upload_time_iso_8601": "2021-05-11T03:09:23.440000Z",
+        "url": "https://files.pythonhosted.org/packages/2f/25/61b7e2dc3f9933461f5a648a8fc58455412d8efa30fb81ac81af250cf2d3/transformer-utils-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6cfed87d5863fa1684aee86e58e3522b8c08a27d196eccea74a7ae89c53b5b8d",
+          "md5": "04c7f5a341318c8674f7f6b638245b29",
+          "sha256": "c09cf2d6cb5e71b98a8994ab809a06670f3bcbbc76590949c62dabc9df4ff22c"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "04c7f5a341318c8674f7f6b638245b29",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9098,
+        "upload_time": "2021-05-11T04:09:08",
+        "upload_time_iso_8601": "2021-05-11T04:09:08.614273Z",
+        "url": "https://files.pythonhosted.org/packages/6c/fe/d87d5863fa1684aee86e58e3522b8c08a27d196eccea74a7ae89c53b5b8d/transformer_utils-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e62a2d671c35842b72f74dd0e56b71434758942b244406c97c6eec8c68cf638b",
+          "md5": "8031f943b53b85402c481201b325f0f1",
+          "sha256": "954dd0321c929d7bc2151973a8d7adde6a21e06d9dc1a79521624c4d5283c1d4"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8031f943b53b85402c481201b325f0f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5836,
+        "upload_time": "2021-05-11T04:09:09",
+        "upload_time_iso_8601": "2021-05-11T04:09:09.894932Z",
+        "url": "https://files.pythonhosted.org/packages/e6/2a/2d671c35842b72f74dd0e56b71434758942b244406c97c6eec8c68cf638b/transformer-utils-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4397313ae2950b1906e6e04ba8e94589381fac8de3bbc85554579b94bd8c88be",
+          "md5": "a4eb9b7e4da2b88782a362c0ccad8bb6",
+          "sha256": "c5704025ced0f7d64c08593193b6074e75460bb58621edc63daeff5fb1d051f0"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a4eb9b7e4da2b88782a362c0ccad8bb6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9095,
+        "upload_time": "2021-05-11T05:00:54",
+        "upload_time_iso_8601": "2021-05-11T05:00:54.428814Z",
+        "url": "https://files.pythonhosted.org/packages/43/97/313ae2950b1906e6e04ba8e94589381fac8de3bbc85554579b94bd8c88be/transformer_utils-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62b237e9737534f1be21c95a672e0c80923d7cf6d88bb08d77916ef32f6aa449",
+          "md5": "1a688f3d556d1eb7af7c8debadb935e1",
+          "sha256": "a6e6d327152d92e3e2855646aa1a423721a94fd742d0de65dbe3d9b0189a313b"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a688f3d556d1eb7af7c8debadb935e1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5833,
+        "upload_time": "2021-05-11T05:00:55",
+        "upload_time_iso_8601": "2021-05-11T05:00:55.934165Z",
+        "url": "https://files.pythonhosted.org/packages/62/b2/37e9737534f1be21c95a672e0c80923d7cf6d88bb08d77916ef32f6aa449/transformer-utils-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b712079cd78b9c4d07f6b2987e412c47b72b4491f70302e8f4eb8b2a95cbf4f3",
+          "md5": "e1ef6b9e5dd58973bdf79c1ccc6cf82f",
+          "sha256": "a8bc71ca8ad6a96bc27379c931eb3fded568d34edd1920afac757a7f30b71d4b"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e1ef6b9e5dd58973bdf79c1ccc6cf82f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10705,
+        "upload_time": "2021-05-12T02:24:30",
+        "upload_time_iso_8601": "2021-05-12T02:24:30.730792Z",
+        "url": "https://files.pythonhosted.org/packages/b7/12/079cd78b9c4d07f6b2987e412c47b72b4491f70302e8f4eb8b2a95cbf4f3/transformer_utils-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1eeaff2c69352d620031c2b8fb4fc2022248262478b75ddf8a1bf165682d9248",
+          "md5": "5f36fdf9231e5b679969ee90259037d6",
+          "sha256": "56516d5afc747807ab573f4acf05ea822e1ef85f2c856517008e05cd33649863"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5f36fdf9231e5b679969ee90259037d6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7309,
+        "upload_time": "2021-05-12T02:24:32",
+        "upload_time_iso_8601": "2021-05-12T02:24:32.398255Z",
+        "url": "https://files.pythonhosted.org/packages/1e/ea/ff2c69352d620031c2b8fb4fc2022248262478b75ddf8a1bf165682d9248/transformer-utils-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b370960ecb50734829b00e1a17b5c4f61c2c7c3422ad1fd2bc3014082ca00a6f",
+          "md5": "9e102b4061babf5c28c030d27c4af176",
+          "sha256": "c43fb0756c3faf91504880e434de4d7e65f12fd420ea188a889b6947ddef55b1"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9e102b4061babf5c28c030d27c4af176",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 13029,
+        "upload_time": "2021-05-14T23:10:13",
+        "upload_time_iso_8601": "2021-05-14T23:10:13.026597Z",
+        "url": "https://files.pythonhosted.org/packages/b3/70/960ecb50734829b00e1a17b5c4f61c2c7c3422ad1fd2bc3014082ca00a6f/transformer_utils-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cbfb4e995eebf8172789eb27058d6f9cd80c25e7fa941e6e7a899a51a2e1ca4",
+          "md5": "146e6fd55e72dcbf7c69e23406ca5263",
+          "sha256": "4775299b3b14980613f06741030f7965c577d08506c3efdfbdd8bb899a0a29fd"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "146e6fd55e72dcbf7c69e23406ca5263",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11376,
+        "upload_time": "2021-05-14T23:10:14",
+        "upload_time_iso_8601": "2021-05-14T23:10:14.397018Z",
+        "url": "https://files.pythonhosted.org/packages/3c/bf/b4e995eebf8172789eb27058d6f9cd80c25e7fa941e6e7a899a51a2e1ca4/transformer-utils-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3f36724ec6c5e8f41bdb038429bab4b3ab212f36930201fc8ac418adbabf7e7",
+          "md5": "2acbdec6aafbd168601d35ec0758ba8a",
+          "sha256": "3ca2c4125d8075bf5bb6668785de7e9c73b26d788d508974d72cd3937c9da8ae"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2acbdec6aafbd168601d35ec0758ba8a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 17040,
+        "upload_time": "2021-05-18T00:55:33",
+        "upload_time_iso_8601": "2021-05-18T00:55:33.459024Z",
+        "url": "https://files.pythonhosted.org/packages/f3/f3/6724ec6c5e8f41bdb038429bab4b3ab212f36930201fc8ac418adbabf7e7/transformer_utils-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e556686945f3a03ed244f55f6bd0bdd07bf1e506f947eb4ad7844461f804277e",
+          "md5": "c935f709c6ea1481ef58e8af5d3e0a3e",
+          "sha256": "5e20e9125d0cb978f2c84db80dd40d86e1b53b7b2cc7a8d3fa6abe7ade8d4e4f"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c935f709c6ea1481ef58e8af5d3e0a3e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14495,
+        "upload_time": "2021-05-18T00:55:34",
+        "upload_time_iso_8601": "2021-05-18T00:55:34.821008Z",
+        "url": "https://files.pythonhosted.org/packages/e5/56/686945f3a03ed244f55f6bd0bdd07bf1e506f947eb4ad7844461f804277e/transformer-utils-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "451ab7aca6edae9b8bfb5a20ba500fc572f3fed69f558ae809e2c42c1301dcd2",
+          "md5": "2e8f373c037c286a8f7e10e84957844f",
+          "sha256": "1bdd30bbc2fd21db11795431e931021b9b91144d1a450d25fa04803db63043bb"
+        },
+        "downloads": -1,
+        "filename": "transformer_utils-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e8f373c037c286a8f7e10e84957844f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 17106,
+        "upload_time": "2022-07-14T19:30:49",
+        "upload_time_iso_8601": "2022-07-14T19:30:49.605065Z",
+        "url": "https://files.pythonhosted.org/packages/45/1a/b7aca6edae9b8bfb5a20ba500fc572f3fed69f558ae809e2c42c1301dcd2/transformer_utils-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "032708e48b6f46b848ebbf50b809b2fe5a71343c73d5112222fc1b4b9c2aedf1",
+          "md5": "96a8efc8767004335efb702f03734cc6",
+          "sha256": "f6f16d28e99e3a575d26fe4293096d77c247ba0b18830bb34c2f89dd4bbce4c0"
+        },
+        "downloads": -1,
+        "filename": "transformer-utils-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "96a8efc8767004335efb702f03734cc6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14805,
+        "upload_time": "2022-07-14T19:30:52",
+        "upload_time_iso_8601": "2022-07-14T19:30:52.425807Z",
+        "url": "https://files.pythonhosted.org/packages/03/27/08e48b6f46b848ebbf50b809b2fe5a71343c73d5112222fc1b4b9c2aedf1/transformer-utils-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "451ab7aca6edae9b8bfb5a20ba500fc572f3fed69f558ae809e2c42c1301dcd2",
+        "md5": "2e8f373c037c286a8f7e10e84957844f",
+        "sha256": "1bdd30bbc2fd21db11795431e931021b9b91144d1a450d25fa04803db63043bb"
+      },
+      "downloads": -1,
+      "filename": "transformer_utils-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "2e8f373c037c286a8f7e10e84957844f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 17106,
+      "upload_time": "2022-07-14T19:30:49",
+      "upload_time_iso_8601": "2022-07-14T19:30:49.605065Z",
+      "url": "https://files.pythonhosted.org/packages/45/1a/b7aca6edae9b8bfb5a20ba500fc572f3fed69f558ae809e2c42c1301dcd2/transformer_utils-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "032708e48b6f46b848ebbf50b809b2fe5a71343c73d5112222fc1b4b9c2aedf1",
+        "md5": "96a8efc8767004335efb702f03734cc6",
+        "sha256": "f6f16d28e99e3a575d26fe4293096d77c247ba0b18830bb34c2f89dd4bbce4c0"
+      },
+      "downloads": -1,
+      "filename": "transformer-utils-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "96a8efc8767004335efb702f03734cc6",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 14805,
+      "upload_time": "2022-07-14T19:30:52",
+      "upload_time_iso_8601": "2022-07-14T19:30:52.425807Z",
+      "url": "https://files.pythonhosted.org/packages/03/27/08e48b6f46b848ebbf50b809b2fe5a71343c73d5112222fc1b4b9c2aedf1/transformer-utils-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

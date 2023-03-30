@@ -1,0 +1,135 @@
+{
+  "info": {
+    "author": "Thomas Deniffel",
+    "author_email": "tdeniffel@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "task_in_steps\n=============\n\nMany python-automation scripts can be seperated into steps. \nThis library supports this seperation. You can define steps \nwith classes. The steps are indepodent as they can implement \n`can_skip` which checks if the step can be skipped.\n\n## Example\n\n```python\n\nclass Config:\n\n    def __init__(self):\n        self.parser = argparse.ArgumentParser()\n        self.parser.add_argument('--projectname', help='Name of the new project', required=True)\n        self.parser.add_argument('--domain', help='Top-Level-Domain (without review.)', required=True)\n        self.parser.add_argument('--template', help='A link to a GitHub-Repo, used as template', required=True)\n        self.parser.add_argument('--username', help='LDAP Username', required=True)\n        self.parser.add_argument('--password', help='LDAP Password (optional)', required=False)\n        self.gerrit_port = 29418\n\n    def load_args(self):\n        args = self.parser.parse_args()\n        self.project_name = args.projectname\n        self.template_src = args.template\n        self.gerrit_user = args.username\n        self.password = args.password\n        self.domain = args.domain\n        self.gerrit_host = 'review.' + args.domain\n        self.gerrit_url = f'http://{self.gerrit_host}'\n        return self\n\nif __name__ == \"__main__\":\n    config = Config().load_args()\n\n    run_steps(config, [\n        CertificateOnThisMachine(),\n        UploadSshKey(),\n        ProjectFromTemplate(),\n        CreateGerritProject(),\n        ConfigureGerritGitHooks(),\n        ConfigureGitPushToGerrit(),\n        CreateJenkinsPipelines(),\n        TriggerTemplateInit(),\n        SendInitialCommit()\n    ])\n\n### The steps:\n\nclass CertificateOnThisMachine(Step):\n    name = \"SSH certificate on this machine\"\n\n    def __init__(self):\n        home = os.path.expanduser('~')\n        self.ssh_path = home + '/.ssh'\n\n    def can_skip(self, config):\n        return os.path.isfile(self.ssh_path + '/id_rsa.pub')\n\n    def run(self, config):\n        print('no ssh-certificate: generating one')\n        os.system(f'ssh-keygen -t rsa -N '' -f {self.ssh_path}')\n        return True\n\n\nclass UploadSshKey(Step):\n    name = \"Upload your SSH-Key\"\n\n    def can_skip(self, config):\n        ssh_command = f'ssh -p {config.gerrit_port} {config.gerrit_user}@{config.gerrit_host} gerrit version'\n        res = subprocess.run(ssh_command.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode\n        return res == 0\n\n    def run(self, config):\n        home = os.path.expanduser('~')\n        ssh_path = home + '/.ssh'\n        print()\n        print('You did not upload your SSH-Key.')\n        print()\n        print(f'1. Go to: http://{config.gerrit_host}/settings/#SSHKeys')\n        print( '2. Paste this in, click \"Add Key\" and run again:')\n        with open(f'{ssh_path}/id_rsa.pub', 'r') as file:\n            print(file.read())\n        return False\n\nclass ProjectFromTemplate(Step):\n    name = \"Create project from template\"\n\n    def can_skip(self, config):\n        return os.path.isdir(f'./{config.project_name}')\n\n    def run(self, config):\n        os.system(f'git clone {config.template_src} {config.project_name}')\n        os.chdir(f'./{config.project_name}')\n        os.system(f'rm .git -rf')\n        os.system(f'git init')\n        os.chdir('..')\n        return True\n\n\nclass CreateGerritProject(Step):\n    name = 'Create Gerrit project'\n\n    def can_skip(self, config):\n        command = f'ssh -p {config.gerrit_port} {config.gerrit_user}@{config.gerrit_host} gerrit ls-projects'\n        existing_projects = subprocess.check_output(command, shell=True).decode().strip().split('\\n')\n        return config.project_name in existing_projects\n\n    def run(self, config):\n        os.chdir(f'./{config.project_name}')\n        os.system(f'ssh -p {config.gerrit_port} {config.gerrit_user}@{config.gerrit_host} gerrit create-project {config.project_name}')\n        os.chdir('..')\n        return True\n\n\nclass ConfigureGerritGitHooks(Step):\n    name = 'Installing Gerrit Git-Hooks'\n\n    def can_skip(self, config):\n        path = f'./{config.project_name}/.git/hooks/commit-msg'\n        if not os.path.isfile(path):\n            return False\n        with open(path, 'r') as file:\n            content = file.read()\n            return 'Change-Id:' in content\n\n    def run(self, config):\n        os.chdir(f'./{config.project_name}')\n        os.system(f'scp -p -P {config.gerrit_port} {config.gerrit_user}@{config.gerrit_host}:hooks/commit-msg \".git/hooks/\"')\n        os.chdir('..')\n        return True\n\n\nclass ConfigureGitPushToGerrit(Step):\n    name = 'Configure \"git push\" to Gerrit'\n\n    def can_skip(self, config):\n        path = f'./{config.project_name}/.git/config'\n        if not os.path.isfile(path):\n            return False\n        with open(path, 'r') as file:\n            content = file.read()\n            return 'push = refs/heads/master:refs/for/master' in content\n\n    def run(self, config):\n        path = f'./{config.project_name}/.git/config'\n        git_config = f'''\n[core]\n        repositoryformatversion = 0\n        filemode = true\n        bare = false\n        logallrefupdates = true\n[remote \"origin\"]\n        url = ssh://{config.gerrit_user}@{config.gerrit_host}:{config.gerrit_port}/{config.project_name}\n        fetch = +refs/heads/master:refs/remotes/origin/master\n        push = refs/heads/master:refs/for/master\n[branch \"master\"]\n        remote = origin\n        merge = refs/heads/master\n'''\n        with open(path, 'w') as f:\n            f.write(git_config)\n        return True\n\nclass CreateJenkinsPipelines(Step):\n    name = 'Creating Jenkins-Pipelines'\n\n    def can_skip(self, config):\n        job1 = config.project_name + '-code'\n        job2 = config.project_name + '-deploy'\n\n        server = self._get_server(config)\n        jobs = [job['name'] for job in server.get_all_jobs()]\n\n        return job1 in jobs and job2 in jobs\n\n\n    def run(self, config):\n        self._create_pipeline(config.project_name, 'code', config)\n        self._create_pipeline(config.project_name, 'deploy', config)\n        return True\n\n    def _get_server(self, config):\n        if hasattr(self, 'server'):\n            return self.server\n\n        url = f'http://ci.{config.domain}'\n\n        password = config.password\n        if not password:\n            print(f'Enter credentials for \"{url}\"')\n            print(f'User: {config.gerrit_user}')\n            password = getpass()\n\n        self.server = Jenkins(\n            url, \n            username=config.gerrit_user, \n            password=password)\n\n        return self.server\n\n\n    def _create_pipeline(self, project_name, pipeline_type, config):\n        content = pkg_resources.resource_string('generate_gerrit_jenkins_project', f'jobs/{pipeline_type}.config.xml').decode()\n        content = content.replace('helloworld', project_name)\n\n        try:\n            self._get_server(config).create_job(project_name + '-' + pipeline_type, content)\n        except JenkinsException as e:\n            print(e)\n            raise\n\nclass TriggerTemplateInit(Step):\n    name = 'Trigger Template Init'\n\n    def can_skip(self, config):\n        return not os.path.isfile(f'./{config.project_name}/init_template.py')\n\n    def run(self, config):\n        stdout, stderr, has_error = exec(f'python3 init_template.py', cwd=f'./{config.project_name}')\n        if not has_error:\n            exec(f'rm init_template.py', cwd=f'./{config.project_name}')\n        return not has_error\n\nclass SendInitialCommit(Step):\n    name = 'Send initial commit to gerrit'\n\n    def can_skip(self, config):\n        stdout, stderr, has_error = exec('git log', cwd=f'./{config.project_name}')\n        return not has_error # git log returns error if there are not commits. Skip=True if no error returned\n\n    def run(self, config):\n        stdout, stderr, has_error1 = exec('git add .', cwd=f'./{config.project_name}')\n        print(stdout, stderr)\n        stdout, stderr, has_error2 = exec('git commit -aminit', cwd=f'./{config.project_name}')\n        print(stdout, stderr)\n        stdout, stderr, has_error3 = exec('git push origin master', cwd=f'./{config.project_name}')\n        print(stdout, stderr)\n        return True\n\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/tom-010/task_in_steps",
+    "keywords": "",
+    "license": "Apache2",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "task-in-steps",
+    "package_url": "https://pypi.org/project/task-in-steps/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/task-in-steps/",
+    "project_urls": {
+      "Homepage": "https://github.com/tom-010/task_in_steps"
+    },
+    "release_url": "https://pypi.org/project/task-in-steps/0.0.1/",
+    "requires_dist": null,
+    "requires_python": ">=3",
+    "summary": "Many python-automation scripts can be seperated into steps. This library supports this seperation.",
+    "version": "0.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12369510,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4104981b1a3d917f5e3f2ba7f4862670c07109fd8788a4479e7dc71eb389771",
+          "md5": "7933ec4deeddd1b0f7a0059d6fa62aa1",
+          "sha256": "c0df603b3e4cc53ff78dabbd081249d75b80288ef7ecbbcb94a30008f69fbb6a"
+        },
+        "downloads": -1,
+        "filename": "task_in_steps-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7933ec4deeddd1b0f7a0059d6fa62aa1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 9133,
+        "upload_time": "2021-12-21T10:08:16",
+        "upload_time_iso_8601": "2021-12-21T10:08:16.509665Z",
+        "url": "https://files.pythonhosted.org/packages/e4/10/4981b1a3d917f5e3f2ba7f4862670c07109fd8788a4479e7dc71eb389771/task_in_steps-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "043febfb9bee85ee6da6774606e3212ea30675563b956ad36005c9118245f549",
+          "md5": "3d200a5420830478851f174a1290a1f3",
+          "sha256": "2993ad537587383d622efc42c5d4971cf246e7181d6d3bdcabb81a6498b38c80"
+        },
+        "downloads": -1,
+        "filename": "task_in_steps-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3d200a5420830478851f174a1290a1f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 10710,
+        "upload_time": "2021-12-21T10:08:19",
+        "upload_time_iso_8601": "2021-12-21T10:08:19.121796Z",
+        "url": "https://files.pythonhosted.org/packages/04/3f/ebfb9bee85ee6da6774606e3212ea30675563b956ad36005c9118245f549/task_in_steps-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e4104981b1a3d917f5e3f2ba7f4862670c07109fd8788a4479e7dc71eb389771",
+        "md5": "7933ec4deeddd1b0f7a0059d6fa62aa1",
+        "sha256": "c0df603b3e4cc53ff78dabbd081249d75b80288ef7ecbbcb94a30008f69fbb6a"
+      },
+      "downloads": -1,
+      "filename": "task_in_steps-0.0.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7933ec4deeddd1b0f7a0059d6fa62aa1",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3",
+      "size": 9133,
+      "upload_time": "2021-12-21T10:08:16",
+      "upload_time_iso_8601": "2021-12-21T10:08:16.509665Z",
+      "url": "https://files.pythonhosted.org/packages/e4/10/4981b1a3d917f5e3f2ba7f4862670c07109fd8788a4479e7dc71eb389771/task_in_steps-0.0.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "043febfb9bee85ee6da6774606e3212ea30675563b956ad36005c9118245f549",
+        "md5": "3d200a5420830478851f174a1290a1f3",
+        "sha256": "2993ad537587383d622efc42c5d4971cf246e7181d6d3bdcabb81a6498b38c80"
+      },
+      "downloads": -1,
+      "filename": "task_in_steps-0.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3d200a5420830478851f174a1290a1f3",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3",
+      "size": 10710,
+      "upload_time": "2021-12-21T10:08:19",
+      "upload_time_iso_8601": "2021-12-21T10:08:19.121796Z",
+      "url": "https://files.pythonhosted.org/packages/04/3f/ebfb9bee85ee6da6774606e3212ea30675563b956ad36005c9118245f549/task_in_steps-0.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

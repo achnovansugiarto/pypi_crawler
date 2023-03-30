@@ -1,0 +1,277 @@
+{
+  "info": {
+    "author": "Tyler Goodlet",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Framework :: Trio",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+      "Operating System :: Microsoft :: Windows",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.9",
+      "Programming Language :: Python :: Implementation :: CPython",
+      "Topic :: System :: Distributed Computing"
+    ],
+    "description": "|logo| ``tractor``: next-gen Python parallelism\n\n|gh_actions|\n|docs|\n\n``tractor`` is a `structured concurrent`_, multi-processing_ runtime\nbuilt on trio_.\n\nFundamentally ``tractor`` gives you parallelism via ``trio``-\"*actors*\":\nour nurseries_ let you spawn new Python processes which each run a ``trio``\nscheduled runtime - a call to ``trio.run()``.\n\nWe believe the system adheres to the `3 axioms`_ of an \"`actor model`_\"\nbut likely *does not* look like what *you* probably think an \"actor\nmodel\" looks like, and that's *intentional*.\n\nThe first step to grok ``tractor`` is to get the basics of ``trio`` down.\nA great place to start is the `trio docs`_ and this `blog post`_.\n\n\nFeatures\n--------\n- **It's just** a ``trio`` API\n- *Infinitely nesteable* process trees\n- Builtin IPC streaming APIs with task fan-out broadcasting\n- A (first ever?) \"native\" multi-core debugger UX for Python using `pdb++`_\n- Support for a swappable, OS specific, process spawning layer\n- A modular transport stack, allowing for custom serialization (eg. with\n  `msgspec`_), communications protocols, and environment specific IPC\n  primitives\n- Support for spawning process-level-SC, inter-loop one-to-one-task oriented\n  ``asyncio`` actors via \"infected ``asyncio``\" mode\n- `structured chadcurrency`_ from the ground up\n\n\nRun a func in a process\n-----------------------\nUse ``trio``'s style of focussing on *tasks as functions*:\n\n.. code:: python\n\n    \"\"\"\n    Run with a process monitor from a terminal using::\n\n        $TERM -e watch -n 0.1  \"pstree -a $$\" \\\n            & python examples/parallelism/single_func.py \\\n            && kill $!\n\n    \"\"\"\n    import os\n\n    import tractor\n    import trio\n\n\n    async def burn_cpu():\n\n        pid = os.getpid()\n\n        # burn a core @ ~ 50kHz\n        for _ in range(50000):\n            await trio.sleep(1/50000/50)\n\n        return os.getpid()\n\n\n    async def main():\n\n        async with tractor.open_nursery() as n:\n\n            portal = await n.run_in_actor(burn_cpu)\n\n            #  burn rubber in the parent too\n            await burn_cpu()\n\n            # wait on result from target function\n            pid = await portal.result()\n\n        # end of nursery block\n        print(f\"Collected subproc {pid}\")\n\n\n    if __name__ == '__main__':\n        trio.run(main)\n\n\nThis runs ``burn_cpu()`` in a new process and reaps it on completion\nof the nursery block.\n\nIf you only need to run a sync function and retreive a single result, you\nmight want to check out `trio-parallel`_.\n\n\nZombie safe: self-destruct a process tree\n-----------------------------------------\n``tractor`` tries to protect you from zombies, no matter what.\n\n.. code:: python\n\n    \"\"\"\n    Run with a process monitor from a terminal using::\n\n        $TERM -e watch -n 0.1  \"pstree -a $$\" \\\n            & python examples/parallelism/we_are_processes.py \\\n            && kill $!\n\n    \"\"\"\n    from multiprocessing import cpu_count\n    import os\n\n    import tractor\n    import trio\n\n\n    async def target():\n        print(\n            f\"Yo, i'm '{tractor.current_actor().name}' \"\n            f\"running in pid {os.getpid()}\"\n        )\n\n       await trio.sleep_forever()\n\n\n    async def main():\n\n        async with tractor.open_nursery() as n:\n\n            for i in range(cpu_count()):\n                await n.run_in_actor(target, name=f'worker_{i}')\n\n            print('This process tree will self-destruct in 1 sec...')\n            await trio.sleep(1)\n\n            # raise an error in root actor/process and trigger\n            # reaping of all minions\n            raise Exception('Self Destructed')\n\n\n    if __name__ == '__main__':\n        try:\n            trio.run(main)\n        except Exception:\n            print('Zombies Contained')\n\n\nIf you can create zombie child processes (without using a system signal)\nit **is a bug**.\n\n\n\"Native\" multi-process debugging\n--------------------------------\nUsing the magic of `pdb++`_ and our internal IPC, we've\nbeen able to create a native feeling debugging experience for\nany (sub-)process in your ``tractor`` tree.\n\n.. code:: python\n\n    from os import getpid\n\n    import tractor\n    import trio\n\n\n    async def breakpoint_forever():\n        \"Indefinitely re-enter debugger in child actor.\"\n        while True:\n            yield 'yo'\n            await tractor.breakpoint()\n\n\n    async def name_error():\n        \"Raise a ``NameError``\"\n        getattr(doggypants)\n\n\n    async def main():\n        \"\"\"Test breakpoint in a streaming actor.\n        \"\"\"\n        async with tractor.open_nursery(\n            debug_mode=True,\n            loglevel='error',\n        ) as n:\n\n            p0 = await n.start_actor('bp_forever', enable_modules=[__name__])\n            p1 = await n.start_actor('name_error', enable_modules=[__name__])\n\n            # retreive results\n            stream = await p0.run(breakpoint_forever)\n            await p1.run(name_error)\n\n\n    if __name__ == '__main__':\n        trio.run(main)\n\n\nYou can run this with::\n\n    >>> python examples/debugging/multi_daemon_subactors.py\n\nAnd, yes, there's a built-in crash handling mode B)\n\nWe're hoping to add a respawn-from-repl system soon!\n\n\nSC compatible bi-directional streaming\n--------------------------------------\nYes, you saw it here first; we provide 2-way streams\nwith reliable, transitive setup/teardown semantics.\n\nOur nascent api is remniscent of ``trio.Nursery.start()``\nstyle invocation:\n\n.. code:: python\n\n    import trio\n    import tractor\n\n\n    @tractor.context\n    async def simple_rpc(\n\n        ctx: tractor.Context,\n        data: int,\n\n    ) -> None:\n        '''Test a small ping-pong 2-way streaming server.\n\n        '''\n        # signal to parent that we're up much like\n        # ``trio_typing.TaskStatus.started()``\n        await ctx.started(data + 1)\n\n        async with ctx.open_stream() as stream:\n\n            count = 0\n            async for msg in stream:\n\n                assert msg == 'ping'\n                await stream.send('pong')\n                count += 1\n\n            else:\n                assert count == 10\n\n\n    async def main() -> None:\n\n        async with tractor.open_nursery() as n:\n\n            portal = await n.start_actor(\n                'rpc_server',\n                enable_modules=[__name__],\n            )\n\n            # XXX: this syntax requires py3.9\n            async with (\n\n                portal.open_context(\n                    simple_rpc,\n                    data=10,\n                ) as (ctx, sent),\n\n                ctx.open_stream() as stream,\n            ):\n\n                assert sent == 11\n\n                count = 0\n                # receive msgs using async for style\n                await stream.send('ping')\n\n                async for msg in stream:\n                    assert msg == 'pong'\n                    await stream.send('ping')\n                    count += 1\n\n                    if count >= 9:\n                        break\n\n\n            # explicitly teardown the daemon-actor\n            await portal.cancel_actor()\n\n\n    if __name__ == '__main__':\n        trio.run(main)\n\n\nSee original proposal and discussion in `#53`_ as well\nas follow up improvements in `#223`_ that we'd love to\nhear your thoughts on!\n\n.. _#53: https://github.com/goodboy/tractor/issues/53\n.. _#223: https://github.com/goodboy/tractor/issues/223\n\n\nWorker poolz are easy peasy\n---------------------------\nThe initial ask from most new users is *\"how do I make a worker\npool thing?\"*.\n\n``tractor`` is built to handle any SC (structured concurrent) process\ntree you can imagine; a \"worker pool\" pattern is a trivial special\ncase.\n\nWe have a `full worker pool re-implementation`_ of the std-lib's\n``concurrent.futures.ProcessPoolExecutor`` example for reference.\n\nYou can run it like so (from this dir) to see the process tree in\nreal time::\n\n    $TERM -e watch -n 0.1  \"pstree -a $$\" \\\n        & python examples/parallelism/concurrent_actors_primes.py \\\n        && kill $!\n\nThis uses no extra threads, fancy semaphores or futures; all we need\nis ``tractor``'s IPC!\n\n\"Infected ``asyncio``\" mode\n---------------------------\nHave a bunch of ``asyncio`` code you want to force to be SC at the process level?\n\nCheck out our experimental system for `guest-mode`_ controlled\n``asyncio`` actors:\n\n.. code:: python\n\n    import asyncio\n    from statistics import mean\n    import time\n\n    import trio\n    import tractor\n\n\n    async def aio_echo_server(\n        to_trio: trio.MemorySendChannel,\n        from_trio: asyncio.Queue,\n    ) -> None:\n\n        # a first message must be sent **from** this ``asyncio``\n        # task or the ``trio`` side will never unblock from\n        # ``tractor.to_asyncio.open_channel_from():``\n        to_trio.send_nowait('start')\n\n        # XXX: this uses an ``from_trio: asyncio.Queue`` currently but we\n        # should probably offer something better.\n        while True:\n            # echo the msg back\n            to_trio.send_nowait(await from_trio.get())\n            await asyncio.sleep(0)\n\n\n    @tractor.context\n    async def trio_to_aio_echo_server(\n        ctx: tractor.Context,\n    ):\n        # this will block until the ``asyncio`` task sends a \"first\"\n        # message.\n        async with tractor.to_asyncio.open_channel_from(\n            aio_echo_server,\n        ) as (first, chan):\n\n            assert first == 'start'\n            await ctx.started(first)\n\n            async with ctx.open_stream() as stream:\n\n                async for msg in stream:\n                    await chan.send(msg)\n\n                    out = await chan.receive()\n                    # echo back to parent actor-task\n                    await stream.send(out)\n\n\n    async def main():\n\n        async with tractor.open_nursery() as n:\n            p = await n.start_actor(\n                'aio_server',\n                enable_modules=[__name__],\n                infect_asyncio=True,\n            )\n            async with p.open_context(\n                trio_to_aio_echo_server,\n            ) as (ctx, first):\n\n                assert first == 'start'\n\n                count = 0\n                async with ctx.open_stream() as stream:\n\n                    delays = []\n                    send = time.time()\n\n                    await stream.send(count)\n                    async for msg in stream:\n                        recv = time.time()\n                        delays.append(recv - send)\n                        assert msg == count\n                        count += 1\n                        send = time.time()\n                        await stream.send(count)\n\n                        if count >= 1e3:\n                            break\n\n            print(f'mean round trip rate (Hz): {1/mean(delays)}')\n            await p.cancel_actor()\n\n\n    if __name__ == '__main__':\n        trio.run(main)\n\n\nYes, we spawn a python process, run ``asyncio``, start ``trio`` on the\n``asyncio`` loop, then send commands to the ``trio`` scheduled tasks to\ntell ``asyncio`` tasks what to do XD\n\nWe need help refining the `asyncio`-side channel API to be more\n`trio`-like. Feel free to sling your opinion in `#273`_!\n\n\n.. _#273: https://github.com/goodboy/tractor/issues/273\n\n\nHigher level \"cluster\" APIs\n---------------------------\nTo be extra terse the ``tractor`` devs have started hacking some \"higher\nlevel\" APIs for managing actor trees/clusters. These interfaces should\ngenerally be condsidered provisional for now but we encourage you to try\nthem and provide feedback. Here's a new API that let's you quickly\nspawn a flat cluster:\n\n.. code:: python\n\n    import trio\n    import tractor\n\n\n    async def sleepy_jane():\n        uid = tractor.current_actor().uid\n        print(f'Yo i am actor {uid}')\n        await trio.sleep_forever()\n\n\n    async def main():\n        '''\n        Spawn a flat actor cluster, with one process per\n        detected core.\n\n        '''\n        portal_map: dict[str, tractor.Portal]\n        results: dict[str, str]\n\n        # look at this hip new syntax!\n        async with (\n\n            tractor.open_actor_cluster(\n                modules=[__name__]\n            ) as portal_map,\n\n            trio.open_nursery() as n,\n        ):\n\n            for (name, portal) in portal_map.items():\n                n.start_soon(portal.run, sleepy_jane)\n\n            await trio.sleep(0.5)\n\n            # kill the cluster with a cancel\n            raise KeyboardInterrupt\n\n\n    if __name__ == '__main__':\n        try:\n            trio.run(main)\n        except KeyboardInterrupt:\n            pass\n\n\n.. _full worker pool re-implementation: https://github.com/goodboy/tractor/blob/master/examples/parallelism/concurrent_actors_primes.py\n\n\nInstall\n-------\nFrom PyPi::\n\n    pip install tractor\n\n\nFrom git::\n\n    pip install git+git://github.com/goodboy/tractor.git\n\n\nUnder the hood\n--------------\n``tractor`` is an attempt to pair trionic_ `structured concurrency`_ with\ndistributed Python. You can think of it as a ``trio``\n*-across-processes* or simply as an opinionated replacement for the\nstdlib's ``multiprocessing`` but built on async programming primitives\nfrom the ground up.\n\nDon't be scared off by this description. ``tractor`` **is just** ``trio``\nbut with nurseries for process management and cancel-able streaming IPC.\nIf you understand how to work with ``trio``, ``tractor`` will give you\nthe parallelism you may have been needing.\n\n\nWait, huh?! I thought \"actors\" have messages, and mailboxes and stuff?!\n***********************************************************************\nLet's stop and ask how many canon actor model papers have you actually read ;)\n\nFrom our experience many \"actor systems\" aren't really \"actor models\"\nsince they **don't adhere** to the `3 axioms`_ and pay even less\nattention to the problem of *unbounded non-determinism* (which was the\nwhole point for creation of the model in the first place).\n\nFrom the author's mouth, **the only thing required** is `adherance to`_\nthe `3 axioms`_, *and that's it*.\n\n``tractor`` adheres to said base requirements of an \"actor model\"::\n\n    In response to a message, an actor may:\n\n    - send a finite number of new messages\n    - create a finite number of new actors\n    - designate a new behavior to process subsequent messages\n\n\n**and** requires *no further api changes* to accomplish this.\n\nIf you want do debate this further please feel free to chime in on our\nchat or discuss on one of the following issues *after you've read\neverything in them*:\n\n- https://github.com/goodboy/tractor/issues/210\n- https://github.com/goodboy/tractor/issues/18\n\n\nLet's clarify our parlance\n**************************\nWhether or not ``tractor`` has \"actors\" underneath should be mostly\nirrelevant to users other then for referring to the interactions of our\nprimary runtime primitives: each Python process + ``trio.run()``\n+ surrounding IPC machinery. These are our high level, base\n*runtime-units-of-abstraction* which both *are* (as much as they can\nbe in Python) and will be referred to as our *\"actors\"*.\n\nThe main goal of ``tractor`` is is to allow for highly distributed\nsoftware that, through the adherence to *structured concurrency*,\nresults in systems which fail in predictable, recoverable and maybe even\nunderstandable ways; being an \"actor model\" is just one way to describe\nproperties of the system.\n\n\nWhat's on the TODO:\n-------------------\nHelp us push toward the future of distributed `Python`.\n\n- Erlang-style supervisors via composed context managers (see `#22\n  <https://github.com/goodboy/tractor/issues/22>`_)\n- Typed messaging protocols (ex. via ``msgspec.Struct``, see `#36\n  <https://github.com/goodboy/tractor/issues/36>`_)\n- Typed capability-based (dialog) protocols ( see `#196\n  <https://github.com/goodboy/tractor/issues/196>`_ with draft work\n  started in `#311 <https://github.com/goodboy/tractor/pull/311>`_)\n\n\nFeel like saying hi?\n--------------------\nThis project is very much coupled to the ongoing development of\n``trio`` (i.e. ``tractor`` gets most of its ideas from that brilliant\ncommunity). If you want to help, have suggestions or just want to\nsay hi, please feel free to reach us in our `matrix channel`_.  If\nmatrix seems too hip, we're also mostly all in the the `trio gitter\nchannel`_!\n\n.. _structured concurrent: https://trio.discourse.group/t/concise-definition-of-structured-concurrency/228\n.. _multi-processing: https://en.wikipedia.org/wiki/Multiprocessing\n.. _trio: https://github.com/python-trio/trio\n.. _nurseries: https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/#nurseries-a-structured-replacement-for-go-statements\n.. _actor model: https://en.wikipedia.org/wiki/Actor_model\n.. _trionic: https://trio.readthedocs.io/en/latest/design.html#high-level-design-principles\n.. _async sandwich: https://trio.readthedocs.io/en/latest/tutorial.html#async-sandwich\n.. _3 axioms: https://www.youtube.com/watch?v=7erJ1DV_Tlo&t=162s\n.. .. _3 axioms: https://en.wikipedia.org/wiki/Actor_model#Fundamental_concepts\n.. _adherance to: https://www.youtube.com/watch?v=7erJ1DV_Tlo&t=1821s\n.. _trio gitter channel: https://gitter.im/python-trio/general\n.. _matrix channel: https://matrix.to/#/!tractor:matrix.org\n.. _pdb++: https://github.com/pdbpp/pdbpp\n.. _guest mode: https://trio.readthedocs.io/en/stable/reference-lowlevel.html?highlight=guest%20mode#using-guest-mode-to-run-trio-on-top-of-other-event-loops\n.. _messages: https://en.wikipedia.org/wiki/Message_passing\n.. _trio docs: https://trio.readthedocs.io/en/latest/\n.. _blog post: https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/\n.. _structured concurrency: https://en.wikipedia.org/wiki/Structured_concurrency\n.. _structured chadcurrency: https://en.wikipedia.org/wiki/Structured_concurrency\n.. _structured concurrency: https://en.wikipedia.org/wiki/Structured_concurrency\n.. _unrequirements: https://en.wikipedia.org/wiki/Actor_model#Direct_communication_and_asynchrony\n.. _async generators: https://www.python.org/dev/peps/pep-0525/\n.. _trio-parallel: https://github.com/richardsheridan/trio-parallel\n.. _msgspec: https://jcristharif.com/msgspec/\n.. _guest-mode: https://trio.readthedocs.io/en/stable/reference-lowlevel.html?highlight=guest%20mode#using-guest-mode-to-run-trio-on-top-of-other-event-loops\n\n\n.. |gh_actions| image:: https://img.shields.io/endpoint.svg?url=https%3A%2F%2Factions-badge.atrox.dev%2Fgoodboy%2Ftractor%2Fbadge&style=popout-square\n    :target: https://actions-badge.atrox.dev/goodboy/tractor/goto\n\n.. |docs| image:: https://readthedocs.org/projects/tractor/badge/?version=latest\n    :target: https://tractor.readthedocs.io/en/latest/?badge=latest\n    :alt: Documentation Status\n\n.. |logo| image:: _static/tractor_logo_side.svg\n    :width: 250\n    :align: middle\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/goodboy/tractor",
+    "keywords": "trio,async,concurrency,structured concurrency,actor model,distributed,multiprocessing",
+    "license": "AGPLv3",
+    "maintainer": "Tyler Goodlet",
+    "maintainer_email": "jgbt@protonmail.com",
+    "name": "tractor",
+    "package_url": "https://pypi.org/project/tractor/",
+    "platform": "linux",
+    "project_url": "https://pypi.org/project/tractor/",
+    "project_urls": {
+      "Homepage": "https://github.com/goodboy/tractor"
+    },
+    "release_url": "https://pypi.org/project/tractor/0.1.0a5/",
+    "requires_dist": null,
+    "requires_python": ">=3.9",
+    "summary": "structured concurrrent \"actors\"",
+    "version": "0.1.0a5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14644577,
+  "releases": {
+    "0.1.0a0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bca75dc73455951c8182796f5e0377657889a43944dfc3883d0e881cfebf90ca",
+          "md5": "f6aaf5788e782c55bea1d3ce5edb5601",
+          "sha256": "cad1b028f27c25cb9c500beae2b88a26152fa5789ae8b44fb3f22af5d884bc30"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f6aaf5788e782c55bea1d3ce5edb5601",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 69645,
+        "upload_time": "2021-03-01T03:03:49",
+        "upload_time_iso_8601": "2021-03-01T03:03:49.112093Z",
+        "url": "https://files.pythonhosted.org/packages/bc/a7/5dc73455951c8182796f5e0377657889a43944dfc3883d0e881cfebf90ca/tractor-0.1.0a0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f39ff8af548ad9715ad1d34d652f8791ef85ba585c20d8a660008b543c7d0c0c",
+          "md5": "c70fff9554e4fb42cb38edab28bc87ba",
+          "sha256": "135f1c133ff5339deaa0408bbf87184a26166042711828f9c43df8d701f61e77"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c70fff9554e4fb42cb38edab28bc87ba",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 64924,
+        "upload_time": "2021-03-01T03:03:50",
+        "upload_time_iso_8601": "2021-03-01T03:03:50.837346Z",
+        "url": "https://files.pythonhosted.org/packages/f3/9f/f8af548ad9715ad1d34d652f8791ef85ba585c20d8a660008b543c7d0c0c/tractor-0.1.0a0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c28db0318bee6ed0a9dc33b666e2a1c99482d631f2c3175918020e2f05131e4",
+          "md5": "09314521fe0a435e8a074858be13eb45",
+          "sha256": "ad715854ac8d37204283da2fa3043c47d5fd482d01d50e34c3107044115a17cb"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "09314521fe0a435e8a074858be13eb45",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 83640,
+        "upload_time": "2021-08-01T16:56:41",
+        "upload_time_iso_8601": "2021-08-01T16:56:41.903454Z",
+        "url": "https://files.pythonhosted.org/packages/5c/28/db0318bee6ed0a9dc33b666e2a1c99482d631f2c3175918020e2f05131e4/tractor-0.1.0a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3905ae70551209ee6def733f17b62b9451ad8cf80458c0da19bb0d2befcc96d8",
+          "md5": "5f43c0d8713219974f3dc185b165234f",
+          "sha256": "bb03992c5023f6ade9df2b8785173d698c3fa8e099bef1052a99150282f2bcc3"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5f43c0d8713219974f3dc185b165234f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 87715,
+        "upload_time": "2021-09-08T13:47:43",
+        "upload_time_iso_8601": "2021-09-08T13:47:43.118662Z",
+        "url": "https://files.pythonhosted.org/packages/39/05/ae70551209ee6def733f17b62b9451ad8cf80458c0da19bb0d2befcc96d8/tractor-0.1.0a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1a3bfe37e940d1e70b482798c0ab2bb29db9ae42bc41e174f2e29e11f89ac1d2",
+          "md5": "d3f2edcf82554c67dce85948c8480ed7",
+          "sha256": "e9df708001d3e668bc840a26064cb573d01d2225d4daa4da7963b6d0165f89ee"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d3f2edcf82554c67dce85948c8480ed7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 82680,
+        "upload_time": "2021-09-08T13:47:48",
+        "upload_time_iso_8601": "2021-09-08T13:47:48.461326Z",
+        "url": "https://files.pythonhosted.org/packages/1a/3b/fe37e940d1e70b482798c0ab2bb29db9ae42bc41e174f2e29e11f89ac1d2/tractor-0.1.0a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b1a4c0d4befb1293b8028b0aa163f62f2301f1c2748139acb722a4a55727ad5a",
+          "md5": "d84437d62dda2c3f96e7c5ea967cd342",
+          "sha256": "e53cff8e9afc6e0463f83be142e597095b1d9aff2fe2172408bab42d14a91aaf"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d84437d62dda2c3f96e7c5ea967cd342",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 101285,
+        "upload_time": "2021-11-02T18:49:36",
+        "upload_time_iso_8601": "2021-11-02T18:49:36.001488Z",
+        "url": "https://files.pythonhosted.org/packages/b1/a4/c0d4befb1293b8028b0aa163f62f2301f1c2748139acb722a4a55727ad5a/tractor-0.1.0a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d7fe383d0d5540081976673aeb7b966453f307cbcaa5cd23b6782a13e5185ebf",
+          "md5": "db9827bbdb7cc48d8d46bc0e6a7d24a9",
+          "sha256": "96011a42043a7a22a4b0a2e1269cfbd8a7cd405ba76d93db75fc7810465c6892"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db9827bbdb7cc48d8d46bc0e6a7d24a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 87223,
+        "upload_time": "2021-11-02T18:49:37",
+        "upload_time_iso_8601": "2021-11-02T18:49:37.864915Z",
+        "url": "https://files.pythonhosted.org/packages/d7/fe/383d0d5540081976673aeb7b966453f307cbcaa5cd23b6782a13e5185ebf/tractor-0.1.0a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b10a2c3be1d9c46e004fbdfd7b1e0150ac8252d5ffb7ffdc8ca63953c65aad1c",
+          "md5": "c80f76dab41128937845a6cea1bf964d",
+          "sha256": "96a0242e304b6681fb8d02226f9653c201f28a2ecf4d0fe4df76fb3a1dc342e1"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c80f76dab41128937845a6cea1bf964d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 99461,
+        "upload_time": "2021-12-19T01:15:10",
+        "upload_time_iso_8601": "2021-12-19T01:15:10.934564Z",
+        "url": "https://files.pythonhosted.org/packages/b1/0a/2c3be1d9c46e004fbdfd7b1e0150ac8252d5ffb7ffdc8ca63953c65aad1c/tractor-0.1.0a4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0a5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20a410f84b3003768c8880f8ca848a0b87f0324f5d94960dcd2b1d1aee8bacb8",
+          "md5": "095545ceae1e62ecb3f4c5947e8d0988",
+          "sha256": "20390371dff39659dbe4d2a4088a27a571570cedd23fb5714bc033c9e883eea1"
+        },
+        "downloads": -1,
+        "filename": "tractor-0.1.0a5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "095545ceae1e62ecb3f4c5947e8d0988",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 106719,
+        "upload_time": "2022-08-03T18:33:05",
+        "upload_time_iso_8601": "2022-08-03T18:33:05.826860Z",
+        "url": "https://files.pythonhosted.org/packages/20/a4/10f84b3003768c8880f8ca848a0b87f0324f5d94960dcd2b1d1aee8bacb8/tractor-0.1.0a5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "20a410f84b3003768c8880f8ca848a0b87f0324f5d94960dcd2b1d1aee8bacb8",
+        "md5": "095545ceae1e62ecb3f4c5947e8d0988",
+        "sha256": "20390371dff39659dbe4d2a4088a27a571570cedd23fb5714bc033c9e883eea1"
+      },
+      "downloads": -1,
+      "filename": "tractor-0.1.0a5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "095545ceae1e62ecb3f4c5947e8d0988",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9",
+      "size": 106719,
+      "upload_time": "2022-08-03T18:33:05",
+      "upload_time_iso_8601": "2022-08-03T18:33:05.826860Z",
+      "url": "https://files.pythonhosted.org/packages/20/a4/10f84b3003768c8880f8ca848a0b87f0324f5d94960dcd2b1d1aee8bacb8/tractor-0.1.0a5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

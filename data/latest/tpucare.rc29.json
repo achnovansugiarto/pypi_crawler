@@ -1,0 +1,1370 @@
+{
+  "info": {
+    "author": "Lucas Nestler",
+    "author_email": "github.tpucare@nestler.sh",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# TPU Care\n\nAutomatically take good care of your preemptible TPUs\n\n## Table of Contents\n\n* [TPU Care](#tpu-care)\n    * [Table of Contents](#table-of-contents)\n    * [Features](#features)\n    * [Getting Started](#getting-started)\n        * [Installation](#installation)\n    * [Examples](#examples)\n        * [Long-running preemptible training](#long-running-preemptible-training)\n        * [Sweeps](#sweeps)\n    * [Citation](#citation)\n\n## Features\n\n* **Reliable code execution**: TPU Care starts a TPU, ensures it's set up as specified and continues the experiment\n  whenever the node dies. Think of it like [TerraForm](https://www.terraform.io/) + [Ansible](https://www.ansible.com/)\n  for machine learning.\n* **Maintenance of large swarms**: When running multiple nodes, TPU Care will automatically delete dead instances while\n  keeping as many alive as possible.\n* **Code generation**: To simplify setup, TPU Care efficiently clones your git repository and ensures trustable\n  execution of your `run_command` that continues even during outages.\n* **Optimized management**: When a node dies, TPU Care deletes it within five minutes and creates a new one the second\n  there is capacity.\n\n## Getting Started\n\n### Installation\n\n```BASH\npython3 -m pip install tpucare\n```\n\n## Examples\n\nWe've been using TPU Care for a while at [HomebrewNLP](https://github.com/HomebrewNLP/). In fact, this library is just\nthe branched out core of the original production-ready HomebrewNLP code. At HomebrewNLP, there were two major use-cases\nfor this library. We started both massive hyperparameter sweeps which consumed 900,000 TPU-core hours within three\nmonths and stable training on large TPU pods. Below, you can see a list of TPUs which are largely managed by TPU\nCare: ![PU Output](https://i.imgur.com/LcOm0Bc.png)\n<p align=\"center\">Screenshot from <a href=\"https://github.com/shawwn/tpunicorn\">TPUnicorn</a>, a CLI-based TPU managed software</p>\nIn the following sections, you'll learn how we use at massive scale with minimal code effort.\n\n### Long-running preemptible training\n\nFor example, the following code can be used to create a production-ready v3-256 using\nthe [HomebrewNLP-Jax](https://github.com/HomebrewNLP/HomebrewNLP-Jax) codebase (\nsee [examples/pod.py](https://github.com/clashluke/tpucare/blob/main/examples/pod.py) for an executable version):\n\n```PYTHON\nimport dataclasses\nimport typing\nfrom netrc import netrc\n\nimport yaml\n\nfrom tpucare import exec_command, exec_on_tpu, send_to_tpu, start_single\n\n\n@dataclasses.dataclass\nclass Context:\n    retry: int\n\n\nZONE = \"europe-west4-a\"\nHOST = \"big-pod\"\nRUN_NAME = \"256-core-tpu\"\n\n\ndef load_config(ctx: Context):\n    with open(\"config.yaml\", 'r') as f:\n        config = f.read()\n    config = yaml.safe_load(config)\n\n    wandb_api = wandb.Api()\n    config[\"training\"][\"do_checkpoint\"] = True\n    base_checkpoint_path = config[\"training\"][\"checkpoint_path\"]\n\n    start_step = 0\n    for run in wandb_api.runs(f\"{config['wandb']['entity']}/{config['wandb']['project']}\"):\n        if run.name == config['wandb']['name']:\n            start_step = run.summary[\"_step\"]\n            break\n    start_step -= start_step % config[\"training\"][\"checkpoint_interval\"]\n\n    config[\"training\"][\"start_step\"] = start_step\n    config[\"wandb\"][\"name\"] = f\"{RUN_NAME}-{ctx.retry}\"\n    if ctx.retry > 0:\n        config[\"training\"][\"checkpoint_load_path\"] = config[\"training\"][\"checkpoint_path\"]\n    config[\"training\"][\"checkpoint_path\"] = f\"{base_checkpoint_path}-{ctx.retry}\"\n    return yaml.dump(config)\n\n\ndef start_fn(ctx: Context, worker: int):\n    \"\"\"\n    This function gets executed in threads to start a run on a new TPU. It receives the context object returned by \n    `creation_callback` as well as the worker id which corresponds to the slice id this code was executed on in a \n    multi-host setup. For single-host setups, such as v3-8s, the \"worker\" will always be set to 0.\n    Ideally, it'd copy necessary files to the TPU and then run those. Here, `exec_command` can be used to create an \n    execution command that automatically spawns a `screen` session which persists even when the SSH connection gets cut.\n    \"\"\"\n    send_to_tpu(HOST, ZONE, \"config.yaml\", load_config(ctx), worker)\n    cmd = exec_command(repository=\"https://github.com/HomebrewNLP/HomebrewNLP-Jax\", wandb_key=wandb_key)\n    send_to_tpu(HOST, ZONE, \"setup.sh\", cmd, worker)\n    exec_on_tpu(HOST, ZONE, \"bash setup.sh\", worker)\n\n\ndef creation_callback(host: str, ctx: typing.Optional[Context]) -> Context:\n    \"\"\"\n    The `creation_callback` is called once whenever a new TPU gets created and can be used to persist state\n    (such as retry counters) across multiple invocations.\n    \"\"\"\n    if ctx is None:  # first invocation\n        return Context(0)\n    ctx.retry += 1\n    return ctx\n\n\ndef main(service_account: str, tpu_version: int = 3, slices: int = 32, preemptible: bool = True):\n    start_single(host=HOST, tpu_version=tpu_version, zone=ZONE, preemptible=preemptible,\n                 service_account=service_account, slices=slices, start_fn=start_fn,\n                 creation_callback=creation_callback)\n```\n\n### Sweeps\n\nSimilarly, large swarms of instances can be launched trivially using tpucare. Here, we largely do the same setup as\nabove, but call `launch_multiple` instead of `launch_single` which takes the additional argument `tpus` specifying the\nnumber of TPUs that should be launched and babysit. Depending on capacity and quota, the actual number of TPUs you get\nmight be lower than the number of TPUs specified.\n\n```PYTHON\ndef main(service_account: str, tpus: int, tpu_version: int = 3, slices: int = 32, preemptible: bool = True):\n    start_multiple(prefix=HOST, tpu_version=tpu_version, zone=ZONE, preemptible=preemptible,\n                   service_account=service_account, slices=slices, start_fn=start_fn,\n                   creation_callback=creation_callback, tpus=tpus)\n```\n\nHowever, this would simply launch the same run many times. If you instead plan to register them with a\n[WandB Sweep](https://docs.wandb.ai/guides/sweeps/configuration), we need to modify the `start_fn` to join the wandb\nsweep.\\\nBy patching in the code below, tpucare will start and maintain a large swarm of TPUs all working towards the same\nhyperparameter optimization problem.\n\n```PYTHON\nimport wandb\n\nwith open(\"sweep.yaml\", 'r') as f:  # sweep config passed straight to wandb\n    config = yaml.safe_load(f.read())\nsweep_id = wandb.sweep(config, entity=\"homebrewnlp\", project=\"gpt\")\n\n\ndef start_fn(ctx: Context, worker: int):\n    cmd = exec_command(repository=\"https://github.com/HomebrewNLP/HomebrewNLP-Jax\", wandb_key=wandb_key,\n                       run_command=f\"/home/ubuntu/.local/bin/wandb agent {sweep_id}\")\n    send_to_tpu(HOST, ZONE, \"setup.sh\", cmd, worker)\n    exec_on_tpu(HOST, ZONE, \"bash setup.sh\", worker)\n```\n\nThe full executable code can be found\nin [examples/sweep.py](https://github.com/clashluke/tpucare/blob/main/examples/sweep.py).\n\nSimilarly, the `start_fn` could be adapted to start an inference server\nfor [HomebrewNLP](https://github.com/HomebrewNLP/HomebrewNLP-Jax/)\nor [Craiyon](https://huggingface.co/spaces/dalle-mini/dalle-mini) or even execute machine learning unit-tests in\nparallel.\n\n## Citation\n\n```BIBTEX\n@software{nestler_lucas_2022_6837312,\n  author       = {Nestler, Lucas},\n  title        = {TPU Care},\n  month        = jul,\n  year         = 2022,\n  publisher    = {Zenodo},\n  version      = {0.0.2},\n  doi          = {10.5281/zenodo.6837312},\n  url          = {https://doi.org/10.5281/zenodo.6837312}\n}```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/clashluke/tpucare",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tpucare",
+    "package_url": "https://pypi.org/project/tpucare/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tpucare/",
+    "project_urls": {
+      "Homepage": "https://github.com/clashluke/tpucare"
+    },
+    "release_url": "https://pypi.org/project/tpucare/0.4.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "Automatically take good care of your preemptible TPUs",
+    "version": "0.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15772888,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1fd7370eef8a231bd479a83841ae1d84de037b5e2a19004841d875b3df814087",
+          "md5": "9de04a2acf5edcdbb1bf7830055e5316",
+          "sha256": "ac8d1cb1aee09e690c590d67f4b36907f142b407e97ef21309b5a3378dbbd7c9"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9de04a2acf5edcdbb1bf7830055e5316",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 8845,
+        "upload_time": "2022-07-14T18:01:30",
+        "upload_time_iso_8601": "2022-07-14T18:01:30.140555Z",
+        "url": "https://files.pythonhosted.org/packages/1f/d7/370eef8a231bd479a83841ae1d84de037b5e2a19004841d875b3df814087/tpucare-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8eaccf2b4c86d9fad066fc11245a259d755d6aa04bf66bcfc04c5e221990414c",
+          "md5": "c6058fead64413ba56b2a661d0f9febc",
+          "sha256": "b10d397ce659122183a3bee33ad94ee3368a2655a4b1dd3a40a6cf83bfe670d4"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c6058fead64413ba56b2a661d0f9febc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 10147,
+        "upload_time": "2022-07-14T18:01:34",
+        "upload_time_iso_8601": "2022-07-14T18:01:34.052046Z",
+        "url": "https://files.pythonhosted.org/packages/8e/ac/cf2b4c86d9fad066fc11245a259d755d6aa04bf66bcfc04c5e221990414c/tpucare-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d0bcbe6a45743ef732fffd1e653dc43ad4e4aa56a5afecd49f1883302c5a748",
+          "md5": "479ac0f4c2c844d8d7d0a0008ee35b6c",
+          "sha256": "909b456d5872bbe9ce565c9f1963d37b454dcf887d6439f0de94e26e8b708c0f"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "479ac0f4c2c844d8d7d0a0008ee35b6c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9601,
+        "upload_time": "2022-07-15T06:12:46",
+        "upload_time_iso_8601": "2022-07-15T06:12:46.383704Z",
+        "url": "https://files.pythonhosted.org/packages/8d/0b/cbe6a45743ef732fffd1e653dc43ad4e4aa56a5afecd49f1883302c5a748/tpucare-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0746d915ed431e85c68dad62cd3f97533c08b6044f06abf0988a38adbabd02ba",
+          "md5": "7550c14c6d208ac5d8ce45d87a9560a5",
+          "sha256": "4ac0b64065d03fa5d7641bbc5b452e57a97152d2081027878987e3ea8700cec2"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7550c14c6d208ac5d8ce45d87a9560a5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 11839,
+        "upload_time": "2022-07-15T06:12:48",
+        "upload_time_iso_8601": "2022-07-15T06:12:48.482525Z",
+        "url": "https://files.pythonhosted.org/packages/07/46/d915ed431e85c68dad62cd3f97533c08b6044f06abf0988a38adbabd02ba/tpucare-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e3a3cb346a863fa4c77ab66376ec685e1abbb6b1f06da055d33cf7c3a00a62ec",
+          "md5": "73c1660f0d798e398f13851c545697f4",
+          "sha256": "8fabb3644ecb37d3b5ba5604df5fb02db1e4ccb50dd5418031207a71148014a0"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "73c1660f0d798e398f13851c545697f4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9809,
+        "upload_time": "2022-07-17T11:53:15",
+        "upload_time_iso_8601": "2022-07-17T11:53:15.021020Z",
+        "url": "https://files.pythonhosted.org/packages/e3/a3/cb346a863fa4c77ab66376ec685e1abbb6b1f06da055d33cf7c3a00a62ec/tpucare-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fbea87ea5bb6be75ba54889ddf8c17512fe49d08aa4810a7152b7ba82c79a4c1",
+          "md5": "20a6ccaaf8f24ed62718191eb0a78d59",
+          "sha256": "c3c02b553e45d37a13960846f6f9d61d0745641650d96e6a06a1d486e79d5f58"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20a6ccaaf8f24ed62718191eb0a78d59",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12350,
+        "upload_time": "2022-07-17T11:53:18",
+        "upload_time_iso_8601": "2022-07-17T11:53:18.096881Z",
+        "url": "https://files.pythonhosted.org/packages/fb/ea/87ea5bb6be75ba54889ddf8c17512fe49d08aa4810a7152b7ba82c79a4c1/tpucare-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba91423c85cdd182537868e9d2f3c22152c7275299b2c4b82877c63b62579a52",
+          "md5": "a11134feef78ab59c00a26d437bf04ac",
+          "sha256": "a660b2cf12c44f3e0b554473657b117ed3b04abd96001f02c8720ae82f452b69"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a11134feef78ab59c00a26d437bf04ac",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9751,
+        "upload_time": "2022-07-17T13:50:01",
+        "upload_time_iso_8601": "2022-07-17T13:50:01.129615Z",
+        "url": "https://files.pythonhosted.org/packages/ba/91/423c85cdd182537868e9d2f3c22152c7275299b2c4b82877c63b62579a52/tpucare-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12ce6df5fe12a3be6e7feab9c0fd2213c05a750d1b224c1a6ef7b49a071e582e",
+          "md5": "f6dc05a915a2731cf9dd736c0221fcf4",
+          "sha256": "9fb4978bf86dc18aeea3a0083e73f178e737af0d56ef180e35ba902627873e30"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f6dc05a915a2731cf9dd736c0221fcf4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12324,
+        "upload_time": "2022-07-17T13:50:03",
+        "upload_time_iso_8601": "2022-07-17T13:50:03.811043Z",
+        "url": "https://files.pythonhosted.org/packages/12/ce/6df5fe12a3be6e7feab9c0fd2213c05a750d1b224c1a6ef7b49a071e582e/tpucare-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec2e7de6366d693c1f9ebc1d3a299422654314444ca809be552f784192359d1c",
+          "md5": "5ce798254f10620cc288b9cd4a24851e",
+          "sha256": "a9781654ac7b5c737a46c218c69b7f9eeb2e632b0b6f0daa054b6e0eb045bc78"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5ce798254f10620cc288b9cd4a24851e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9764,
+        "upload_time": "2022-07-17T14:08:45",
+        "upload_time_iso_8601": "2022-07-17T14:08:45.302151Z",
+        "url": "https://files.pythonhosted.org/packages/ec/2e/7de6366d693c1f9ebc1d3a299422654314444ca809be552f784192359d1c/tpucare-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f08daca2684900ca38b7c4381905840a5d8c54e437bcbefbae483e3b4db8bb4",
+          "md5": "887ddc9663f1637e2563794b06c2aa58",
+          "sha256": "88644b0d2147f9983413311aa72e552a239a025024b5f8b25b6a1111adce1119"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "887ddc9663f1637e2563794b06c2aa58",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12310,
+        "upload_time": "2022-07-17T14:08:47",
+        "upload_time_iso_8601": "2022-07-17T14:08:47.374909Z",
+        "url": "https://files.pythonhosted.org/packages/8f/08/daca2684900ca38b7c4381905840a5d8c54e437bcbefbae483e3b4db8bb4/tpucare-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e73fecdfe0e97e3eace5837916cff23c5a7369b43c3cf1dd7c444ccc5b589e5",
+          "md5": "3ed24e6898cb04a64b5d9681268d67e5",
+          "sha256": "3dc97011ae6981ac48326ca4a2b25e0b3248253e9c1768d0df13d857e7108e3c"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ed24e6898cb04a64b5d9681268d67e5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9986,
+        "upload_time": "2022-07-21T06:37:44",
+        "upload_time_iso_8601": "2022-07-21T06:37:44.626302Z",
+        "url": "https://files.pythonhosted.org/packages/0e/73/fecdfe0e97e3eace5837916cff23c5a7369b43c3cf1dd7c444ccc5b589e5/tpucare-0.1.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dfe8b2fdf3b127586db5f8b2c91aab095dc56cfb05c2b2bc878b2cd94c9bda3e",
+          "md5": "a992a856e36c191933070d0cc22ea33b",
+          "sha256": "755c565d663bbef2d36f009ac61ace93c18d14e9e3ca8e72f6a34c899b34a336"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a992a856e36c191933070d0cc22ea33b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12497,
+        "upload_time": "2022-07-21T06:37:47",
+        "upload_time_iso_8601": "2022-07-21T06:37:47.093347Z",
+        "url": "https://files.pythonhosted.org/packages/df/e8/b2fdf3b127586db5f8b2c91aab095dc56cfb05c2b2bc878b2cd94c9bda3e/tpucare-0.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5266a91ff76919fd90906a112f3f8d04cce49cb559df97287894d64ad35724c1",
+          "md5": "860437e0db5c72c805f6ad8c3cc2f431",
+          "sha256": "4be2546faa8ad99c648be92bc024340d89f64d35515fa85d3c74c1e0866d3977"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "860437e0db5c72c805f6ad8c3cc2f431",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10039,
+        "upload_time": "2022-08-06T21:37:00",
+        "upload_time_iso_8601": "2022-08-06T21:37:00.499457Z",
+        "url": "https://files.pythonhosted.org/packages/52/66/a91ff76919fd90906a112f3f8d04cce49cb559df97287894d64ad35724c1/tpucare-0.1.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d06449dcc3d85915823412dcfbf125fe8b9937c41e084fa47dedf0872db33a0d",
+          "md5": "ce69616d897923ab205e0b5c6e123704",
+          "sha256": "845ae626e1c3261439461c2d163a43e86e49c9a810d025dac2fbdd73406aeaca"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ce69616d897923ab205e0b5c6e123704",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12684,
+        "upload_time": "2022-08-06T21:37:02",
+        "upload_time_iso_8601": "2022-08-06T21:37:02.914894Z",
+        "url": "https://files.pythonhosted.org/packages/d0/64/49dcc3d85915823412dcfbf125fe8b9937c41e084fa47dedf0872db33a0d/tpucare-0.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e0f1088fa0a3d50af11c32f433890dcbf84e0eef2dc7852f926efe399f2c2c4",
+          "md5": "c3a7b9d9df256a092258be3a12e0e472",
+          "sha256": "30a9ccd4734b0da9fbae7c13cf318c8c85c7fd0e0e50f279f31aecdce7e2e98a"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c3a7b9d9df256a092258be3a12e0e472",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9734,
+        "upload_time": "2022-07-17T15:04:07",
+        "upload_time_iso_8601": "2022-07-17T15:04:07.694675Z",
+        "url": "https://files.pythonhosted.org/packages/9e/0f/1088fa0a3d50af11c32f433890dcbf84e0eef2dc7852f926efe399f2c2c4/tpucare-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "657c4d58c3a089a7fcf836da1f1840b4eddad5eb9951ff9d9c0e27fbd4542a88",
+          "md5": "be4bc2f7a0cc77d35737d98c1babefc0",
+          "sha256": "99d32a0d95ae8fcdfc05098a8bb05d99ffff5271c3325d8975c115152d9c125f"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "be4bc2f7a0cc77d35737d98c1babefc0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12246,
+        "upload_time": "2022-07-17T15:04:09",
+        "upload_time_iso_8601": "2022-07-17T15:04:09.938227Z",
+        "url": "https://files.pythonhosted.org/packages/65/7c/4d58c3a089a7fcf836da1f1840b4eddad5eb9951ff9d9c0e27fbd4542a88/tpucare-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c48e5097124516911d9a11b83b51591ee9b591b0140b0f26435e47c141560dd",
+          "md5": "927b67776268e28f4701a1a58d70640d",
+          "sha256": "6f3d17c88052993e9a3dc25cfbc4adea5a7916eb68ced7c2ae540c4feef51af5"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "927b67776268e28f4701a1a58d70640d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9739,
+        "upload_time": "2022-07-17T16:25:48",
+        "upload_time_iso_8601": "2022-07-17T16:25:48.782166Z",
+        "url": "https://files.pythonhosted.org/packages/5c/48/e5097124516911d9a11b83b51591ee9b591b0140b0f26435e47c141560dd/tpucare-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba399fc83419539105cddae112d0b9a44f06ee44fe3c0dcbb4547328d6ae48c9",
+          "md5": "ce3680657c32dd78821fda489fd68d8c",
+          "sha256": "9077aa2b87bce099fa202b61fc3ec4bb12e0de95a6d00d412dad469dcb592e84"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ce3680657c32dd78821fda489fd68d8c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12247,
+        "upload_time": "2022-07-17T16:25:51",
+        "upload_time_iso_8601": "2022-07-17T16:25:51.463053Z",
+        "url": "https://files.pythonhosted.org/packages/ba/39/9fc83419539105cddae112d0b9a44f06ee44fe3c0dcbb4547328d6ae48c9/tpucare-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fa012f464a2a1a77f6f7d4d55d908b33df06850b63f6caeb83e33e9dbd90ddaf",
+          "md5": "82dfa021f469b3a6098e61c32c687abf",
+          "sha256": "c9ea14b381d0852aaa208961ceef005487aee025dfc870c8f5338983cbd944ff"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "82dfa021f469b3a6098e61c32c687abf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9738,
+        "upload_time": "2022-07-17T18:46:07",
+        "upload_time_iso_8601": "2022-07-17T18:46:07.106173Z",
+        "url": "https://files.pythonhosted.org/packages/fa/01/2f464a2a1a77f6f7d4d55d908b33df06850b63f6caeb83e33e9dbd90ddaf/tpucare-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "677ff5ef78536ba1ba7d41c75a0cfd28ca021c6cd128924681982e5955ae85f4",
+          "md5": "53831422912dd9983c2f55b8c920509b",
+          "sha256": "490f5062b30a7a90ef18bbf7d317334f958f3507683071e2b2adf7032fcf564e"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "53831422912dd9983c2f55b8c920509b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12256,
+        "upload_time": "2022-07-17T18:46:10",
+        "upload_time_iso_8601": "2022-07-17T18:46:10.178764Z",
+        "url": "https://files.pythonhosted.org/packages/67/7f/f5ef78536ba1ba7d41c75a0cfd28ca021c6cd128924681982e5955ae85f4/tpucare-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0038dbe9c2ca58a427d4e4fd1ac6e58b1ad11be25e38b2da468bc6ee8cca3e95",
+          "md5": "afe7fa19af1d2356650187c7f552cc72",
+          "sha256": "337242894e6f4d5ee9fe9cf8891535a9503e22543747ee1ffdd4d13e28f80c97"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "afe7fa19af1d2356650187c7f552cc72",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9822,
+        "upload_time": "2022-07-19T11:24:01",
+        "upload_time_iso_8601": "2022-07-19T11:24:01.799366Z",
+        "url": "https://files.pythonhosted.org/packages/00/38/dbe9c2ca58a427d4e4fd1ac6e58b1ad11be25e38b2da468bc6ee8cca3e95/tpucare-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6651079aace444add40a45d865d2c136590189c542d1fd142e5f644731c9d24c",
+          "md5": "d1b476509a42cfece9c1ea4522186a11",
+          "sha256": "34f2a400f17820fb568d94d65e2559f7ddb4bcb573020d330490214ee26850ae"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d1b476509a42cfece9c1ea4522186a11",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12344,
+        "upload_time": "2022-07-19T11:24:04",
+        "upload_time_iso_8601": "2022-07-19T11:24:04.544637Z",
+        "url": "https://files.pythonhosted.org/packages/66/51/079aace444add40a45d865d2c136590189c542d1fd142e5f644731c9d24c/tpucare-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2fe94aa26f000643427e54a83a7c2efff9d8a0e6110a74427f6a072b80dae1e",
+          "md5": "29afc83e81004e839bddcd4a0a46273b",
+          "sha256": "5f8cf76b0be3a1a888cb8aa50670bdda8a34b0781de7778d9b4908383f11a2c1"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "29afc83e81004e839bddcd4a0a46273b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9855,
+        "upload_time": "2022-07-19T12:56:29",
+        "upload_time_iso_8601": "2022-07-19T12:56:29.831893Z",
+        "url": "https://files.pythonhosted.org/packages/e2/fe/94aa26f000643427e54a83a7c2efff9d8a0e6110a74427f6a072b80dae1e/tpucare-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1108e0f88a1c6d4c986827a6132e9b3f3c956604b7316c285b44d2187ae1ebdb",
+          "md5": "09a3c14b58af5975ed6d85101146ce3e",
+          "sha256": "b362a4133d3d951d1bdec1adaf9e897001902c592ea8ada20839f809a94efd7e"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09a3c14b58af5975ed6d85101146ce3e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12360,
+        "upload_time": "2022-07-19T12:56:32",
+        "upload_time_iso_8601": "2022-07-19T12:56:32.213160Z",
+        "url": "https://files.pythonhosted.org/packages/11/08/e0f88a1c6d4c986827a6132e9b3f3c956604b7316c285b44d2187ae1ebdb/tpucare-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f9e8b93fbd43671957fd1e6033fe8ee7d337665d4121ad2f420837c6ab2092d5",
+          "md5": "670651a8b78c0d5b891eb42642e93e18",
+          "sha256": "177ebde24f1b1092c6844bdce8d04f9148885355fbe20d2ff6dcee9c03baae2c"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "670651a8b78c0d5b891eb42642e93e18",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9861,
+        "upload_time": "2022-07-19T18:41:48",
+        "upload_time_iso_8601": "2022-07-19T18:41:48.958579Z",
+        "url": "https://files.pythonhosted.org/packages/f9/e8/b93fbd43671957fd1e6033fe8ee7d337665d4121ad2f420837c6ab2092d5/tpucare-0.1.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71c8cc21d8fc6c213277a44fa03b98e0d90e3d1de767642b9f2283556402ccc2",
+          "md5": "f6a8dab65e00c01165423e171c879ab6",
+          "sha256": "eba088fe9dffff1b1d131ad6578602b5fe3731a90639ffb52f9219260b402694"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f6a8dab65e00c01165423e171c879ab6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12384,
+        "upload_time": "2022-07-19T18:41:52",
+        "upload_time_iso_8601": "2022-07-19T18:41:52.357114Z",
+        "url": "https://files.pythonhosted.org/packages/71/c8/cc21d8fc6c213277a44fa03b98e0d90e3d1de767642b9f2283556402ccc2/tpucare-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ea3d152096159b15f3229060d421147469a49754d0ba27b2fb4ff9fa6fa5df2",
+          "md5": "078d6020a0f38845a9cca9b94b022099",
+          "sha256": "6506145d24b667d594f7a6fed17db6086173e4d8ca79b68b4891971622c29d06"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "078d6020a0f38845a9cca9b94b022099",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9913,
+        "upload_time": "2022-07-19T19:09:26",
+        "upload_time_iso_8601": "2022-07-19T19:09:26.304664Z",
+        "url": "https://files.pythonhosted.org/packages/5e/a3/d152096159b15f3229060d421147469a49754d0ba27b2fb4ff9fa6fa5df2/tpucare-0.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cd034d7003c206954065b52c2654b7ec34664ed7de450a6fec06632b49ab09c",
+          "md5": "93d64e9b6c8bff30c95e1274ed6d9346",
+          "sha256": "734746f639a57ff8992086d0b822badb50316aa6c347b9cd9cb3f42059aa5f82"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "93d64e9b6c8bff30c95e1274ed6d9346",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12431,
+        "upload_time": "2022-07-19T19:09:29",
+        "upload_time_iso_8601": "2022-07-19T19:09:29.550268Z",
+        "url": "https://files.pythonhosted.org/packages/3c/d0/34d7003c206954065b52c2654b7ec34664ed7de450a6fec06632b49ab09c/tpucare-0.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8472ed3595c5c4aa3fdec38cc9c5c2bc88f3a3ce9525bc44c544d9394d97a585",
+          "md5": "d12b843fb5fd73c6627f467ec9524f40",
+          "sha256": "7e21656d877935db94fb0da026667d960f38963ac5c829bd0dabea28acd2b77f"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d12b843fb5fd73c6627f467ec9524f40",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9959,
+        "upload_time": "2022-07-19T19:36:20",
+        "upload_time_iso_8601": "2022-07-19T19:36:20.552118Z",
+        "url": "https://files.pythonhosted.org/packages/84/72/ed3595c5c4aa3fdec38cc9c5c2bc88f3a3ce9525bc44c544d9394d97a585/tpucare-0.1.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d1f2b6f01fbca0f943c3f10c2ba1d2624278b9655697773ec769685c0bb7dbb",
+          "md5": "d11610977b9525670304dc8da5afb9b6",
+          "sha256": "fa71a022de0f0f7847087f7c45efa90abecede6407d9dc87d3d0de37b061e276"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d11610977b9525670304dc8da5afb9b6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12491,
+        "upload_time": "2022-07-19T19:36:23",
+        "upload_time_iso_8601": "2022-07-19T19:36:23.337074Z",
+        "url": "https://files.pythonhosted.org/packages/2d/1f/2b6f01fbca0f943c3f10c2ba1d2624278b9655697773ec769685c0bb7dbb/tpucare-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71dcad737a032f87c7a6efc8cff5a1f6ddebac641e3192bf6c6f8200421948dd",
+          "md5": "f84bcf59a31ef749a664206c29711316",
+          "sha256": "212acc607ad9c2bcee9d057cb2829a3e275b81c396d20fc88411f80f1a849b68"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f84bcf59a31ef749a664206c29711316",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9994,
+        "upload_time": "2022-08-06T22:58:28",
+        "upload_time_iso_8601": "2022-08-06T22:58:28.123279Z",
+        "url": "https://files.pythonhosted.org/packages/71/dc/ad737a032f87c7a6efc8cff5a1f6ddebac641e3192bf6c6f8200421948dd/tpucare-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69432b0f06d02b56fe25036f89a0ea326132a2cbe3c5f706337d4041b4ceb233",
+          "md5": "e50b2797df4db30c177761dd21bc3902",
+          "sha256": "d3d1c695a9c3359f252b10aaf9eadfb85a605f5ca99cebcafb2383784149f71e"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e50b2797df4db30c177761dd21bc3902",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12655,
+        "upload_time": "2022-08-06T22:58:30",
+        "upload_time_iso_8601": "2022-08-06T22:58:30.363867Z",
+        "url": "https://files.pythonhosted.org/packages/69/43/2b0f06d02b56fe25036f89a0ea326132a2cbe3c5f706337d4041b4ceb233/tpucare-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "787975d250d7953aede5368ceaa6cab616f54d149cc1824fb736c9be9740243f",
+          "md5": "91ea27efa0e5237f7ed8d6a7cf895a89",
+          "sha256": "f2e88c4137dfd5cdfde0191e3fa2f0c2f170b4944e86f0229230ca4407ad6f19"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "91ea27efa0e5237f7ed8d6a7cf895a89",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10000,
+        "upload_time": "2022-08-06T23:05:48",
+        "upload_time_iso_8601": "2022-08-06T23:05:48.040988Z",
+        "url": "https://files.pythonhosted.org/packages/78/79/75d250d7953aede5368ceaa6cab616f54d149cc1824fb736c9be9740243f/tpucare-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd4f4f9eec5de9124451f5704eadee3204fe86900dd9bef262d8d070b494a50b",
+          "md5": "268beb2e597bbd52871ae5248e6b24b4",
+          "sha256": "c5d7f4a85916f1ef06634b15491834c4f456400103de0b775a1b85ab57702293"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "268beb2e597bbd52871ae5248e6b24b4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 12656,
+        "upload_time": "2022-08-06T23:05:50",
+        "upload_time_iso_8601": "2022-08-06T23:05:50.304434Z",
+        "url": "https://files.pythonhosted.org/packages/dd/4f/4f9eec5de9124451f5704eadee3204fe86900dd9bef262d8d070b494a50b/tpucare-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "262f27566c9fee81446bd6ef4e25f71d48c8801f8db074dffae95a91c8c2bc73",
+          "md5": "d887374de1405ae81906ed09bce5c18b",
+          "sha256": "fe592b9b6494092d721063dbf503a6f0809587554d7606c0ce1c705e984f6e73"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d887374de1405ae81906ed09bce5c18b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10246,
+        "upload_time": "2022-08-06T23:23:02",
+        "upload_time_iso_8601": "2022-08-06T23:23:02.059324Z",
+        "url": "https://files.pythonhosted.org/packages/26/2f/27566c9fee81446bd6ef4e25f71d48c8801f8db074dffae95a91c8c2bc73/tpucare-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75e00c0c2e55ebcb6df0e92bfdf7d7b8434d1d427e3eb4fb40730b1971fb1193",
+          "md5": "0dba64b70b1e27f7cf0637f50249d571",
+          "sha256": "0edc051f5af954fad9bda25149d7598913585c48fcc4f968be44d4714d43bf2d"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0dba64b70b1e27f7cf0637f50249d571",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13282,
+        "upload_time": "2022-08-06T23:23:04",
+        "upload_time_iso_8601": "2022-08-06T23:23:04.210230Z",
+        "url": "https://files.pythonhosted.org/packages/75/e0/0c0c2e55ebcb6df0e92bfdf7d7b8434d1d427e3eb4fb40730b1971fb1193/tpucare-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db51cb9a1683b5eabed7f3ccb1fbaebbdb43cad6546c3381592d33285d6d0a18",
+          "md5": "b09937cac5369093fcd7acef7c891b6a",
+          "sha256": "1095541275868c3349c0ed59bc425708130c0a8ae1ce398a8b776604d53d99cb"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b09937cac5369093fcd7acef7c891b6a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10260,
+        "upload_time": "2022-08-06T23:26:54",
+        "upload_time_iso_8601": "2022-08-06T23:26:54.040367Z",
+        "url": "https://files.pythonhosted.org/packages/db/51/cb9a1683b5eabed7f3ccb1fbaebbdb43cad6546c3381592d33285d6d0a18/tpucare-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ca50d22eb846870dda32738842570263c78e5051d7a8173b1977140e0ed3f5c",
+          "md5": "a834828c49965af28fc55ef8f92e5fdd",
+          "sha256": "506b778c05659906ce687d7c2db984c7de4d62650ea3f300c54532656f22d2be"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a834828c49965af28fc55ef8f92e5fdd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13330,
+        "upload_time": "2022-08-06T23:26:56",
+        "upload_time_iso_8601": "2022-08-06T23:26:56.511512Z",
+        "url": "https://files.pythonhosted.org/packages/7c/a5/0d22eb846870dda32738842570263c78e5051d7a8173b1977140e0ed3f5c/tpucare-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37c2a6fd4a02555ad99872c2640a50c38212b50196012e443f2de1c47da5eeb3",
+          "md5": "62f37a56c6ab71f703db7fad81d9a508",
+          "sha256": "95c36b35faf974ab28240cf5a76eb07a4ffbf7471428961f67ffe4f5ed9fc316"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "62f37a56c6ab71f703db7fad81d9a508",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10299,
+        "upload_time": "2022-08-07T00:03:06",
+        "upload_time_iso_8601": "2022-08-07T00:03:06.246783Z",
+        "url": "https://files.pythonhosted.org/packages/37/c2/a6fd4a02555ad99872c2640a50c38212b50196012e443f2de1c47da5eeb3/tpucare-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c93804d8d531370a6e65748d89cd11411570a26753c5a9b2e5f2a93ede36874a",
+          "md5": "18f0a227e67fa91236422f498aa3a4ea",
+          "sha256": "084af33423208270329884b608aaafffbb7d90f8726de20c6a87171e5b30d7d0"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "18f0a227e67fa91236422f498aa3a4ea",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13360,
+        "upload_time": "2022-08-07T00:03:08",
+        "upload_time_iso_8601": "2022-08-07T00:03:08.110493Z",
+        "url": "https://files.pythonhosted.org/packages/c9/38/04d8d531370a6e65748d89cd11411570a26753c5a9b2e5f2a93ede36874a/tpucare-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b34a828eb0596839ad30fc5704f522592ddb651d1a452673ed55ae5ca3133bc",
+          "md5": "a5ab710df056bd163dff816acf8fd3d8",
+          "sha256": "9c5a47e38dcc918fa962691d9de13aa77e6f8508d7e42ca9494de3241fc654bb"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a5ab710df056bd163dff816acf8fd3d8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10317,
+        "upload_time": "2022-08-07T20:13:07",
+        "upload_time_iso_8601": "2022-08-07T20:13:07.859388Z",
+        "url": "https://files.pythonhosted.org/packages/0b/34/a828eb0596839ad30fc5704f522592ddb651d1a452673ed55ae5ca3133bc/tpucare-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "609b38791f1347a788bf38ad6c01306489e992a561ccfc2621040eba9ce3cfe2",
+          "md5": "3108117eeb04d39f6c90d5dc3550a8f9",
+          "sha256": "e7cd1414db1a0dc8e7bef2314ccb0e494569fe36ee23619846b826146e836417"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3108117eeb04d39f6c90d5dc3550a8f9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13387,
+        "upload_time": "2022-08-07T20:13:10",
+        "upload_time_iso_8601": "2022-08-07T20:13:10.708790Z",
+        "url": "https://files.pythonhosted.org/packages/60/9b/38791f1347a788bf38ad6c01306489e992a561ccfc2621040eba9ce3cfe2/tpucare-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5a77fc693c8d5d3c5f05bf9f9653dfe069b2aca50c885018417637a631e57b1",
+          "md5": "bac6d0292f7973a93a52144c4426b25c",
+          "sha256": "0385b534c4d737b54c4af9f34ba030afde74ae9e30531e0ff8fc8bb27b45016d"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bac6d0292f7973a93a52144c4426b25c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10412,
+        "upload_time": "2022-08-23T12:44:30",
+        "upload_time_iso_8601": "2022-08-23T12:44:30.501639Z",
+        "url": "https://files.pythonhosted.org/packages/b5/a7/7fc693c8d5d3c5f05bf9f9653dfe069b2aca50c885018417637a631e57b1/tpucare-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dbffe3e74672b112fde5a6bf3483cf40e3fabc6f99e3664f34a93b467cef7d0d",
+          "md5": "8ef0c792db6c7a16e9301b52b6e3231a",
+          "sha256": "30ed1be9d4a38092da7fe5abacba6429bb83059e5689f638c081cc2fff3b639f"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ef0c792db6c7a16e9301b52b6e3231a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13496,
+        "upload_time": "2022-08-23T12:44:32",
+        "upload_time_iso_8601": "2022-08-23T12:44:32.535749Z",
+        "url": "https://files.pythonhosted.org/packages/db/ff/e3e74672b112fde5a6bf3483cf40e3fabc6f99e3664f34a93b467cef7d0d/tpucare-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1de4e5e08f923984dc2b0307d9506e9f73537f2728ed403e809a58755fe10959",
+          "md5": "ee8100400efebc557ff3b96276d721be",
+          "sha256": "7ab5a6936d9984f24d7c73bf5e20e6f91bfd727b8f1067415e4857df4c2719f8"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ee8100400efebc557ff3b96276d721be",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10529,
+        "upload_time": "2022-09-08T16:51:46",
+        "upload_time_iso_8601": "2022-09-08T16:51:46.717215Z",
+        "url": "https://files.pythonhosted.org/packages/1d/e4/e5e08f923984dc2b0307d9506e9f73537f2728ed403e809a58755fe10959/tpucare-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "92b8c5d5ac05dcd9f74ef1996c9c45fc3407b12ae53cde13c0766209c0cb2c60",
+          "md5": "d6b0ecf05de48767c6cbf354b37344b8",
+          "sha256": "40fab11532dfc475a72e661f8ff572b836e904da464eeb383c3249032d92d975"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d6b0ecf05de48767c6cbf354b37344b8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13659,
+        "upload_time": "2022-09-08T16:51:49",
+        "upload_time_iso_8601": "2022-09-08T16:51:49.536001Z",
+        "url": "https://files.pythonhosted.org/packages/92/b8/c5d5ac05dcd9f74ef1996c9c45fc3407b12ae53cde13c0766209c0cb2c60/tpucare-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4ff8be5ce9f2072fc3c9711f41dc2ed0122fb040b538468e6e8c17186f00f2df",
+          "md5": "7b3dba60ce3abd93ede95e8e90e5f5b7",
+          "sha256": "d339ce437e33c7af26ef147d9306bee5f6830c956cb9f108f9c9c592aaafed21"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7b3dba60ce3abd93ede95e8e90e5f5b7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10544,
+        "upload_time": "2022-09-08T17:57:02",
+        "upload_time_iso_8601": "2022-09-08T17:57:02.376491Z",
+        "url": "https://files.pythonhosted.org/packages/4f/f8/be5ce9f2072fc3c9711f41dc2ed0122fb040b538468e6e8c17186f00f2df/tpucare-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "540c0163a090de5a0cd28a260d83476ab4d2e8317b58d7b8f03364eec7dac6a8",
+          "md5": "451d04cf30c311bb302bbebf815bcee5",
+          "sha256": "89ce3cd3b210d5ae247a1185b9e450a7f952c6961c1793222b993f9ad54bb763"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "451d04cf30c311bb302bbebf815bcee5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13678,
+        "upload_time": "2022-09-08T17:57:04",
+        "upload_time_iso_8601": "2022-09-08T17:57:04.575069Z",
+        "url": "https://files.pythonhosted.org/packages/54/0c/0163a090de5a0cd28a260d83476ab4d2e8317b58d7b8f03364eec7dac6a8/tpucare-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "044a5599c50b5c76e47ed094af3f9368c184f16c153256c242b4cefcddc2f1d7",
+          "md5": "49ff268f9fa64b53d54a431409a18725",
+          "sha256": "ffb7292da0cd4c8e65024c81123e57645a8f4c09a33b527eace54c2c3c9a0a2a"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "49ff268f9fa64b53d54a431409a18725",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10678,
+        "upload_time": "2022-10-24T15:03:38",
+        "upload_time_iso_8601": "2022-10-24T15:03:38.987630Z",
+        "url": "https://files.pythonhosted.org/packages/04/4a/5599c50b5c76e47ed094af3f9368c184f16c153256c242b4cefcddc2f1d7/tpucare-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "581d3960b427813534729688d3f4d80f0b3f596065a8f25cbeb22fdd74f47365",
+          "md5": "573ea87e017565a2e88745b81e80746d",
+          "sha256": "d8ce5f18690826e9c6b4a6556452b9cb27ba190d6858c5b45062993bb718449b"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "573ea87e017565a2e88745b81e80746d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13820,
+        "upload_time": "2022-10-24T15:03:41",
+        "upload_time_iso_8601": "2022-10-24T15:03:41.816994Z",
+        "url": "https://files.pythonhosted.org/packages/58/1d/3960b427813534729688d3f4d80f0b3f596065a8f25cbeb22fdd74f47365/tpucare-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "205592b22cd27a88f3d5b334f8f84b00a807ed3052243544a5b292487f4feac8",
+          "md5": "d72e258c2f51822ed19c061075b8e09f",
+          "sha256": "e39357492805c22142a748b0972b38b32eba7e13f1c997c1c15168ef1d47b526"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d72e258c2f51822ed19c061075b8e09f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10674,
+        "upload_time": "2022-10-24T16:15:26",
+        "upload_time_iso_8601": "2022-10-24T16:15:26.421341Z",
+        "url": "https://files.pythonhosted.org/packages/20/55/92b22cd27a88f3d5b334f8f84b00a807ed3052243544a5b292487f4feac8/tpucare-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bda7dc5ee803512b7f65b43f566b88609da3663bc79216ca7bf552df39fd11f",
+          "md5": "158099ab799d7baf6729752c7ab9807c",
+          "sha256": "2ebd4e2da7ac1e660d7efc304c4594af3378f960afacd5dfe155ec9eccd80e01"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "158099ab799d7baf6729752c7ab9807c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13827,
+        "upload_time": "2022-10-24T16:15:27",
+        "upload_time_iso_8601": "2022-10-24T16:15:27.932571Z",
+        "url": "https://files.pythonhosted.org/packages/5b/da/7dc5ee803512b7f65b43f566b88609da3663bc79216ca7bf552df39fd11f/tpucare-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "235c4c344e36ceb4859b284a2122c91c5d621d6511d316610c2ced9ecabed1cb",
+          "md5": "229a4dec543ef285c99631526c2f4444",
+          "sha256": "f1a0e9b004c96b9448cabfab90e4c233c9d16ef6ce079f4a350de72423ee722c"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "229a4dec543ef285c99631526c2f4444",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10687,
+        "upload_time": "2022-10-24T16:38:19",
+        "upload_time_iso_8601": "2022-10-24T16:38:19.477747Z",
+        "url": "https://files.pythonhosted.org/packages/23/5c/4c344e36ceb4859b284a2122c91c5d621d6511d316610c2ced9ecabed1cb/tpucare-0.3.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c313b2fe58ea48bc1a796253d0a1506d76713877ed22150647373dc4fb308ed8",
+          "md5": "5479866c9e7d458649646c53df4e5526",
+          "sha256": "224fb711579d982eb0bc41dc6b4035ce93c33be25329bd47861c1a90cf4d7759"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5479866c9e7d458649646c53df4e5526",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13829,
+        "upload_time": "2022-10-24T16:38:20",
+        "upload_time_iso_8601": "2022-10-24T16:38:20.964235Z",
+        "url": "https://files.pythonhosted.org/packages/c3/13/b2fe58ea48bc1a796253d0a1506d76713877ed22150647373dc4fb308ed8/tpucare-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47a775daa4371318e09c78bc4fb60ef50259918cc992d199fe0921f93226213e",
+          "md5": "967b9095f411f5623308ce1adf3cd80b",
+          "sha256": "342c2070a5ee297bc4829897df4df9d634c2098a26355d7ff18b835d7c85a513"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "967b9095f411f5623308ce1adf3cd80b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10669,
+        "upload_time": "2022-11-12T18:07:04",
+        "upload_time_iso_8601": "2022-11-12T18:07:04.743160Z",
+        "url": "https://files.pythonhosted.org/packages/47/a7/75daa4371318e09c78bc4fb60ef50259918cc992d199fe0921f93226213e/tpucare-0.3.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "54d0c701ba9a9a0884cbdd6363650a9ba18b721fa01bb10907c9e12c5b04b1de",
+          "md5": "503ad803e8de7a3b09fd02ee31fd5a69",
+          "sha256": "ddab1d2b2f99b834744cea12835d9da71a2a0f7eaaf9607c73df51ef090cdd43"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "503ad803e8de7a3b09fd02ee31fd5a69",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13821,
+        "upload_time": "2022-11-12T18:07:06",
+        "upload_time_iso_8601": "2022-11-12T18:07:06.673064Z",
+        "url": "https://files.pythonhosted.org/packages/54/d0/c701ba9a9a0884cbdd6363650a9ba18b721fa01bb10907c9e12c5b04b1de/tpucare-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "58cd2cb8819763a672cac730c2f4757f81c94c577f1ef7159b2fff47bf582d0a",
+          "md5": "12ac3150a36c7e035136f67f13fc9ea0",
+          "sha256": "28916f2cc99402f52364a17106d052d440bc32521042b503e64f80506479d548"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "12ac3150a36c7e035136f67f13fc9ea0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 10770,
+        "upload_time": "2022-11-15T09:45:53",
+        "upload_time_iso_8601": "2022-11-15T09:45:53.869899Z",
+        "url": "https://files.pythonhosted.org/packages/58/cd/2cb8819763a672cac730c2f4757f81c94c577f1ef7159b2fff47bf582d0a/tpucare-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b8119e3bf56d39c4c8eba4341e2926699e3c7990e108aab0da586526f496257",
+          "md5": "da745374d42926f71b08d7890e8b0226",
+          "sha256": "da072d05783db48fce63cf2ad132455e79c32613b4358ea294dc5b85dd1f36db"
+        },
+        "downloads": -1,
+        "filename": "tpucare-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "da745374d42926f71b08d7890e8b0226",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 13926,
+        "upload_time": "2022-11-15T09:45:55",
+        "upload_time_iso_8601": "2022-11-15T09:45:55.607976Z",
+        "url": "https://files.pythonhosted.org/packages/8b/81/19e3bf56d39c4c8eba4341e2926699e3c7990e108aab0da586526f496257/tpucare-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "58cd2cb8819763a672cac730c2f4757f81c94c577f1ef7159b2fff47bf582d0a",
+        "md5": "12ac3150a36c7e035136f67f13fc9ea0",
+        "sha256": "28916f2cc99402f52364a17106d052d440bc32521042b503e64f80506479d548"
+      },
+      "downloads": -1,
+      "filename": "tpucare-0.4.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "12ac3150a36c7e035136f67f13fc9ea0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 10770,
+      "upload_time": "2022-11-15T09:45:53",
+      "upload_time_iso_8601": "2022-11-15T09:45:53.869899Z",
+      "url": "https://files.pythonhosted.org/packages/58/cd/2cb8819763a672cac730c2f4757f81c94c577f1ef7159b2fff47bf582d0a/tpucare-0.4.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8b8119e3bf56d39c4c8eba4341e2926699e3c7990e108aab0da586526f496257",
+        "md5": "da745374d42926f71b08d7890e8b0226",
+        "sha256": "da072d05783db48fce63cf2ad132455e79c32613b4358ea294dc5b85dd1f36db"
+      },
+      "downloads": -1,
+      "filename": "tpucare-0.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "da745374d42926f71b08d7890e8b0226",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 13926,
+      "upload_time": "2022-11-15T09:45:55",
+      "upload_time_iso_8601": "2022-11-15T09:45:55.607976Z",
+      "url": "https://files.pythonhosted.org/packages/8b/81/19e3bf56d39c4c8eba4341e2926699e3c7990e108aab0da586526f496257/tpucare-0.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,93 @@
+{
+  "info": {
+    "author": "Kyle Hanson",
+    "author_email": "me@khanson.io",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "# Tino\nThe fastest, cutest, little API you ever did see\n\n### What is Tino?\n\nTino is a framework to remotely call functions. It builds both clients and servers. \n\nTradidtional APIs are JSON over HTTP. Tino is Msgpack over the Redis Serialization Protocol. This makes it go faster, use less bandwidth, and its binary format easier to understand.\n\n\n### Does Tino use Redis?\n\nNo. Tino uses RESP, the Redis Serialization Protocol, to encode messages over TCP. Tino only needs Redis if the service you build adds it.\n\n\n### Generalizing the Redis Protocol\n\nTino was born after a long search to find an alternative to HTTP. The protocol is great for the web, but for backend server-to-server services, it is a bit overkill. HTTP2 tried to fix some of the problems, but ended up as is a mess of statemachines, multiplexing, and header compression algorithms that proper clients took years to come out and some languages still haven't implemented it fully.\n\n\n[RESP](https://redis.io/topics/protocol), the Redis Serialization Protocol, is a Request-Response model with a very simple human readable syntax. It is also very fast to parse which makes it a great candidate for use in an API. After a [weekend of hacking](https://medium.com/swlh/hacking-the-redis-protocol-as-an-http-api-alternative-using-asyncio-in-python-7e57ba65dce3?source=friends_link&sk=029399a8cd40d6ef63895fd777459cad), a proof of concept was born and Tino quickly followed.\n\n\n### MessagePack for Serialization\n\nIt is fast, can enable zero-copy string and bytes decoding, and the most important, it is [only an afternoon of hacking](https://medium.com/@hansonkd/building-beautiful-binary-parsers-in-elixir-1bd7f865bf17?source=friends_link&sk=6f7b440eb04ee81679c3ddfede9bab07) to get a serializer and parser going.\n\nMessagePack paired with RESP means that you can implement the entire stack, protocol and serialization, by yourself from scratch if you needed to without too much trouble. And it will be fast.\n\n### The Basics\n\nTino follows closely the design of [FastAPI](https://fastapi.tiangolo.com/). Type annotations are required for both arguments and return values so that values can automatically be parsed and serialized. In Redis all commands are arrays. The position of your argument in the signature of the function matches the position of the string array of the redis command. Tino commands can not contain keyword arguments.\n\n```python\n# server.py\nfrom tino import Tino\n\napp = Tino()\n\n@app.command\ndef add(a: int, b: int) -> int:\n    return a + b\n\nif __name__ == \"__main__\":\n    app.run()\n```\n\nNow you can run commands against the server using any Redis api in any language as long as the client supports custom Redis commands (most do).\n\nOr you can use Tino's builtin high-performance client:\n\n```python\n# client.py\nimport asyncio\nfrom server import app # import the app from above\n\nasync def go():\n    client = app.client()\n    await client.connect()\n\n    three = await client.add(1, 2)\n\n    client.close()\n    await client.wait_closed()\n\nif __name__ == \"__main__\":\n    asyncio.run(go())\n```\n\n\n### Authorization\n\nTino has authorization by adding `AuthRequired` to the type signature of the methods you want to protect and supplying the `Tino` object with an `auth_func`. The `auth_func` takes a `bytes` object and returns `None` if the connection failed authorization or any other value symbolizing the authorization state if they succeeded.\n\n```python\nfrom tino import Tino\n\nKEYS = {\n    b'tinaspassword': 'tina'\n}\ndef auth_func(password: bytes):\n    return KEYS.get(password, None)\n\napp = Tino(auth_func=auth_func)\n\n@app.command\ndef add(a: int, b: int, auth: AuthRequired) -> int:\n    print(auth.value)\n    return a + b\n```\n\nAnd pass the password to the `client.connect`.\n\n```python\nasync def do():\n    client = app.client()\n    await client.connect(password=\"tinaspassword\")\n```\n\n### Other Magic Arguments\n\nBesides `AuthRequired` you can also add `Auth` (where `auth.value` can be None) and `ConnState` to get the state if you also supply a `state_factory`. This state is mutatable and is private to the connection.\n\n```python\nfrom tino import Tino\n\nasync def state_factory():\n    return 0\n\napp = Tino(state_factory=state_factory)\n\n@app.command\ndef add(a: int, b: int, auth: Auth, conn: ConnState) -> int:\n    # Count the number of unauthorized calls on this connection.\n    if auth.value is None:\n        conn.value += 1\n    return a + b\n\n```\n\n\n### Is Tino Secure?\nProbably the biggest vulnerability is a DDOS attack. More testing needs to be done to see how Tino behaves under large message sizes. Currently placing views behind `AuthRequired` does not protect against this because the entire message is parsed. So for the time being, Tino should only be considered for private connections. This can be improved however, by parsing the command first, doing the permission check then reading and parsing the body.\n\n### What about Databases?\nFor SQL I recommend using the [databases](https://pypi.org/project/databases/) project with SQLAlchemy to get true asyncio support. This example is borrowed from [fastapi](https://fastapi.tiangolo.com/advanced/async-sql-databases/)\n\n```python\nfrom tino import Tino\nimport databases\nimport sqlalchemy\nfrom typing import List\n\n# SQLAlchemy specific code, as with any other app\nDATABASE_URL = \"sqlite:///./test.db\"\n# DATABASE_URL = \"postgresql://user:password@postgresserver/db\"\n\ndatabase = databases.Database(DATABASE_URL)\n\nmetadata = sqlalchemy.MetaData()\n\nnotes = sqlalchemy.Table(\n    \"notes\",\n    metadata,\n    sqlalchemy.Column(\"id\", sqlalchemy.Integer, primary_key=True),\n    sqlalchemy.Column(\"text\", sqlalchemy.String),\n    sqlalchemy.Column(\"completed\", sqlalchemy.Boolean),\n)\n\n\nengine = sqlalchemy.create_engine(\n    DATABASE_URL, connect_args={\"check_same_thread\": False}\n)\nmetadata.create_all(engine)\n\n\nclass NoteIn(BaseModel):\n    text: str\n    completed: bool\n\n\nclass Note(BaseModel):\n    id: int\n    text: str\n    completed: bool\n\n\napp = Tino()\n\n@app.on_startup\nasync def startup():\n    await database.connect()\n\n\n@app.on_shutdown\nasync def shutdown():\n    await database.disconnect()\n\n@app.command\nasync def read_notes() -> List[Note]:\n    query = notes.select()\n    rows = await database.fetch_all(query)\n    return [Note(**n) for n in rows]\n\n\n@app.command\nasync def create_note(note: NoteIn) -> Note:\n    query = notes.insert().values(text=note.text, completed=note.completed)\n    last_record_id = await database.execute(query)\n    return Note(id=last_record_id, **note.dict())\n\n\n\nif __name__ == \"__main__\":\n    app.run()\n```\n\n\n### Should I use Tino in Production?\n\nIts not ready for public consumption at the moment, but if you want my help to run it, just drop me a line.\n\n\n### TLS Support\n\nIts probably easiest to deploy Tino behind a TCP loadbalancer that already supports TLS. You can pass in the `SSLContext` to the `client.connect` function as kwargs to the Redis connection pool.\n\n### Coming Soon\n\n* Iterators",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/hansonkd/tino",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tino",
+    "package_url": "https://pypi.org/project/tino/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/tino/",
+    "project_urls": {
+      "Homepage": "https://github.com/hansonkd/tino"
+    },
+    "release_url": "https://pypi.org/project/tino/0.0.1/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "API Framework built on MsgPack and Redis Protocol",
+    "version": "0.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7428621,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dedb14a72e8d549c2166ce5871fda4ed12ed1e3101d973b8ae33eb9a30b2db30",
+          "md5": "06435f970a0b116edc870f34edfd8ef8",
+          "sha256": "04b9706353eff202450dde8ca934f2cfd10e61ef5e9adb1de74e8e4a91921f61"
+        },
+        "downloads": -1,
+        "filename": "tino-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06435f970a0b116edc870f34edfd8ef8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8547,
+        "upload_time": "2020-06-09T04:16:38",
+        "upload_time_iso_8601": "2020-06-09T04:16:38.797584Z",
+        "url": "https://files.pythonhosted.org/packages/de/db/14a72e8d549c2166ce5871fda4ed12ed1e3101d973b8ae33eb9a30b2db30/tino-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "dedb14a72e8d549c2166ce5871fda4ed12ed1e3101d973b8ae33eb9a30b2db30",
+        "md5": "06435f970a0b116edc870f34edfd8ef8",
+        "sha256": "04b9706353eff202450dde8ca934f2cfd10e61ef5e9adb1de74e8e4a91921f61"
+      },
+      "downloads": -1,
+      "filename": "tino-0.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "06435f970a0b116edc870f34edfd8ef8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 8547,
+      "upload_time": "2020-06-09T04:16:38",
+      "upload_time_iso_8601": "2020-06-09T04:16:38.797584Z",
+      "url": "https://files.pythonhosted.org/packages/de/db/14a72e8d549c2166ce5871fda4ed12ed1e3101d973b8ae33eb9a30b2db30/tino-0.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

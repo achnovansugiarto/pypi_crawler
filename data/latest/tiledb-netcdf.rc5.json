@@ -1,0 +1,356 @@
+{
+  "info": {
+    "author": "Peter Killick",
+    "author_email": "peter.killick@informaticslab.co.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# tiledb_netcdf\nAn adapter to convert [NetCDF](https://www.unidata.ucar.edu/software/netcdf/) files to [TileDB](https://tiledb.com/) or [Zarr](https://zarr.readthedocs.io/en/stable/index.html) arrays.\n\n## Usage Examples\n\nHere we'll demonstrate using this library to convert NetCDF files to TileDB and Zarr, and read the results using Iris and Xarray.\n\n### Converting to TileDB\n\nTileDB supports direct interaction with blob storage as provided by public cloud platforms.\nCurrently this library only supports Azure Blob Storage containers, but we will add AWS support\nin a future release. If you'd like that support right now, do raise an issue 👆!\n\n#### 1. Create a common data model\n\nUse the data model class `NCDataModel` to create a data model:\n\n```python\nfrom nctotdb import NCDataModel\n\ndata_model = NCDataModel('/path/to/my/file.nc')\ndata_model.populate()\n```\n\n##### Manually modifying classification\n\nClassifying NetCDF variables is a long way from a precise science, and occasionally the\nprocess may fail to correctly classify a variable. In such a case you can manually modify\nthe classification processes by using the following instead of calling `data_model.populate()`:\n\n```python\ndata_model = NCDataModel('/path/to/my/file.nc')\nmy_bespoke_data_var_name = 'foobarbaz'\n\nwith data_model.open_netcdf():\n    data_model.classify_variables()\n    data_model.data_var_names = [my_bespoke_data_var_name]\n    data_model.get_metadata()\n```\n\n#### 2. Write the data model\n\nWith a data model created, we can convert the contents of the NetCDF file to a supported\ncloud-ready fileformat (one of `TileDB` or `Zarr`). We'll demonstrate writing to TileDB here,\nwith Zarr covered in the next section.\n\nAs mentioned earlier, we can write either to posix-like filepaths or directly to\nan Azure Storage account blob container. Let's cover each of these in turn.\n\n##### 2a. Filepaths\n\n```python\nfrom nctotdb import TileDBWriter\n\n# TileDB.\ntiledb_save_path = '/path/to/my_tdb'\ntiledb_name = 'my_tiledb'\nunlimited_dims = 'z'  # Useful if you know you're going to need to append to the `z` dimension\n\nwriter = TileDBWriter(data_model,\n                      array_filepath=tiledb_save_path,\n                      array_name=tiledb_name,\n                      unlimited_dims=unlimited_dims)\nwriter.create_domains()\n```\n\n##### 2b. Blob container\n\nSome more setup is needed to interface with an Azure Storage account Blob container.\nWe need to provide authentication to the Azure Storage account and configure TileDB operations\nto work with the Blob container we wish to write to:\n\n```python\nimport tiledb\n\n# Azure blob storage definitions.\nstorage_account_name = 'my_azure_storage_account_name'\ncontainer = 'my_blob_container_name'\nuri = f'azure://{container}'\naccess_key = 'my_azure_access_key'\n\n# TileDB configuration for Azure Blob.\ncfg = tiledb.Config()\ncfg['vfs.azure.storage_account_name'] = storage_account_name\ncfg['vfs.azure.storage_account_key'] = access_key\ncfg[\"vfs.s3.use_multipart_upload\"] = 'false'\n\nctx = tiledb.Ctx(config=cfg)\n```\n\n**Important!** Do not share or publish your Azure Storage account key! You can also\nset an environment variable that TileDB will use instead of pasting your account key\ninto your code.\n\nNow we can write to our TileDB array. This is much the same as with posix-like\npaths, other than that we must also pass the TileDB `Ctx` (context) object and specify\na container rather than a filepath to save to:\n\n```python\nwriter = TileDBWriter(data_model,\n                      container=container,\n                      array_name=tiledb_name,\n                      unlimited_dims=unlimited_dims,\n                      ctx=ctx)\nwriter.create_domains()\n```\n\n#### 3. Append\n\nWe can also append the contents of one or more extra NetCDF files along a named dimension.\nThe extra NetCDF files can be specified either as a list of filepaths or as a list of data model\nobjects. If filepaths are specified they will be automatically converted to data model objects.\n\n```python\nappend_files = ['file1.nc', 'file2.nc', 'file3.nc']\ndata_array_name = 'data'  # The name of the data arrays in the TileDB array, typically `data`.\n\nwriter.append(append_files, unlimited_dims, data_array_name)\n```\n\nYou can track the progress of append operations by enabling verbose mode:\n\n```python\nwriter.append(append_files, unlimited_dims, data_array_name,\n              verbose=True)\n```\n\nIf you have a large number of files to append or you simply want the append to complete\nfaster, `tiledb_netcdf` can use dask to parallelise the append operation on a per-file basis.\nAssuming you have already set up a dask cluster, `my_cluster`:\n\n```python\nclient = dask.distributed.Client(my_cluster)\nlogfile = \"append.log\"\nwriter.append(append_files, unlimited_dims, data_array_name,\n              parallel=True, logfile=logfile)\n```\n\n**Note:** it is recommended you also log parallel appends for error tracking, should\nanything go wrong during the append process.\n\n##### 3a. Scalar Append\n\nOne case of appending needs to be handled differently. This is the case where the datasets to\nbe appended are scalar along the append dimension. For example, you may wish to append along the\n`time` dimension, but the base dataset and all files to be appended only contain a single\n(that is, scalar) time point. In this case a scalar append needs to be carried out.\n\nTypically the append algorithm uses the separation between points along the append dimension\nto calculate the offsets of all datasets to be appended. With only a single point along the\nappend dimension this is not possible, so instead you need to also supply a file to the append\ncall that allows the offset between files to be calculated. To ensure the correct offset is\ncalculated, this file *must* describe the next step in the append dimension from the file\noriginally used to create the TileDB array.\n\nThe file used to calculate the offset is passed into the append operation using the\n`baseline` keyword argument. For example:\n\n```python\nappend_files = ['file1.nc', 'file2.nc', 'file3.nc', 'file4.nc', 'file5.nc']\ndata_array_name = 'data'\n\nwriter.append(append_files, unlimited_dims, data_array_name,\n              baselines={unlimited_dims: append_files[0]})\n```\n\n**Note:** The file used to calculate the offsets is not appended as well as being used to calculate\nthe offset. You will need to include the offset file in the append files as well!\n\n**Note:** All appends with a scalar append dimension must be supplied with a `baseline`\nfile to calculate the offset, even if an append has already successfully been carried out. You must also specify one baseline file per scalar append dimension, in a dictionary of `{\"append_dim\": baseline_file}`.\n\nIf you try and perform an append along a scalar dimension without providing a `baseline`\nfile to calculate the offset, you will encounter an error message:\n\n```python-traceback\nValueError: Cannot determine scalar step without a baseline dataset.\n```\n\n##### 3b. Custom offsets between files being appended\n\nYou may occasionally need to override the offset between successive files being appended, for example to introduce some padding between files, or to handle unexpected short files. This can be done using\nthe `override_offsets` kwarg to `append`. As with specifying `baselines`, you need to pass a dictionary linking the named append dimension to the offset override you wish to apply to that dimension. For example:\n\n```python\nappend_files = ['file1.nc', 'file2.nc', 'file3_short.nc', 'file4.nc', 'file5.nc']\nexpected_dim_len = 10\ndata_array_name = 'data'\n\nwriter.append(append_files, unlimited_dims, data_array_name,\n              override_offsets={unlimited_dims: expected_dim_len})\n```\n\nIn this case, the third file is shorter than expected (as helpfully indicated in its filename), and the override offset allows us to pad the append dimension with missing data where the file runs short. We can use the `fill_missing_points` method to fill in the gap in the associated dimension coordinate after the append has completed:\n\n```python\nwriter.fill_missing_points(unlimited_dims)\n```\n\n**Note:** you do not have to provide an override offset for every append dimension.\n\n#### 4. Read Converted Arrays\n\nWe can use the `Reader` classes to read our TileDB array with Iris or Xarray:\n\n```python\nfrom nctotdb import TileDBReader\n\n# From a posix-like filepath:\ntiledb_reader = TileDBReader(tiledb_name, array_filepath=tiledb_save_path)\n\n# Or directly from Azure Blob:\ntiledb_reader = TileDBReader(tiledb_name, container=container, ctx=ctx)\n\n# TileDB to Iris.\ncubes = tiledb_reader.to_iris()  # Convert all TileDB arrays to Iris Cubes.\ncube = tiledb_reader.to_iris('array_name')  # Convert a named variable to an Iris Cube.\n\n# TileDB to Xarray.\ndss = tiledb_reader.to_xarray()  # Convert all TileDB arrays to Xarray.\nds = tiledb_reader.to_xarray('array_name')  # Convert a named variable to an Xarray dataset.\n```\n\n### Converting to Zarr\n\nWe can also convert NetCDF files to Zarr using this library, and read these Zarrs\nback into Iris and Xarray. A similar set of APIs is provided for Zarr as was provided\nfor TileDB.\n\n#### 1. Create a common data model\n\nThis is exactly the same as for TileDB. The differentiation comes at the next step\nwhen we choose the data representation format we want to use to store the contents of\nthe NetCDF file represented by the data model.\n\n```python\nfrom nctotdb import NCDataModel\n\nmy_nc_filepath = '/path/to/my/file.nc'\ndata_model = NCDataModel(my_nc_file)\ndata_model.populate()\n```\n\n#### 2. Write to Zarr\n\nWith a data model created we can write the contents of the NetCDF file as exposed via\nthe data model. Here we write the contents to Zarr:\n\n```python\nfrom nctotdb import ZarrWriter\n\nzarr_writer = ZarrWriter(data_model, '/path/to/my_zarr',\n                         array_name='my_zarr')\nzarr_writer.create_zarr()\n```\n\n#### 3. Append\n\nWe can also add the contents of other NetCDF files to the Zarr we created, and\nextend one of the Zarr's dimensions:\n\n```python\nmy_other_nc_filepath = '/path/to/my/other_file.nc'\nother_data_model = NCDataModel(my_other_nc_file)\n\nappend_var_name = 'array_name'\nappend_dim = 'dimension_name'\n\nzarr_writer.append(other_data_model, append_var_name, append_dim)\n```\n\n#### 4. Read Zarr\n\nFinally we can read the Zarr we created into Iris and Xarray:\n\n```python\nfrom nctotdb import ZarrReader\n\nzarr_reader = ZarrReader('/path/to/my_zarr')\ncubes = zarr_reader.to_iris()\nds = zarr_reader.to_xarray()\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/informatics-lab/tiledb_netcdf",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tiledb-netcdf",
+    "package_url": "https://pypi.org/project/tiledb-netcdf/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/tiledb-netcdf/",
+    "project_urls": {
+      "Homepage": "https://github.com/informatics-lab/tiledb_netcdf"
+    },
+    "release_url": "https://pypi.org/project/tiledb-netcdf/0.3.0/",
+    "requires_dist": [
+      "distributed (>=2.28.0)",
+      "tiledb (>=0.6.6)",
+      "scitools-iris (>=2.4.0)",
+      "xarray (>=0.15.1)",
+      "zarr (>=2.4.0)"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "An adapter to convert NetCDF files to TileDB or Zarr arrays",
+    "version": "0.3.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10476402,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9be451344ba5295b0abba5730b3312226f9c6e090454ce0980201745e9044c45",
+          "md5": "32dd1903ea54a558bb87fa88084a6163",
+          "sha256": "fbae1e7d5890a26da008cdc5d18d60699e4402231b14a54d313e05cf8f46cb81"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.1.0-py3.6.egg",
+        "has_sig": false,
+        "md5_digest": "32dd1903ea54a558bb87fa88084a6163",
+        "packagetype": "bdist_egg",
+        "python_version": "3.6",
+        "requires_python": ">=3.7",
+        "size": 58084,
+        "upload_time": "2020-10-21T10:52:39",
+        "upload_time_iso_8601": "2020-10-21T10:52:39.721852Z",
+        "url": "https://files.pythonhosted.org/packages/9b/e4/51344ba5295b0abba5730b3312226f9c6e090454ce0980201745e9044c45/tiledb_netcdf-0.1.0-py3.6.egg",
+        "yanked": true,
+        "yanked_reason": "Version incorrect."
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef31a8063e40bca7be5e528070daddbe522b57230d7c5a2a4aef6f32baaa9515",
+          "md5": "d3e5371e6d3867afe62a0070ab4282e4",
+          "sha256": "d971a81cdf3ad9e7cbeb653c043d6434ff22267b068a04a3675728eaf2fab92e"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.1.0-py3.7.egg",
+        "has_sig": false,
+        "md5_digest": "d3e5371e6d3867afe62a0070ab4282e4",
+        "packagetype": "bdist_egg",
+        "python_version": "3.7",
+        "requires_python": ">=3.7",
+        "size": 58258,
+        "upload_time": "2020-10-21T10:52:41",
+        "upload_time_iso_8601": "2020-10-21T10:52:41.018870Z",
+        "url": "https://files.pythonhosted.org/packages/ef/31/a8063e40bca7be5e528070daddbe522b57230d7c5a2a4aef6f32baaa9515/tiledb_netcdf-0.1.0-py3.7.egg",
+        "yanked": true,
+        "yanked_reason": "Version incorrect."
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b6011550fd01889de959d6e07b1090f55fec082a7eaf9098cd5765e0622e7be",
+          "md5": "216eac2b626b995e7f981b9e33cf5500",
+          "sha256": "59e9dc1fc6fabc581a125356619a66ed651329d4c0046dc66e35bc70e69281bd"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "216eac2b626b995e7f981b9e33cf5500",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 41536,
+        "upload_time": "2020-10-21T10:52:37",
+        "upload_time_iso_8601": "2020-10-21T10:52:37.196052Z",
+        "url": "https://files.pythonhosted.org/packages/7b/60/11550fd01889de959d6e07b1090f55fec082a7eaf9098cd5765e0622e7be/tiledb_netcdf-0.1.0-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": "Version incorrect."
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c43b11055edaeb4127a35a8e71d6b53d8347426a2a530d527a1d20380f40135",
+          "md5": "60c618250902f1b85c8ead6139792a24",
+          "sha256": "556ae8415ae6a2ed743124ab56436a5882a88d111144d1e00ed1a45bcf546d47"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "60c618250902f1b85c8ead6139792a24",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 29797,
+        "upload_time": "2020-10-21T10:52:42",
+        "upload_time_iso_8601": "2020-10-21T10:52:42.074779Z",
+        "url": "https://files.pythonhosted.org/packages/0c/43/b11055edaeb4127a35a8e71d6b53d8347426a2a530d527a1d20380f40135/tiledb_netcdf-0.1.0.tar.gz",
+        "yanked": true,
+        "yanked_reason": "Version incorrect."
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9aa3b824ce83c9e8e3d11b13127f6e6fea104b5eea450c77d2d4bed42330b036",
+          "md5": "25fabf0ed429ed55498790317ff056a2",
+          "sha256": "8916f30fc53e2b62f1505a7421bf7e843b82eadf3377f04928f20c967bf78625"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "25fabf0ed429ed55498790317ff056a2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 41534,
+        "upload_time": "2020-10-21T11:01:23",
+        "upload_time_iso_8601": "2020-10-21T11:01:23.090279Z",
+        "url": "https://files.pythonhosted.org/packages/9a/a3/b824ce83c9e8e3d11b13127f6e6fea104b5eea450c77d2d4bed42330b036/tiledb_netcdf-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "074747d82d696a7b7d100235f6594dc87676874270fb54845e440c2e40e2c411",
+          "md5": "3b8f8c963e659734023bc875bd8eb8a6",
+          "sha256": "22b0ce7f0c7305d0094cd46dc43a7629e1cf99e60bbb90ac1096bc3d9680eb41"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b8f8c963e659734023bc875bd8eb8a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 29783,
+        "upload_time": "2020-10-21T11:01:24",
+        "upload_time_iso_8601": "2020-10-21T11:01:24.395271Z",
+        "url": "https://files.pythonhosted.org/packages/07/47/47d82d696a7b7d100235f6594dc87676874270fb54845e440c2e40e2c411/tiledb_netcdf-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c74afd8ffadac7c15bc8fb78467ada6a1acf6196a622ebcd92a5771b31ad334",
+          "md5": "f223f696f4b021378e6efdc3bcc4c549",
+          "sha256": "3fe7e018d2002d10676a7ac5b320ecfceb795449943262fc8648f530ac22826c"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f223f696f4b021378e6efdc3bcc4c549",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 41222,
+        "upload_time": "2020-10-26T14:35:56",
+        "upload_time_iso_8601": "2020-10-26T14:35:56.684114Z",
+        "url": "https://files.pythonhosted.org/packages/0c/74/afd8ffadac7c15bc8fb78467ada6a1acf6196a622ebcd92a5771b31ad334/tiledb_netcdf-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a987616f68f6f1c5e070c9cd166863c4bb99194210750e2db2f4d4d7bcf9d781",
+          "md5": "6aaaec37253a9dec88600a30c45a209c",
+          "sha256": "04eaf19058421b4e41e18eb65193df749a2ec849d91b36196c39c9e754d6361f"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6aaaec37253a9dec88600a30c45a209c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 29524,
+        "upload_time": "2020-10-26T14:35:58",
+        "upload_time_iso_8601": "2020-10-26T14:35:58.170779Z",
+        "url": "https://files.pythonhosted.org/packages/a9/87/616f68f6f1c5e070c9cd166863c4bb99194210750e2db2f4d4d7bcf9d781/tiledb_netcdf-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a92a98762a993408d916d09c060c57ef5b523f39ce7c955b38bce662c6f3db41",
+          "md5": "4e106efc82919abe2dafdf7c79948880",
+          "sha256": "d71f00c90bfea58f9f687e4ab718f1eb896c064ce88d4a21fbd75bbaf2bdf8f9"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4e106efc82919abe2dafdf7c79948880",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 43341,
+        "upload_time": "2020-12-03T16:01:06",
+        "upload_time_iso_8601": "2020-12-03T16:01:06.095778Z",
+        "url": "https://files.pythonhosted.org/packages/a9/2a/98762a993408d916d09c060c57ef5b523f39ce7c955b38bce662c6f3db41/tiledb_netcdf-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3613731e30d41c77f1c41b308a7c03f8d9b9e664d37359090f37d5619863cf31",
+          "md5": "804324e26901b2ff1d379d0059d3d44f",
+          "sha256": "e9c2eedcef20e68252811ffa994ffd4d2b8a0334dba0c00a4266aa75339b16ef"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "804324e26901b2ff1d379d0059d3d44f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31557,
+        "upload_time": "2020-12-03T16:01:07",
+        "upload_time_iso_8601": "2020-12-03T16:01:07.780616Z",
+        "url": "https://files.pythonhosted.org/packages/36/13/731e30d41c77f1c41b308a7c03f8d9b9e664d37359090f37d5619863cf31/tiledb_netcdf-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8c5137fab89ca6fb84d34c59428f0b3d1defb87ac69f5f40a8b0933ea0f66ebe",
+          "md5": "88184334b07a60260f020608aa9de726",
+          "sha256": "251addb29e1de08d41653b315e8937471f5f341834346ab0f4c4b733df2762a8"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "88184334b07a60260f020608aa9de726",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 45954,
+        "upload_time": "2021-05-26T13:59:31",
+        "upload_time_iso_8601": "2021-05-26T13:59:31.268067Z",
+        "url": "https://files.pythonhosted.org/packages/8c/51/37fab89ca6fb84d34c59428f0b3d1defb87ac69f5f40a8b0933ea0f66ebe/tiledb_netcdf-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f5c26056253cca581cca6785cf34bebaf387d54cdcc652293143fbf892687d3",
+          "md5": "917a227e9487ee7707f7b0bcd1e7f47b",
+          "sha256": "7c3cccbd4fc173aebb032b36839b0700bcda316124c68ab6a3bf3014655818a7"
+        },
+        "downloads": -1,
+        "filename": "tiledb_netcdf-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "917a227e9487ee7707f7b0bcd1e7f47b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 33678,
+        "upload_time": "2021-05-26T13:59:32",
+        "upload_time_iso_8601": "2021-05-26T13:59:32.840917Z",
+        "url": "https://files.pythonhosted.org/packages/5f/5c/26056253cca581cca6785cf34bebaf387d54cdcc652293143fbf892687d3/tiledb_netcdf-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8c5137fab89ca6fb84d34c59428f0b3d1defb87ac69f5f40a8b0933ea0f66ebe",
+        "md5": "88184334b07a60260f020608aa9de726",
+        "sha256": "251addb29e1de08d41653b315e8937471f5f341834346ab0f4c4b733df2762a8"
+      },
+      "downloads": -1,
+      "filename": "tiledb_netcdf-0.3.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "88184334b07a60260f020608aa9de726",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 45954,
+      "upload_time": "2021-05-26T13:59:31",
+      "upload_time_iso_8601": "2021-05-26T13:59:31.268067Z",
+      "url": "https://files.pythonhosted.org/packages/8c/51/37fab89ca6fb84d34c59428f0b3d1defb87ac69f5f40a8b0933ea0f66ebe/tiledb_netcdf-0.3.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5f5c26056253cca581cca6785cf34bebaf387d54cdcc652293143fbf892687d3",
+        "md5": "917a227e9487ee7707f7b0bcd1e7f47b",
+        "sha256": "7c3cccbd4fc173aebb032b36839b0700bcda316124c68ab6a3bf3014655818a7"
+      },
+      "downloads": -1,
+      "filename": "tiledb_netcdf-0.3.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "917a227e9487ee7707f7b0bcd1e7f47b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 33678,
+      "upload_time": "2021-05-26T13:59:32",
+      "upload_time_iso_8601": "2021-05-26T13:59:32.840917Z",
+      "url": "https://files.pythonhosted.org/packages/5f/5c/26056253cca581cca6785cf34bebaf387d54cdcc652293143fbf892687d3/tiledb_netcdf-0.3.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

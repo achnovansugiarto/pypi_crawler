@@ -1,0 +1,532 @@
+{
+  "info": {
+    "author": "Christian Trapp",
+    "author_email": "trapp@gbv.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# tachyconnect\n\nThis package can be used make Qt applications communicate with [leica](https://leica-geosystems.com/) total stations.\nQt is required to provide threading and signal/ slot infrastructure. \nIt provides a message abstraction for the [GSI](https://totalopenstation.readthedocs.io/en/stable/input_formats/if_leica_gsi.html) and [geoCOM](http://webarchiv.ethz.ch/geometh-data/student/eg1/2010/02_deformation/TPS1200_GeoCOM_Manual.pdf) protocols.\n\n## The Concept\n\nLeica total stations use a set of communication protocols.\nThis package creates an abstraction layer that allows to send a command to the device (e.g. \"set reflector height\") and connect the response to a Qt slot.\nThe communication handling lives in its own thread and thus is non blocking. \n\n## The Players\n\n### Protocols\n`geo_com`, `gc_constants` and `GSI_parser` deal with creating and interpreting messages in either protocol.\n\n\n#### `GSI_parser.py`\n\nThis is mostly used to translate measurements that are triggered at the device and transmitted via serial, but is capable to read any successful reply to a GSI command.\nThe `parse(line)` function is the central element, the rest consists of definitions.\nIt takes the ascii decoded bytes from the serial port an returns two dicts: \n\n```python\n# We requested the height of the total station and got:\nreply = \"*88..10+0000000000000000\"\n\nprint(parse(reply))\n\n>>> ({'precision': 16, 'instrumentZ': 0.0}, {'instrumentZ': 'meter_1mm'})\n```\n\nThe first carries the actual data, cast to an appropriate type, the second one provides a string that informs us about the unit. \nThe keys (except `precision`, which is attached by the parser) are taken from the `dict_units_attributes_digits`, around line 240 in the parser source.\nThe `precision` entry refers to the number of available digits for each datum.\nGSI uses a fixed field width and GSI8 provides eight places for data.\nThe newer format GSI16 used in the example surprises with sixteen places.\nWhich dialect is used is indicated by the leading asterisk of the reply.\n\n\n#### `geo_com.py'\n\nThis is legacy code that has been replaced by 'TachyRequest.py` that primarily exists as design notes for the author. \n\n\n#### `gc_constants.py`\n\nHere you find names for the constants that are used as return codes (`GRC_...`) and commands (`BMM...`, `COM_...`, `CSV...`...).\nYou also get a set of dicts that map the return codes to their names and a more verbose message.\nFor commands you get a dict that maps command names to the numerical codes.\n\nA geoCOM reply consist of two sections: header and a results section, which are separated by a colon.\nThe first entry in the results usually is a return code that describes the overall success of the command.\nThe header also contains a return code, which describes the success of the transaction.\nBoth parts can have seemingly conflicting reply codes at the same time.\nA typical example is the `TMC_GetCoordinate` command that even after being successfully transmitted may inform you that it requires a fresh distance measurement `1285: \"Warning: only angle measurement valid\"`.\n\nNote that the command and return codes are integers.\nWhen handling actual replies, they come as strings, so remember to cast them to integers.\n\n\n### Abstraction\n\nMessages to and from the total station get a technical implementation which is then wrapped in an abstraction.\nThe technical implementation handles the details of constructing the actual byte array that is sent over the serial connection and the extraction of results from the reply.\nThis is done for GSI and geoCom and takes place in `ts_control.py`.\n\nThe wrapper deals with the *intent* of a command e.g. \"Take a measurement\" and separates it from the two dialects.\n\n\n#### `TachyRequest.py`\n\nTachyRequest contains classes for abstracted commands. \nEach class represents one action that can be requested and provides the methods `get_gsi_command()` and `get_geocom_command()`.\nThe commands bear the names of their geoCOM equivalent:\n\n```python\n# Switch off device:\nclass COM_SwitchOffTPS(TachyRequest):\n    gsi_command = \"b\"\n\n```\n\n***NOTE: This is only partially implemented :( ***\n\nThis is to be used in conjunction with an implementation map that informs the dispatcher, which dialect is used for each command by the connected total station. \nWhen implementing a remote shut down button we would instantiate `COM_SwitchOffTPS` and submit it to the dispatcher.\nThe dispatcher looks up which dialect implements the functionality and generate the relevant message by calling either `get_gsi_command()` or `get_geocom_command()` and append the result to the respective queue.\n\n***END of fiction***\n\nThe class name is also used as label, which in turn can be used to link commands to slots.\nSee the `ReplyHandler` documentation below for more on this.\nEach `TachyRequest` has a gsi command string, a geoCOM command string and also `unpacking_keys`, which are required to access the data in GSI replies.\n***NOTE: It turned out that the command subsets of the two dialects are much less congruent than initially assumed. So far only a hand full of GSI commands are actually implemented.\nIn the example above this would be '`instrumentZ`'.\nThe constructor takes a timeout in seconds (defaults to 2) and optional parameters, which will be attached to the actual request.\n\n\n#### `ReplyHandler.py`\n\nThis guy was designed to provide a connection between Qt slots and total station replies, along the lines of \"When the reply to a `TMC_GetCoordinate` request comes in, fire a `got_coordinate` signal.\nIt also emits a fall back signal when it encounters replies that have no connected slot. \n⚠️ ***THIS DOES NOT WORK*** because the design of Qt's signal/ slot architecture prohibits the creation of signals at runtime.\n\n***HOWEVER*** We can do the next best thing.\nSignals and slots are only really required for communication between treads. \nAs long as we stay in the main class of our widget, we can use callables instead of slots.\n\nThis slot should be passed to the ctor.\nBesides that the following methods are provided:\n\n1. `register_command(self, command_class, slot)`: Takes any class from `TachyRequest` ⬆️ and a callable. When the reply to the request shows up, the result is extracted from the reply and passed to the callable which is then invoked. The association between requests and callables is implemented as a dict so each request can have at most one function to handle its results.\n1. `unregister_command(self, command_class)`: Allows to delete the association between a request and an action.\n1. `handle(self, request, reply)`: This is called from the dispatcher when a reply is being received on a queue. Note that the queue bundles each reply with the request that triggered it. The ReplyHandler now looks for an associated function to call. If none is found, request and reply are directed to the fallback signal (if provided earlier).\n\n## The Console\n\nThe `tachy_console.py` provides you with debugging functionalities and examples for sending and receiving messages.\n![Main window](media/main_window.png)\n\nUse the Tachy menu to connect to your device. The two comboboxes at the left are the dialect selector and the command selector. \nOnce a command is selected additional comboboxes or line edits are shown and populated with default values.\nThey also get tool tips.\nClicking the send button on the right appends the request to the active queue with a default time out of two seconds.\nThis works for most commands besides the robotic commands for search, which may take much longer to finish.\nRequest, reply and time outs are being displayed in the central multi line text field.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/gbv/tachyconnect",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tachyconnect",
+    "package_url": "https://pypi.org/project/tachyconnect/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tachyconnect/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/gbv/tachyconnect/issues",
+      "Homepage": "https://github.com/gbv/tachyconnect"
+    },
+    "release_url": "https://pypi.org/project/tachyconnect/0.4.1/",
+    "requires_dist": [
+      "pyqt5"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Leica total stations and Qt via python",
+    "version": "0.4.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16277667,
+  "releases": {
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8473323a891705fac20622ca798fc2108214e2eee46ff80ea6a476d273d6af32",
+          "md5": "36606adea9f6047af26ae31fbdf57708",
+          "sha256": "571ac792816bab8923a0f249f349844328ca376e097c81543a16ad2b35ded35d"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "36606adea9f6047af26ae31fbdf57708",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 37381,
+        "upload_time": "2022-03-11T12:49:36",
+        "upload_time_iso_8601": "2022-03-11T12:49:36.416814Z",
+        "url": "https://files.pythonhosted.org/packages/84/73/323a891705fac20622ca798fc2108214e2eee46ff80ea6a476d273d6af32/tachyconnect-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4d5e541f4f0760efa19f23afc1e335323480c0d451ae7c0a341c5997ae9b7db",
+          "md5": "2c3c64f756acf0128cc85e0b621e030c",
+          "sha256": "f5cbb5c93e629b9aeb1de076791ab4a28c1217b20c9e5e56c535fac2b304c079"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c3c64f756acf0128cc85e0b621e030c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 38810,
+        "upload_time": "2022-03-11T12:49:38",
+        "upload_time_iso_8601": "2022-03-11T12:49:38.112264Z",
+        "url": "https://files.pythonhosted.org/packages/d4/d5/e541f4f0760efa19f23afc1e335323480c0d451ae7c0a341c5997ae9b7db/tachyconnect-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "90adb6bf1b30a2d2605418434d2536d58f1f91a34e008f0aa0df2c1c32e6e724",
+          "md5": "71003750339ea7a17161b1627e14b325",
+          "sha256": "b0473c8f6045b40eac69cec2559279b37484019f8a8afbd6e4cb660402b192b5"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "71003750339ea7a17161b1627e14b325",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 38129,
+        "upload_time": "2022-05-03T13:44:34",
+        "upload_time_iso_8601": "2022-05-03T13:44:34.952982Z",
+        "url": "https://files.pythonhosted.org/packages/90/ad/b6bf1b30a2d2605418434d2536d58f1f91a34e008f0aa0df2c1c32e6e724/tachyconnect-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "31624d26213665e62a8e3bb99046b1b3bd68dba7cf82af2404e827de5506e7af",
+          "md5": "22625675efb8f5f2df65fe3faa529338",
+          "sha256": "254d81cd373d25cff45755a243c629ce73fcf566be048c2ce4ef739bb77058c3"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22625675efb8f5f2df65fe3faa529338",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 39567,
+        "upload_time": "2022-05-03T13:44:38",
+        "upload_time_iso_8601": "2022-05-03T13:44:38.991115Z",
+        "url": "https://files.pythonhosted.org/packages/31/62/4d26213665e62a8e3bb99046b1b3bd68dba7cf82af2404e827de5506e7af/tachyconnect-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7453e392be153d32bf1d3688ae7e01e70e905489b828a720a59d41d7221d0572",
+          "md5": "90a7f98ca597827000a9c0c4933b6803",
+          "sha256": "03ec24376c842b97a1b2b4b06f3db165ab820eb939b21db95fc3c979f668a169"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "90a7f98ca597827000a9c0c4933b6803",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 46890,
+        "upload_time": "2022-05-13T11:06:03",
+        "upload_time_iso_8601": "2022-05-13T11:06:03.591525Z",
+        "url": "https://files.pythonhosted.org/packages/74/53/e392be153d32bf1d3688ae7e01e70e905489b828a720a59d41d7221d0572/tachyconnect-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d0aa7aaf06c5787ed37fb8b6ca6c86059958d567d333f81c17899919717d6d0",
+          "md5": "8ea0c2f03feffcbf95bec92699478565",
+          "sha256": "88cc06f33306b38ebe2d36d085c48c55fabf917f1c43748753ee765266f5bc47"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ea0c2f03feffcbf95bec92699478565",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 47854,
+        "upload_time": "2022-05-13T11:06:07",
+        "upload_time_iso_8601": "2022-05-13T11:06:07.797846Z",
+        "url": "https://files.pythonhosted.org/packages/4d/0a/a7aaf06c5787ed37fb8b6ca6c86059958d567d333f81c17899919717d6d0/tachyconnect-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "97d9c86cab10333880e0a20f86ec9068dd640fd057dae0de3f5e9c4c415916f1",
+          "md5": "f4b42ac804d1484045b6cf18ceeea52c",
+          "sha256": "95fe78ba3c160dfaa955615abebd2976177dfc420cba5efa7f4e2002bdc08fe9"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f4b42ac804d1484045b6cf18ceeea52c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 46897,
+        "upload_time": "2022-05-16T11:06:40",
+        "upload_time_iso_8601": "2022-05-16T11:06:40.934476Z",
+        "url": "https://files.pythonhosted.org/packages/97/d9/c86cab10333880e0a20f86ec9068dd640fd057dae0de3f5e9c4c415916f1/tachyconnect-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "453912dc67bb698fef6fc3bcc545435726802d8bbc24749eacc4f9cdcb4c6e8f",
+          "md5": "12879da187b8b61b23c30f1ceec43ee2",
+          "sha256": "61efce45016017186339325c2d439923591218dd37911b9f32487398709ffead"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "12879da187b8b61b23c30f1ceec43ee2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 47846,
+        "upload_time": "2022-05-16T11:06:50",
+        "upload_time_iso_8601": "2022-05-16T11:06:50.686027Z",
+        "url": "https://files.pythonhosted.org/packages/45/39/12dc67bb698fef6fc3bcc545435726802d8bbc24749eacc4f9cdcb4c6e8f/tachyconnect-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0feb0f8a7445013939a43245a80713185de623d32c5457990fbf9a659398ecf0",
+          "md5": "04fc00a8f5862a83be400111ddcfa93d",
+          "sha256": "a5c68dda1e24149d475bba73f8c3e9881cf6f22d211d51304dfa7dc0fbd1ad2e"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "04fc00a8f5862a83be400111ddcfa93d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 48454,
+        "upload_time": "2022-05-16T11:39:48",
+        "upload_time_iso_8601": "2022-05-16T11:39:48.650806Z",
+        "url": "https://files.pythonhosted.org/packages/0f/eb/0f8a7445013939a43245a80713185de623d32c5457990fbf9a659398ecf0/tachyconnect-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2cc57c1ee16a63cee716d85da9695debf9c2c1ba025628cf52ec4777c0cae875",
+          "md5": "1f8bc8872e1c081f7b7cc04748d1cb6e",
+          "sha256": "2a0fdac99401c3977c119cd4e766c45a36aded628afe52aa4df2ca786eb6a62c"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1f8bc8872e1c081f7b7cc04748d1cb6e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 49422,
+        "upload_time": "2022-05-16T11:40:08",
+        "upload_time_iso_8601": "2022-05-16T11:40:08.193072Z",
+        "url": "https://files.pythonhosted.org/packages/2c/c5/7c1ee16a63cee716d85da9695debf9c2c1ba025628cf52ec4777c0cae875/tachyconnect-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d9d1bdb82bde80411cadae575a910f6071e35b41055630ab45d1d9a4a01cdbe8",
+          "md5": "c79da23d3c81d6854dc784a7acf485e7",
+          "sha256": "4b455a870715a7a0a4f3f20eef1d576aae82e477a91e2f3b8391abb0c4acce67"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c79da23d3c81d6854dc784a7acf485e7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 48457,
+        "upload_time": "2022-05-16T12:46:15",
+        "upload_time_iso_8601": "2022-05-16T12:46:15.418299Z",
+        "url": "https://files.pythonhosted.org/packages/d9/d1/bdb82bde80411cadae575a910f6071e35b41055630ab45d1d9a4a01cdbe8/tachyconnect-0.3.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f231511c9fa6f41c2a6ac2388a677c21ae9db3fe7345db39cff2255516d64880",
+          "md5": "32388018ba778040423d00634716c3ce",
+          "sha256": "97484cfa9311ac8ab05aaa3220a0ebdeca1343f5db0398a06ce24afca5193f28"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "32388018ba778040423d00634716c3ce",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 49438,
+        "upload_time": "2022-05-16T12:46:18",
+        "upload_time_iso_8601": "2022-05-16T12:46:18.321088Z",
+        "url": "https://files.pythonhosted.org/packages/f2/31/511c9fa6f41c2a6ac2388a677c21ae9db3fe7345db39cff2255516d64880/tachyconnect-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "19d8aa72b41fdfe7da8f951ee941e1c6e26769924ecabc456aa532d4a28577b5",
+          "md5": "edb491980551beea1f6d51bc8eb24bec",
+          "sha256": "e7b871907a524e1bfea0d8a6640784c1f4e73f9d6fe010f8e62cd91d8d07a36e"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "edb491980551beea1f6d51bc8eb24bec",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 50022,
+        "upload_time": "2022-05-16T13:31:53",
+        "upload_time_iso_8601": "2022-05-16T13:31:53.688978Z",
+        "url": "https://files.pythonhosted.org/packages/19/d8/aa72b41fdfe7da8f951ee941e1c6e26769924ecabc456aa532d4a28577b5/tachyconnect-0.3.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "85550b3af47890c7b931a1530ca4d917ebaa371e56dd45043df60b5819c36c57",
+          "md5": "0d53b705810270ae401ce531a4aa8865",
+          "sha256": "6f91ef47046a0a07853581bba5724108de63bdb09cc4fc2526a5e28a6de217b6"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0d53b705810270ae401ce531a4aa8865",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 50916,
+        "upload_time": "2022-05-16T13:31:57",
+        "upload_time_iso_8601": "2022-05-16T13:31:57.250192Z",
+        "url": "https://files.pythonhosted.org/packages/85/55/0b3af47890c7b931a1530ca4d917ebaa371e56dd45043df60b5819c36c57/tachyconnect-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f576be721e314ce055ddd66a708ba9f02a64e3db0972143a2b859b2565b2d07e",
+          "md5": "56b9bb4d5e211afe9fc7b1a8f76ae116",
+          "sha256": "2eb92bca97436a788ea6265c33c33862c8dbf3e34ebd0620fd84e9cc6eb96c1b"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "56b9bb4d5e211afe9fc7b1a8f76ae116",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 50054,
+        "upload_time": "2022-05-16T13:53:33",
+        "upload_time_iso_8601": "2022-05-16T13:53:33.885123Z",
+        "url": "https://files.pythonhosted.org/packages/f5/76/be721e314ce055ddd66a708ba9f02a64e3db0972143a2b859b2565b2d07e/tachyconnect-0.3.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "697b2492368ad4b606fbfb7b3f720c086f51035558ca687a948ef00ce36bb8b8",
+          "md5": "970eb870035134ad0c2d98ce9d0d5d7c",
+          "sha256": "52d4ed4ac84d81404df5af5eca581d99d915886e80ac6b291db630333075cfef"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "970eb870035134ad0c2d98ce9d0d5d7c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 50917,
+        "upload_time": "2022-05-16T13:53:37",
+        "upload_time_iso_8601": "2022-05-16T13:53:37.913487Z",
+        "url": "https://files.pythonhosted.org/packages/69/7b/2492368ad4b606fbfb7b3f720c086f51035558ca687a948ef00ce36bb8b8/tachyconnect-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a2065af7cc73092c2683d8d92f7e66ad138e29a199a0cd58beb72f1f170ba5fb",
+          "md5": "7f0f45ab3347601ed22a355a6b502d81",
+          "sha256": "47e69f8be95dd7bf55f00717adea12ab0382054604ccebf27758ac20db3c657b"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7f0f45ab3347601ed22a355a6b502d81",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 56266,
+        "upload_time": "2022-06-02T11:19:06",
+        "upload_time_iso_8601": "2022-06-02T11:19:06.751604Z",
+        "url": "https://files.pythonhosted.org/packages/a2/06/5af7cc73092c2683d8d92f7e66ad138e29a199a0cd58beb72f1f170ba5fb/tachyconnect-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7a4618dd4730a45fe7f7116d1764592e2184808c2e690ff24814bdad39455ba",
+          "md5": "0194d9cbb6e632b04ec193d445d45e92",
+          "sha256": "de2bc46594e80afe2a9298d1e45ed8965404c8b0ce95a0bc480430191e015528"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0194d9cbb6e632b04ec193d445d45e92",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 57700,
+        "upload_time": "2022-06-02T11:19:08",
+        "upload_time_iso_8601": "2022-06-02T11:19:08.960892Z",
+        "url": "https://files.pythonhosted.org/packages/a7/a4/618dd4730a45fe7f7116d1764592e2184808c2e690ff24814bdad39455ba/tachyconnect-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47bf6acf86e51349f6fff54b05d474795220371b1dcd263a7218a29f1174e3d5",
+          "md5": "ceb514b4bfdfa3b82593f8782625c7e7",
+          "sha256": "eef691225626b2203f059a02a00f1aa0d4d5658b7bd01418842f3bfc4def9512"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ceb514b4bfdfa3b82593f8782625c7e7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 56010,
+        "upload_time": "2023-01-02T09:54:44",
+        "upload_time_iso_8601": "2023-01-02T09:54:44.014917Z",
+        "url": "https://files.pythonhosted.org/packages/47/bf/6acf86e51349f6fff54b05d474795220371b1dcd263a7218a29f1174e3d5/tachyconnect-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22f9eea9f1e8d35b73f99b4f4f156ce9e643ea1d2f820fbd1c56e4feeca1e1b1",
+          "md5": "703d6ceedaf4abaf157edca5b1d6d9d0",
+          "sha256": "5c45b3cd71f58bc7ca285b3287feda408787a260df141b47a91387b2580e2115"
+        },
+        "downloads": -1,
+        "filename": "tachyconnect-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "703d6ceedaf4abaf157edca5b1d6d9d0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 57395,
+        "upload_time": "2023-01-02T09:54:46",
+        "upload_time_iso_8601": "2023-01-02T09:54:46.204466Z",
+        "url": "https://files.pythonhosted.org/packages/22/f9/eea9f1e8d35b73f99b4f4f156ce9e643ea1d2f820fbd1c56e4feeca1e1b1/tachyconnect-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "47bf6acf86e51349f6fff54b05d474795220371b1dcd263a7218a29f1174e3d5",
+        "md5": "ceb514b4bfdfa3b82593f8782625c7e7",
+        "sha256": "eef691225626b2203f059a02a00f1aa0d4d5658b7bd01418842f3bfc4def9512"
+      },
+      "downloads": -1,
+      "filename": "tachyconnect-0.4.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ceb514b4bfdfa3b82593f8782625c7e7",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 56010,
+      "upload_time": "2023-01-02T09:54:44",
+      "upload_time_iso_8601": "2023-01-02T09:54:44.014917Z",
+      "url": "https://files.pythonhosted.org/packages/47/bf/6acf86e51349f6fff54b05d474795220371b1dcd263a7218a29f1174e3d5/tachyconnect-0.4.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "22f9eea9f1e8d35b73f99b4f4f156ce9e643ea1d2f820fbd1c56e4feeca1e1b1",
+        "md5": "703d6ceedaf4abaf157edca5b1d6d9d0",
+        "sha256": "5c45b3cd71f58bc7ca285b3287feda408787a260df141b47a91387b2580e2115"
+      },
+      "downloads": -1,
+      "filename": "tachyconnect-0.4.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "703d6ceedaf4abaf157edca5b1d6d9d0",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 57395,
+      "upload_time": "2023-01-02T09:54:46",
+      "upload_time_iso_8601": "2023-01-02T09:54:46.204466Z",
+      "url": "https://files.pythonhosted.org/packages/22/f9/eea9f1e8d35b73f99b4f4f156ce9e643ea1d2f820fbd1c56e4feeca1e1b1/tachyconnect-0.4.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

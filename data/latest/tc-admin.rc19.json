@@ -1,0 +1,931 @@
+{
+  "info": {
+    "author": "Dustin Mitchell",
+    "author_email": "dustin@mozilla.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "The `tc-admin` library supports administration of the runtime configuration of a Taskcluster deployment.\nThis means creation and maintenance of resources such as roles, hooks, and worker pools, based on version-controlled specifications..\n\n# Usage\n\nThis library is used as a dependency of a Python application containing code and configuration specific to the taskcluster deployment(s) being administered.\nThe project should contain a `tc-admin.py` that serves to define the application configuration.\n\nAssuming that is in place, the tool is easy to use:\n\nAfter installing the app, run `tc-admin generate` to generate the expected set of resources (use `--json` to get JSON output).\nThis will require `TASKCLUSTER_ROOT_URL` to be set in the environment, to know which deployment to talk to.\nSimilarly, `tc-admin current` will generate the current set of resources (optionally with `--json`).\nTo compare them, run `tc-admin diff`.\n\nIf the configuration includes secrets, you may want to pass the `--without-secrets` option.\nThis option skips managing the content of secrets, and thus needs neither access to secret values nor Taskcluster credentials to fetch secrets.\n\nRun `tc-admin apply` to apply the changes.\nNote that only `apply` will require Taskcluster credentials, and it's a good practice to only set TC credentials when running this command.\n\nSee `tc-admin <command> --help` for more useful options.\n\n## Checks\n\nChecks are a way to double-check that purpose-specific invariants are satisfied in a Taskcluster deployment.\nFor example, it may be important to check that only specific repository roles have scopes to create tasks in critical worker pools.\nChecks are defined as normal Python tests, and have access to the current and generated configurations.\n\nIf the app has checks set up, then `tc-admin check` will run those checks.\n\n# Quick Guide to Library Operation\n\nThe operation of this tool is pretty simple: it generates a set of expected Taskcluster resources, downloads existing resources from the Taskcluster API, and compares them.\nA collection of resources also specifies the set of \"managed\" resources -- this allows deletion of resources that are no longer expected, without risk of deleting *everything* in the Taskcluster API.\n\nAfter generation, resources can be \"modified\".\nThis is typically used to make minor changes to resources depending on environment.\nFor exmaple, in a staging environment, hook schedules might be removed.\n\n# App Configuration\n\n## `tc-admin` and `tc-admin.py`\n\nA tc-admin app is configured by `tc-admin.py`.\nThis is a Python file which is responsible for creating and customizing an `AppConfig` object.\n\n```python\nfrom tcadmin.appconfig import AppConfig\n\nappconfig = AppConfig()\n# .. customize\n```\n\nThe `tc-admin` command looks for `tc-admin.py` in the current directory, or in the directory given by `$TC_ADMIN_PY` or command-line argument `--tc-admin-py`.\nLike most Python modules, the global `__file__` is set when `tc-admin.py` is executed, and can be used to determine relative paths.\n\nBefore `tc-admin.py` is executed, the current working directory is changed to the directory containing it.\nThis enables relative imports as well as loading files with relative paths (such as with LocalLoader, below).\n\n## Programmatic Interface\n\nThis library can also be used programmatically.\nSimply create an AppConfig object directly and call `tcadmin.main.main` with it:\n\n```python\nfrom tcadmin.appconfig import AppConfig\nfrom tcadmin.main import main\n\ndef boot():\n    appconfig = AppConfig()\n    # .. customize\n    main(appconfig)\n\nif __name__ == \"__main__\":\n    boot()\n```\n\nNote that the current directory is not automatically set in this case.\n\n## AppConfig\n\nThe AppConfig object contains a number of properties that can be customized, described below.\nDuring execution, the current AppConfig object is available from `AppConfig.current()`.\nThis can be useful when generators or modifiers are defined in separate Python modules.\n\n### Generators\n\nGenerators generate expected Taskcluster resources and defined the managed resource names.\nEach generator is an async function that is given a `Resources` object and is expected to call `resources.manage` and `resources.update`.\n\nGenerators are registered with `appconfig.generators.register`, most easily with a decorator:\n\n```python\n@appconfig.generators.register\nasync def update_resources(resources):\n    # modify in place ...\n```\n\nWhen generating secrets, respect the `--with-secrets` option, and generate secrets without values when it is false.\nYou can also use this option to determine whether the generation process requires access to secret values.\nThis allows generation runs with `--without-secrets` to occur without any credentials or access to secret values.\n\n```python\n@appconfig.generators.register\nasync def update_resources(resources):\n    # modify in place ...\n    if appconfig.options.get('--with-secrets'):\n        secretstore = load_secret_values()\n        resources.add(Secret(\n            name=\"top-secret/cookie-recipe\",\n            secret=secretstore.decrypt('recipes/double-chocolate-chip')))\n     else:\n        resources.add(Secret(name=\"top-secret/cookie-recipe\"))\n```\n\n### Modifiers\n\nModifiers are responsible for modifying an existing set of resources.\nSince resources are immutable, the signature differs slightly from generators:\n\n```python\n@appconfig.modifiers.register\nasync def modify_resources(resources):\n    # return new set of resources\n    return resources.map(..)\n```\n\nModifiers are called sequentially in the order in which they were registered.\n\n### Callbacks\n\nCallbacks are external function from your own application that can be executed at specific times during the `tc-admin apply` execution:\n\n* A `before_apply` callback will run before a resource is created, updated or deleted,\n* A `after_apply` callback will run after a resource has beencreated, updated or deleted.\n\nSupported actions are :\n\n* create\n* update\n* delete\n\nBy default all actions are used.\n\nAll resources are supported by callbacks, and enabled by default. If you want to limit your callback to some resources, you need to specify them using their class (not a string).\n\nYou can declare your callbacks as:\n\n```python\nfrom tcadmin.resources import Secret\n\nasync def my_action(action, resource):\n    print(\"Got a callback on\", action, resource)\n\n# Will call your function when a secret has been updated or deleted\nappconfig.callbacks.add(\"after_apply\", my_action, actions=[\"update\", \"delete\"], resources=[Secret, ])\n```\n\n### Command-Line Options\n\nApps can add additional command-line options, the values of which are then available during resource generation.\n\nTo register an option, call `appconfig.options.add`, with the full option name and any of the following keyword options:\n * `required` - if True, the option is required\n * `help` - help string to be shown in `tc-admin generate --help`\n * `default` - default value for the option\n\nTo retrieve the option value during generation, call `appconfig.options.get(name)`.\nAll together, then:\n\n```python\nappconfig.options.add(\"--branch\", help=\"configuration branch to read from\")\n\n@appconfig.generators.register\nasync def update_resources(resources):\n    branch = appconfig.options.get(\"--branch\")\n    # ...\n```\n\nAs a special case, the `--with-secrets` secret is available through this same mechanism.\n\n### Checks\n\nThe `appconfig.check_path` property gives the path of the checks to run for `tc-admin check`, relative to the current directory.\nThis directory is a \"normal\" pytest directory.\n\nTo help distinguish checks from tests, include a `pytest.ini` in this directory:\n\n```ini\n[pytest]\npython_classes = Check*\npython_files = check_*.py\npython_functions = check_*\n```\n\n### description_prefix\n\nThe `appconfig.description_prefix` property allows the users to customize the prefix of the description.\nThis can be customized in the `tc-admin.py` as follows:\n\n```python\nfrom tcadmin.appconfig import AppConfig\n\nappconfig = AppConfig()\nappconfig.description_prefix = \"YOUR_CUSTOM_PREFIX\"\n```\n\nThe DEFAULT value of the description_prefix is `*DO NOT EDIT* - This resource is configured automatically.\\n\\n`\n\n### Root URL\n\nFor the common case of a configuration that applies to only one Taskcluster deployment, specify that deployment's root URL in `tc-admin.py`:\n\n```python\nfrom tcadmin.appconfig import AppConfig\n\nappconfig = AppConfig()\nappconfig.root_url = \"https://taskcluster.example.com\"\n```\n\nTo support more complex cases, this value can also be an async callable.\nIt will be invoked once, after the `click` options have been processed, so it can access `appconfig.options` if necessary.\n\nThe current root URL is available from an async helper function:\n\n```python\nfrom tcadmin.util.root_url import root_url\n\nasync def foo():\n    print(await root_url())\n```\n\nThis will retrieve the value from the AppConfig or, if that is not set, from `TASKCLUSTER_ROOT_URL`.\nIf both are set, and the values do not match, it will produce an error message.\n\n### Loading Config Sources\n\nMost uses of this library load configuration data from some easily-modified YAML files.\nThe `tcadmin.util.config` package provides some support for loading and parsing these files.\nAll of this is entirely optional; use what is appropriate to the purpose.\n\n#### Loaders\n\nFirst, define a loader that can load data from files.\n\n```python\nfrom tcadmin.util.config import LocalLoader\n\nloader = LocalLoader()\n```\n\nThe LocalLoader class knows how to load configuration from files relative to `tc-admin.py`.\nIt has a `load` method that will load data, optionally parsing it as YAML:\n\n```python\ndata = loader.load(\"data.bin\")\naliases = await loader.load(\"aliases.yml\", parse=\"yaml\")\n```\n\nYou can also define your own loader class.\nJust implement the `load_raw` method to return bytes, given a filename.\n\n#### Config\n\nYAML data is inconvenient to deal with in Python, introducig a lot of `[\"..\"]` noise.\nCommonly, config files are either a top-level array, or a top-level object with named \"stanzas\" of configuration.\nThe ConfigList and ConfigDict classes support these formats.\nWe suggest using these with the Python `attrs` library.\n\nDefine a class that inherits from either of these classes, specifies the filename to load from, and has an `Item` class for the items in the collection:\n\n```python\nfrom tcadmin.util.config import ConfigList\n\nclass Workers(ConfigList):\n    filename = \"workers.yml\"\n\n    @attr.s\n    class Item:\n        workerId = attr.ib(type=str)\n        bigness = attr.ib(type=int, default=1)\n```\n\nThen simply call `await Workers.load(loader)` to load a `workers.yml` that looks something like\n\n```yaml\n- workerId: small\n  bigness: 5\n- workerId: huge\n  bigness: 5000\n```\n\nThe ConfigDict class is similar, but parses files like\n\n```yaml\nsmall:\n  bigness: 5\nhuge:\n  bigness: 5000\n```\n\nConfigList creates new `Item` instances from array elements `item` with `Item(**item)`.\nConfigDict creates new `Item` instances from `k: item` with `Item(k, **item)`.\nThis approach is compatible with `attrs`, where in the latter case `k` should be the first attribute defined.\n\nIf array elements or object values are not themselves YAML objects, add a class method named `transform_item` to transform the data in the YAML file into a Python dictionary.\nFor example:\n\n```python\nclass Workers(ConfigList):\n\n    @classmethod\n    def transform_item(cls, item):\n        # given a simple string, assume that is the workerId and apply defaults\n        if isinstance(item, str):\n            return {\"workerId\": item}\n        return item\n\n    ...\n```\n\n## Resources\n\nThe `tcadmin.resources` package contains clasess for defining Taskcluster resources and collections.\n\n```python\nfrom tcadmin.resources import Resources\n```\n\nThe `Resources` class defines a collection of resources and tracks what resources are managed.\nResources found in the Taskcluster deployment that match the \"managed\" patterns but are not generated will be deleted on `apply`.\nThe class has the following methods:\n\n* `resources.add(resource)` - add a resource to the collection.  The resource must be managed.\n* `resources.update(iterable)` - add an iterable full of resources to the collection.  All resources must be managed.\n* `resources.manage(pattern)` - consider reources matching regular expression string `pattern` to be managed\n* `resources.is_managed(id)` - return true if the given resource is managed\n* `resources.filter(pattern)` - return a new Resources object containing only resources matching the given regular expression string\n* `resources.map(functor)` - return a new Resources object, with fuctor applied to each resource.  This is typically used in modifiers.\n\nResources must be unique -- tc-admin cannot manage multiple hooks with the same name, for example.\nHowever, some resource kinds support merging, where adding a resource with the same identity as one that already exists \"merges\" it into the existing resource.\nSee the description of roles, below.\n\nThe remaining classes represent individual resources.\nEach has an `id` formed from its kind and the unique identifier for the resource in the Taskcluster.\nFor example, `Hook=release-hooks/beta-release`.\nResources are immutable once created, but can be \"evolved\" (returning a new resource) with `rsrc.evolve(**updates)`.\n\nResources with descriptions automatically prepend a \"DO NOT EDIT\" prefix to dissuade users from editing them in the Taskcluster UI.\n\n### Hook\n\n```python\nfrom tcadmin.resources import Hook, Binding\n\nhook = Hook(\n    hookGroupId=..,\n    hookId=..,\n    name=..,\n    description=..,\n    owner=..,\n    emailOnError=..,\n    schedule=(.., ..),\n    bindings=(.., ..),\n    task={..},\n    triggerSchema={..})\n```\n\nMost of these fields correspond directly to the Taskcluster definition.\nBoth `schedule` and `bindings` must be tuples, not lists (as lists are mutable).\nThe items in `schedule` are cron-like strings.\nThe items in `bindings` are instances of `Binding(exchange=.., routingKeyPattern=..)`.\n\n### Secret\n\n```python\nfrom tcadmin.resources import Secret\n\nsecret = Secret(\n    name=..,\n    secret=..)\n\n# or, when not managing secret values\n\nsecret = Secret(name=..)\n```\n\nSecrets are managed using the Secret resource type.\nWhile Taskcluster supports expiration times on secrets, this library sets those times the far future, effectively creating non-expiring secrets\n\nThis library is careful to not display secret values in its output.\nInstead, it displays `<unknown>` when not managing secret values, and displays a salted hash of the secret value when managing secret values.\nThe salted hash allows `tc-admin diff` to show that a secret value has changed, without revealing the value of that secret.\nThe salt includes a per-run salt, and the name of the secret, with the result that even if two secrets have the same value, they will be shown with different hashes in `tc-admin generate`.\n\n### Role\n\n```python\nfrom tcadmin.resources import Role\n\nrole = Role(\n    roleId=..,\n    description=..,\n    scopes=(.., ..))\n```\n\nAs with hooks, `scopes` must be a tuple (not a list) of strings.\n\nRoles can be merged if their descriptions match.\nThe resulting role contains the union of the scopes of the input roles.\nThis functionality makes management of roles easier in cases where different parts of the generation process may add scopes to the same role.\n\nFor example:\n\n```python\nresources.add(Role(roleId=\"my-role\", description=\"My Role\", scopes=[\"scope1\"]))\nresources.add(Role(roleId=\"my-role\", description=\"My Role\", scopes=[\"scope2\"]))\n```\n\nThis will result in a single Role with scopes `[\"scope1\", \"scope2\"]`.\n\n### Client\n\n```python\nfrom tcadmin.resources import Client\n\nclient = Client(\n    clientId=..,\n    description=..,\n    scopes=(.., ..))\n```\n\nClients work much like roles.\nAs with roles, `scopes` must be a tuple (not a list) of strings.\nThis library does not manage access tokens: it discards them from the response to `auth.createClient`.\nThe expectation is that project admins who need credentials for the managed clients will call `auth.resetAccessToken` and use the returned token.\n\nClients configured by this library have an expiration date far in the future.\nLike roles, the clients managed here last \"forever\".\n\n### WorkerPool\n\n```python\nfrom tcadmin.resources import WorkerPool\n\nworkerPool = WorkerPool(\n    workerPoolId=..,\n    providerId=..,\n    description=..,\n    owner=..,\n    config={..},\n    emailOnError=..)\n```\n\nAll attributes of this class match the Taskcluster definition.\n\n## Utiliites\n\nThe library provides a number of utilities for common application requirements.\n\n*NOTE*: only functions described in this README are considered stable.\nOther functions defined by the library may change without notice.\n\n### Scopes\n\nAs an aid to writing checks, tc-admin supplies local implementations of various scope-related algorithms.\n\n```python\nfrom tcadmin.util.scopes import satisfies, normalizeScopes, Resolver\n```\n\nThe `satisfies` function determines scope satisfaction, without any expansion.\nSatisfaction means that the first argument contains all scopes in the second argument.\n\n```python\nassert satisfies(['balloons:*', 'cake:birthday'], ['baloons:mylar:happy-birthday'])\n```\n\nThe `normalizeScopes` function normalizes a scopeset, removing redundant scopes and sorting.\n\n```python\nassert normalizedScopes(['balloons:*', 'balloons:mylar:*']) == ['baloons:*']\n```\n\nFinally, `Resolver` can perform scope expansion.\nIt is initialized with a dictionary mapping roleIds to scope lists.\nAlternately, it can be initialized from a `Resources` instance using `Resolver.from_resources(resources)`.\n\nIts `expandScopes` method behaves identically to the remote call `auth.expandScopes`.\n\n```python\nresolver = Resolver.from_resources(resources)\nassert resolver.expandScopes(['assume:clown:grimaldi']) == ['assume:clown:grimaldi', 'ruffle:full']\n```\n\n### aiohttp session\n\nThe library uses `aiohttp` to communicate with Taskcluster, and establishes a single session for efficiency.\nApplications can use the same session for any other HTTP operations.\n\n```python\nfrom tcadmin.util.session import aiohttp_session\n\nasync def foo():\n    # ...\n    async with aiohttp_session().get(url) as response:\n        response.raise_for_status()\n        result = await response.read()\n```\n\nTests and checks can set this value using `with_aiohttp_session`:\n\n```python\nfrom tcadmin.util.sessions import with_aiohttp_session\nimport pytest\n\n@pytest.mark.asyncio\n@with_aiohttp_session\nasync def test_something():\n    # ...\n```\n\n### MatchList\n\nA MatchList is a list of regular expressions that can determine whether a given\nstring matches one of those patterns.  Patterns are rooted at the left, but\nshould use `$` where required to match the end of the string.\n\n```python\nfrom tcadmin.util.matchlist import MatchList\n\nml = MatchList()\nml.add(\"fo+$\")\nml.add(\"ba+r$\")\nassert ml.matches(\"foo\")\n```\n\nThis functionality is used to track managed resources, but may be useful otherwise.\n\n# Development\n\nTo install for development, in a virtualenv:\n\n```\npip install -e [path]\n```\n\nAnd to run flake8 and tests:\n\n```\npython setup.py flake8\npython setup.py test\n```\n\nThe library uses [Black](https://black.readthedocs.io/en/stable/) to format code.\n\n```\npip install black\nblack tcadmin\n```\n\n## Releasing\n\nTo release:\n\n * update version in `setup.py` and `git commit -m \"vX.Y.Z\"`\n * `git tag vX.Y.z`\n * push those changes to `main`\n * `./release.sh --real` and enter your pypi credentials when prompted (omit the `--real` to try it against the testing pypi, if you're not sure)\n * Find the tag in https://github.com/taskcluster/tc-admin/releases and create a new release with a brief description of the changes\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/taskcluster/tc-admin",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tc-admin",
+    "package_url": "https://pypi.org/project/tc-admin/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tc-admin/",
+    "project_urls": {
+      "Homepage": "https://github.com/taskcluster/tc-admin"
+    },
+    "release_url": "https://pypi.org/project/tc-admin/3.3.1/",
+    "requires_dist": [
+      "taskcluster (~=44.0.0)",
+      "click (<8.2,>=8.0.0)",
+      "blessings (~=1.7)",
+      "attrs (<22.2,>=21.4.0)",
+      "sortedcontainers (~=2.4.0)",
+      "aiohttp (~=3.8.0)",
+      "pytest (<7.3,>=7.0.0)",
+      "pyyaml (~=6.0)"
+    ],
+    "requires_python": "",
+    "summary": "Administration of Taskcluster runtime configuration",
+    "version": "3.3.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15597318,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dcce97b0212191ac6c675b62b9e92e9d405d64e6f7514ec3de287def0e92eba9",
+          "md5": "0348869c939edbf9384227250a210b52",
+          "sha256": "1fcd0e10807d51e0ecf6ee93498f3aa95656f3b5a19ef3348981c4807b4e1655"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0348869c939edbf9384227250a210b52",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 26810,
+        "upload_time": "2019-09-23T18:14:25",
+        "upload_time_iso_8601": "2019-09-23T18:14:25.494783Z",
+        "url": "https://files.pythonhosted.org/packages/dc/ce/97b0212191ac6c675b62b9e92e9d405d64e6f7514ec3de287def0e92eba9/tc_admin-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "90c06031fc9c5e3102488cea7dadbb7af8a6ad5b45881e441d59f7d160c39429",
+          "md5": "c5ccb36c2d29b72fee0ab113c761be22",
+          "sha256": "243240dc4ee3cbeb5222d9ebb6279f4e0d917890ad0fb883444eb8c2a034ef81"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c5ccb36c2d29b72fee0ab113c761be22",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18276,
+        "upload_time": "2019-09-23T18:14:29",
+        "upload_time_iso_8601": "2019-09-23T18:14:29.931603Z",
+        "url": "https://files.pythonhosted.org/packages/90/c0/6031fc9c5e3102488cea7dadbb7af8a6ad5b45881e441d59f7d160c39429/tc-admin-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e8f7f2f2e6c737cfa23fba9707197882858ff3cb560574b984288a4618b229bb",
+          "md5": "81595eadf06d79d3bd1050af18668849",
+          "sha256": "a62b18cdd5f5e2b3fadd41ae4174481f403a72af67647c9911a747708c4c1d39"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "81595eadf06d79d3bd1050af18668849",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 32867,
+        "upload_time": "2019-10-14T15:44:55",
+        "upload_time_iso_8601": "2019-10-14T15:44:55.710780Z",
+        "url": "https://files.pythonhosted.org/packages/e8/f7/f2f2e6c737cfa23fba9707197882858ff3cb560574b984288a4618b229bb/tc_admin-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4dfb668bd1f0e8bfbeefb33ecf96c11f834faecf0434dbf18b379f12426d23da",
+          "md5": "3402e9217da857fdb5b679e3ea8bad4d",
+          "sha256": "ebcb963aa728c14a28bc853e9817238bef75eb766fdb31430e09e9729ab9f027"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3402e9217da857fdb5b679e3ea8bad4d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21257,
+        "upload_time": "2019-10-14T15:45:08",
+        "upload_time_iso_8601": "2019-10-14T15:45:08.914137Z",
+        "url": "https://files.pythonhosted.org/packages/4d/fb/668bd1f0e8bfbeefb33ecf96c11f834faecf0434dbf18b379f12426d23da/tc-admin-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e6ed5d84fa7d3d8ef5d4e66893b8305deab51ffeed7f3c047a8f688a6f53f1e",
+          "md5": "7d778dd9d5952e77f53702fe729b9803",
+          "sha256": "107ffcb030b9c1b11b39b43d20b7daf3b0384d01eccba38a89363791a9cc2e50"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7d778dd9d5952e77f53702fe729b9803",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 33675,
+        "upload_time": "2019-10-14T21:17:36",
+        "upload_time_iso_8601": "2019-10-14T21:17:36.413682Z",
+        "url": "https://files.pythonhosted.org/packages/4e/6e/d5d84fa7d3d8ef5d4e66893b8305deab51ffeed7f3c047a8f688a6f53f1e/tc_admin-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "638d9439e916a5d2ee057c02381b506a1cd6dac3db1675a8f5e461818a92e96e",
+          "md5": "ebcbfee356a2e3356e5708efa1212843",
+          "sha256": "4b2bce71f3e2a1ba0c71d323211eb1f72e772a55eb504ae9b3aa62ff3b5c24ce"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ebcbfee356a2e3356e5708efa1212843",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22134,
+        "upload_time": "2019-10-14T21:17:41",
+        "upload_time_iso_8601": "2019-10-14T21:17:41.482848Z",
+        "url": "https://files.pythonhosted.org/packages/63/8d/9439e916a5d2ee057c02381b506a1cd6dac3db1675a8f5e461818a92e96e/tc-admin-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "257bcd08aa7e44205b702d0dd64694e8285cddc9f4e36ce7ee9f7974a8714028",
+          "md5": "8a7ed24157e74de17c0eea222cc46747",
+          "sha256": "92423ee2bd47d353dfd0fc27eccc6324c85bbe6d0a4fc7564c3fb05f369296b7"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8a7ed24157e74de17c0eea222cc46747",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 33687,
+        "upload_time": "2019-10-16T22:32:17",
+        "upload_time_iso_8601": "2019-10-16T22:32:17.403413Z",
+        "url": "https://files.pythonhosted.org/packages/25/7b/cd08aa7e44205b702d0dd64694e8285cddc9f4e36ce7ee9f7974a8714028/tc_admin-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8456f740ed2cc63b397ae08b4c7c924473e2804b1a9104da01075b2acd9a8af3",
+          "md5": "08031f88acd74cb49521a9688b9692cc",
+          "sha256": "1020f04d059be363818fd760ff0a7d7ab509ea839e0d1d534a7b0705ea6993c7"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "08031f88acd74cb49521a9688b9692cc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22144,
+        "upload_time": "2019-10-16T22:32:19",
+        "upload_time_iso_8601": "2019-10-16T22:32:19.367215Z",
+        "url": "https://files.pythonhosted.org/packages/84/56/f740ed2cc63b397ae08b4c7c924473e2804b1a9104da01075b2acd9a8af3/tc-admin-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7215ad4fe3863fd44f21cd96edcdb2b429a906c6c47ccdb51e9da5e32939ac7",
+          "md5": "621b91df2eec0a02470bbcbf7dd127cc",
+          "sha256": "088709f25acc31516f1fe460467f0889f87ffea89c8f779228e404ea64cd4ab2"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "621b91df2eec0a02470bbcbf7dd127cc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 35401,
+        "upload_time": "2019-10-24T15:38:19",
+        "upload_time_iso_8601": "2019-10-24T15:38:19.613338Z",
+        "url": "https://files.pythonhosted.org/packages/e7/21/5ad4fe3863fd44f21cd96edcdb2b429a906c6c47ccdb51e9da5e32939ac7/tc_admin-2.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6cb8f3e51b3496a7438540bbdcbdb8d015223d875068196127271933ac6bbdb",
+          "md5": "182515705ee9f6160b2d09eb3fb29f63",
+          "sha256": "71b96e03a082e42843e20da531fc7023c9e528feeff2bff1afb04670df790351"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "182515705ee9f6160b2d09eb3fb29f63",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22631,
+        "upload_time": "2019-10-24T15:38:21",
+        "upload_time_iso_8601": "2019-10-24T15:38:21.514675Z",
+        "url": "https://files.pythonhosted.org/packages/b6/cb/8f3e51b3496a7438540bbdcbdb8d015223d875068196127271933ac6bbdb/tc-admin-2.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6c533326c7209b38f1617ee8720608d25e54accc3f314d28f5ac260a46ade34",
+          "md5": "03a8c2b70d2fc7b6d6bf98ace4d7fcb9",
+          "sha256": "20f7e1772dfb2abb10d3c2c3296f39fda9085e73fe2a7f38fac899f104f85b30"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "03a8c2b70d2fc7b6d6bf98ace4d7fcb9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 35299,
+        "upload_time": "2019-11-03T02:22:19",
+        "upload_time_iso_8601": "2019-11-03T02:22:19.852773Z",
+        "url": "https://files.pythonhosted.org/packages/b6/c5/33326c7209b38f1617ee8720608d25e54accc3f314d28f5ac260a46ade34/tc_admin-2.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b570a17fbb19532b8895856a317a176761df0963849f2b5a92e565050791088b",
+          "md5": "9651d4b2f3b3977794ba90e93d26054b",
+          "sha256": "a647575434a8f05cfff8f96ff55cff4651a59110800fd7b0df692010baa44dac"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9651d4b2f3b3977794ba90e93d26054b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22530,
+        "upload_time": "2019-11-03T02:22:21",
+        "upload_time_iso_8601": "2019-11-03T02:22:21.681060Z",
+        "url": "https://files.pythonhosted.org/packages/b5/70/a17fbb19532b8895856a317a176761df0963849f2b5a92e565050791088b/tc-admin-2.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b86fd2cd9cabbf1662e02c8aa696c83b15813b4b41940b6581c54655b482cd81",
+          "md5": "ae74c0da5145e9e9ecfc7e211093bdf5",
+          "sha256": "1f1992e33be0880190390ad5e5a9638b4cfbdaacfb898b91ed9c50391156955a"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ae74c0da5145e9e9ecfc7e211093bdf5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 38471,
+        "upload_time": "2019-11-04T19:41:10",
+        "upload_time_iso_8601": "2019-11-04T19:41:10.918209Z",
+        "url": "https://files.pythonhosted.org/packages/b8/6f/d2cd9cabbf1662e02c8aa696c83b15813b4b41940b6581c54655b482cd81/tc_admin-2.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da712de8f72dc9b5c6daec465616acd1f5c756947cc8e627efa1b0c3201c593d",
+          "md5": "72721df06c4f251e40f7c525d6811d66",
+          "sha256": "54bf92efe2219cea801601c7d59f826b1515891cd1a43f8c31a02bcda85f5ec6"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72721df06c4f251e40f7c525d6811d66",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24665,
+        "upload_time": "2019-11-04T19:41:12",
+        "upload_time_iso_8601": "2019-11-04T19:41:12.560855Z",
+        "url": "https://files.pythonhosted.org/packages/da/71/2de8f72dc9b5c6daec465616acd1f5c756947cc8e627efa1b0c3201c593d/tc-admin-2.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e3a1c3d805d2a71302ca59bb4a6c38936b596e13bfcbc6a9f50ed51a9841baa",
+          "md5": "363f1545bd2d28d33226c448f39cb151",
+          "sha256": "953cfe9c3eed0bf840e66a0b147228e1b14e227ac69264a5dda298b725d7767b"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "363f1545bd2d28d33226c448f39cb151",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 36409,
+        "upload_time": "2020-02-05T22:06:27",
+        "upload_time_iso_8601": "2020-02-05T22:06:27.041839Z",
+        "url": "https://files.pythonhosted.org/packages/6e/3a/1c3d805d2a71302ca59bb4a6c38936b596e13bfcbc6a9f50ed51a9841baa/tc_admin-2.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11a436200d057ffed94fbb196723f44d19d43046edb752fee580f2f2fe2dcdac",
+          "md5": "a40cdb033284c473cd69f3a3c9ef93cd",
+          "sha256": "099f0e7d12e625ff5ee09c95368b7ad6f4c6ca1a01a8d10225a5fbd19bf91b5f"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a40cdb033284c473cd69f3a3c9ef93cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23904,
+        "upload_time": "2020-02-05T22:06:28",
+        "upload_time_iso_8601": "2020-02-05T22:06:28.958566Z",
+        "url": "https://files.pythonhosted.org/packages/11/a4/36200d057ffed94fbb196723f44d19d43046edb752fee580f2f2fe2dcdac/tc-admin-2.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39e128d924cb349a5b1f69c6131000d03fe094660b9823b410801aeeb44c99ac",
+          "md5": "aaec15ea7aeca2d9c782295620a367cf",
+          "sha256": "ff0462c9a69c5faa95d6676e5fd33b6ab591ab74acf0f4002e700669957eb245"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aaec15ea7aeca2d9c782295620a367cf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 36952,
+        "upload_time": "2020-03-02T13:57:56",
+        "upload_time_iso_8601": "2020-03-02T13:57:56.924559Z",
+        "url": "https://files.pythonhosted.org/packages/39/e1/28d924cb349a5b1f69c6131000d03fe094660b9823b410801aeeb44c99ac/tc_admin-2.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75732935474c15962a20818de04a8c0236098d58f2391bce30cf6e174bd59a8c",
+          "md5": "d12817c8a92594465fdf46d334770e7d",
+          "sha256": "1235c10c282aacd29a46710d235ddab7efa3335fa3016759e756f40606e939bc"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d12817c8a92594465fdf46d334770e7d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25003,
+        "upload_time": "2020-03-02T13:57:58",
+        "upload_time_iso_8601": "2020-03-02T13:57:58.839287Z",
+        "url": "https://files.pythonhosted.org/packages/75/73/2935474c15962a20818de04a8c0236098d58f2391bce30cf6e174bd59a8c/tc-admin-2.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4f104c8cb0aa23f9cfe7b068a02335814eb112288dbf716c850c76371428a4f",
+          "md5": "d1db5a87749b829e926723e9f6aa8030",
+          "sha256": "85ae23cf2bf2d8dd12af2e4d61a7f7af2602a4e3f658bf36c35cec25563b16aa"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d1db5a87749b829e926723e9f6aa8030",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39043,
+        "upload_time": "2020-03-13T13:24:30",
+        "upload_time_iso_8601": "2020-03-13T13:24:30.835772Z",
+        "url": "https://files.pythonhosted.org/packages/a4/f1/04c8cb0aa23f9cfe7b068a02335814eb112288dbf716c850c76371428a4f/tc_admin-2.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "434604bf2a00c01b8ab96d86a5a4cf0e4ea3a43be4dd44d3f3c08c5d7fb2c7dd",
+          "md5": "8e5e8fc31159c3e473f2bbd25c03670c",
+          "sha256": "cee5af1aad69986d2dd5fbbc88248e15ac36203a3a76f1542c473c4cf7bff0a6"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8e5e8fc31159c3e473f2bbd25c03670c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 27313,
+        "upload_time": "2020-03-13T13:24:32",
+        "upload_time_iso_8601": "2020-03-13T13:24:32.335891Z",
+        "url": "https://files.pythonhosted.org/packages/43/46/04bf2a00c01b8ab96d86a5a4cf0e4ea3a43be4dd44d3f3c08c5d7fb2c7dd/tc-admin-2.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5fa522a3f9c8e32b623e6fea44e790f5ae15e2fc57a772e0ade784ef0c9535dc",
+          "md5": "c97b2cce33d540597585019de6757f67",
+          "sha256": "9f0f000fcd522cadb88f4952e4c8c1cd7977219ed825568864ee813b625bd3fe"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c97b2cce33d540597585019de6757f67",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39043,
+        "upload_time": "2020-05-29T16:40:18",
+        "upload_time_iso_8601": "2020-05-29T16:40:18.631821Z",
+        "url": "https://files.pythonhosted.org/packages/5f/a5/22a3f9c8e32b623e6fea44e790f5ae15e2fc57a772e0ade784ef0c9535dc/tc_admin-2.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1795cd319729a4a73a7f09c455c8326e8e9015cde26c5c999f0e3d52e4eb30e9",
+          "md5": "82099ce83c69643c344283d74081489f",
+          "sha256": "675dba24cb47bc570a7e67885a0fa2876e0cf7586718d82853f58ad024c2f245"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "82099ce83c69643c344283d74081489f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 27328,
+        "upload_time": "2020-05-29T16:40:19",
+        "upload_time_iso_8601": "2020-05-29T16:40:19.981754Z",
+        "url": "https://files.pythonhosted.org/packages/17/95/cd319729a4a73a7f09c455c8326e8e9015cde26c5c999f0e3d52e4eb30e9/tc-admin-2.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2bd86d1817e1a940b32b895b60b99b376a9cbd4dcf9046c7830c179b9fb7a70e",
+          "md5": "d55f371bb47a47be2daab1832976fd5e",
+          "sha256": "690b115e22e236d195e3c18e6c43020d925bd154486a33eb8cfc65fcda94a63b"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d55f371bb47a47be2daab1832976fd5e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39196,
+        "upload_time": "2020-12-29T22:34:31",
+        "upload_time_iso_8601": "2020-12-29T22:34:31.922163Z",
+        "url": "https://files.pythonhosted.org/packages/2b/d8/6d1817e1a940b32b895b60b99b376a9cbd4dcf9046c7830c179b9fb7a70e/tc_admin-2.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a020c8ad7afcfc78655a8c65ad75d052b5f025772e5626971dab53e6db7b2d18",
+          "md5": "396fb7d1b3961fb12c24b55885719502",
+          "sha256": "722f94af9644ef6f0f5892c409e016411a817b28661621f3d925136e9f4492c1"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "396fb7d1b3961fb12c24b55885719502",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 27983,
+        "upload_time": "2020-12-29T22:34:33",
+        "upload_time_iso_8601": "2020-12-29T22:34:33.338098Z",
+        "url": "https://files.pythonhosted.org/packages/a0/20/c8ad7afcfc78655a8c65ad75d052b5f025772e5626971dab53e6db7b2d18/tc-admin-2.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "086b7c349da6a3d5ca6f989144618d42f608076296148b00bde48fbb30a2aaec",
+          "md5": "d2ac06b38756c4b55277a9303f5431f5",
+          "sha256": "a5ab2d29a5447b2da2511230bc98afbb8f2e210f65e58fb3b4f85941856c9be3"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.6.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d2ac06b38756c4b55277a9303f5431f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39197,
+        "upload_time": "2021-03-31T19:56:20",
+        "upload_time_iso_8601": "2021-03-31T19:56:20.079901Z",
+        "url": "https://files.pythonhosted.org/packages/08/6b/7c349da6a3d5ca6f989144618d42f608076296148b00bde48fbb30a2aaec/tc_admin-2.6.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8dc4f3655573830c7ca4930f7cc7908de7d747f73eb94dc211ad6e5bf5a5d439",
+          "md5": "2b9cf7443ab183f6281c282ec9f1db7f",
+          "sha256": "320a50eff5f864f2db69f7b9cc6100f363d286cfd9a9d0350d707f8cea8fc5e3"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2b9cf7443ab183f6281c282ec9f1db7f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 27985,
+        "upload_time": "2021-03-31T19:56:21",
+        "upload_time_iso_8601": "2021-03-31T19:56:21.762316Z",
+        "url": "https://files.pythonhosted.org/packages/8d/c4/f3655573830c7ca4930f7cc7908de7d747f73eb94dc211ad6e5bf5a5d439/tc-admin-2.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "297668639441eb74b1792a7f30bc0477b09c1d5d8ac8e2900f2e1301a22e2837",
+          "md5": "9eb42a70d6c72a513c5684cab36a45f1",
+          "sha256": "529e22e2d11371a8d11ea8b4e08c87cbda674165950a697e5db058a959dd74b4"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-2.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9eb42a70d6c72a513c5684cab36a45f1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39608,
+        "upload_time": "2021-05-05T14:11:01",
+        "upload_time_iso_8601": "2021-05-05T14:11:01.440044Z",
+        "url": "https://files.pythonhosted.org/packages/29/76/68639441eb74b1792a7f30bc0477b09c1d5d8ac8e2900f2e1301a22e2837/tc_admin-2.7.0-py3-none-any.whl",
+        "yanked": true,
+        "yanked_reason": "non-functional due to bugs with root_url()"
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38a4462458bccfa5ab47b4f90ad825011972c9d7a53227bfe7050edf37202e5e",
+          "md5": "34e1725b88b3fb99b989c880ea01f607",
+          "sha256": "07caf45ddfabe3f1dd1bfc2218098406ccf9cbfd34ff67a2432a911f77b92da6"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-2.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "34e1725b88b3fb99b989c880ea01f607",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29543,
+        "upload_time": "2021-05-05T14:11:03",
+        "upload_time_iso_8601": "2021-05-05T14:11:03.382871Z",
+        "url": "https://files.pythonhosted.org/packages/38/a4/462458bccfa5ab47b4f90ad825011972c9d7a53227bfe7050edf37202e5e/tc-admin-2.7.0.tar.gz",
+        "yanked": true,
+        "yanked_reason": "non-functional due to bugs with root_url()"
+      }
+    ],
+    "3.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a28cd559aefe0c561951a43bf0fa03d7c65879bf73138550cf685bdbf74e640",
+          "md5": "e1ae60b5ea6bf4a58b38ff2d8afd9ad2",
+          "sha256": "db2bb3f503fc4f2288f6d0defe1ff23c853a9decfcea5713e2bf55b618e9e5fc"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-3.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e1ae60b5ea6bf4a58b38ff2d8afd9ad2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39652,
+        "upload_time": "2021-05-05T17:43:32",
+        "upload_time_iso_8601": "2021-05-05T17:43:32.452972Z",
+        "url": "https://files.pythonhosted.org/packages/5a/28/cd559aefe0c561951a43bf0fa03d7c65879bf73138550cf685bdbf74e640/tc_admin-3.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fcadaf1b19592585949129e074ad5ae669eb8bf566457f0ea7fec9b97df57ab6",
+          "md5": "283a217a7862312367617b3f6a2d39ce",
+          "sha256": "0e6f552b017eb36da781cde5aa550325a5a811616534444e01b7d4b2ff2f8cbf"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-3.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "283a217a7862312367617b3f6a2d39ce",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29562,
+        "upload_time": "2021-05-05T17:43:35",
+        "upload_time_iso_8601": "2021-05-05T17:43:35.354784Z",
+        "url": "https://files.pythonhosted.org/packages/fc/ad/af1b19592585949129e074ad5ae669eb8bf566457f0ea7fec9b97df57ab6/tc-admin-3.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42255dffdf18e50471408d7cafc4f68ea4d905cd760069af40a8cd90feead0c4",
+          "md5": "13832858ef9711ab8ef07424a8a99b42",
+          "sha256": "efc27aea54e60c579a9341738f9688374a7c6019be8f3a48d15955a321756bd4"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-3.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "13832858ef9711ab8ef07424a8a99b42",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39717,
+        "upload_time": "2021-05-12T18:31:20",
+        "upload_time_iso_8601": "2021-05-12T18:31:20.599971Z",
+        "url": "https://files.pythonhosted.org/packages/42/25/5dffdf18e50471408d7cafc4f68ea4d905cd760069af40a8cd90feead0c4/tc_admin-3.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ba94d2ffee17d48eb494949b12d0ac7a429dd11ddea99b9ad96e84b5899f5bc",
+          "md5": "2c1bf880a9733a2798bf0906f27fb776",
+          "sha256": "a7589cceb505abb30c20e1bbdd67ad5a3aaf80a18cbd6652480df68ffa4902f5"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-3.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c1bf880a9733a2798bf0906f27fb776",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29632,
+        "upload_time": "2021-05-12T18:31:22",
+        "upload_time_iso_8601": "2021-05-12T18:31:22.885250Z",
+        "url": "https://files.pythonhosted.org/packages/5b/a9/4d2ffee17d48eb494949b12d0ac7a429dd11ddea99b9ad96e84b5899f5bc/tc-admin-3.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e4973addf769af7a3226089c8e3fac85f8668be36cfbd5690610e40c00f24cb",
+          "md5": "cbf9d03688789bdfa3e61fe700de3c51",
+          "sha256": "095a488938d4b2a9723976ea7c700db0e9246a4fec052ff56ab2bc91e78b970c"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-3.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cbf9d03688789bdfa3e61fe700de3c51",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39861,
+        "upload_time": "2021-05-19T18:35:22",
+        "upload_time_iso_8601": "2021-05-19T18:35:22.732035Z",
+        "url": "https://files.pythonhosted.org/packages/2e/49/73addf769af7a3226089c8e3fac85f8668be36cfbd5690610e40c00f24cb/tc_admin-3.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca13743c7f5744cc3bf8398fb02c593a66cd8a36718a394d10170773833248e9",
+          "md5": "837d9e39749fabb34ee939187caee473",
+          "sha256": "3928ce089353959e8425fff40f78e1dbb89a04d4fbd8c557f18aef4fc4eb2d0f"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-3.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "837d9e39749fabb34ee939187caee473",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29759,
+        "upload_time": "2021-05-19T18:35:24",
+        "upload_time_iso_8601": "2021-05-19T18:35:24.599948Z",
+        "url": "https://files.pythonhosted.org/packages/ca/13/743c7f5744cc3bf8398fb02c593a66cd8a36718a394d10170773833248e9/tc-admin-3.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b1d59ff970e28fceee8bf71fab2eba4c2fffa09ab234be2157201dab28b2d88",
+          "md5": "36231b7a3822d9dc3b51d5f451cd0bf6",
+          "sha256": "fe09f1ff84621009885f317d66262046677f9f6e4f07ad0499d52d5b3cd071ed"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-3.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "36231b7a3822d9dc3b51d5f451cd0bf6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39990,
+        "upload_time": "2021-11-05T09:08:56",
+        "upload_time_iso_8601": "2021-11-05T09:08:56.847101Z",
+        "url": "https://files.pythonhosted.org/packages/9b/1d/59ff970e28fceee8bf71fab2eba4c2fffa09ab234be2157201dab28b2d88/tc_admin-3.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c214c3d44c46e20484112dcfeba75b303704cb5abca05b037da1790ba15b984b",
+          "md5": "f310853cd73cc0a7f3cec5ebafc8f41f",
+          "sha256": "ce83107fc7038b1ab339f34e6d08e82d13ad3a78a666fd8a7f0fdb873e17d135"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-3.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f310853cd73cc0a7f3cec5ebafc8f41f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26415,
+        "upload_time": "2021-11-05T09:08:58",
+        "upload_time_iso_8601": "2021-11-05T09:08:58.661194Z",
+        "url": "https://files.pythonhosted.org/packages/c2/14/c3d44c46e20484112dcfeba75b303704cb5abca05b037da1790ba15b984b/tc-admin-3.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56bc80933fba5d1b591897621247794d1aea17b98e92f429d6dd476ee2ab714c",
+          "md5": "7f345f6a8f5fe784fed51f77d356d9da",
+          "sha256": "53b8313f438eee0e91afed159ed5a4c2db984cb91a4617ea5d35a21c42077274"
+        },
+        "downloads": -1,
+        "filename": "tc_admin-3.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7f345f6a8f5fe784fed51f77d356d9da",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 40094,
+        "upload_time": "2022-10-31T13:23:19",
+        "upload_time_iso_8601": "2022-10-31T13:23:19.278763Z",
+        "url": "https://files.pythonhosted.org/packages/56/bc/80933fba5d1b591897621247794d1aea17b98e92f429d6dd476ee2ab714c/tc_admin-3.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03edd2aaaf5a29827a437362a3e8fe3f9c810a1f5df583a80577f38801f71c30",
+          "md5": "b4ea5965166b515f61af549ab19833a2",
+          "sha256": "cbaf8518efe05408a2fc5889a3798f7ff62b92c225909867456db77334167581"
+        },
+        "downloads": -1,
+        "filename": "tc-admin-3.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b4ea5965166b515f61af549ab19833a2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26571,
+        "upload_time": "2022-10-31T13:23:20",
+        "upload_time_iso_8601": "2022-10-31T13:23:20.702509Z",
+        "url": "https://files.pythonhosted.org/packages/03/ed/d2aaaf5a29827a437362a3e8fe3f9c810a1f5df583a80577f38801f71c30/tc-admin-3.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "56bc80933fba5d1b591897621247794d1aea17b98e92f429d6dd476ee2ab714c",
+        "md5": "7f345f6a8f5fe784fed51f77d356d9da",
+        "sha256": "53b8313f438eee0e91afed159ed5a4c2db984cb91a4617ea5d35a21c42077274"
+      },
+      "downloads": -1,
+      "filename": "tc_admin-3.3.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7f345f6a8f5fe784fed51f77d356d9da",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 40094,
+      "upload_time": "2022-10-31T13:23:19",
+      "upload_time_iso_8601": "2022-10-31T13:23:19.278763Z",
+      "url": "https://files.pythonhosted.org/packages/56/bc/80933fba5d1b591897621247794d1aea17b98e92f429d6dd476ee2ab714c/tc_admin-3.3.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "03edd2aaaf5a29827a437362a3e8fe3f9c810a1f5df583a80577f38801f71c30",
+        "md5": "b4ea5965166b515f61af549ab19833a2",
+        "sha256": "cbaf8518efe05408a2fc5889a3798f7ff62b92c225909867456db77334167581"
+      },
+      "downloads": -1,
+      "filename": "tc-admin-3.3.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b4ea5965166b515f61af549ab19833a2",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 26571,
+      "upload_time": "2022-10-31T13:23:20",
+      "upload_time_iso_8601": "2022-10-31T13:23:20.702509Z",
+      "url": "https://files.pythonhosted.org/packages/03/ed/d2aaaf5a29827a437362a3e8fe3f9c810a1f5df583a80577f38801f71c30/tc-admin-3.3.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,414 @@
+{
+  "info": {
+    "author": "DeepMind",
+    "author_email": "tf2jax-dev@google.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Education",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Mathematics",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# TF2JAX\n\n![CI status](https://github.com/deepmind/tf2jax/workflows/ci/badge.svg)\n![pypi](https://img.shields.io/pypi/v/tf2jax)\n\nTF2JAX is an experimental library for converting [TensorFlow] functions/graphs\nto [JAX] functions.\n\nSpecifically, it aims to transform a `tf.function`, e.g.\n\n```python\n@tf.function\ndef tf_fn(x):\n  return tf.sin(tf.cos(x))\n```\n\nto a python function equivalent to the following JAX code.\n\n```python\ndef jax_fn(x):\n  return jnp.sin(jnp.cos(x))\n```\n\nUsers are able to apply additional JAX transforms (e.g. `jit`, `grad`, `vmap`,\n`make_jaxpr`, etc.) to the converted function as they would any other code\nwritten in JAX.\n\n[TOC]\n\n## Installation\n\nYou can install the latest released version of TF2JAX from PyPI via:\n\n```sh\npip install tf2jax\n```\n\nor you can install the latest development version from GitHub:\n\n```sh\npip install git+https://github.com/deepmind/tf2jax.git\n```\n\n## Motivations\n\nTF2JAX enables existing TensorFlow functions and models (including\n[SavedModel](https://www.tensorflow.org/guide/saved_model) and\n[TensorFlow Hub](https://www.tensorflow.org/hub/tf1_hub_module)) to be reused\nand/or fine-tuned within JAX codebases. The conversion process is transparent\nto the users, which is useful for debugging and introspection.\n\nThis also provide a pathway for JAX users to integrate JAX functions serialized\nvia `jax2tf.convert`, back into their existing JAX codebases.\n\nSee [section](#alternatives) at the end for comparison with an alternative\napproach provided by `jax2tf.call_tf`.\n\n## Disclaimer\n\nThis is experimental code with potentially unstable API, and there are no\nguarantees for using it at this point in time. We highly recommend you\nthoroughly test the resulting JAX functions to ensure they meet your\nrequirements.\n\n## Quick start\n\nThe rest of this document assumes the following imports:\n\n```python\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nimport tensorflow as tf  # Assumes this is v2.\nimport tf2jax\n```\n\nAn example using the `convert` API and the Sonnet v2 MLP.\n\n```python\nimport sonnet.v2 as snt\n\nmodel = snt.nets.MLP((64, 10,))\n\n@tf.function\ndef forward(x):\n  return model(x)\n\nx = np.random.normal(size=(128, 16)).astype(np.float32)\n\n# TF -> JAX, jax_params are the network parameters of the MLP\njax_func, jax_params = tf2jax.convert(forward, np.zeros_like(x))\n\n# Call JAX, also return updated jax_params (e.g. variable, batchnorm stats)\njax_outputs, jax_params = jax_func(jax_params, x)\n```\n\n`tf2jax.convert` has the signature `convert(fn: tf.Function, *args, **kwargs)`,\nwhere `fn(*args, **kwargs)` is used to trace the function `fn` and generates the\ncorresponding `tf.GraphDef`. The `zeros_like` is not necessary, only used here\nto demonstrate the JAX function is not memorizing the outputs.\n\n### Example with a pure function\n\nIf your function is pure, i.e. it does not capture any variables, then you can\ndrop the parameters from the inputs and outputs of the converted function with\n`tf2jax.convert_functional`.\n\n```python\n@tf.function\ndef forward(x):\n  return tf.sin(tf.cos(x))\n\njax_func = tf2jax.convert_functional(forward, np.zeros_like(x))\njax_outputs = jax_func(x)\n```\n\n## Randomness and PRNG Keys\n\nA TensorFlow function that make use of random ops will be converted to a JAX\nfunction that takes a PRNG key as a keyword-only argument. TF2JAX will\ncomplain loudly if a PRNG key is required but not provided.\n\n```python\njax_outputs, jax_params = jax_func(jax_params, x, rng=jax.random.PRNGKey(42))\n```\n\n## Custom Gradient\n\nCustom gradient support is highly experimental, please report any errors.\n\n```python\n@tf.function\n@tf.custom_gradient\ndef forward(x):\n  e = tf.exp(x)\n  def grad(dy):\n    return dy * tf.sin(x) + e  # # This is deliberately the wrong gradient.\n  return tf.reduce_sum(e), grad\n\nwith tf2jax.override_config(\"convert_custom_gradient\", True):\n  jax_func = tf2jax.convert_functional(forward, np.zeros_like(x))\n\njax_grads = jax.grad(jax_func)(x)\n```\n\n## Support for Serialization Formats\n\n### SavedModel\n\n[SavedModel](https://www.tensorflow.org/guide/saved_model) is the preferred\nformat for serializing TF2 functions.\n\n```python\nmodel = tf.Module()\nmodel.f = forward\nmodel.f(x)  # Dummy call.\ntf.saved_model.save(model, \"/tmp/blah\")\n\nrestored = tf.saved_model.load(\"/tmp/blah\")\njax_func, jax_params = tf2jax.convert(restored.f, np.zeros_like(x))\n```\n\nIf the restored function has an unambiguous signature, i.e. it was only traced\nonce prior to export. Then TF2JAX can convert the function directly from its\nGraphDef without tracing it again.\n\n```python\njax_func, jax_params = tf2jax.convert_from_restored(restored.f)\n```\n\n### TF-Hub\n\nThe (legacy, TF1) [TF-Hub](https://www.tensorflow.org/hub/tf1_hub_module)\nformat is supported with minor boilerplate.\n\n```python\nimport tensorflow_hub as hub\n\nhub_model = hub.load(\"/tmp/blah\")\njax_func, jax_params = tf2jax.convert(tf.function(hub_model), tf.zeros_like(x))\njax_outputs, updated_jax_params = jax_func(jax_params, x)\n```\n\n## JAX to TensorFlow and Back Again.\n\n`tf2jax.convert_functional` can convert the outputs of `jax2tf.convert` back\ninto JAX code.\n\n```python\n# Some JAX function.\ndef forward(*inputs):\n  ...\n\n# JAX -> TF\ntf_func = jax2tf.convert(forward)\n\n# JAX -> TF -> JAX\njax_func = tf2jax.convert_functional(tf.function(tf_func), *tree.map_structure(np.zeros_like, inputs))\n\n# JAX -> TF -> SavedModel -> TF\nmodel = tf.Module()\nmodel.f = tf.function(tf_func)\nmodel.f(*tree.map_structure(tf.zeros_like, inputs))  # Dummy call.\ntf.saved_model.save(model, \"/tmp/blah\")\nrestored = tf.saved_model.load(\"/tmp/blah\")\n\n# JAX -> TF -> SavedModel -> TF -> JAX\njax_too_func = tf2jax.convert_functional(restored.f, *tree.map_structure(np.zeros_like, inputs))\n```\n\n## Additional Configuration\n\nThe behaviour of TF2JAX can be configured globally via `tf2jax.update_config`,\nor configured locally via the context manager `tf2jax.override_config`.\n\n### Strict shape and dtype checking\n\nBy default, TF2JAX will assert that the input shapes to the converted function\nare compatible with the input shapes of the original function. This is because\nsome functions have shape dependent behaviours that will silently return the\nincorrect outputs after conversion, e.g. some batchnorm implementation.\n\n```python\njax_func = tf2jax.convert_functional(forward, np.zeros((10, 5), np.float32))\n\n# This will raise an error.\njax_func(np.zeros((20, 5), np.float32))\n\n# This will not.\nwith tf2jax.override_config(\"strict_shape_check\", False):\n  jax_func(np.zeros((20, 5), np.float32))\n```\n\nThe input dtypes are not currently checked but this may change in the future.\n\n```python\njax_func = tf2jax.convert_functional(forward, np.zeros((10, 5), np.float32))\n\n# This will not raise an error.\njax_func(np.zeros((20, 5), np.int32))\n\n# This will.\nwith tf2jax.override_config(\"strict_dtype_check\", True):\n  jax_func(np.zeros((20, 5), np.int32))\n```\n\n### Convert constants to bfloat16\n\nTF2JAX allows users to trace the converted function with parameters and inputs\nof different precision than the original function, e.g. `bfloat16` instead of\n`float32`. To aid this, the configuration `force_const_float32_to_bfloat16`\nand `force_const_float64_to_bfloat16` can be used to force float constants in\nthe original function into `bfloat16` precision, to avoid accidental type\npromotion.\n\n```python\n@tf.function\ndef forward(x):\n  return x + tf.constant(3.14, dtype=tf.float32)\n\nwith tf2jax.override_config(\"force_const_float32_to_bfloat16\", True):\n  jax_func = tf2jax.convert_functional(forward, np.zeros_like(x))\njax_bf16_outputs = jax_func(jnp.asarray(x, jnp.bfloat16))\n```\n\n### Disable PreventGradient\n\nIf `jax2tf.convert(..., with_gradient=False)` is used to produce the initial TF\nfunction (and possibly exported as SavedModel), then TF2JAX will respect the\ninserted `tf.raw_ops.PreventGradient` ops and raise `LookupError` when computing\ngradients.\n\nThis can be disabled by setting the configuration `raise_on_prevent_gradient` to\nfalse (default is true), so that TF2JAX will only log a warning but otherwise\nallow the gradient to be computed as though the `PreventGradient` ops were not\npresent.\n\n```python\n@tf.function\ndef prevent(x):\n  return tf.raw_ops.PreventGradient(input=x * x, message=\"prevented\")\n\njax_func = tf2jax.convert_functional(prevent, 0.0)\njax.grad(jax_func)(3.14)  # Raise LookupError.\n\nwith tf2jax.config.override_config(\"raise_on_prevent_gradient\", False):\n  jax_func = tf2jax.convert_functional(prevent, 0.0)\ng = jax.grad(jax_func)(3.14)  # Returns 6.28.\n\n```\n\n### Infer Cumulative Reductions\n\nIf the `infer_cumulative_reduction_from_jax2tf` flag is true (default) then\nTF2JAX will attempt to infer `cummax`, `cummin`, `cumprod` and `cumsum`\noperations from `reduce_window` operations generated by JAX2TF. This provides\nbetter performance because `reduce_window` implementation of these ops have\nO(N^2) complexity on CPU and GPU backends, and can suffer from long compilation\ntimes due to aggressive constant folding.\n\nSee [jax2tf_cumulative_reduction] for more context.\n\n## Limitations\n\nCurrently, only a subset of TensorFlow ops are supported, and not necessarily\nall functionalities are supported for some ops. The code will fail fast. Support\nfor additional TensorFlow ops are added on a as-needed basis. Please submit your\nrequests via Github issues or send in your pull requests.\n\nThere will likely to be some cases where the resulting JAX code is not\nequivalent to the TensorFlow code, both in terms of performance and numerical\noutputs. The goal is to minimise differences in the latter for model endpoints,\nahead of improving performance.\n\nTF2 control flows are supported with some limitations, e.g. for while loops,\nthe `cond` and `body` functions cannot have side effects such as assigning to\nvariables.\n\nTF1 control flows are not supported.\n\n## Alternatives\n\n### `jax2tf.call_tf`\n\n`jax2tf` now also offers the experimental `call_tf` function which allows JAX to\ncall TensorFlow functions. For compiled code, this works by staging out\nTensorFlow functions to XLA.\n\nFrom the [jax2tf documentation], as of 2022-07-22:\n\n> The function `call_tf` allows JAX functions to call TensorFlow functions.\n> These functions can be called anywhere in a JAX computation, including in\n> staging contexts `jax.jit`, `jax.pmap`, `jax.xmap`, or inside JAX's\n> control-flow primitives. In non-staging contexts, the TensorFlow function is\n> called in eager mode. For now, only reverse-mode autodiff is supported for\n> these functions (no forward-mode autodiff, nor `vmap`).\n\nThe advantage of `call_tf` is that it implicitly covers all TensorFlow ops and\nsupports `custom_gradient` by deferring to TensorFlow during eager execution and\nto XLA for compiled code.\n\nThe disadvantage is that it only supports a limited set of JAX transforms\n(`jit`, `grad`, `pmap`, `remat`) and otherwise appears as a \"black box\" to\nJAX (e.g. `vmap` is not supported, nor custom transforms). A TensorFlow function\nmust be compileable to XLA if it is to be jitted after `call_tf`.\n\n## Citing TF2JAX\n\nThis repository is part of the [DeepMind JAX Ecosystem], to cite TF2JAX please\nuse the [DeepMind JAX Ecosystem citation].\n\n## Contributing\n\nWe are happy to receive pull requests that improve our coverage of TensorFlow\nops.\n\n[DeepMind JAX Ecosystem]: https://deepmind.com/blog/article/using-jax-to-accelerate-our-research \"DeepMind JAX Ecosystem\"\n[DeepMind JAX Ecosystem citation]: https://github.com/deepmind/jax/blob/main/deepmind2020jax.txt \"Citation\"\n[JAX]: https://github.com/google/jax \"JAX on GitHub\"\n[TensorFlow]: https://github.com/tensorflow/tensorflow \"TensorFlow on GitHub\"\n[jax2tf documentation]: https://github.com/google/jax/blob/master/jax/experimental/jax2tf/README.md#calling-tensorflow-functions-from-jax \"jax2tf documentation\"\n[jax2tf_cumulative_reduction]: https://github.com/google/jax/blob/main/jax/experimental/jax2tf/jax2tf.py#L2172\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/deepmind/tf2jax",
+    "keywords": "jax tensorflow conversion translate",
+    "license": "Apache 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "tf2jax",
+    "package_url": "https://pypi.org/project/tf2jax/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/tf2jax/",
+    "project_urls": {
+      "Homepage": "https://github.com/deepmind/tf2jax"
+    },
+    "release_url": "https://pypi.org/project/tf2jax/0.3.3/",
+    "requires_dist": [
+      "absl-py",
+      "dm-tree (>=0.1.5)",
+      "jax (>=0.3.14)",
+      "jaxlib (>=0.1.37)",
+      "numpy (>=1.23.0)",
+      "tensorflow (>=2.8.0) ; sys_platform != \"darwin\" or platform_machine != \"arm64\"",
+      "tensorflow-macos (>=2.8.0) ; sys_platform == \"darwin\" and platform_machine == \"arm64\""
+    ],
+    "requires_python": ">=3.7",
+    "summary": "TF2JAX: Convert TensorFlow to JAX",
+    "version": "0.3.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16798193,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f5ab35fb564baed2f790cd5b3826b1819629fbd0bc0a5171730f3d888a155f4",
+          "md5": "703fb3a2a9d0b1112c619acd6c90dae1",
+          "sha256": "49e01aca4cbd684666015272e46e36d51c7eb5b840c845563332adc9808ec3f7"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "703fb3a2a9d0b1112c619acd6c90dae1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 56442,
+        "upload_time": "2022-03-18T16:14:35",
+        "upload_time_iso_8601": "2022-03-18T16:14:35.453492Z",
+        "url": "https://files.pythonhosted.org/packages/1f/5a/b35fb564baed2f790cd5b3826b1819629fbd0bc0a5171730f3d888a155f4/tf2jax-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad771fc2a9422a370401be8f3844e04a68a7ccb8522f1a01a691e12588894854",
+          "md5": "bd4c016c94cc8fa1e25de922c850270f",
+          "sha256": "cd5e051340f7768846da0a89161dee2580db4301f351fe1db5549d8fbd68e25a"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bd4c016c94cc8fa1e25de922c850270f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 54913,
+        "upload_time": "2022-03-18T16:14:37",
+        "upload_time_iso_8601": "2022-03-18T16:14:37.003071Z",
+        "url": "https://files.pythonhosted.org/packages/ad/77/1fc2a9422a370401be8f3844e04a68a7ccb8522f1a01a691e12588894854/tf2jax-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3657323c6529dc8e0f01b6c57bffd28ceb5cbcf7b6ba9f87f4e9d18f10969927",
+          "md5": "a8b1b2e3e985cb46855a1bceb234db30",
+          "sha256": "f93194537fea9c87a5a333eec02f10c8be557e1149d5b9bb5ecfa53c2eff7432"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a8b1b2e3e985cb46855a1bceb234db30",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 58642,
+        "upload_time": "2022-05-03T14:19:03",
+        "upload_time_iso_8601": "2022-05-03T14:19:03.679156Z",
+        "url": "https://files.pythonhosted.org/packages/36/57/323c6529dc8e0f01b6c57bffd28ceb5cbcf7b6ba9f87f4e9d18f10969927/tf2jax-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4c353f2942b8fecfd5410afae30a6699c5a11fc4d1c0abdcbecf760848681a3",
+          "md5": "9e81f34f17c3fa00d20b3a388710c29f",
+          "sha256": "d42df94b7be0707dfe5702bb6d7e00e4a60e8ffa316ce8593b107205c56df1ff"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e81f34f17c3fa00d20b3a388710c29f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 57161,
+        "upload_time": "2022-05-03T14:19:04",
+        "upload_time_iso_8601": "2022-05-03T14:19:04.762296Z",
+        "url": "https://files.pythonhosted.org/packages/e4/c3/53f2942b8fecfd5410afae30a6699c5a11fc4d1c0abdcbecf760848681a3/tf2jax-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38507f4a64cb864abffd684e05d1ee1735ab0f5cf9ba535243d161e9b0b848c0",
+          "md5": "36dd838010485072c0d6159cd6b660e3",
+          "sha256": "c3f625b6f66fa8a36a8c5beade1c6c121017a7b3d2fa59eae88f0992fede5487"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "36dd838010485072c0d6159cd6b660e3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 60821,
+        "upload_time": "2022-05-06T15:36:59",
+        "upload_time_iso_8601": "2022-05-06T15:36:59.031373Z",
+        "url": "https://files.pythonhosted.org/packages/38/50/7f4a64cb864abffd684e05d1ee1735ab0f5cf9ba535243d161e9b0b848c0/tf2jax-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8032129ef5ce70260519ab89c6e6d91f5392ca86b2d1a60b83f49032da5cfa90",
+          "md5": "cab56eb090b31ac7bd9a7a28ecece951",
+          "sha256": "33a5b19201126eb736221fef2fbc59bfd07b500182bdc294dface88077329d23"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cab56eb090b31ac7bd9a7a28ecece951",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 58409,
+        "upload_time": "2022-05-06T15:37:00",
+        "upload_time_iso_8601": "2022-05-06T15:37:00.624911Z",
+        "url": "https://files.pythonhosted.org/packages/80/32/129ef5ce70260519ab89c6e6d91f5392ca86b2d1a60b83f49032da5cfa90/tf2jax-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21d253ffbaea6589e3d970de08ff67afe71a2a37580396b4d591d35b2407546e",
+          "md5": "9bdff92ca92d9b6acdba6af7ef7fa25e",
+          "sha256": "44ef0de909a41434f93f1cbcd15b6e8d10afe744290d1f33f8123ffbe42f367f"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9bdff92ca92d9b6acdba6af7ef7fa25e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 63147,
+        "upload_time": "2022-06-21T13:47:39",
+        "upload_time_iso_8601": "2022-06-21T13:47:39.391821Z",
+        "url": "https://files.pythonhosted.org/packages/21/d2/53ffbaea6589e3d970de08ff67afe71a2a37580396b4d591d35b2407546e/tf2jax-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2df3b256943c92859c01c03c21336d919e0cea3206ca89b25e5b5be615832474",
+          "md5": "0833c0857a126976e25d8d477ca80a7a",
+          "sha256": "ea8d16cece9d427058587de0a2061c46abe845640606737c98ceed77937ed133"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0833c0857a126976e25d8d477ca80a7a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 61095,
+        "upload_time": "2022-06-21T13:47:41",
+        "upload_time_iso_8601": "2022-06-21T13:47:41.240999Z",
+        "url": "https://files.pythonhosted.org/packages/2d/f3/b256943c92859c01c03c21336d919e0cea3206ca89b25e5b5be615832474/tf2jax-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b1114a822cb145ba3698bdb198c2c4ddc0483fd70aa55f26f359cae496c4933",
+          "md5": "2290f25ed9e8cb252be6f1cdc71c146a",
+          "sha256": "60b325f3c00dc1aaed4cd6647af7d2794979d10f8fe034e892763d772e49db81"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2290f25ed9e8cb252be6f1cdc71c146a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 67754,
+        "upload_time": "2022-08-02T14:23:38",
+        "upload_time_iso_8601": "2022-08-02T14:23:38.697147Z",
+        "url": "https://files.pythonhosted.org/packages/9b/11/14a822cb145ba3698bdb198c2c4ddc0483fd70aa55f26f359cae496c4933/tf2jax-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24e5b7610f706996b68c52c3de6542a5891ab48d98e8abe481fa13eb81542b7e",
+          "md5": "59dd4f83f99bf12b12d76e8fcbf28c74",
+          "sha256": "0201d597ce5ad7e4a1dc1ae94384a0e65fbb51e6bf5af048bc8c1c557dcc5c84"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "59dd4f83f99bf12b12d76e8fcbf28c74",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 64813,
+        "upload_time": "2022-08-02T14:23:40",
+        "upload_time_iso_8601": "2022-08-02T14:23:40.327097Z",
+        "url": "https://files.pythonhosted.org/packages/24/e5/b7610f706996b68c52c3de6542a5891ab48d98e8abe481fa13eb81542b7e/tf2jax-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe79fdec31e94374d8cad1780ac35c12b602d286826e5d9372fe97c200927316",
+          "md5": "3f022ba17fd53b26ab9ba07cb51a9495",
+          "sha256": "532a5e38b057497eaa6da55780e2255f91bbccb33dc7841899df070090220e0a"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3f022ba17fd53b26ab9ba07cb51a9495",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 79083,
+        "upload_time": "2023-01-23T11:56:48",
+        "upload_time_iso_8601": "2023-01-23T11:56:48.714069Z",
+        "url": "https://files.pythonhosted.org/packages/fe/79/fdec31e94374d8cad1780ac35c12b602d286826e5d9372fe97c200927316/tf2jax-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a0b51e7663cbd5d3ab023b404d38b5fc22e0f1ba188a77cd7d250e55098b790c",
+          "md5": "d81d3db639ec9f9487398120b9c7b746",
+          "sha256": "a40f9bf8689bfbf137a2c5b94d01d015b1c8327fda4ed203f779a1a202cb41ec"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d81d3db639ec9f9487398120b9c7b746",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 73729,
+        "upload_time": "2023-01-23T11:56:50",
+        "upload_time_iso_8601": "2023-01-23T11:56:50.572970Z",
+        "url": "https://files.pythonhosted.org/packages/a0/b5/1e7663cbd5d3ab023b404d38b5fc22e0f1ba188a77cd7d250e55098b790c/tf2jax-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99ee4edbb2c43baa10f5eeed30be509c89c92797f333dcf2c19818468391500c",
+          "md5": "e40397dfde7adcf4dd71e3fe42ede1b4",
+          "sha256": "1a94095d105bbc91d04c93a05b79dc31cb1ae2853f813cfb7a269ce47fd924e0"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e40397dfde7adcf4dd71e3fe42ede1b4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 79694,
+        "upload_time": "2023-02-10T20:21:28",
+        "upload_time_iso_8601": "2023-02-10T20:21:28.617159Z",
+        "url": "https://files.pythonhosted.org/packages/99/ee/4edbb2c43baa10f5eeed30be509c89c92797f333dcf2c19818468391500c/tf2jax-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87d8f59cd1704fa4bd388c84a48ca0531de92a8c2ed8feb53e86c0572b609560",
+          "md5": "28b182c64ad53eceb2fd7b9b3d8d75f9",
+          "sha256": "f9e17ac0d5ffae2463354d0a2ec89cd557a078edab38f209db4b5d9f40b36436"
+        },
+        "downloads": -1,
+        "filename": "tf2jax-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28b182c64ad53eceb2fd7b9b3d8d75f9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 74341,
+        "upload_time": "2023-02-10T20:21:30",
+        "upload_time_iso_8601": "2023-02-10T20:21:30.080742Z",
+        "url": "https://files.pythonhosted.org/packages/87/d8/f59cd1704fa4bd388c84a48ca0531de92a8c2ed8feb53e86c0572b609560/tf2jax-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "99ee4edbb2c43baa10f5eeed30be509c89c92797f333dcf2c19818468391500c",
+        "md5": "e40397dfde7adcf4dd71e3fe42ede1b4",
+        "sha256": "1a94095d105bbc91d04c93a05b79dc31cb1ae2853f813cfb7a269ce47fd924e0"
+      },
+      "downloads": -1,
+      "filename": "tf2jax-0.3.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e40397dfde7adcf4dd71e3fe42ede1b4",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 79694,
+      "upload_time": "2023-02-10T20:21:28",
+      "upload_time_iso_8601": "2023-02-10T20:21:28.617159Z",
+      "url": "https://files.pythonhosted.org/packages/99/ee/4edbb2c43baa10f5eeed30be509c89c92797f333dcf2c19818468391500c/tf2jax-0.3.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "87d8f59cd1704fa4bd388c84a48ca0531de92a8c2ed8feb53e86c0572b609560",
+        "md5": "28b182c64ad53eceb2fd7b9b3d8d75f9",
+        "sha256": "f9e17ac0d5ffae2463354d0a2ec89cd557a078edab38f209db4b5d9f40b36436"
+      },
+      "downloads": -1,
+      "filename": "tf2jax-0.3.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "28b182c64ad53eceb2fd7b9b3d8d75f9",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 74341,
+      "upload_time": "2023-02-10T20:21:30",
+      "upload_time_iso_8601": "2023-02-10T20:21:30.080742Z",
+      "url": "https://files.pythonhosted.org/packages/87/d8/f59cd1704fa4bd388c84a48ca0531de92a8c2ed8feb53e86c0572b609560/tf2jax-0.3.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
