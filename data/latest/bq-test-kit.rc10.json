@@ -1,0 +1,535 @@
+{
+  "info": {
+    "author": "Bounkong Khamphousone",
+    "author_email": "bounkong@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Topic :: Software Development :: Testing"
+    ],
+    "description": "# bigquery-test-kit, a testing framework to be more confident in your BigQuery SQL\n\n[BigQuery](https://cloud.google.com/bigquery) doesn't provide any locally runnabled server,\nhence tests need to be run in Big Query itself.\n\nbigquery-test-kit enables Big Query testing by providing you an almost immutable DSL that allows you to :\n\n - create and delete dataset\n - create and delete table, partitioned or not\n - load csv or json data into tables\n - run query templates\n - transform json or csv data into a data literal or a temp table\n\nYou can, therefore, test your query with data as literals or instantiate\ndatasets and tables in projects and load data into them.\n\nIt's faster to run query with data as literals but using materialized tables is mandatory for some use cases.\nIn fact, data literal may add complexity to your request and therefore be rejected by BigQuery.\nIn such a situation, temporary tables may come to the rescue as they don't rely on data loading but on data literals.\nComplexity will then almost be like you where looking into a real table.\n\nImmutability allows you to share datasets and tables definitions as a fixture and use it accros all tests,\nadapt the definitions as necessary without worrying about mutations.\n\nIn order to have reproducible tests, BQ-test-kit add the ability to create isolated dataset or table,\nthus query's outputs are predictable and assertion can be done in details.\nIf you are running simple queries (no DML), you can use data literal to make test running faster.\n\nTemplate queries are rendered via [varsubst](https://pypi.org/project/varsubst/) but you can provide your own\ninterpolator by extending *bq_test_kit.interpolators.base_interpolator.BaseInterpolator*. Supported templates are\nthose supported by varsubst, namely envsubst-like (shell variables) or jinja powered.\n\nIn order to benefit from those interpolators, you will need to install one of the following extras,\n**bq-test-kit[shell]** or **bq-test-kit[jinja2]**.\n\nUsage\n=====\n\nCommon setup with materialized tables\n-------------------------------------\n\n```python\nfrom google.cloud.bigquery.client import Client\nfrom bq_test_kit.bq_test_kit import BQTestKit\nfrom bq_test_kit.bq_test_kit_config import BQTestKitConfig\nfrom bq_test_kit.resource_loaders.package_file_loader import PackageFileLoader\n\nclient = Client(location=\"EU\")\nbqtk_conf = BQTestKitConfig().with_test_context(\"basic\")\nbqtk = BQTestKit(bq_client=client, bqtk_config=bqtk_conf)\n# project() uses default one specified by GOOGLE_CLOUD_PROJECT environment variable\nwith bqtk.project().dataset(\"my_dataset\").isolate().clean_and_keep() as d:\n    # dataset `GOOGLE_CLOUD_PROJECT.my_dataset_basic` is created\n    # isolation is done via isolate() and the given context.\n    # if you are forced to use existing dataset, you must use noop().\n    #\n    # clean and keep will keep clean dataset if it exists before its creation.\n    # Then my_dataset will be kept. This allows user to interact with BigQuery console afterwards.\n    # Default behavior is to create and clean.\n    schema = [SchemaField(\"f1\", field_type=\"STRING\"), SchemaField(\"f2\", field_type=\"INT64\")]\n    with d.table(\"my_table\", schema=schema).clean_and_keep() as t:\n        # table `GOOGLE_CLOUD_PROJECT.my_dataset_basic.my_table` is created\n        # noop() and isolate() are also supported for tables.\n        pfl = PackageFileLoader(\"tests/it/bq_test_kit/bq_dsl/bq_resources/data_loaders/resources/dummy_data.csv\")\n        t.csv_loader(from_=pfl).load()\n        result = bqtk.query_template(from_=f\"select count(*) as nb from `{t.fqdn()}`\").run()\n        assert len(result.rows) > 0\n    # table `GOOGLE_CLOUD_PROJECT.my_dataset_basic.my_table` is deleted\n# dataset `GOOGLE_CLOUD_PROJECT.my_dataset_basic` is deleted\n```\n\nAdvanced setup with materialized tables\n---------------------------------------\n\n```python\nfrom google.cloud.bigquery.client import Client\nfrom bq_test_kit.bq_test_kit import BQTestKit\nfrom bq_test_kit.bq_test_kit_config import BQTestKitConfig\nfrom bq_test_kit.resource_loaders.package_file_loader import PackageFileLoader\n\nclient = Client(location=\"EU\")\nbqtk_conf = BQTestKitConfig().with_test_context(\"basic\")\nbqtk = BQTestKit(bq_client=client, bqtk_config=bqtk_conf)\np = bqtk.project(\"it\") \\\n        .dataset(\"dataset_foo\").isolate() \\\n        .table(\"table_foofoo\") \\\n        .table(\"table_foobar\") \\\n        .project.dataset(\"dataset_bar\").isolate() \\\n        .table(\"table_barfoo\") \\\n        .table(\"table_barbar\") \\\n        .project\ntable_foofoo, table_foobar, table_barfoo, table_barbar = None, None, None, None\nwith Tables.from_(p, p) as tables:\n    # create datasets and tables in the order built with the dsl. Then, a tuples of all tables are returned.\n    assert len(tables) == 4\n    table_names = [t.name for t in tables]\n    assert table_names == [\"table_foofoo\",\n                           \"table_foobar\",\n                           \"table_barfoo\",\n                           \"table_barbar\"]\n    table_foofoo, table_foobar, table_barfoo, table_barbar = tables\n    assert table_foofoo.show() is not None\n    assert table_foobar.show() is not None\n    assert table_barfoo.show() is not None\n    assert table_barbar.show() is not None\n```\n\nSimple BigQuery SQL test with data literals\n-------------------------------------------\n\n```python\nimport pytz\n\nfrom datetime import datetime\nfrom google.cloud.bigquery.client import Client\nfrom google.cloud.bigquery.schema import SchemaField\nfrom bq_test_kit.bq_test_kit import BQTestKit\nfrom bq_test_kit.bq_test_kit_config import BQTestKitConfig\nfrom bq_test_kit.data_literal_transformers.json_data_literal_transformer import JsonDataLiteralTransformer\nfrom bq_test_kit.interpolators.shell_interpolator import ShellInterpolator\n\nclient = Client(location=\"EU\")\nbqtk_conf = BQTestKitConfig().with_test_context(\"basic\")\nbqtk = BQTestKit(bq_client=client, bqtk_config=bqtk_conf)\nresults = bqtk.query_template(from_=\"\"\"\n    SELECT\n        f.foo, b.bar, e.baz, f._partitiontime as pt\n    FROM\n        ${TABLE_FOO} f\n        INNER JOIN ${TABLE_BAR} b ON f.foobar = b.foobar\n        LEFT JOIN ${TABLE_EMPTY} e ON b.foobar = e.foobar\n\"\"\").with_datum({\n    \"TABLE_FOO\": (['{\"foobar\": \"1\", \"foo\": 1, \"_PARTITIONTIME\": \"2020-11-26 17:09:03.967259 UTC\"}'], [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"foo\", \"INT64\"), SchemaField(\"_PARTITIONTIME\", \"TIMESTAMP\")]),\n    \"TABLE_BAR\": (['{\"foobar\": \"1\", \"bar\": 2}'], [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"bar\", \"INT64\")]),\n    \"TABLE_EMPTY\": (None, [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"baz\", \"INT64\")])\n    }) \\\n    .as_data_literals() \\\n    .loaded_with(JsonDataLiteralTransformer()) \\\n    .add_interpolator(ShellInterpolator()) \\\n    .run()\nassert len(results.rows) == 1\nassert results.rows == [{\"foo\": 1, \"bar\": 2, \"baz\": None, \"pt\": datetime(2020, 11, 26, 17, 9, 3, 967259, pytz.UTC)}]\n```\n\nSimple BigQuery SQL test with temp tables\n-----------------------------------------\n\n```python\nimport pytz\n\nfrom datetime import datetime\nfrom google.cloud.bigquery.client import Client\nfrom google.cloud.bigquery.schema import SchemaField\nfrom bq_test_kit.bq_test_kit import BQTestKit\nfrom bq_test_kit.bq_test_kit_config import BQTestKitConfig\nfrom bq_test_kit.data_literal_transformers.json_data_literal_transformer import JsonDataLiteralTransformer\nfrom bq_test_kit.interpolators.shell_interpolator import ShellInterpolator\n\nclient = Client(location=\"EU\")\nbqtk_conf = BQTestKitConfig().with_test_context(\"basic\")\nbqtk = BQTestKit(bq_client=client, bqtk_config=bqtk_conf)\nresults = bqtk.query_template(from_=\"\"\"\n    SELECT\n        f.foo, b.bar, e.baz, f._partitiontime as pt\n    FROM\n        ${TABLE_FOO} f\n        INNER JOIN ${TABLE_BAR} b ON f.foobar = b.foobar\n        LEFT JOIN ${TABLE_EMPTY} e ON b.foobar = e.foobar\n\"\"\").with_datum({\n    \"TABLE_FOO\": (['{\"foobar\": \"1\", \"foo\": 1, \"_PARTITIONTIME\": \"2020-11-26 17:09:03.967259 UTC\"}'], [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"foo\", \"INT64\"), SchemaField(\"_PARTITIONTIME\", \"TIMESTAMP\")]),\n    \"TABLE_BAR\": (['{\"foobar\": \"1\", \"bar\": 2}'], [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"bar\", \"INT64\")]),\n    \"TABLE_EMPTY\": (None, [SchemaField(\"foobar\", \"STRING\"), SchemaField(\"baz\", \"INT64\")])\n    }) \\\n    .loaded_with(JsonDataLiteralTransformer()) \\\n    .add_interpolator(ShellInterpolator()) \\\n    .run()\nassert len(results.rows) == 1\nassert results.rows == [{\"foo\": 1, \"bar\": 2, \"baz\": None, \"pt\": datetime(2020, 11, 26, 17, 9, 3, 967259, pytz.UTC)}]\n```\n\nMore usage can be found in [it tests](https://github.com/tiboun/python-bq-test-kit/tree/main/tests/it).\n\nConcepts\n========\n\nResource Loaders\n----------------\n\nCurrently, the only resource loader available is *bq_test_kit.resource_loaders.package_file_loader.PackageFileLoader*.\nIt allows you to load a file from a package, so you can load any file from your source code.\n\nYou can implement yours by extending *bq_test_kit.resource_loaders.base_resource_loader.BaseResourceLoader*.\nIf so, please create a merge request if you think that yours may be interesting for others.\n\nInterpolators\n-------------\n\nInterpolators enable variable substitution within a template.\nThey lay on dictionaries which can be in a global scope or interpolator scope.\nWhile rendering template, interpolator scope's dictionary is merged into global scope thus,\ninterpolator scope takes precedence over global one.\n\nYou can benefit from two interpolators by installing the extras **bq-test-kit[shell]** or **bq-test-kit[jinja2]**.\nThose extra allows you to render you query templates with envsubst-like variable or jinja.\nYou can define yours by extending *bq_test_kit.interpolators.BaseInterpolator*.\n\n\n```python\nfrom google.cloud.bigquery.client import Client\nfrom bq_test_kit.bq_test_kit import BQTestKit\nfrom bq_test_kit.bq_test_kit_config import BQTestKitConfig\nfrom bq_test_kit.resource_loaders.package_file_loader import PackageFileLoader\nfrom bq_test_kit.interpolators.jinja_interpolator import JinjaInterpolator\nfrom bq_test_kit.interpolators.shell_interpolator import ShellInterpolator\n\nclient = Client(location=\"EU\")\nbqtk_conf = BQTestKitConfig().with_test_context(\"basic\")\nbqtk = BQTestKit(bq_client=client, bqtk_config=bqtk_conf)\n\nresult = bqtk.query_template(from_=\"select ${NB_USER} as nb\") \\\n            .with_global_dict({\"NB_USER\": \"2\"}) \\\n            .add_interpolator(ShellInterpolator()) \\\n            .run()\nassert len(result.rows) == 1\nassert result.rows[0][\"nb\"] == 2\nresult = bqtk.query_template(from_=\"select {{NB_USER}} as nb\") \\\n            .with_interpolators([JinjaInterpolator({\"NB_USER\": \"3\"})]) \\\n            .run()\nassert len(result.rows) == 1\nassert result.rows[0][\"nb\"] == 3\n```\n\n\nData loaders\n------------\n\nSupported data loaders are csv and json only even if Big Query API support more.\nData loaders were restricted to those because they can be easily modified by a human and are maintainable.\n\nIf you need to support more, you can still load data by instantiating\n*bq_test_kit.bq_dsl.bq_resources.data_loaders.base_data_loader.BaseDataLoader*.\n\n\nData Literal Transformers\n-------------------------\n\nSupported data literal transformers are csv and json.\nData Literal Transformers can be less strict than their counter part, Data Loaders.\nIn fact, they allow to use cast technique to transform string to bytes or cast a date like to its target type.\nFurthermore, in json, another format is allowed, JSON_ARRAY.\nThis allows to have a better maintainability of the test resources.\n\nData Literal Transformers allows you to specify _partitiontime or _partitiondate as well,\nthus you can specify all your data in one file and still matching the native table behavior.\nIf you were using Data Loader to load into an ingestion time partitioned table,\nyou would have to load data into specific partition.\nLoading into a specific partition make the time rounded to 00:00:00.\n\nIf you need to support a custom format, you may extend BaseDataLiteralTransformer\nto benefit from the implemented data literal conversion.\n*bq_test_kit.data_literal_transformers.base_data_literal_transformer.BaseDataLiteralTransformer*.\n\nResource strategies\n-------------------\n\nDataset and table resource management can be changed with one of the following :\n - Noop : don't manage the resource at all\n - CleanBeforeAndAfter : clean before each creation and after each usage.\n - CleanAfter : create without cleaning first and delete after each usage. This is the default behavior.\n - CleanBeforeAndKeepAfter : clean before each creation and don't clean resource after each usage.\n\nThe DSL on dataset and table scope provides the following methods in order to change resource strategy :\n - noop : set to Noop\n - clean_and_keep : set to CleanBeforeAndKeepAfter\n - with_resource_strategy : set to any resource strategy you want\n\nContributions\n=============\n\nContributions are welcome. You can create issue to share a bug or an idea.\nYou can create merge request as well in order to enhance this project.\n\nLocal testing\n-------------\n\nTesting is separated in two parts :\n\n - unit testing : doesn't need interaction with Big Query\n - integration testing : validate behavior against Big Query\n\nIn order to run test locally, you must install [tox](https://pypi.org/project/tox/).\n\nAfter that, you are able to run unit testing with `tox -e clean, py36-ut` from the root folder.\n\nIf you plan to run integration testing as well, please use a service account and authenticate yourself with `gcloud auth application-default login` which will set **GOOGLE_APPLICATION_CREDENTIALS** env var. You will have to set **GOOGLE_CLOUD_PROJECT** env var as well in order to run `tox`.\n\nThanks.\n\n\nWARNING\n=======\n\nDSL may change with breaking change until release of 1.0.0.\n\nEditing in VSCode\n=================\n\nIn order to benefit from VSCode features such as debugging, you should type the following commands in the root folder of this project.\n\nLinux\n-----\n\n - python3 -m venv .venv\n - source .venv/bin/activate\n - pip3 install -r requirements.txt -r requirements-test.txt -e .\n\nWindows\n-------\n\n - py -3 -m venv .venv\n - .venv\\scripts\\activate\n - python -m pip install -r requirements.txt -r requirements-test.txt -e .\n\nChangelog\n=========\n\n0.4.3\n-----\n - rename project as python-bigquery-test-kit\n\n0.4.2\n-----\n - remove load job config in log\n - fix temp tables query generation\n\n0.4.1\n-----\n - fix empty array generation for data literals\n\n0.4.0\n-----\n - add ability to rely on temp tables or data literals with query template DSL\n - fix generate empty data literal when json array is empty\n\n0.3.1\n-----\n\n - change method typo of with_interpolators\n - fix README.md related to interpolators\n\n0.3.0\n-----\n\n - add data literal transformer package exports\n\n0.2.0\n-----\n\n - Change return type of `Tables.__enter__` (closes #6)\n - Make jinja's local dictionary optional (closes #7)\n - Wrap query result into BQQueryResult (closes #9)\n\n\n0.1.2\n-----\n\n - Fix time partitioning type in TimeField (closes #3)\n\n0.1.1\n-----\n\n - Fix table reference in Dataset (closes #2)\n\n0.1.0\n-----\n\n - BigQuery resource DSL to create dataset and table (partitioned or not)\n - isolation of dataset and table names\n - results as dict with ease of test on byte arrays. Decoded as base64 string.\n - query templates interpolation made easy\n - csv and json loading into tables, including partitioned one, from code based resources.\n - context manager for cascading creation of BQResource\n - resource definition sharing accross tests made possible with \"immutability\".\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/tiboun/python-bigquery-test-kit",
+    "keywords": "bigquery testing test-kit bqtk dataset table isolation dsl immutability sql test",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "bq-test-kit",
+    "package_url": "https://pypi.org/project/bq-test-kit/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/bq-test-kit/",
+    "project_urls": {
+      "Homepage": "https://github.com/tiboun/python-bigquery-test-kit"
+    },
+    "release_url": "https://pypi.org/project/bq-test-kit/0.4.3/",
+    "requires_dist": [
+      "google-cloud-bigquery",
+      "logzero",
+      "varsubst[jinja2] ; extra == 'jinja2'",
+      "varsubst ; extra == 'shell'"
+    ],
+    "requires_python": ">=3",
+    "summary": "BigQuery test kit",
+    "version": "0.4.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9880500,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01e132e44eb3dcfa8061a1e81fbd0b448289d539e4be18a0660517a2d41c176e",
+          "md5": "b1f9628651d314429798207a7cd0fc5c",
+          "sha256": "07fa7a215334ce10477d6bae03740120972b80c0345b9ad221841177c373d084"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1f9628651d314429798207a7cd0fc5c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 39520,
+        "upload_time": "2020-11-23T08:12:47",
+        "upload_time_iso_8601": "2020-11-23T08:12:47.602119Z",
+        "url": "https://files.pythonhosted.org/packages/01/e1/32e44eb3dcfa8061a1e81fbd0b448289d539e4be18a0660517a2d41c176e/bq_test_kit-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf049d9860cf82a2bb2e4b47a4cf9b95e6881d161850335db42c30c67c4d4a69",
+          "md5": "681bee4e03e65fed60ee2de47a62608a",
+          "sha256": "7e5ff88e50b4648413b4b337480ca1c62600fd393ad67af81a8aeae82b4ce214"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "681bee4e03e65fed60ee2de47a62608a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 25256,
+        "upload_time": "2020-11-23T08:12:49",
+        "upload_time_iso_8601": "2020-11-23T08:12:49.546922Z",
+        "url": "https://files.pythonhosted.org/packages/cf/04/9d9860cf82a2bb2e4b47a4cf9b95e6881d161850335db42c30c67c4d4a69/bq-test-kit-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6b2df8bc57698e77509b7c428bbb3103abf5e3fc5bcdd2958af5fe8a33d03445",
+          "md5": "49398df287473e1be1bd0985a531e2f2",
+          "sha256": "2def58eff3a077b30246c519e22f74e78a5722863ef6083cf6a9e771a29237e6"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "49398df287473e1be1bd0985a531e2f2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 43084,
+        "upload_time": "2020-11-30T16:53:34",
+        "upload_time_iso_8601": "2020-11-30T16:53:34.446292Z",
+        "url": "https://files.pythonhosted.org/packages/6b/2d/f8bc57698e77509b7c428bbb3103abf5e3fc5bcdd2958af5fe8a33d03445/bq_test_kit-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "498ad3defda8146fdcc6a43417570c5e7688a4d4092c67bca388dd9090268df3",
+          "md5": "1dba54fa4662f1a5b32294e52099b88c",
+          "sha256": "a26faa9210514360c8964e6f2bd4c58f1594557361aa4a76456fc6224732ab04"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1dba54fa4662f1a5b32294e52099b88c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 28863,
+        "upload_time": "2020-11-30T16:53:36",
+        "upload_time_iso_8601": "2020-11-30T16:53:36.013689Z",
+        "url": "https://files.pythonhosted.org/packages/49/8a/d3defda8146fdcc6a43417570c5e7688a4d4092c67bca388dd9090268df3/bq-test-kit-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a951bf6485e1c64f90fda5282617feeba479462597bc451551ebb534278879c4",
+          "md5": "b503f561239c3db25cd01d8a70febc0d",
+          "sha256": "b1988316fa37362ff8943ada6005e6a51890677e813daa795b6c07006e12f77a"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b503f561239c3db25cd01d8a70febc0d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 43100,
+        "upload_time": "2020-11-30T17:53:30",
+        "upload_time_iso_8601": "2020-11-30T17:53:30.848146Z",
+        "url": "https://files.pythonhosted.org/packages/a9/51/bf6485e1c64f90fda5282617feeba479462597bc451551ebb534278879c4/bq_test_kit-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46be33899f750e44747b8ff18bd0debb8e1f6cdd126ac2f162dc0396e7945aea",
+          "md5": "c344f93e7e3186ae5e23fc1e117780b0",
+          "sha256": "46bcec90bff99a8c97febd254a2a6231b8356eaac6737f7e0395ee01714f3611"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c344f93e7e3186ae5e23fc1e117780b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 28888,
+        "upload_time": "2020-11-30T17:53:32",
+        "upload_time_iso_8601": "2020-11-30T17:53:32.202876Z",
+        "url": "https://files.pythonhosted.org/packages/46/be/33899f750e44747b8ff18bd0debb8e1f6cdd126ac2f162dc0396e7945aea/bq-test-kit-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d11273f219b4e0270c162b02aa362e2daa4deeb22dd9f31f9883345e43e6244a",
+          "md5": "9b03c848ab20cb70ad327e6d5ef43dc6",
+          "sha256": "9d628c972c2de5557962cf3ed09162bb45200c697e33121045ab865eb968ef3b"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9b03c848ab20cb70ad327e6d5ef43dc6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 40473,
+        "upload_time": "2020-12-01T22:40:07",
+        "upload_time_iso_8601": "2020-12-01T22:40:07.167613Z",
+        "url": "https://files.pythonhosted.org/packages/d1/12/73f219b4e0270c162b02aa362e2daa4deeb22dd9f31f9883345e43e6244a/bq_test_kit-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "15ee989b09410b4d23b5e52a00ee1a0cb442bfe79abd8ef3012636efc5649915",
+          "md5": "4bc50005a10c2ffb3effb699ffed64fe",
+          "sha256": "22255058ed2aaf3bc2c77cc5ce2a0e4de18a3fe71f5e9376e16299194cd8f7c9"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bc50005a10c2ffb3effb699ffed64fe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 29248,
+        "upload_time": "2020-12-01T22:40:08",
+        "upload_time_iso_8601": "2020-12-01T22:40:08.731904Z",
+        "url": "https://files.pythonhosted.org/packages/15/ee/989b09410b4d23b5e52a00ee1a0cb442bfe79abd8ef3012636efc5649915/bq-test-kit-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45022adc8fdc9109291a29f2422dc24d48eb03a8ed22b0ec6b68de21746056ff",
+          "md5": "4df8faba60a6ac2c0371b1aa9c550e64",
+          "sha256": "997641eefbe4120f0f5430d78385327e0eba9839ab092fe2f17892dca5f78374"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4df8faba60a6ac2c0371b1aa9c550e64",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 51607,
+        "upload_time": "2020-12-17T08:18:30",
+        "upload_time_iso_8601": "2020-12-17T08:18:30.458322Z",
+        "url": "https://files.pythonhosted.org/packages/45/02/2adc8fdc9109291a29f2422dc24d48eb03a8ed22b0ec6b68de21746056ff/bq_test_kit-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01a6d63fea0d133fc0cbc8311cb5affec25da476433d5fd56e36dec1e68383cf",
+          "md5": "d9060324767422c28edabba39663b4fc",
+          "sha256": "5ef149f82f677cdf5cefadc80a82c5246ecb82f267801a986d98d41abc9bfb2d"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d9060324767422c28edabba39663b4fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 34377,
+        "upload_time": "2020-12-17T08:18:31",
+        "upload_time_iso_8601": "2020-12-17T08:18:31.860445Z",
+        "url": "https://files.pythonhosted.org/packages/01/a6/d63fea0d133fc0cbc8311cb5affec25da476433d5fd56e36dec1e68383cf/bq-test-kit-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b72265c037be4ca8f69ac3f008fa649836bd2acfae00cb2a23369b91371b80c6",
+          "md5": "81fbbf002ab487799180d9556793042e",
+          "sha256": "21ffe1e10a10677f15b9a59230d3d31bd38a632916ccd51cde2c51767bbe7ec6"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "81fbbf002ab487799180d9556793042e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 51651,
+        "upload_time": "2020-12-17T08:30:12",
+        "upload_time_iso_8601": "2020-12-17T08:30:12.569899Z",
+        "url": "https://files.pythonhosted.org/packages/b7/22/65c037be4ca8f69ac3f008fa649836bd2acfae00cb2a23369b91371b80c6/bq_test_kit-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd854e2cdd8f1ed4f028f35a13ffdd565ad3e117cbaa6f2c456c44e91bba0251",
+          "md5": "e8c0d5eb56b4b139f56fec16963bbaa4",
+          "sha256": "8506ba8609848d301df188e7889f0963c0c186957a290c04b494708dc26923e3"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e8c0d5eb56b4b139f56fec16963bbaa4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 34540,
+        "upload_time": "2020-12-17T08:30:14",
+        "upload_time_iso_8601": "2020-12-17T08:30:14.199799Z",
+        "url": "https://files.pythonhosted.org/packages/cd/85/4e2cdd8f1ed4f028f35a13ffdd565ad3e117cbaa6f2c456c44e91bba0251/bq-test-kit-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e0a57554260f3e336bf18ca15b956613f7c823f2057099871fedde5d56b78f69",
+          "md5": "10bb58f21615383fe74a3c7bd329db8b",
+          "sha256": "1d34e646f4feb6e50d873e528e5ca31a33d6051188b403f52a438594120e9492"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "10bb58f21615383fe74a3c7bd329db8b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 56113,
+        "upload_time": "2021-01-26T15:14:48",
+        "upload_time_iso_8601": "2021-01-26T15:14:48.727316Z",
+        "url": "https://files.pythonhosted.org/packages/e0/a5/7554260f3e336bf18ca15b956613f7c823f2057099871fedde5d56b78f69/bq_test_kit-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fcb09a69906ae6e3aa1609ac2d4afb173dae8c71385c1c9eb7d9093e1c7d19bc",
+          "md5": "33953542601315031a3ff7ba80409424",
+          "sha256": "b7351c12a908e03d2d0b88ae6dbac91f719331cef41eaf9e239a569de4c55b22"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33953542601315031a3ff7ba80409424",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 38652,
+        "upload_time": "2021-01-26T15:14:50",
+        "upload_time_iso_8601": "2021-01-26T15:14:50.926193Z",
+        "url": "https://files.pythonhosted.org/packages/fc/b0/9a69906ae6e3aa1609ac2d4afb173dae8c71385c1c9eb7d9093e1c7d19bc/bq-test-kit-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a59dfb04f3da17e6dc26aa25c9f6f486802d3d7189c5baee1188cbfb61bb462f",
+          "md5": "1a28b2ab8c1d3d5896eb4ce220573998",
+          "sha256": "7dce6b8e5d97b85a4c66d0d58a63268b69685aba4a463a1755ad0a6f6326248a"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1a28b2ab8c1d3d5896eb4ce220573998",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 56164,
+        "upload_time": "2021-01-26T21:17:00",
+        "upload_time_iso_8601": "2021-01-26T21:17:00.822377Z",
+        "url": "https://files.pythonhosted.org/packages/a5/9d/fb04f3da17e6dc26aa25c9f6f486802d3d7189c5baee1188cbfb61bb462f/bq_test_kit-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fb369c810edc329d08c4962b3a7291fc05a88ad98fcd1f2f4f52d274f019d31c",
+          "md5": "737ddf369449f633d61d210690c1f01c",
+          "sha256": "74511dddf92f1bd49b46aff4651ebafbeacbdce72271cee02ac05ac92042c2b5"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "737ddf369449f633d61d210690c1f01c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 38710,
+        "upload_time": "2021-01-26T21:17:02",
+        "upload_time_iso_8601": "2021-01-26T21:17:02.417083Z",
+        "url": "https://files.pythonhosted.org/packages/fb/36/9c810edc329d08c4962b3a7291fc05a88ad98fcd1f2f4f52d274f019d31c/bq-test-kit-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91b4e342064c84a29335d5a25bfbd9776d58ce9432f66038a4e5a9b6122542e5",
+          "md5": "9ff12376cef531ede1b32b0d04ca38c2",
+          "sha256": "0e3e84b9fae0f3927cdafdfd02f40428d3e1441bf6928b7648b1e75a7c0b1dd3"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9ff12376cef531ede1b32b0d04ca38c2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 56334,
+        "upload_time": "2021-01-29T13:37:27",
+        "upload_time_iso_8601": "2021-01-29T13:37:27.933284Z",
+        "url": "https://files.pythonhosted.org/packages/91/b4/e342064c84a29335d5a25bfbd9776d58ce9432f66038a4e5a9b6122542e5/bq_test_kit-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "959334ac1166b4ea21d6c80297afc234151e691b4936aa36fd9b2577e7edbc4c",
+          "md5": "3c87baeac4c3f2b8d672471c93f39bb0",
+          "sha256": "5a9ed02c3bc6a92dd2709dc52f24b371459aaee77554e5db6536a13d02e1b286"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3c87baeac4c3f2b8d672471c93f39bb0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 38939,
+        "upload_time": "2021-01-29T13:37:29",
+        "upload_time_iso_8601": "2021-01-29T13:37:29.210369Z",
+        "url": "https://files.pythonhosted.org/packages/95/93/34ac1166b4ea21d6c80297afc234151e691b4936aa36fd9b2577e7edbc4c/bq-test-kit-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76dfeac8fb48efc036cbd6d6befad218b18cb9b8d556eb29d7fb0df8b7518049",
+          "md5": "8b58765631866f9f03331373afd411a0",
+          "sha256": "d98f76b4d58320aaa185671c608873e210affbf5dfce0ac1792af060f8354a95"
+        },
+        "downloads": -1,
+        "filename": "bq_test_kit-0.4.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8b58765631866f9f03331373afd411a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3",
+        "size": 56358,
+        "upload_time": "2021-03-25T19:21:53",
+        "upload_time_iso_8601": "2021-03-25T19:21:53.134780Z",
+        "url": "https://files.pythonhosted.org/packages/76/df/eac8fb48efc036cbd6d6befad218b18cb9b8d556eb29d7fb0df8b7518049/bq_test_kit-0.4.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b194ea379b97d230d84217064ab830e415abc69aa12757c3c762e3c252789b18",
+          "md5": "f40186044665828b3ad49bb9b7607833",
+          "sha256": "a016a30526e56c153d7042523dd83d8ba6be7cd4f5a3ab54cd1140e964865e5d"
+        },
+        "downloads": -1,
+        "filename": "bq-test-kit-0.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f40186044665828b3ad49bb9b7607833",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3",
+        "size": 38982,
+        "upload_time": "2021-03-25T19:21:55",
+        "upload_time_iso_8601": "2021-03-25T19:21:55.777300Z",
+        "url": "https://files.pythonhosted.org/packages/b1/94/ea379b97d230d84217064ab830e415abc69aa12757c3c762e3c252789b18/bq-test-kit-0.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "76dfeac8fb48efc036cbd6d6befad218b18cb9b8d556eb29d7fb0df8b7518049",
+        "md5": "8b58765631866f9f03331373afd411a0",
+        "sha256": "d98f76b4d58320aaa185671c608873e210affbf5dfce0ac1792af060f8354a95"
+      },
+      "downloads": -1,
+      "filename": "bq_test_kit-0.4.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8b58765631866f9f03331373afd411a0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3",
+      "size": 56358,
+      "upload_time": "2021-03-25T19:21:53",
+      "upload_time_iso_8601": "2021-03-25T19:21:53.134780Z",
+      "url": "https://files.pythonhosted.org/packages/76/df/eac8fb48efc036cbd6d6befad218b18cb9b8d556eb29d7fb0df8b7518049/bq_test_kit-0.4.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b194ea379b97d230d84217064ab830e415abc69aa12757c3c762e3c252789b18",
+        "md5": "f40186044665828b3ad49bb9b7607833",
+        "sha256": "a016a30526e56c153d7042523dd83d8ba6be7cd4f5a3ab54cd1140e964865e5d"
+      },
+      "downloads": -1,
+      "filename": "bq-test-kit-0.4.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f40186044665828b3ad49bb9b7607833",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3",
+      "size": 38982,
+      "upload_time": "2021-03-25T19:21:55",
+      "upload_time_iso_8601": "2021-03-25T19:21:55.777300Z",
+      "url": "https://files.pythonhosted.org/packages/b1/94/ea379b97d230d84217064ab830e415abc69aa12757c3c762e3c252789b18/bq-test-kit-0.4.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

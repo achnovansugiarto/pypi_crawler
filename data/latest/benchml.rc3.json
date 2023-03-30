@@ -1,0 +1,232 @@
+{
+  "info": {
+    "author": "Carl Poelking",
+    "author_email": "cp605@cam.ac.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Chemistry",
+      "Topic :: Scientific/Engineering :: Physics"
+    ],
+    "description": "<div align=\"center\">\n    <img src=\"https://github.com/capoe/benchml/raw/master/web/bml.png\" width=\"250px\">\n</div>\n\n# Description\nBenchML is a machine-learning (ML) suite for rapid development and deployment of ML models.\nThe library is geared towards physical/chemical datasets and prediction settings. It implements\ntransforms and provides plugins for a variety of atomistic and molecular descriptors,\ndata filtering and feature generation routines, regressors and classifiers, etc. The pipelines\ncan be efficiently optimized using grid-based or Bayesian protocols that minimise recomputation\nby dependency hashing.\n\nSee also our recent manuscript https://arxiv.org/abs/2112.02287, which details an application of BenchML to benchmarking of chemical representations.\n\n# Installation\nFor a minimal installation without plugins, simply\n```bash\npip install benchml\n```\n\nFor a complete installation, create a (new) conda environment from env.yml. E.g.,\n```bash\ngit clone https://github.com/capoe/benchml.git\ncd benchml\nconda env create -n py3benchml -f env.yml\nconda activate py3benchml\npip install .\n```\n\n# Getting started\nIn the examples folder, the demo notebook (examples/demo) illustrates how to build simple model pipelines for generic non-molecular datasets. Other examples include ligand activity predictions (examples/ecfp_binding) and a benchmarking workflow (examples/benchmark).\n\nNote that BenchML is being actively developed and still in an alpha state. I.e., the API has not fully equilibrated yet, but we will work on keeping the examples up-to-date as well as making a more detailed documentation available soon. \n\nSee the remainder of this page for a description of the key concepts underlying the BenchML framework.\n\n# BenchML pipelines\n\n<div align=\"center\">\n    <img src=\"https://github.com/capoe/benchml/raw/master/web/model.png\" width=\"75%\">\n</div>\n\n# A short guide to ...\n- [Transforms](#transforms)\n- [Modules](#modules)\n- [Macros](#macros)\n- [Hyper-optimization](#hyper-optimization)\n\n## Transforms\n\nTransforms are the nodes of the pipeline: They act on the data stream via calls to their .map and/or .fit methods.\nThe results are then stored in their private stream and/or parameter object. An example for the constructor call that\ncreates a new transform instance reads as follows:\n```python\ntrafo = RandomProjector(\n    args={\n        \"cutoff\": 0.1,\n        \"epsilon\": 0.01,\n        # ...\n    },\n    inputs={\n        \"X\": \"descriptor.x\",\n        \"y\": \"input.y\",\n        \"M\": \"predictor._model\",\n        # ...\n    },\n)\n```\n- The \"args\" dictionary supplies the parameters of the transformation, such as a cutoff, a convergence threshold, etc.\n  These parameters should not be confused with the *output* parameters (which could, e.g.,\n  include fit coefficients or trained models) stored in the params() object of a transform.\n- The \"inputs\" field contains links to the data stream of ancestral transforms on which the transformation acts.\n  The address of the inputs is specified in the form <transform_tag>.<data_tag>.\n  For example, \"descriptor.x\" points to the field \"x\" stored in the stream of the transform with name tag \"descriptor\".\n  If the tag is prefixed with an underscore \"\\_\" (such as in \"predictor.\\_model\"),\n  then the input is not read from the stream of the respective node, but its params object.\n\n### Implementing a new transform class\n\nThere are three types of transforms: input, map, and fit+map transforms.\nWhich type we are dealing with is determined by which methods (.\\_feed, .\\_map, .\\_fit) a particular transform implements.\n\n#### Input transforms\n\nInput transforms, such as ExtXyzInput, implement the .\\_feed method that is called inside .open of a model (= pipeline):\n```python\nstream = model.open(data)  # < Internally this will call .feed on all\n                           #   transforms that implement the ._feed method.\n```\nBelow we show an example implementation for an input node (here: ExtXyzInput),\nwhere .feed is used to release \"configs\",\"y\" and \"meta\" into the data stream:\n```python\nclass ExtXyzInput(InputTransform):            # < All transforms derive from <TransformBase>\n    allow_stream = {\"configs\", \"y\", \"meta\"}   # < Fields permitted in the stream object\n    stream_copy = (\"meta\",)                   # < See section on class attributes\n    stream_samples = (\"configs\", \"y\")         # < See section on class attributes\n\n    def _feed(self, data, stream):\n        stream.put(\"configs\", data)\n        stream.put(\"y\", data.y)\n        stream.put(\"meta\", data.meta)\n```\n\n#### Map transforms\n\nA map transform implements only .\\_map (but not .\\_fit). Most descriptors fall within this class of transforms,\nsuch as the RandomDescriptor class below:\n```python\nclass RandomDescriptor(Transform):\n    default_args = {\n      \"xmin\": -1.0,\n      \"xmax\": +1.0,\n      \"dim\": None\n    }\n    req_args = (\"dim\",)           # < Required fields to be specified in the constructor \"args\"\n    req_inputs = (\"configs\",)     # < Required inputs to be specified in the constructor \"inputs\"\n    allow_stream = {\"X\"}\n    stream_samples = (\"X\",)\n    precompute = True\n\n    def _map(self, inputs, stream):       # < The inputs dictionary comes preloaded with the appropriate data\n        shape = (\n          len(inputs[\"configs\"]),\n          self.args[\"dim\"])\n        X = np.random.uniform(\n          self.args[\"xmin\"],\n          self.args[\"xmax\"],\n          size=shape)\n        stream.put(\"X\", X) # < The X matrix is stored in the active stream of the transform\n```\n\n#### Fit transforms\n\nFit transforms implement .\\_fit and .\\_map: The former is called during the training stage within model.fit(stream)\nThe fit stores its parameters in the transform.params() object, but may also access transform.stream(), e.g.,\nto store predicted targets for the training set.\nThe map operation reads model parameters from .params() (e.g. via self.params().get(\"coeffs\")),\nand releases the mapped output into the stream. See below a wrapper around the Ridge predictor from sklearn:\n```python\nclass Ridge(FitTransform):\n    default_args = {\"alpha\": 1.0}\n    req_inputs = (\"X\", \"y\")\n    allow_params = {\"model\"}\n    allow_stream = {\"y\"}\n\n    def _fit(self, inputs, stream, params):\n        model = sklearn.linear_model.Ridge(**self.args)\n        model.fit(X=inputs[\"X\"], y=inputs[\"y\"])\n        yp = model.predict(inputs[\"X\"])\n        params.put(\"model\", model)\n        stream.put(\"y\", yp)\n\n    def _map(self, inputs, stream):\n        y = self.params().get(\"model\").predict(inputs[\"X\"])\n        stream.put(\"y\", y)\n```\n\n### TransformBase class attributes\nNew transform classes may require us to update their class attributes in order to define default arguments,\nrequired inputs, or ensure correct handling of their data streams.\nThe base TransformBase class lists the following class attributes:\n```python\nclass TransformBase(object):\n    default_args = {}\n    req_args = tuple()\n    req_inputs = tuple()\n    precompute = False\n    allow_stream = {}\n    allow_params = {}\n    stream_copy = tuple()\n    stream_samples = tuple()\n    stream_kernel = tuple()\n```\nComputationally expensive transforms should typically set \"precompute = True\",\nwhich will add them to the list of transforms mapped during a call to model.precompute(stream).\nThis will precompute the output for a specific data stream, and then only recompute values\nif the version hash of the stream changes (e.g., due to an args update of an ancestral transform).\n\nFor hyperoptimization, as well as benchmarking purposes, the stream attached to a transform needs to know\nhow to split its data into a train and test partition. Consider e.g.,\n```python\nstream = model.open(data)\nmodel.precompute(stream)\nstream_train, stream_test = stream.split(method=\"random\", n_splits=5, train_fraction=0.7)\nmodel.fit(stream_train)\n```\nThe stream_copy, stream_samples and stream_kernel attributes inform the streamm\nhow to adequately split its member data onto these partitions.\nFor example, for ExtXyzInput, we have the following:\n```python\nclass ExtXyzInput(InputTransform):\n    allow_stream = {\"configs\", \"y\", \"meta\"}\n    stream_copy = (\"meta\",)\n    stream_samples = (\"configs\", \"y\")\n```\nThis will instruct the split operation to simply copy all the \"meta\" data to both stream_train and stream_test,\nwhereas the \"configs\" and \"y\" data listed in \"stream_samples\" will be sliced\n(such as in configs_train = configs\\[trainset\\], configs_test = configs\\[testset\\]).\n\nFinally, for a precomputed kernel object, this slicing operation differs qualitatively\nfrom slicing of, say, a design matrix, as this affects the two axes of the matrix in different way\ne.g., K_train = K\\[trainset\\]\\[:,trainset\\], where K_test = K\\[testset\\]\\[:,trainset\\].\nThis is why the kernel matrix computed, e.g.,by the KernelDot transform is listed in a dedicated stream_kernel attribute:\n```python\nclass KernelDot(FitTransform):\n    default_args = {\"power\": 1}\n    req_inputs = (\"X\",)\n    allow_params = {\"X\"}\n    allow_stream = {\"K\"}\n    stream_kernel = (\"K\",)\n    precompute = True\n```\n\n### How to add a plugin\nNew transforms can be defined either externally or internally. In the latter case, add a source file\nwith the implementation to the benchml/plugins folder, and ,subsequently,\nimport that file in benchml/plugins/__init__.py.\nYou can check that your transforms were successfully added using bin/bmark.py:\n```bash\n./bin/bmark.py --list_transforms\n```\n\n## Modules\n\nA module (also referred to as a *pipeline* or *model*) comprises a set of interdependent transforms,\nwith at least one input transform. The module applies the transforms sequentially to the data input\nduring the fitting and mapping stages, managing both data streams and parameters.\n\nThe code example below creates a new pipeline instance that combines a topological fingerprint\nwith a dot-product kernel and kernel ridge regression:\n```python\nmodel = Module(\n    tag=\"morgan_krr\",\n    transforms=[\n        ExtXyzInput(tag=\"input\"),                 # < By assigning the tag \"input\", the stream\n        TopologicalFP(                            #   from ExtXyzInput can be accessed via \"input.<field>\"\n            tag=\"descriptor\",                     #   instead of \"ExtXyzInput.<field>\".\n            inputs={\"configs\": \"input.configs\"}),\n        KernelDot(\n            tag=\"kernel\",\n            inputs={\"X\": \"descriptor.X\"}),\n        KernelRidge(\n            args={\"alpha\": 1e-5, \"power\": 2},\n            inputs={\"K\": \"kernel.K\", \"y\": \"input.y\"})\n    ],\n    hyper=BayesianHyper(\n        Hyper({\n            \"KernelRidge.alpha\": [-3, 3 ],\n            \"KernelRidge.power\": [ 1., 3. ]}),\n        convert={\n            \"KernelRidge.alpha\": lambda a: 10**a}),\n    broadcast={ \"meta\": \"input.meta\" },           # < Data objects referenced here are broadcast to\n    outputs={ \"y\": \"KernelRidge.y\" },             #   all transforms, and can be accessed via the\n)                                                 #   inputs argument in their .\\_map and .\\_fit methods.\n```\nNote that except for \"transforms\", all arguments in this constructor are optional.\nStill, most pipelines will typically define some \"outputs\",\nthat are returned as a dictionary after calls to model.map(stream).\nHyperparameter optimization is added via \"hyper\".\nIn the example above, a grid search over the kernel ridge parameters \"alpha\" and \"power\"\nwill be performed within model.hyperfit(stream, ...).\nCalls to model.fit(stream) on the other hand would only consider the transform args\nspecified in the \"transforms\" section of the constructor.\n\n### Using the module\n\nIn the simpler .fit case, where a model is to be parametrized on some predefined training data,\nand then applied to a prospective screen, the workflow would simply be:\n```python\nstream_train = model.open(data_train)\nmodel.fit(stream_train)\nstream_screen = model.open(data_screen)\noutput = model.map(stream_screen)\nprint(\"Predicted targets =\", output[\"y\"])\n```\n\nIf hyperparameter optimization is desired, the type of nested splits as well as\nan evaluation metric need to be specified.\nIt is then usually a good idea to call model.precompute before model.hyperfit in order to cache data\n(such as, e.g., a design matrix) that do not change during the hyperparameter sweep:\n```python\nstream_train = model.open(data_train)\nmodel.precompute(stream_train)\nmodel.hyperfit(\n    stream=stream_train,\n    split_args={\"method\": \"random\", \"n_splits\": 5, \"train_fraction\": 0.75},\n    accu_args={\"metric\": \"mse\"},  # < These arguments are handed over to an \"accumulator\"\n    target=\"y\",                   #   that evaluates the desired metric between the target \"y\"\n    target_ref=\"input.y\")         #   (read from the model output) and reference \"input.y\"\n                                  #   (read from the stream of the \"input\" transform).\n  ```\n\n### Accessing data within a stream or module\nThe methods model.open(data) as well as stream.split(...) return handles on a data stream.\nYou can manually access the data stored in the stream via\n```python\nX = stream.resolve(\"descriptor.X\")\ny_true = stream.resolve(\"descriptor.y\")\n```\nYou can also obtain data and model parameters from an active stream and params objects through the model:\n```python\ny_pred = model.get(\"KernelRidge.y\")\npredictor = model.get(\"KernelRidge._model\")\n```\nThe underscore \"\\_\" indicates that the \"model\" data is to be read from\nthe .params() of the KernelRidge transforminstead of the .stream().\n\n## Macros\nCertain transform sequences may reappear in various models in the same way.\nIt can then be convenient to implement a macro that behaves like a single transform class\nwhen supplied to the constructor of a new module.\nBelow we show how to combine a topological fingerprint with a dot-product kernel within a single macro:\n```python\nclass TopologicalKernel(Macro):\n    req_inputs = (\"descriptor.configs\",)\n    transforms = [\n        {\n            \"class\": TopologicalFP,\n            \"tag\": \"descriptor\",\n            \"args\": {\"length\": 1024, \"radius\": 3},\n            \"inputs\": {\"configs\": \"?\"},\n        },\n        {\n            \"class\": KernelDot,\n            \"tag\": \"kernel\",\n            \"args\": {},\n            \"inputs\": {\"X\": \"descriptor.X\"}\n        }\n    ]\n```\nThis macro can then be used by a module that, e.g., sums two kernels with different hyperparameters\ninto a single kernel using the \"Add\" transform:\n```python\nModule(\n    transforms=[\n        ExtXyzInput(tag=\"input\"),\n        TopologicalKernel(\n            tag=\"A\",\n            args={\"descriptor.fp_length\": 1024, \"descriptor.fp_radius\": 2},\n            inputs={\"descriptor.configs\": \"input.configs\"},\n        ),\n        TopologicalKernel(\n            tag=\"B\",\n            args={\"descriptor.fp_length\": 2048, \"descriptor.fp_radius\": 4},\n            inputs={\"descriptor.configs\": \"input.configs\"}\n        ),\n        Add(\n            args={\"coeffs\": [ 0.5, 0.5 ]},\n            inputs={\"X\": [\"A/kernel.K\", \"B/kernel.K\"]}\n        ),\n        KernelRidge(\n            args={\"alpha\": 0.1, \"power\": 2},\n            inputs={\"K\": \"Add.y\", \"y\": \"input.y\"}\n        ),\n    ]\n)\n```\nNote that streams within the macros are located within their own namespace.\nHence, the kernel from transform \"A\" is referenced outside the macro via \"A/kernel.K\" instead of just \"kernel.K\".\n\n## Hyper-optimization\n\nThe library currently allows grid-based and Bayesian hyperparameter optimization.\nThese are added to the model definition via the \"hyper\" argument of the constructor.\nA grid-based example reads as follows:\n```python\nmodel = Module(\n    transforms=[\n        # ...\n        KernelRidge(...)\n        # ...\n    ],\n    hyper=GridHyper(\n        Hyper({ \"KernelRidge.alpha\": np.logspace(-3,+3, 5), }),\n        Hyper({ \"KernelRidge.power\": [ 1., 2., 3. ] })),\n),\n```\nAs there are two independent <Hyper> objects within the GridHyper constructor,\na complete combinatorial sweep will be performed, testing all combinations\nof \"KernelRidge.alpha\" and \"KernelRidge.power\" (here: 5x3 = 15).\nHyperparameters contained within the same Hyper object, by contrast, are swept over in a linear fashion:\n```python\nmodel = Module(\n    transforms=[\n        # ...\n        KernelRidge(...)\n        # ...\n    ],\n    hyper=GridHyper(\n        Hyper({\n            \"KernelRidge.alpha\": np.logspace(-3,+3, 3), # < Only three combinations considered:\n            \"KernelRidge.power\": [ 1., 2., 3. ]         #   (alpha, power) = (-3,1), (0,2), (3,3)\n        }))\n)\n```\n\nAs the number of hyperparameters increases, the grid-based sweep becomes increasingly expensive.\nBayesian optimization can then be a more efficient choice:\n```python\nmodel = Module(\n    transforms=[\n        # ...\n        KernelRidge(...)\n        # ...\n    ],\n    hyper=BayesianHyper(\n        Hyper({\n            \"KernelRidge.alpha\": [ -3, 3 ],\n            \"KernelRidge.power\": [ 1.0, 3.0 ] }),\n        convert={\"KernelRidge.alpha\": lambda a: 10**a}),\n),\n```\nHere we specified the lower and upper limit for each hyperparameter.\nThe \"convert\" dictionary contains instructions that are applied to a hyperparameter\nbefore it is supplied to the module: For example, \"KernelRidge.alpha\" is exponentiated with base 10,\nsuch that the Bayesian optimization (which is hence applied to the log of the regularization alpha)\nexperiences a smoother landscape.\nA similar conversion is necessary when integral or boolean parameters are to be optimized:\n```python\n# ...\nhyper=BayesianHyper(\n    Hyper({\n        \"trafo.some_boolean\": [ 0.0, 1.0 ],\n        \"trafo.some_integer\": [ 128, 512] }),\n    convert={\n        \"trafo.some_boolean\": lambda b: bool(np.round(b)),\n        \"trafo.some_integer\": lambda f: int(f)\n    })\n# ...\n```\n# Development\n## Tests\n\nThe tests are split onto unit and end-to-end (e2e) tests:\n```sh\npython3 -m pytest tests/unit_tests\npython3 tests/e2e_tests/test_all.py\n```\nAdding --create to the second command will generate reference results.\n\nTo run a juypter notebook as a test, do\n```sh\npip install nbmake\npython3 -m pytest --nbmake \"examples/\"\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/capoe/benchml",
+    "keywords": "chemical,physicochemical,atomistic,machine learning,pipelining,benchmarking",
+    "license": "Apache License 2.0",
+    "maintainer": "Carl Poelking",
+    "maintainer_email": "cp605@cam.ac.uk",
+    "name": "BenchML",
+    "package_url": "https://pypi.org/project/BenchML/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/BenchML/",
+    "project_urls": {
+      "Homepage": "https://github.com/capoe/benchml"
+    },
+    "release_url": "https://pypi.org/project/BenchML/0.3.4/",
+    "requires_dist": [
+      "numpy",
+      "scipy",
+      "scikit-learn"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Machine-learning pipelining and benchmarking suite geared towards the physical sciences.",
+    "version": "0.3.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14432487,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11b0e169f5c5ef4a015d2994430334e651289a811a4e24f96e6140e7ceb9e4ad",
+          "md5": "e5ad6c0a7fe3bb2951dddd5a7d1d5424",
+          "sha256": "24864be23320b605ba80f003627ca8d795595e40b14f08cad6fe7cc1d6dc717b"
+        },
+        "downloads": -1,
+        "filename": "benchml-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e5ad6c0a7fe3bb2951dddd5a7d1d5424",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 80511,
+        "upload_time": "2021-02-26T18:22:47",
+        "upload_time_iso_8601": "2021-02-26T18:22:47.987929Z",
+        "url": "https://files.pythonhosted.org/packages/11/b0/e169f5c5ef4a015d2994430334e651289a811a4e24f96e6140e7ceb9e4ad/benchml-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98b13dabd6c8bc03bf0e02ec7f2383393bf397c1a5c5bdbb00504a43cfeb168e",
+          "md5": "9c0229fe6203cb8157d64146952b1d96",
+          "sha256": "db1b748648499414cda666b8e7784b09f62c47f2057dbb622b99b70fd1974b51"
+        },
+        "downloads": -1,
+        "filename": "benchml-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9c0229fe6203cb8157d64146952b1d96",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 64645,
+        "upload_time": "2021-02-26T18:22:54",
+        "upload_time_iso_8601": "2021-02-26T18:22:54.898109Z",
+        "url": "https://files.pythonhosted.org/packages/98/b1/3dabd6c8bc03bf0e02ec7f2383393bf397c1a5c5bdbb00504a43cfeb168e/benchml-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d2bfe649e3b947f57ffcac052d9981c0378cf028203d2225ef0b9230e641492e",
+          "md5": "b624b3956353e60d349b7b26142a198b",
+          "sha256": "9396dd805c5389f26de859fdedc97199190f5abcb227de630b76f5c1dacff7ac"
+        },
+        "downloads": -1,
+        "filename": "BenchML-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b624b3956353e60d349b7b26142a198b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 304908,
+        "upload_time": "2021-03-11T14:30:07",
+        "upload_time_iso_8601": "2021-03-11T14:30:07.973268Z",
+        "url": "https://files.pythonhosted.org/packages/d2/bf/e649e3b947f57ffcac052d9981c0378cf028203d2225ef0b9230e641492e/BenchML-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd110968a8c9a80a40bf92e391b8b4c5af6c37cf7ae59bb9a8a7e365e777ce2c",
+          "md5": "0de549cd93ea03ebf08a558263c9e636",
+          "sha256": "f552d350548e9cdada79b4eda9855fd20782b3d7a57d6622c649a7fbe640089e"
+        },
+        "downloads": -1,
+        "filename": "BenchML-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0de549cd93ea03ebf08a558263c9e636",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 66758,
+        "upload_time": "2021-03-11T14:30:09",
+        "upload_time_iso_8601": "2021-03-11T14:30:09.562425Z",
+        "url": "https://files.pythonhosted.org/packages/cd/11/0968a8c9a80a40bf92e391b8b4c5af6c37cf7ae59bb9a8a7e365e777ce2c/BenchML-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59e782ded728e470a6e63e884ba9565e8c9a5a830f3665048f61736d0a4ae748",
+          "md5": "9e641772e12a54ca7745481323449d69",
+          "sha256": "1cdc7e3b579164646b8fe9dcccd727ef3af7672ca091a8bf0de98e9bac1bfd29"
+        },
+        "downloads": -1,
+        "filename": "BenchML-0.3.4-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9e641772e12a54ca7745481323449d69",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.6",
+        "size": 100639,
+        "upload_time": "2022-07-14T08:22:38",
+        "upload_time_iso_8601": "2022-07-14T08:22:38.601169Z",
+        "url": "https://files.pythonhosted.org/packages/59/e7/82ded728e470a6e63e884ba9565e8c9a5a830f3665048f61736d0a4ae748/BenchML-0.3.4-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e53dafac7e5e55a3bf5820ddc565b44222a2c2e44eba73793f97ffa8a14438d",
+          "md5": "0e282bac2ccd0f1c756f0c5d45efa0b7",
+          "sha256": "c02abedee98559fd9ac13321d5f7c2f024d0d10fdb6d8d1cd99bc613683a6527"
+        },
+        "downloads": -1,
+        "filename": "BenchML-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0e282bac2ccd0f1c756f0c5d45efa0b7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 84869,
+        "upload_time": "2022-07-14T08:22:42",
+        "upload_time_iso_8601": "2022-07-14T08:22:42.257908Z",
+        "url": "https://files.pythonhosted.org/packages/1e/53/dafac7e5e55a3bf5820ddc565b44222a2c2e44eba73793f97ffa8a14438d/BenchML-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "59e782ded728e470a6e63e884ba9565e8c9a5a830f3665048f61736d0a4ae748",
+        "md5": "9e641772e12a54ca7745481323449d69",
+        "sha256": "1cdc7e3b579164646b8fe9dcccd727ef3af7672ca091a8bf0de98e9bac1bfd29"
+      },
+      "downloads": -1,
+      "filename": "BenchML-0.3.4-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "9e641772e12a54ca7745481323449d69",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=3.6",
+      "size": 100639,
+      "upload_time": "2022-07-14T08:22:38",
+      "upload_time_iso_8601": "2022-07-14T08:22:38.601169Z",
+      "url": "https://files.pythonhosted.org/packages/59/e7/82ded728e470a6e63e884ba9565e8c9a5a830f3665048f61736d0a4ae748/BenchML-0.3.4-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1e53dafac7e5e55a3bf5820ddc565b44222a2c2e44eba73793f97ffa8a14438d",
+        "md5": "0e282bac2ccd0f1c756f0c5d45efa0b7",
+        "sha256": "c02abedee98559fd9ac13321d5f7c2f024d0d10fdb6d8d1cd99bc613683a6527"
+      },
+      "downloads": -1,
+      "filename": "BenchML-0.3.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0e282bac2ccd0f1c756f0c5d45efa0b7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 84869,
+      "upload_time": "2022-07-14T08:22:42",
+      "upload_time_iso_8601": "2022-07-14T08:22:42.257908Z",
+      "url": "https://files.pythonhosted.org/packages/1e/53/dafac7e5e55a3bf5820ddc565b44222a2c2e44eba73793f97ffa8a14438d/BenchML-0.3.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

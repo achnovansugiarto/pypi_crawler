@@ -1,0 +1,165 @@
+{
+  "info": {
+    "author": "James E. King III",
+    "author_email": "jking@apache.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries :: Python Modules",
+      "Typing :: Typed"
+    ],
+    "description": "# boto3-post-conditions\n\n ![ci](https://github.com/jeking3/boto3_post_conditions/actions/workflows/test.yml/badge.svg)\n[![codecov](https://codecov.io/gh/jeking3/boto3-post-conditions/branch/main/graph/badge.svg?token=NP7WihxzHD)](https://codecov.io/gh/jeking3/boto3-post-conditions)\n[![open issues](https://img.shields.io/github/issues-raw/jeking3/boto3_post_conditions)](https://github.com/jeking3/boto3_post_conditions/issues)\n[![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n\nMost AWS APIs are eventually consistent with few guarantees.  For example when\nyou use SSM `put_parameter` (which succeeds), then immediately call `get_parameter`,\nyou might get an error such as `ParameterNotFound`.  Welcome to the world of\neventual consistency.  Anyone who has worked with the AWS CLI or API has been\nforced to do one of two things:\n\n1. Add sleep logic to wait for things to align, or\n2. Add retry logic to wait for things to align.\n\nThis library injects logic for post-condition blocking checks in boto3\nto eliminate the majority of retry code that everyone has been forced to\nadd (and develop tests for) in their own code.  This is especially useful\nin serial scripts that manipulate AWS, where different commands in the script\ndepend on changes from the previous command to be fully realized.  Hopefully\nthis sort of logic can make its way into botocore in the future so that\nserialized scripts can take advantage of it and become vastly simplified.\n\n## Quick Start\n\n### Compatibility\n\nboto3-post-conditions supports at least some of the following AWS subsystems:\n\n- SSM Parameter Store\n- Secrets Manager\n\n### Installing\n\n    pip install boto3-post-conditions\n\nor\n\n    poetry add boto3-post-conditions\n\n### Using\n\nCreate a boto3 client like you normally would.  To enforce post-conditions\non calls to that client, register the client with the `PostConditionEnforcer`:\n\n    import boto3\n    from boto3_post_conditions import PostConditionEnforcer\n\n    client = boto3.client(\"ssm\")\n    PostConditionEnforcer.register(client)\n\nThe enforcer will inject event handlers into the client definition to\nblock returning from your API calls until changes are actually realized\nin the AWS service you are modifying.\n\n## Limitations\n\nIt's beta, so there are going to be some major gaps...\n\n- Only supports some of Secrets Manager and SSM initially.\n- Post-conditions are always checked serially after each modification.\n  There is no batch post-condition processing yet, but certainly\n  being able to wrap boto calls in a context manager and then finalize\n  their changes all at once (allowing AWS to process all the requests\n  in parallel) is going to be useful.\n\n## Background\n\nEvery developer who has worked with the AWS API has encountered eventual\nconsistency issues.  This behavior has led virtually every reliable product\nthat leverages the AWS API to add their own code to defeat the effects of\neventual consistency.  The best way to deal with eventual consistency in a\npipeline is to add post-condition checks.  For example, if you delete a secret\nin AWS Secrets Manager, it is not immediately deleted.  It is scheduled for\ndeletion and then it is eventually deleted.  If you attempt to insert a new\nsecret with the same name during this transition you get an error.  You may\neven still be able to read the secret even though the delete call returned\nsuccess.\n\nAWS documents [eventual consistency](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/query-api-troubleshooting.html#eventual-consistency)\nseparately for each of their subsystems.\n\nTag management falls into the same category, as some AWS subsystems rely on\nthe Resource and Tag Manager to handle tagging, and that means more eventual\nconsistency.  If you modify or remove a tag on a resource, it is often not\nrealized immediately (causing a situation where you cannot read what you\nwrote), so follow-up code that depends on that tag being modified or deleted\ncan fail.\n\nboto3-post-conditions hooks into [botocore](https://github.com/boto/botocore)\nin a manner similar to the simulation library [moto](https://github.com/spulec/moto)\nsuch that when a call completes that modifies something, the client verifies\nthat the change has been realized.  This does require a little bit of stack\ninspection, as the client and original call parameters are not passed through\nthe handle_event mechanism.\n\n## Theory of Operation\n\nEach boto3 call that makes a modification can be verified for liveness with\na subsequent read call.  The \"after-call\" boto3 event occurs after every call\nallowing code to plug into the request stream.  When the response indicates\na change is successful, post-conditions can be enforced by reading back the\nresource and ensuring the expected change is there.\n\nTake the Systems Manager (SSM) Parameter Store, for example.  As an eventually\nconsistent system, extra care must be taken to avoid some common pitfalls,\nsuch as:\n\n- Calling put_parameter immediately followed by get_parameter has no guarantee\n  of success.  In fact, it can raise a ParameterNotFound.\n- Calling delete_parameter immediately followed by get_parameter can still return\n  the parameter.\n\nboto3_post_conditions adds logic to ensure that the modifications you are making\nare realized by that subsystem's control plane before returning control to the\ncaller.  For example with put_parameter, boto3_post_conditions will ensure that:\n\n- The parameter can be read (with GetParameter) to handle the case of a novel\n  parameter being added.\n- The parameter's tags can be read, should the Tags be set during creation.\n  The resource and tag manager is a separate subsystem which adds even more\n  delays to realization.\n\nEvery modification or deletion has a post-condition remedy that can ensure\nthe vast majority of these cases are eliminated, and virtually removing retry\nlogic from your code and tests!  As proof, look at the recorded test for\n`test_ssm_integration`.\n\n## Development\n\nThis project uses [poetry](https://pypi.org/project/poetry/) to manage the development\nvirtual environment.  To get started you need to install poetry using pip, then run\nthe command `poetry install`.  The project is configured to store the virtual environment\nin the `.venv` directory.\n\nTo update supported services, look in the `boto3_post_conditions/services` directory.\nThere is one module for each service.  Each API call for a service that has post-conditions\nhas an identically named function with a decorator.  This package also extends the event\ndata carried through such that the original call parameters and client are available.\n\nNever call the original API from the post-condition function (unless you like infinite\nrecursion)!\n\nEach post-condition method should guarantee visibility of the API that was called. For\nexample when something is deleted, the function should attempt to get that resource\nand raise a `PostConditionNotSatisfiedError` if it is still there.  The framework will\nthen enter a retry loop, calling the function again after an increasing delay.\n\nUnit testing is required for new code.  If you submit a PR without testing it will not be\napproved.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/jeking3/boto3-post-conditions/",
+    "keywords": "boto3,aws,eventual consistency,retry",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "boto3-post-conditions",
+    "package_url": "https://pypi.org/project/boto3-post-conditions/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/boto3-post-conditions/",
+    "project_urls": {
+      "Homepage": "https://github.com/jeking3/boto3-post-conditions/",
+      "Repository": "https://github.com/jeking3/boto3-post-conditions/"
+    },
+    "release_url": "https://pypi.org/project/boto3-post-conditions/0.3.0/",
+    "requires_dist": [
+      "boto3 (>=1.20,<2.0)",
+      "retry (>=0.9.2,<0.10.0)"
+    ],
+    "requires_python": ">=3.8,<3.11",
+    "summary": "Remove retry logic from boto3 clients by enforcing post-conditions.",
+    "version": "0.3.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12520689,
+  "releases": {
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fde4dc6ed6b599a6bd276bb379fbcc019f1af31e98c45c1cc86cff3ac02a03e",
+          "md5": "7c60aaa120f58f5fe9b1b3605143f4cb",
+          "sha256": "00edb77380e12e4aac6fc4365380b603bdbbee760cb408fe590c41b618024b4f"
+        },
+        "downloads": -1,
+        "filename": "boto3-post-conditions-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7c60aaa120f58f5fe9b1b3605143f4cb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 11323,
+        "upload_time": "2021-12-30T19:56:39",
+        "upload_time_iso_8601": "2021-12-30T19:56:39.971315Z",
+        "url": "https://files.pythonhosted.org/packages/6f/de/4dc6ed6b599a6bd276bb379fbcc019f1af31e98c45c1cc86cff3ac02a03e/boto3-post-conditions-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad0f08415be26785f2fad9cc5710ed56415125cef6c10ff33c5a88cdd65fe1d5",
+          "md5": "d21696907d1272afbbac5020ab664857",
+          "sha256": "ca360ef751d3c013781d2e70e9d9b5e212cebe660e6ec43839bc478f7de1e863"
+        },
+        "downloads": -1,
+        "filename": "boto3_post_conditions-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d21696907d1272afbbac5020ab664857",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 11718,
+        "upload_time": "2022-01-09T16:29:14",
+        "upload_time_iso_8601": "2022-01-09T16:29:14.451840Z",
+        "url": "https://files.pythonhosted.org/packages/ad/0f/08415be26785f2fad9cc5710ed56415125cef6c10ff33c5a88cdd65fe1d5/boto3_post_conditions-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0555a27282ea5b08c67433020a5d028a89ade001dc11269682b1be787b64e6c",
+          "md5": "267dc2a9edfdc7110e0b8050a9141845",
+          "sha256": "7badc9c73d02ff2bc6c08075880767f30cc133fcf98b6b78437e362369f7640f"
+        },
+        "downloads": -1,
+        "filename": "boto3-post-conditions-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "267dc2a9edfdc7110e0b8050a9141845",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 12346,
+        "upload_time": "2022-01-09T16:29:13",
+        "upload_time_iso_8601": "2022-01-09T16:29:13.320154Z",
+        "url": "https://files.pythonhosted.org/packages/f0/55/5a27282ea5b08c67433020a5d028a89ade001dc11269682b1be787b64e6c/boto3-post-conditions-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ad0f08415be26785f2fad9cc5710ed56415125cef6c10ff33c5a88cdd65fe1d5",
+        "md5": "d21696907d1272afbbac5020ab664857",
+        "sha256": "ca360ef751d3c013781d2e70e9d9b5e212cebe660e6ec43839bc478f7de1e863"
+      },
+      "downloads": -1,
+      "filename": "boto3_post_conditions-0.3.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d21696907d1272afbbac5020ab664857",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<3.11",
+      "size": 11718,
+      "upload_time": "2022-01-09T16:29:14",
+      "upload_time_iso_8601": "2022-01-09T16:29:14.451840Z",
+      "url": "https://files.pythonhosted.org/packages/ad/0f/08415be26785f2fad9cc5710ed56415125cef6c10ff33c5a88cdd65fe1d5/boto3_post_conditions-0.3.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f0555a27282ea5b08c67433020a5d028a89ade001dc11269682b1be787b64e6c",
+        "md5": "267dc2a9edfdc7110e0b8050a9141845",
+        "sha256": "7badc9c73d02ff2bc6c08075880767f30cc133fcf98b6b78437e362369f7640f"
+      },
+      "downloads": -1,
+      "filename": "boto3-post-conditions-0.3.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "267dc2a9edfdc7110e0b8050a9141845",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<3.11",
+      "size": 12346,
+      "upload_time": "2022-01-09T16:29:13",
+      "upload_time_iso_8601": "2022-01-09T16:29:13.320154Z",
+      "url": "https://files.pythonhosted.org/packages/f0/55/5a27282ea5b08c67433020a5d028a89ade001dc11269682b1be787b64e6c/boto3-post-conditions-0.3.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,270 @@
+{
+  "info": {
+    "author": "Enrico Rotundo",
+    "author_email": "team@bacalhau.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 2 - Pre-Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: Apache Software License",
+      "Natural Language :: English",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "# Apache Airflow Provider for Bacalhau\n\nThis is `bacalhau-airflow`, a Python package that integrates [Bacalhau](https://github.com/bacalhau-project/bacalhau) with [Apache Airflow](https://github.com/apache/airflow).\nThe benefit is two fold.\nFirst, thanks to this package you can now write complex pipelines for Bacalhau.\nFor instance, jobs can communicate their output's CIDs to downstream jobs, that can use those as inputs.\nSecond, Apache Airflow provides a solid solution to reliably orchestrate your DAGs.\n\n> :warning: You may try this out using a local devstack until https://github.com/bacalhau-project/bacalhau/issues/2038 has been fixed. Please set the following environment variables `AIRFLOW_VAR_BACALHAU_API_HOST`, `AIRFLOW_VAR_BACALHAU_API_PORT`.\n\n## Features\n\n- Create Airflow tasks that run on Bacalhau (via custom operator!)\n- Support for sharded jobs: output shards can be passed downstream (via [XComs](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/xcoms.html))\n- Coming soon...\n    - Lineage (see [OpenLineage proof-of-concept integration here](https://github.com/enricorotundo/bacalhau-airflow-provider))\n    - Various working code examples\n    - Hosting instructions\n\n## Requirements\n\n- Python 3.8+\n- [`bacalhau-sdk` 0.1.6](https://pypi.org/project/bacalhau-sdk/)\n- `apache-airflow` 2.3+\n\n## Installation\n\nThe integration automatically registers itself for Airflow 2.3+ if it's installed on the Airflow worker's Python.\n\n## From pypi\n\n```console\npip install bacalhau-airflow\n```\n\n## From source\n\nClone the public repository:\n\n```shell\ngit clone https://github.com/bacalhau-project/bacalhau/\n```\n\nOnce you have a copy of the source, you can install it with:\n\n```shell\ncd integration/airflow/\npip install .\n```\n\n## Worked example\n\n### Setup\n\n\n> In a production environment you may want to follow the [official Airflow's instructions](https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/production-deployment.html) or pick one of the suggested [hosted solutions](https://airflow.apache.org/ecosystem/#airflow-as-a-service).\n\nIf you're just curious and want to give it a try on your *local machine*, please follow the steps below.\n\nFirst, install and initalize Airflow:\n\n```shell\n$ pip install apache-airflow\nexport AIRFLOW_HOME=~/airflow\n$ airflow db init\n```\n\nThen, we need to point Airflow to the absolute path of the folder where your pipelines live.\nTo do that we edit the `dags_folder` field in `${AIRFLOW_HOME}/airflow.cfg` file.\nIn this example I'm going to use the `hello_world.py` DAG shipped with this repository;\nfor the sake of completeness, the next section will walk you through the actual code.\n\nMy config file looks like what follows:\n\n```\n[core]\ndags_folder = /Users/enricorotundo/bacalhau/integration/airflow/example_dags\n...\n```\n\nOptionally, to reduce clutter in the Airflow UI, you could disable the loading of the default example DAGs by setting `load_examples` to `False`.\n\nFinally, we can launch Airflow locally:\n\n```shell\nairflow standalone\n```\n\n### Example DAG: chaining jobs\n\nWhile Airflow's pinwheel is warming up in the background, let's take a look at the `hello_world.py` break down below.\n\n> In brief, the first task of this DAG prints out \"Hello World\" to stdout, then automatically pipe its output into the subsequent task as an input file. The second task will simply print out the content of its input file.\n\nAll you need to import from this package is the `BacalhauSubmitJobOperator`.\nIt allows you to submit a job spec comprised of the usual fields such as engine, image, etc.\n\n```python\nfrom datetime import datetime\nfrom airflow import DAG\nfrom bacalhau_airflow.operators import BacalhauSubmitJobOperator\n```\n\nThis operator supports chaining multiple jobs without the need to manually pass any CID along, in this regards a special note goes to the `input_volumes` parameter (see `task_2` below).\nEvery time the operator runs a task, it stores a comma-separated string with the output shard-CIDs in an internal key-value store under the `cids` key.\nThus, downstream tasks can read in those CIDs via the `input_volumes` parameter.\n\nAll you need to do is (1) use the [XComs syntax](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/xcoms.html) (in curly brackets) to specify the \"sender\" task ids and the `cids` key (e.g. `{{ task_instance.xcom_pull(task_ids='task_1', key='cids') }}`), (2) define a target mount point separated by a colon (e.g. `:/task_1_output`).\n\nLastly, we define task dependencies simply with `task_1 >> task_2`.\nTo learn more about [Airflow's DAG syntax please check out this page](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html#task-dependencies).\n\n```python\nwith DAG(\"bacalhau-helloworld-dag\", start_date=datetime(2023, 3, 1)) as dag:\n    task_1 = BacalhauSubmitJobOperator(\n        task_id=\"task_1\",\n        api_version=\"V1beta1\",\n        job_spec=dict(\n            engine=\"Docker\",\n            verifier=\"Noop\",\n            publisher=\"IPFS\",\n            docker=dict(\n                image=\"ubuntu\",\n                entrypoint=[\"echo\", \"Hello World\"],\n            ),\n            deal=dict(concurrency=1, confidence=0, min_bids=0),\n        ),\n    )\n\n    task_2 = BacalhauSubmitJobOperator(\n        task_id=\"task_2\",\n        api_version=\"V1beta1\",\n        input_volumes=[\n            \"{{ task_instance.xcom_pull(task_ids='task_1', key='cids') }}:/task_1_output\",\n        ],\n        job_spec=dict(\n            engine=\"Docker\",\n            verifier=\"Noop\",\n            publisher=\"IPFS\",\n            docker=dict(\n                image=\"ubuntu\",\n                entrypoint=[\"cat\", \"/task_1_output/stdout\"],\n            ),\n            deal=dict(concurrency=1, confidence=0, min_bids=0),\n        ),\n    )\n\n    task_1 >> task_2\n```\n\n### Run it\n\nNow the we understand what the example DAG is supposed to do, let's just run it!\nHead over to http://0.0.0.0:8080 were Airflow UI is being served.\nThe screenshot below shows our hello world has been loaded correctly.\n\n![](docs/_static/airflow_01.png)\n\nWhen you inspect a DAG, Airflow will render a graph depicting a color-coded topology (see image below).\nFor active (i.e. running) pipelines, this will be useful to oversee what the status of each task is.\n\nTo trigger a DAG please enable the toggle shown below.\n\n![](docs/_static/airflow_02.png)\n\nWhen all tasks have completed, we want to fetch the output of our pipeline.\nTo do so we need to retrieve the job-id of the last task.\nClick on a green box in the `task_2` line and then open the XCom tab.\n\n![](docs/_static/airflow_03.png)\n\nHere we find the `bacalhau_job_id`.\nSelect that value and copy into your clipboard.\n\n![](docs/_static/airflow_04.png)\n\nLastly, we can use the bacalhau cli `get` command to fetch the output data as follows:\n\n```console\n$ bacalhau get 8fdab73b-00fd-4d13-941c-8ba002f8178d\nFetching results of job '8fdab73b-00fd-4d13-941c-8ba002f8178d'...\n...\nResults for job '8fdab73b-00fd-4d13-941c-8ba002f8178d' have been written to...\n/tmp/dag-example/job-8fdab73b\n\n$ cat /tmp/dag-example/job-8fdab73b/combined_results/stdout\nHello World\n```\n\nThat's all folks :rainbow:.\n\n## Development\n\n\n```console\npip install -r dev-requirements.txt\n```\n\n### Unit tests\n\n\n```shell\ntox\n```\n\nYou can also skip using `tox` and run `pytest` on your own dev environment.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/filecoin-project/bacalhau/tree/main/integration/airflow",
+    "keywords": "bacalhau,airflow,provider",
+    "license": "Apache Software License 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "bacalhau-airflow",
+    "package_url": "https://pypi.org/project/bacalhau-airflow/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/bacalhau-airflow/",
+    "project_urls": {
+      "Homepage": "https://github.com/filecoin-project/bacalhau/tree/main/integration/airflow"
+    },
+    "release_url": "https://pypi.org/project/bacalhau-airflow/0.3.25/",
+    "requires_dist": [
+      "bacalhau-sdk",
+      "apache-airflow (>=2.3.0)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "An Apache Airflow provider for Bacalhau.",
+    "version": "0.3.25",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17395741,
+  "releases": {
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60ffae0f33a9fbb2b0e9803e95b87ba211b6606d3bfad56aef3ae4285ec0b4d0",
+          "md5": "ba1d14e31e3aa1aa7463cbc40ba1ced3",
+          "sha256": "bd945c5436e70b92e8626c237ee76fbf660438e6c0e7a5b190b92069d98858bb"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.0.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ba1d14e31e3aa1aa7463cbc40ba1ced3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.7",
+        "size": 9556,
+        "upload_time": "2023-02-28T17:06:09",
+        "upload_time_iso_8601": "2023-02-28T17:06:09.594441Z",
+        "url": "https://files.pythonhosted.org/packages/60/ff/ae0f33a9fbb2b0e9803e95b87ba211b6606d3bfad56aef3ae4285ec0b4d0/bacalhau_airflow-0.0.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b7e0a4613caae426138ba9706db0da5c8ed6f5b150f16cd6a9940c73c2cd52d",
+          "md5": "81f5b949d2e16c679bc0e3fdffd02500",
+          "sha256": "b1365bb46e92a8da13d8f10355935c8e2197e500e05db0459c047ddc19a2e07e"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81f5b949d2e16c679bc0e3fdffd02500",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 14753,
+        "upload_time": "2023-02-28T17:06:11",
+        "upload_time_iso_8601": "2023-02-28T17:06:11.194729Z",
+        "url": "https://files.pythonhosted.org/packages/0b/7e/0a4613caae426138ba9706db0da5c8ed6f5b150f16cd6a9940c73c2cd52d/bacalhau_airflow-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.24.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30738c4e4aabc9defd43675d10fd9e16c77876452d8151541ae7c68dd64774b7",
+          "md5": "b279cb2bf2e7cc11b386b3685e0c2689",
+          "sha256": "e3a4a6d4e6ff07e4d148e7fdbcaf0f96f0f7f898274b328c5f6c28586ed683d4"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.24.dev1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b279cb2bf2e7cc11b386b3685e0c2689",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.7",
+        "size": 11959,
+        "upload_time": "2023-03-10T17:45:30",
+        "upload_time_iso_8601": "2023-03-10T17:45:30.092859Z",
+        "url": "https://files.pythonhosted.org/packages/30/73/8c4e4aabc9defd43675d10fd9e16c77876452d8151541ae7c68dd64774b7/bacalhau_airflow-0.3.24.dev1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a6b6cf81c082fa0c7a4e242354d50a6d6b9c45f9b95713207b9fd6a040407f8",
+          "md5": "60db8c2ecb39a564b538f4592d7b34cf",
+          "sha256": "c183c204ec7278106ef5615654d6861e4488663ab086de7e42b42e86e34b3964"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.24.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "60db8c2ecb39a564b538f4592d7b34cf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 4834840,
+        "upload_time": "2023-03-10T17:45:33",
+        "upload_time_iso_8601": "2023-03-10T17:45:33.240566Z",
+        "url": "https://files.pythonhosted.org/packages/7a/6b/6cf81c082fa0c7a4e242354d50a6d6b9c45f9b95713207b9fd6a040407f8/bacalhau_airflow-0.3.24.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.24.dev8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0ee368bacef51a80eeae45e3f00816a9f92cace0fc2df75aaf6907c14a666ad2",
+          "md5": "765728da9ac839e664009e9913b9a3f5",
+          "sha256": "26486b7cf97826b091258aff5b4d4917fe3631d8fbecb69fbd972dbed72be509"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.24.dev8-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "765728da9ac839e664009e9913b9a3f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.8",
+        "size": 11968,
+        "upload_time": "2023-03-14T16:10:06",
+        "upload_time_iso_8601": "2023-03-14T16:10:06.051194Z",
+        "url": "https://files.pythonhosted.org/packages/0e/e3/68bacef51a80eeae45e3f00816a9f92cace0fc2df75aaf6907c14a666ad2/bacalhau_airflow-0.3.24.dev8-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60f4594997fe6edbe55618a47f10078d12f576a43d8ced4a295746fda1e94695",
+          "md5": "06aa96932dbd37a9e86ef9bbf37aa2f6",
+          "sha256": "af9a85d1b5b4dd1692afd2aca1b7eea755f4baf36d345eb7581a54139e718881"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.24.dev8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06aa96932dbd37a9e86ef9bbf37aa2f6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 2426142,
+        "upload_time": "2023-03-14T16:10:07",
+        "upload_time_iso_8601": "2023-03-14T16:10:07.270293Z",
+        "url": "https://files.pythonhosted.org/packages/60/f4/594997fe6edbe55618a47f10078d12f576a43d8ced4a295746fda1e94695/bacalhau_airflow-0.3.24.dev8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.25": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7c16d9ee673803a7b9579a811a6c9d49b9163f53b03b619f9fcf974c17240ca",
+          "md5": "2232c1b17d650a888df445a2da5a9d29",
+          "sha256": "0ce4c92725ad4d2e21ace904e324766365c253c685bd2e6cc7a19a30a98a5889"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.25-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2232c1b17d650a888df445a2da5a9d29",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.8",
+        "size": 11908,
+        "upload_time": "2023-03-22T09:44:42",
+        "upload_time_iso_8601": "2023-03-22T09:44:42.127311Z",
+        "url": "https://files.pythonhosted.org/packages/e7/c1/6d9ee673803a7b9579a811a6c9d49b9163f53b03b619f9fcf974c17240ca/bacalhau_airflow-0.3.25-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1051871c9e2d5d80b07acd32e738e84903c7693815579d37250f62a5215033a5",
+          "md5": "21aa151f8a573b4bf6c4701b13cee4a5",
+          "sha256": "cd6ea26d6c310e8127615f6fb0ffe678113d324b95128186579752132fb0f46a"
+        },
+        "downloads": -1,
+        "filename": "bacalhau_airflow-0.3.25.tar.gz",
+        "has_sig": false,
+        "md5_digest": "21aa151f8a573b4bf6c4701b13cee4a5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 2426109,
+        "upload_time": "2023-03-22T09:44:43",
+        "upload_time_iso_8601": "2023-03-22T09:44:43.332221Z",
+        "url": "https://files.pythonhosted.org/packages/10/51/871c9e2d5d80b07acd32e738e84903c7693815579d37250f62a5215033a5/bacalhau_airflow-0.3.25.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e7c16d9ee673803a7b9579a811a6c9d49b9163f53b03b619f9fcf974c17240ca",
+        "md5": "2232c1b17d650a888df445a2da5a9d29",
+        "sha256": "0ce4c92725ad4d2e21ace904e324766365c253c685bd2e6cc7a19a30a98a5889"
+      },
+      "downloads": -1,
+      "filename": "bacalhau_airflow-0.3.25-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "2232c1b17d650a888df445a2da5a9d29",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=3.8",
+      "size": 11908,
+      "upload_time": "2023-03-22T09:44:42",
+      "upload_time_iso_8601": "2023-03-22T09:44:42.127311Z",
+      "url": "https://files.pythonhosted.org/packages/e7/c1/6d9ee673803a7b9579a811a6c9d49b9163f53b03b619f9fcf974c17240ca/bacalhau_airflow-0.3.25-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1051871c9e2d5d80b07acd32e738e84903c7693815579d37250f62a5215033a5",
+        "md5": "21aa151f8a573b4bf6c4701b13cee4a5",
+        "sha256": "cd6ea26d6c310e8127615f6fb0ffe678113d324b95128186579752132fb0f46a"
+      },
+      "downloads": -1,
+      "filename": "bacalhau_airflow-0.3.25.tar.gz",
+      "has_sig": false,
+      "md5_digest": "21aa151f8a573b4bf6c4701b13cee4a5",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 2426109,
+      "upload_time": "2023-03-22T09:44:43",
+      "upload_time_iso_8601": "2023-03-22T09:44:43.332221Z",
+      "url": "https://files.pythonhosted.org/packages/10/51/871c9e2d5d80b07acd32e738e84903c7693815579d37250f62a5215033a5/bacalhau_airflow-0.3.25.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

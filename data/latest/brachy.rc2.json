@@ -1,0 +1,187 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Ashok Cutkosky <ashok@cutkosky.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Programming Language :: Python :: Implementation :: CPython",
+      "Programming Language :: Python :: Implementation :: PyPy"
+    ],
+    "description": "# Brachy\n## A (increasingly less) simple neural network library on top of JAX.\n\n## Better JIT wrapper\nFirst, it is very annoying that `jax.jit` cannot handle dictionaries as static arguments, or arguments that are pytree where some values are static and some can be traced, or functions that return static values. So, we provide a general wrapper in `structure_util.improved_static` that takes care of this by automatically separating  out traceable and non-traceable components of arguments before \npassing to `jit`. It also can handle non-jaxtypes in return values. However, be careful with these: we assume that any non-jaxtype in a return value must be a fixed function of\nthe static arguments and the shape of the traced arguments (i.e. their values do not change unless the function needs to be re-traced).\n```\nimport jax\nfrom jax import numpy as jnp\nfrom brachy import structure_util as su\n\njit  = su.jit\n# su.jit is an alias for su.improved_static(jax.jit).\n\n@jit\ndef foo(x,y):\n    if x['q'] == 'go ahead!':\n        return {'a': x['a'], 'b': y['b']}\n    else:\n        return {'a': 2*y['a'], 'b': y['b']}\n\nx = {\n    'q': 'stop',\n    'a': jnp.ones(3)\n}\ny = {\n    'a': jnp.ones(5),\n    'b': ['hello', 'friend']\n}\n\nz = foo(x,y) \n## z should be:\n# {'a': jnp.array([2,2,2,2,2]), 'b': ['hello', 'friend']}\n```\n\nFurther, this wrapper also will automatically extract and make static the static components of a structure tree (described below). That is,\nif a structure tree has an otherwise traceable value under the `'aux'` key (e.g. a `False` for configuration or similar), then it will not be traced.\n\nThis wrapper `su.improved_static` can also  be used  to impart similar behavior to other JAX primitives (e.g. `xmap`).\n\n\n## Overview\nHAX tries to keep your code as close to the functional spirit of JAX as possible\nwhile also facilitating easy portability from pytorch.\n\n\nIn pytorch, a module is an instance of a class that stores various model parameters\n(i.e. network weights) as class members. These are relatively straightforward to code up, but have two\nimportant drawbacks. First, this style of module does not play nice with JAX's functional programming style.\nThis means that it is difficult to implement more complicated ideas such as meta-gradient descent (i.e. differentiating with respect to hyperparameters).\nSecond, as models grow in size and complexity, it will likely become more and more important to be able to \"mix and match\" different\ncomponents of pre-trained modules in an easy way. Right now, to extract the output of some intermediate layer or to add a new layer somewhere\nin the module computation requires a careful inspection of the source code and often some extra work to transfer pretrained weights to the new architecture.\nHowever, this is not really necessary: model architectures are usually relatively straightforwardly described as simple trees. Hax exploits this to solve both\nproblems by providing utilities to directly compute with architectures described in a tree form. \n\nA Hax module is a pair consisting of a \"structure tree\" and a \"global config\". Both of these are python dictionaries. The global config should probably be even a\na JSON object of config values (e.g. {'training_mode': True}). The structure tree is a tree that contains both model weights and functions describing how to \napply these weights. We *could* have tried to organize the structure tree as a python class. However, we wanted to make the structure trees as hackable as possible. Wrapping them in some complicated class mechanism in order to provide some ease of use in common cases might make this more difficult. That said, Hax does still provide a class `StateOrganizer` that can be used to convert a structure tree into a class that behaves very similarly to a pytorch module, which is useful for building structure trees.\n\nFormally, a Hax structure tree `S` is a `dict` whose keys are  `\"params\"`, `\"buffers\"`, `\"aux\"`, `\"apply\"`, and `\"submodules\"`.\nThe value `S[\"submodules\"]` is either a dict whose values are themselves structure trees (i.e. `S[\"submodules\"]` specified the children of `S` \nin the tree).\nThe values `S[\"params\"]` and `S[\"buffers\"]` are both dicts whose values are *JAX types*. By a JAX type, we mean a value that is a valid argument\nto a traced JAX functions (e.g. a pytree where all leaves are JAX arrays). That is, the function:\n```\n@jax.jit\ndef identity(x):\n    return jax.tree_utils.tree_map(lambda a:a, x)\n```\nwill run without error on any JAX type.\n\nThe value `S[\"apply\"]` is a function with signature:\n```\ndef apply(\n    structure_tree: Hax.structure_tree,\n    global_config: dict,\n    *args,\n    **kwargs) -> Hax.structure_tree, Any\n```\n`Hax.structure_tree` is simply an alias for a dict, so any function that takes a dict as the first two arguments\nand returns a dict is acceptable. The additional arguments to `apply` will be implementation specific. The first\nreturn value is the \"output\" of the module, and the second return value is an updated version of the\ninput argument `structure_tree`. For example, a linear layer might be implemented as follows:\n\n```\ndef linear_apply(S: Hax.structure_tree, global_config: dict, x: Array) -> Array, Hax.structure_tree:\n    weight = S[\"params\"][\"weight\"]\n    bias = S[\"params\"][\"bias\"]\n\n    y = x @ weight + bias\n\n    return S, y\n```\n\nIn this case, we did not need to change the input structure tree. However, layers that require state, randomization, or different\nbehaviors in the train or eval setting require more delicate construction:\n\n```\ndef dropout_apply(S: Hax.structure_tree, global_config: dict, x: Array) -> Array, Hax.structure_tree:\n    if not global_config[\"is_training\"]:\n        return S, x\n\n    rng = S[\"buffers\"][\"rng\"]\n    rng, subkey = jax.random.split(rng)\n\n    p = S[\"buffers\"][\"p\"]\n    y = x * jax.random.bernoulli(subkey, p, shape=x.shape)/p\n\n    S[\"buffers\"][\"rng\"] = rng\n\n    return S, y\n```\nNote that it is strongly advised NOT to change the `\"apply\"` or `\"aux\"` values of the input `S` inside these apply functions as this will cause\nretracing when jitting. Instead, these values are meant to be edited as part of an overall surgery on the model architecture.\n\n## Structure Tree Terminology\n\nTechnically, many of the functions in this package do not require a structure tree to have all the keys `\"params\"`, `\"buffers\"`, `\"aux\"`, `\"apply\"`: only the `\"submodules\"` key is really needed. Given a structure tree `tree`, we say that `tree` is a leaf if `tree[\"submodules\"] = {}`. Further, we say that `tree` is a node with path `[k1, k2, k3]` if there is a root tree `root` such that `tree = root[\"submodules\"][k1][\"submodules\"][k2][\"submodules\"][k3]`. In general, the path of `tree[\"submodules\"][k]` is `P + [k]` where `P` is the path of `tree`.\n\n## Structure Tree Utils\n\n`brachy.structure_tree_util` contains the core functions that power converting structure trees into the forward pass function for a module and back.\nKey utilities include:\n\n* `structure_tree_map(func: Callable, *trees: List[dict], path={}) -> Union[dict, Tuple[dict,...]]`. The first argument is a function `func(*nodes, path)` that outputs a leaf node (or a tuple of leaf nodes).The second argument `trees` must be either a single structure tree or a list of structure trees. The output will be a structure tree such that for each unique path `P` in any of the trees in `trees`, the output tree will have a node with path `P` that is the output of `func` with first argument `nodes` being the list `[subtree of tree at path P for tree in trees]` and `path=P`. If `func` returns multiple trees, then `structure_tree_map` will output the corresponding multiple trees.\n* `StateOrganizer`: this class does a lot of the heavy lifting to make defining new structure trees similar to the experience of defining a module in pytorch. Eventually, one can call `organizer.create_module()` to obtain a tuple `tree, global_config`. When building the tree, if you assign a new attribute to a `StateOrganizer` object with a tuple via `'organizer.name = (subtree, sub_global_config)`, then the tree returned by `organizer.create_module()` will have `subtree` as the value `[\"submodules\"][name]`. Also, `global_config` will be merged with `sub_global_config` (value in `sub_global_config` do not override old values).\nSee the examples directory to see how to use `StateOrganizer` objects.\n* `apply_tree(tree: dict, global_config: dict, *args, **kwargs)`. This function is a shorthand for `tree['apply'](tree, global_config, *args, **kwargs)`.\n* `bind_module(tree: dict, global_config: dict) -> dict, Callable`. This function is mostly unecessary given the updated `brachy.structure_util.jit` functionality described earlier. It takes as input a structure tree and a global config and returns a `state` dictionary and an `apply` function. The state dictionary is just the original structure tree with all but the `\"params\"`, `\"buffers\"`, and `\"submodules\"` keys removed. This represents the current mutable state of the module. The apply function will apply the tree: it takes a state dictionary and whatever inputs the module requires and returns both an updated state dictionary and all the ouptuts of the module.\nThe returned `apply` function from `bind_module` can be Jitted as it captures the unhashable `global_config` dictionary in a closure. To change the global config dictionary, use `apply.bind_global_config(new_global_config)`. To recover a full structure tree, use `tree, global_config = unbind_module(state, apply)`.\n\n## Random number generator utils\n\nThe file `rng_util.py` contains a context manager that makes it easier to pass JAX prngkeys down through a tree of functions without having to write a ton of `rng, subkey = jax.random.split(rng)` all over the place. See the comments at the top of the file or the usages in the resnet example or the `nn.py` file for more info.\n\nThis utility can be combined with the `StateOrganizer` via the decorators `organized_init_with_rng` and `organized_apply` defined in `structure_util.py`. See the language modeling example for these decorators in use.\n    \n\n## Installing\n\n### From pip\nYou can now `pip install brachy`! However, this will explicitly NOT install jax as the installation process for jax seems to differ depending on GPU vs CPU. You should install the appropriate jax version\n\n\n### BU SCC setup instructions\nYou need python3, and jax (pytorch useful for dataloaders, or running tests). Currently there seems to be some issue preventing simultaneous loading of jax, pytorch and tensorflow. However, we probably don't need tensorflow so it is not a huge problem.\n```\nmodule load python3 pytorch cuda/11.6 jax/0.4.6\n```\nYou should probably also setup a virtual environment: `python -m venv brachyenv` to create, `source brachyenv/bin/activate` to activate,  `deactive` to leave the environment.\n\nSome of the example require additional packages listed in the `requirements.txt` file. You can `pip install --upgrade pip` and then `pip install -r requirements.txt` to get them to run.\nOr just run an example and then do `pip  install` one by one as you get \"ModuleNotFoundError\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "brachy",
+    "package_url": "https://pypi.org/project/brachy/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/brachy/",
+    "project_urls": {
+      "Documentation": "https://github.com/optimizedlearning/brachy#readme",
+      "Issues": "https://github.com/unknown/optimizedlearning/issues",
+      "Source": "https://github.com/optimizedlearning/brachy"
+    },
+    "release_url": "https://pypi.org/project/brachy/0.0.2/",
+    "requires_dist": [
+      "dill",
+      "einops"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "pytorch-like ML with Jax",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17325985,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68be189bbe38f37c016fc3d961df019b00b21aa951fbf14dee66d95310ff6a9a",
+          "md5": "3ae93eba6bea5fde4df04110359b2d10",
+          "sha256": "41e31f32174753f9890e9d8afe49a69d31e3e641efbe9baacc2aa8e9cbb5b37a"
+        },
+        "downloads": -1,
+        "filename": "brachy-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ae93eba6bea5fde4df04110359b2d10",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 34620,
+        "upload_time": "2023-03-15T18:04:17",
+        "upload_time_iso_8601": "2023-03-15T18:04:17.046747Z",
+        "url": "https://files.pythonhosted.org/packages/68/be/189bbe38f37c016fc3d961df019b00b21aa951fbf14dee66d95310ff6a9a/brachy-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3ae287b25f0054e1c494df3c28f556eb7a9db4430f26a079664a7e853dc8a893",
+          "md5": "d706bb965d9e4b2f73759db88eb4a340",
+          "sha256": "5b6480b909508315373819eea38c053445c887e10d8ed0779b8b12d3636483ae"
+        },
+        "downloads": -1,
+        "filename": "brachy-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d706bb965d9e4b2f73759db88eb4a340",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 14632095,
+        "upload_time": "2023-03-15T18:17:58",
+        "upload_time_iso_8601": "2023-03-15T18:17:58.089125Z",
+        "url": "https://files.pythonhosted.org/packages/3a/e2/87b25f0054e1c494df3c28f556eb7a9db4430f26a079664a7e853dc8a893/brachy-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21be524ef56abf90a3512a60b0901c998df377add67b99cc592702ba53f1b65d",
+          "md5": "c944751921861bd6763afb5270c38a70",
+          "sha256": "7e24b83febea50e1b6a1d6dd937a26227b3f05020b3ea218903489dd3b5bb826"
+        },
+        "downloads": -1,
+        "filename": "brachy-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c944751921861bd6763afb5270c38a70",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 32318,
+        "upload_time": "2023-03-17T00:12:49",
+        "upload_time_iso_8601": "2023-03-17T00:12:49.082161Z",
+        "url": "https://files.pythonhosted.org/packages/21/be/524ef56abf90a3512a60b0901c998df377add67b99cc592702ba53f1b65d/brachy-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e03f6f02d795b7b9845be44fb665a209facf784e91e96c7642e949fd15e4d67",
+          "md5": "a005d9e188e3698747ba74ed66adf76b",
+          "sha256": "5ba2dc126b851c3533fdd45fe8552daa2ced797cc91dcc23b66f66c77ab92274"
+        },
+        "downloads": -1,
+        "filename": "brachy-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a005d9e188e3698747ba74ed66adf76b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53645,
+        "upload_time": "2023-03-17T00:12:50",
+        "upload_time_iso_8601": "2023-03-17T00:12:50.603095Z",
+        "url": "https://files.pythonhosted.org/packages/3e/03/f6f02d795b7b9845be44fb665a209facf784e91e96c7642e949fd15e4d67/brachy-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "21be524ef56abf90a3512a60b0901c998df377add67b99cc592702ba53f1b65d",
+        "md5": "c944751921861bd6763afb5270c38a70",
+        "sha256": "7e24b83febea50e1b6a1d6dd937a26227b3f05020b3ea218903489dd3b5bb826"
+      },
+      "downloads": -1,
+      "filename": "brachy-0.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "c944751921861bd6763afb5270c38a70",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 32318,
+      "upload_time": "2023-03-17T00:12:49",
+      "upload_time_iso_8601": "2023-03-17T00:12:49.082161Z",
+      "url": "https://files.pythonhosted.org/packages/21/be/524ef56abf90a3512a60b0901c998df377add67b99cc592702ba53f1b65d/brachy-0.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3e03f6f02d795b7b9845be44fb665a209facf784e91e96c7642e949fd15e4d67",
+        "md5": "a005d9e188e3698747ba74ed66adf76b",
+        "sha256": "5ba2dc126b851c3533fdd45fe8552daa2ced797cc91dcc23b66f66c77ab92274"
+      },
+      "downloads": -1,
+      "filename": "brachy-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a005d9e188e3698747ba74ed66adf76b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 53645,
+      "upload_time": "2023-03-17T00:12:50",
+      "upload_time_iso_8601": "2023-03-17T00:12:50.603095Z",
+      "url": "https://files.pythonhosted.org/packages/3e/03/f6f02d795b7b9845be44fb665a209facf784e91e96c7642e949fd15e4d67/brachy-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
