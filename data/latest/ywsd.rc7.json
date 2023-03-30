@@ -1,0 +1,404 @@
+{
+  "info": {
+    "author": "Garwin (Martin Lang)",
+    "author_email": "garwin@eventphone.de",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Yate Wählsystem Digital\n\nYwsd is a telephone number routing engine for the [Yate](http://Yate.ro/) telephone engine to be used in event\ntelephone networks. It provides the routing backend for common PBX features such as group calls (including delayed\nringing and hunting groups), (conditional) call forwarding, caller verification or caller masquerading. The main design\ngoal of this backend to provide as much flexibility for call routing as possible while ensuring a certain set of\nconsistency conditions. To split the phone network into multiple failure domains or also allow for load\nbalancing, Ywsd is designed to support a PBX that consists of multiple Yate servers. Routing information is (globally)\nstored in a PostgreSQL database that enforces consistency of basic participant properties and the links between\nextensions (groups, forwards, etc…).\n\nBased on this consistent data model, the routing offers all kinds of degrees of freedom. There is no principle\nlimitation on nesting call groups or mixing groups with call forwards as needed. Extensions that are external to the\nPBX can be added with a placeholder extension entry and also participate in groups and forwards. Still, the engine will\nensure that created calls do not create call loops and phones cannot be called from the same call more than once.\n\nIf you don't want to know the details, just [jump to the setup guide](#Getting-started)\n\n## Basic Architecture\n\nYwsd based routing is split into two stages. Routing stage 1 calculates all extensions that are involved in a call\nas well as their relation (groups, forwards, delays, etc…). It does not resolve the call to SIP addresses of the\nindividual participant but only goes so far as to know on which SIP server the participant should be registered and\nwill route calls to this SIP server.\n\nRouting 2 then takes care of the information which devices registered for a SIP extension. It supports multiple\ndevice registrations per extensions and configurable call waiting support per extension.\n\n## Stage1 Architecture\n\nRouting is illustrated as a tree in ywsd. An extension is a leaf in such a tree if it can be immediately routed.\nThat is, it corresponds to a physical extension, has no forwards or other devices that should ring when a call\nis routed to it. Otherwise, an extension is an inner node. This is most visible for call groups. They have all\ncall group members as children in the routing tree and don't correspond to a device themselves. The routing, however,\nalso supports a mixed-mode (called multi-ring) where an extension has a physical device and behaves like a call group at\nthe same time. This is used to, e.g., configure desktop SIP phone to also ring when your DECT is ringing.\n\nExtensions can also become inner tree nodes if they forward to another extension. This can also lead to a situation\nwhere this extension won't be called anymore (immediate forward) or will be called for a while and only then the\nforward will be activated (delayed forward). The routing engine also supports forward on busy or forward on unavailable.\n\nOne might think that routing can and should rather be represented as DAG than as tree. In particular, if two nested\ngroups have the same member, shouldn't those be merged?. Unfortunately, call routing has unpredictable timing\nbehaviour. Depending on hunt group or delayed ring configuration it is not possible to consider all scenarios statically\nwhile routing as the final behaviour can depend on which devices are currently active and/or busy. Thus, ywsd keeps the\ntree representation and has additional measures to ensure devices don't ring twice on the same call at runtime.\n\n### Tree Discovery\n\nThe final routing result is computed in two big steps. The first step called **tree discovery** retrieves the routing\ntree node by node from the database. While walking along the tree, it ensures that no loops are created and disables\nbranches that would lead to a loop. It also decides in which direction the tree is expanded. For example, the members\nof a group that have an active immediate forward are not loaded.\n\n#### Groups and call forks \n\nThe implementation of call groups follows closely Yate's CallFork module. A fork may have multiple ranks. Each rank\nrepresents a set of extensions that is called at the same time. The ranks are ordered. Each rank can either extend\nthe current call of the previous rank after a given time or replace all participants called in the previous rank(s).\n\nConsequently, inner tree nodes can link immediately to another extension (with forwards) or a fork rank that\n(itself) then links to extensions. The following examples illustrate the shape of call routing trees.\n\n![Simple group routing](docs/simple-group-routing.png)\n\nThis shows a simple routing tree in which the extension 1010 calls the group 1011. This group has four participants.\nThese are the extensions 1002, 1004, 1005 and 1001. The user with extension 1001 has currently paused their membership\nand was thus discovered but will not be considered in the generated call.\n\n![Complex group routing](docs/complex-group-routing.png)\n\nThis is a more involved example of a routing tree that features groups with multiple and non-default fork ranks,\nnested groups and a call forward from user 1001 to 1006. It illustrates no particular use case but should rather\nserve as an example of how generic and complex routing trees might look like.\n\n### Route Generation\n\nThe second routing step is called **route generation**. It uses a Visitor pattern to walk along the previously\ncalculated routing tree and generates an intermediate routing result for each inner node based on the intermediate\nrouting results of its children. So, the route generation process is bottom-up. The basic idea is that every inner node\nof the routing tree will lead to a Yate call fork. The fork will contain all children of the respective tree node.\n\nIf the child can be routed immediately, this is then a reference to the sip module with a reference to which SIP server\nto call. If the target is locally on the same Yate, it will just issue a `lateroute/` for the extension with a flag to\nforward this to routing stage 2.\n\nIf the child is again an inner node, the call target is symbolic and of the form `lateroute/stage1-<callid>-<treepath>`.\nTo ensure consistency in the routing, all intermediate routing results will be cached after the initial routing\nwas completely calculated. Once the call progresses, Yate's lateroute module will query the routing engine again for the\nsymbolic names of the inner nodes. These requests will then be answered from the cache.\n\nAltogether, this approach gives maximum flexibility and also allows for constructs that a single call fork would not\nbe able to provide. E.g., a single call fork is unable to provide forward on busy for one participant while\nimplementing delayed ringing for another. This is only possible by letting the forks follow the structure of the routing\ntree.\n\n## Stage2 Architecture\n\nStage 2 routing is relatively simple and dumb (compared to Stage 1). It is based on a simple user and registration\ntable in the database. In addition to this, Yate's register module is used to maintain a list of currently registered\nSIP devices per extension in the registration table.\n\nStage 2 routing is either triggered by the flag *eventphone_stage2* in the `call.route` message (put there by\nrouting stage 1) or automatically triggered if a call is coming from a specific SIP listener. In our multi Yate PBX\nsetup, we use one network with special SIP listeners that exchanges all calls between the different Yate instances\nof our PBX. Such calls from another Yate in our PBX where stage1-routed on their home Yate.\nThey only need stage 2 at this point.\n\nThe main job of stage 2 routing is to forward the call to the actual SIP extension. If there is only a single\nregistration, the sip module will be immediately called with the registered SIP endpoint. If there are multiple\ndevices registered, one last simple and flat call fork with all the registered SIP endpoints will be issued.\n\nIn addition to this, stage2 uses the cdrbuild module to keep track of calls that are currently active at an extension.\nIt tracks the number of calls currently active on a device as well as the callids (uuid4). Call id tracking is used to\nensure that a single call does not lead to a device ringing twice on the same call. The duplicate call is filtered here.\nThe number of active calls is used to signal busy if call waiting is deactivated for the extension. If call waiting is\nactive, the extension will be called independent of whether the line is currently busy or not.\n\nSo please note that stage2 needs a particular configuration of the `cdrbuild` and `register` module in Yate to\nwork correctly. See instructions below.\n\n### Static target routing\n\nStage2 routing also supports static routing targets in addition to regular SIP users. Static routing targets can\nbe used to dynamically configure extensions that are not a SIP client but rather a special yate call target like\n`conf/` or (most prominently) `external/`. In order to use static call routing, create an entry in the `users` table\nof stage2 routing with `type` being `static` instead of (the default) `user`. Put the yate call target into \n`static_target`. You may use the syntax\n```\nexternal/nodata//opt/script.tcl arg1 arg2;myparam=myvalue;…\n```\nto popuate the semicolon separated `key=value` pairs into the `call.route`/`call.execute` message.\n\n## Getting started\n\nYwsd uses a PostgeSQL database backend that is accessed via the asyncio aiopg module. As a consequence, a minimal test\nsetup needs a Postgres database and all python packages from requirements.txt installed. For production deployments,\ncached routing results should be stored in a Redis instance. For development purposes, the simple python built-in\ndictionary-based cache suffices.\n\nNext, a `routing_engine.yaml` configuration file needs to be created. You can see the example file that ships with this\nrepository to get a feeling of how it could look like.\n\nOnce the configuration is complete, the database can be setup. Run `ywsd_init_db --config <your_config> --stage1` to\nbootstrap the stage1 routing database. Then run `ywsd_init_db --config <your_config> --stage2` to bootstrap the stage2\nrouting database.\n\nIn principle, your ywsd instance is now ready to go. To actually route something, for sure, the database\nneeds to be populated with extensions.\n\nIf you want to test ywsd without a running Yate, you may use the webserver only mode. Start ywsd with\n```\nywsd_engine --config <your_config> --web-only\n```\nYwsd then starts without connecting to a Yate and just offers the webserver on the configured interface/port. You can\nthen ask for a sample routing and will get the results in JSON form. Depending on your test data, results can look\nlike this:\n```\ncurl http://localhost:9000/stage1\\?caller\\=2001\\&called\\=4711 | jq .\n  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n100   172  100   172    0     0  24571      0 --:--:-- --:--:-- --:--:-- 24571\n{\n  \"routing_tree\": null,\n  \"main_routing_result\": null,\n  \"all_routing_results\": {},\n  \"routing_status\": \"ERROR\",\n  \"routing_status_details\": \"noroute: Routing target was not found\"\n\ncurl http://localhost:9000/stage1\\?caller\\=2001\\&called\\=2000 | jq .\n  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n100  3550  100  3550    0     0   247k      0 --:--:-- --:--:-- --:--:--  247k\n{\n  \"routing_tree\": {\n    \"id\": 1,\n    \"yate_id\": null,\n    \"extension\": \"2000\",\n    \"name\": \"PoC\",\n    \"short_name\": null,\n    \"outgoing_extension\": null,\n    \"outgoing_name\": null,\n    \"dialout_allowed\": false,\n    \"ringback\": null,\n    \"forwarding_delay\": null,\n    \"forwarding_extension_id\": null,\n    \"lang\": \"de_DE\",\n    \"type\": \"Type.GROUP\",\n    \"forwarding_mode\": \"ForwardingMode.DISABLED\",\n    \"tree_identifier\": \"1\",\n    \"logs\": [],\n    \"fork_ranks\": [\n      {\n        \"id\": 1,\n        \"extension_id\": 1,\n        \"index\": 0,\n        \"delay\": null,\n        \"mode\": \"Mode.DEFAULT\",\n        \"tree_identifier\": \"1-fr1\",\n        \"logs\": [\n          {\n            \"msg\": \"Discovery aborted for <Extension 2001, name=PoC Sascha, type=Type.MULTIRING> in <ForkRank id=1, extension_id=1, index=Mode.DEFAULT, mode=0, delay=Mode.DEFAULT>, was already present.\\nTemporarily disable membership for this routing.\",\n            \"level\": \"WARN\",\n            \"related_node\": \"1-fr1-2\"\n          }\n        ],\n        \"members\": [\n          {\n            \"type\": \"RankMemberType.DEFAULT\",\n            \"active\": false,\n            \"extension\": {\n              \"id\": 2,\n              \"yate_id\": 2,\n              \"extension\": \"2001\",\n              \"name\": \"PoC Sascha\",\n              \"short_name\": null,\n              \"outgoing_extension\": null,\n              \"outgoing_name\": null,\n              \"dialout_allowed\": false,\n              \"ringback\": null,\n              \"forwarding_delay\": null,\n              \"forwarding_extension_id\": null,\n              \"lang\": \"de_DE\",\n              \"type\": \"Type.MULTIRING\",\n              \"forwarding_mode\": \"ForwardingMode.DISABLED\",\n              \"tree_identifier\": \"1-fr1-2\",\n              \"logs\": []\n            }\n          },\n          {\n            \"type\": \"RankMemberType.DEFAULT\",\n            \"active\": true,\n            \"extension\": {\n              \"id\": 3,\n              \"yate_id\": 2,\n              \"extension\": \"2002\",\n              \"name\": \"PoC Bernie\",\n              \"short_name\": null,\n              \"outgoing_extension\": null,\n              \"outgoing_name\": null,\n              \"dialout_allowed\": false,\n              \"ringback\": null,\n              \"forwarding_delay\": null,\n              \"forwarding_extension_id\": null,\n              \"lang\": \"de_DE\",\n              \"type\": \"Type.SIMPLE\",\n              \"forwarding_mode\": \"ForwardingMode.DISABLED\",\n              \"tree_identifier\": \"1-fr1-3\",\n              \"logs\": []\n            }\n          },\n          {\n            \"type\": \"RankMemberType.DEFAULT\",\n            \"active\": true,\n            \"extension\": {\n              \"id\": 4,\n              \"yate_id\": 2,\n              \"extension\": \"2004\",\n              \"name\": \"PoC BeF\",\n              \"short_name\": null,\n              \"outgoing_extension\": null,\n              \"outgoing_name\": null,\n              \"dialout_allowed\": false,\n              \"ringback\": null,\n              \"forwarding_delay\": null,\n              \"forwarding_extension_id\": null,\n              \"lang\": \"de_DE\",\n              \"type\": \"Type.SIMPLE\",\n              \"forwarding_mode\": \"ForwardingMode.DISABLED\",\n              \"tree_identifier\": \"1-fr1-4\",\n              \"logs\": []\n            }\n          },\n          {\n            \"type\": \"RankMemberType.DEFAULT\",\n            \"active\": true,\n            \"extension\": {\n              \"id\": 6,\n              \"yate_id\": 2,\n              \"extension\": \"2042\",\n              \"name\": \"PoC Garwin\",\n              \"short_name\": null,\n              \"outgoing_extension\": null,\n              \"outgoing_name\": null,\n              \"dialout_allowed\": false,\n              \"ringback\": null,\n              \"forwarding_delay\": null,\n              \"forwarding_extension_id\": null,\n              \"lang\": \"de_DE\",\n              \"type\": \"Type.SIMPLE\",\n              \"forwarding_mode\": \"ForwardingMode.DISABLED\",\n              \"tree_identifier\": \"1-fr1-6\",\n              \"logs\": []\n            }\n          }\n        ]\n      }\n    ]\n  },\n  \"main_routing_result\": {\n    \"type\": \"Type.FORK\",\n    \"target\": {\n      \"target\": \"lateroute/stage1-d4490817a7954559ac801f81f3dbbd7e-1\",\n      \"parameters\": {\n        \"x_eventphone_id\": \"d4490817a7954559ac801f81f3dbbd7e\",\n        \"osip_X-Eventphone-Id\": \"d4490817a7954559ac801f81f3dbbd7e\",\n        \"callername\": \"PoC Sascha\",\n        \"osip_X-Caller-Language\": \"de_DE\",\n        \"calledname\": \"PoC\"\n      }\n    },\n    \"fork_targets\": [\n      {\n        \"target\": \"lateroute/2002\",\n        \"parameters\": {\n          \"eventphone_stage2\": \"1\",\n          \"x_eventphone_id\": \"d4490817a7954559ac801f81f3dbbd7e\",\n          \"osip_X-Eventphone-Id\": \"d4490817a7954559ac801f81f3dbbd7e\"\n        }\n      },\n      {\n        \"target\": \"lateroute/2004\",\n        \"parameters\": {\n          \"eventphone_stage2\": \"1\",\n          \"x_eventphone_id\": \"d4490817a7954559ac801f81f3dbbd7e\",\n          \"osip_X-Eventphone-Id\": \"d4490817a7954559ac801f81f3dbbd7e\"\n        }\n      },\n      {\n        \"target\": \"lateroute/2042\",\n        \"parameters\": {\n          \"eventphone_stage2\": \"1\",\n          \"x_eventphone_id\": \"d4490817a7954559ac801f81f3dbbd7e\",\n          \"osip_X-Eventphone-Id\": \"d4490817a7954559ac801f81f3dbbd7e\"\n        }\n      }\n    ]\n  },\n  \"all_routing_results\": {},\n  \"routing_status\": \"OK\",\n  \"routing_status_details\": \"\"\n}\n```\n\n## Necessary Yate configuration to make it run\n\nThe Yate modules `register` and `cdrbuild` provide partial functionality to stage2 ywsd-based routing. In particular,\nthe register module is used to manage registrations of SIP clients in the stage2 database. The cdrbuild module keeps\ntrack of the calls on a certain SIP client and fills the stage2 database with information that is needed to provide\ndeny-on-busy or filtering if a single call ends up twice with one SIP client.\n\nThe following configuration is needed in these modules to provide the desired functionality. Please also note\nthat Yate needs to be compiled and configured to use Postgres database via the `pgsqldb` module.\n\nExample register.conf:\n```\n[general]\nexpires=30\n\nuser.auth=yes\nuser.register=yes\nuser.unregister=yes\nengine.timer=yes\n;call.preroute=no\ncall.cdr=yes\nlinetracker=yes\n\n[default]\npriority=10\naccount=default\n\n[user.auth]\nquery=SELECT password FROM users WHERE username='${username}' AND password IS NOT NULL AND password<>'' AND type='user' LIMIT 1;\nresult=password\n\n[user.register]\nquery=INSERT INTO registrations (username, location, oconnection_id, expires) VALUES ('${username}', '${data}', '${oconnection_id}', NOW() + INTERVAL '${expires} s') ON CONFLICT ON CONSTRAINT uniq_registrations DO UPDATE SET expires = NOW() + INTERVAL '${expires} s'\n\n[user.unregister]\nquery=DELETE FROM registrations WHERE (username = '${username}' AND location = '${data}' AND oconnection_id = '${connection_id}') OR ('${username}' = '' AND '${data}' = '' AND oconnection_id = '${connection_id}')\n\n[engine.timer]\nquery=DELETE FROM registrations WHERE expires<=CURRENT_TIMESTAMP;\n\n[call.cdr]\ncritical=no\n\n[linetracker]\ncritical=yes\ninitquery=UPDATE users SET inuse=0 WHERE inuse is not NULL;DELETE from active_calls;\ncdr_initialize=UPDATE users SET inuse=inuse+1 WHERE username='${external}';INSERT INTO active_calls SELECT username, x_eventphone_id FROM (SELECT '${external}' as username, '${X-Eventphone-Id}' as x_eventphone_id, '${direction}' as direction) as active_call WHERE x_eventphone_id != '' AND x_eventphone_id IS NOT NULL and direction = 'outgoing';\ncdr_finalize=UPDATE users SET inuse=(CASE WHEN inuse>0 THEN inuse-1 ELSE 0 END) WHERE username='${external}';DELETE FROM active_calls WHERE username = '${external}' AND  x_eventphone_id = '${X-Eventphone-Id}' AND '${direction}' = 'outgoing';\n```\n\nTo enable duplicate call filtering, the parameters section of your cdrbuild.conf should have a line for\nX-Eventphone-Id like this\n```\n[parameters]\nX-Eventphone-Id=false\n```\n\n## Project ToDos\n\nThere are currently no tests available for this project. There is a basic set of test data that was used during\ndevelopment and integration with Yate but no automatic testing was developed so far. Due to the nature of this\nproject, it plans to add a suite of end-to-end functionality tests based on the webserver exposure of routing\nresults. An extensive set of unit tests for DB loading or data structure generation is currently not planned\nbut would be welcomed if contributed.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.rc5.de/eventphone/ywsd",
+    "keywords": "",
+    "license": "AGPLv3+",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ywsd",
+    "package_url": "https://pypi.org/project/ywsd/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/ywsd/",
+    "project_urls": {
+      "Homepage": "https://gitlab.rc5.de/eventphone/ywsd"
+    },
+    "release_url": "https://pypi.org/project/ywsd/0.12.2/",
+    "requires_dist": [
+      "aiopg",
+      "aiohttp",
+      "python-yate (>=0.4)",
+      "pyyaml",
+      "sqlalchemy"
+    ],
+    "requires_python": "",
+    "summary": "A yate routing engine for event telephone networks",
+    "version": "0.12.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15941853,
+  "releases": {
+    "0.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "61d1dd22615d7aa9f9bcffc006218a2aecd661729b9f703de17fa4f624aab393",
+          "md5": "82edd21ec97266327e9dd95fcda1f03d",
+          "sha256": "b3b72dba921a7a7323313d00db68b0b99b27842ccafc107e5f6045e1a246bef2"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.10.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "82edd21ec97266327e9dd95fcda1f03d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 40350,
+        "upload_time": "2020-12-20T23:08:47",
+        "upload_time_iso_8601": "2020-12-20T23:08:47.272157Z",
+        "url": "https://files.pythonhosted.org/packages/61/d1/dd22615d7aa9f9bcffc006218a2aecd661729b9f703de17fa4f624aab393/ywsd-0.10.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "51780ec3f7fffcdc12e7ec64e20bc1708b03e1e625d574b9b68879eb58a4eb21",
+          "md5": "6b1e6238c41d0d398c24e2a5298578fc",
+          "sha256": "e41ce0a2c128e675ae4887634dacf0d54434db146d680728a4c348c0e81a2d84"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.10.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6b1e6238c41d0d398c24e2a5298578fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32556,
+        "upload_time": "2020-12-20T23:08:48",
+        "upload_time_iso_8601": "2020-12-20T23:08:48.396173Z",
+        "url": "https://files.pythonhosted.org/packages/51/78/0ec3f7fffcdc12e7ec64e20bc1708b03e1e625d574b9b68879eb58a4eb21/ywsd-0.10.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3ac907ec5590f5509f21a851046905c0781fec39e70495025ee7ca070a665bfb",
+          "md5": "c00ef6e49af1af81a5252a3b7572f16b",
+          "sha256": "c41ec0a878ce786c9c22eb836e7a58fa5af9eefbfdd750dbd62ce863f6d62e85"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.11.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c00ef6e49af1af81a5252a3b7572f16b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 40588,
+        "upload_time": "2020-12-28T22:23:07",
+        "upload_time_iso_8601": "2020-12-28T22:23:07.458893Z",
+        "url": "https://files.pythonhosted.org/packages/3a/c9/07ec5590f5509f21a851046905c0781fec39e70495025ee7ca070a665bfb/ywsd-0.11.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6313b6860f0051b11fb70e2ac2dc68aff03d3b321113b1ddbc02866bba2e0b6d",
+          "md5": "ebceb870a5c0bf99193f1e2ba1af10f0",
+          "sha256": "7158299fd67e8bf0a240811a20a7ed171428d7792342e2b96c13c1d9c26a63ba"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.11.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ebceb870a5c0bf99193f1e2ba1af10f0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 32737,
+        "upload_time": "2020-12-28T22:23:08",
+        "upload_time_iso_8601": "2020-12-28T22:23:08.410944Z",
+        "url": "https://files.pythonhosted.org/packages/63/13/b6860f0051b11fb70e2ac2dc68aff03d3b321113b1ddbc02866bba2e0b6d/ywsd-0.11.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8a0e3f0955ba27c936d85bd8179cdf0f6f4a150c44ea1008c6dcf9803192188",
+          "md5": "6241e2f19513998b56566d091429fbb3",
+          "sha256": "16f7acc9dfd869b1dcee6fcfaf6171ba6141a1a890d39305d2980d500d2784fa"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6241e2f19513998b56566d091429fbb3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39477,
+        "upload_time": "2022-11-28T17:30:16",
+        "upload_time_iso_8601": "2022-11-28T17:30:16.255966Z",
+        "url": "https://files.pythonhosted.org/packages/b8/a0/e3f0955ba27c936d85bd8179cdf0f6f4a150c44ea1008c6dcf9803192188/ywsd-0.12.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b35e8cd8fde5695c5c7171747cddb9c4e8113ea9e5d67362c68abb3ec06038c",
+          "md5": "cb5ebd1647f66000f7b479342496b579",
+          "sha256": "1ff480db97f76e67a4d82eb4ab08ceb50ac04955fb828a0879ce81cd2e4ab624"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cb5ebd1647f66000f7b479342496b579",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42573,
+        "upload_time": "2022-11-28T17:30:17",
+        "upload_time_iso_8601": "2022-11-28T17:30:17.684920Z",
+        "url": "https://files.pythonhosted.org/packages/0b/35/e8cd8fde5695c5c7171747cddb9c4e8113ea9e5d67362c68abb3ec06038c/ywsd-0.12.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f61e36b7a85b215c3a9d6019b7120699da3f632899daf21a757300f4cd1b0c40",
+          "md5": "77749077d7e3daf7ae20b04b3a719d8e",
+          "sha256": "40db1edf330c0aadc624f2e1febd27886f4beeb6c081e5fa2aa2f14bf94121ba"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "77749077d7e3daf7ae20b04b3a719d8e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39480,
+        "upload_time": "2022-11-29T11:07:16",
+        "upload_time_iso_8601": "2022-11-29T11:07:16.821313Z",
+        "url": "https://files.pythonhosted.org/packages/f6/1e/36b7a85b215c3a9d6019b7120699da3f632899daf21a757300f4cd1b0c40/ywsd-0.12.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf6fa960940efad21944b3fb122144d44d12b5ac557946ccfb255d2204b5f3d0",
+          "md5": "ef230f5d8396fa4ae50682e53a2730f5",
+          "sha256": "1acd92511ac08684c2c8d2210f8e20d549ef789373790628bb81b635dc06a32c"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ef230f5d8396fa4ae50682e53a2730f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42575,
+        "upload_time": "2022-11-29T11:07:17",
+        "upload_time_iso_8601": "2022-11-29T11:07:17.913576Z",
+        "url": "https://files.pythonhosted.org/packages/bf/6f/a960940efad21944b3fb122144d44d12b5ac557946ccfb255d2204b5f3d0/ywsd-0.12.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "58a0d6fc8a7a0949cb43823586e57e06922c8c2162312b99f439f861af84786b",
+          "md5": "1c04abf140b296d882d1d617b598f45a",
+          "sha256": "4279016e844a927077314a54eb586529d2a3e421092633ca693737c5df180383"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1c04abf140b296d882d1d617b598f45a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39483,
+        "upload_time": "2022-11-30T12:38:26",
+        "upload_time_iso_8601": "2022-11-30T12:38:26.465820Z",
+        "url": "https://files.pythonhosted.org/packages/58/a0/d6fc8a7a0949cb43823586e57e06922c8c2162312b99f439f861af84786b/ywsd-0.12.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87cef018000e57b2c9c05c07556e27dd2890162cbb4d39320d7ac68d3e2b29de",
+          "md5": "fd278119ed3171ebf2e1a42025ad89f9",
+          "sha256": "b99d2770fdb4367d5a71e628d888a17d052a6c64e44a1ac1947c4ea44ec9aaa0"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.12.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd278119ed3171ebf2e1a42025ad89f9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42587,
+        "upload_time": "2022-11-30T12:38:27",
+        "upload_time_iso_8601": "2022-11-30T12:38:27.823405Z",
+        "url": "https://files.pythonhosted.org/packages/87/ce/f018000e57b2c9c05c07556e27dd2890162cbb4d39320d7ac68d3e2b29de/ywsd-0.12.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "acb639604792acd0f052e58ef5159204e609ac1636f52bb0834df1fd9e082a39",
+          "md5": "be2797fdefcd5ed514d17d64a7593614",
+          "sha256": "20efcb9e16f8d79f369b5d5088d2d2ff043ae5361dc1b7309f6a188f321f2d05"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.9.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "be2797fdefcd5ed514d17d64a7593614",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39696,
+        "upload_time": "2020-12-02T22:36:49",
+        "upload_time_iso_8601": "2020-12-02T22:36:49.368741Z",
+        "url": "https://files.pythonhosted.org/packages/ac/b6/39604792acd0f052e58ef5159204e609ac1636f52bb0834df1fd9e082a39/ywsd-0.9.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e3bb0cdc924bb17e4cae837e07f655223e62966e3365f69b422d54c56bf2f02a",
+          "md5": "3cb25abae63e26f8445c41061fc68cb3",
+          "sha256": "6cbfcd9a0ba7d3e514902fe82fdfd1df0ccbf080bf5075b9139400f3749ddca4"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.9.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3cb25abae63e26f8445c41061fc68cb3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 31702,
+        "upload_time": "2020-12-02T22:36:50",
+        "upload_time_iso_8601": "2020-12-02T22:36:50.704659Z",
+        "url": "https://files.pythonhosted.org/packages/e3/bb/0cdc924bb17e4cae837e07f655223e62966e3365f69b422d54c56bf2f02a/ywsd-0.9.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a289afc9358f6b6cac4a4c04fa0dbc939f7446762c1ade71640f74d605ec9a3f",
+          "md5": "522ca6b6db9b51b8a58799b11ccac4ae",
+          "sha256": "7890fa114087835b252a83caed2a6566b84291ad97af6208b436bed0f6a0969a"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.9.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "522ca6b6db9b51b8a58799b11ccac4ae",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39764,
+        "upload_time": "2020-12-02T22:46:26",
+        "upload_time_iso_8601": "2020-12-02T22:46:26.704544Z",
+        "url": "https://files.pythonhosted.org/packages/a2/89/afc9358f6b6cac4a4c04fa0dbc939f7446762c1ade71640f74d605ec9a3f/ywsd-0.9.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad07f3215701fec8f7da6774eecbd0835d89fd8a4080623563feaa2ca1c54a2d",
+          "md5": "44a3b91b83bc70123d017f8192ffca3c",
+          "sha256": "302faddcfa71772e7a13d7201589680d0b0d2ea409c14c6e38291035ce2da1e9"
+        },
+        "downloads": -1,
+        "filename": "ywsd-0.9.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "44a3b91b83bc70123d017f8192ffca3c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 31718,
+        "upload_time": "2020-12-02T22:46:27",
+        "upload_time_iso_8601": "2020-12-02T22:46:27.866878Z",
+        "url": "https://files.pythonhosted.org/packages/ad/07/f3215701fec8f7da6774eecbd0835d89fd8a4080623563feaa2ca1c54a2d/ywsd-0.9.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "58a0d6fc8a7a0949cb43823586e57e06922c8c2162312b99f439f861af84786b",
+        "md5": "1c04abf140b296d882d1d617b598f45a",
+        "sha256": "4279016e844a927077314a54eb586529d2a3e421092633ca693737c5df180383"
+      },
+      "downloads": -1,
+      "filename": "ywsd-0.12.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "1c04abf140b296d882d1d617b598f45a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 39483,
+      "upload_time": "2022-11-30T12:38:26",
+      "upload_time_iso_8601": "2022-11-30T12:38:26.465820Z",
+      "url": "https://files.pythonhosted.org/packages/58/a0/d6fc8a7a0949cb43823586e57e06922c8c2162312b99f439f861af84786b/ywsd-0.12.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "87cef018000e57b2c9c05c07556e27dd2890162cbb4d39320d7ac68d3e2b29de",
+        "md5": "fd278119ed3171ebf2e1a42025ad89f9",
+        "sha256": "b99d2770fdb4367d5a71e628d888a17d052a6c64e44a1ac1947c4ea44ec9aaa0"
+      },
+      "downloads": -1,
+      "filename": "ywsd-0.12.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "fd278119ed3171ebf2e1a42025ad89f9",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 42587,
+      "upload_time": "2022-11-30T12:38:27",
+      "upload_time_iso_8601": "2022-11-30T12:38:27.823405Z",
+      "url": "https://files.pythonhosted.org/packages/87/ce/f018000e57b2c9c05c07556e27dd2890162cbb4d39320d7ac68d3e2b29de/ywsd-0.12.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
