@@ -1,0 +1,225 @@
+{
+  "info": {
+    "author": "Jim Fulton",
+    "author_email": "jim@zope.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": ".. image:: https://travis-ci.org/zopefoundation/zc.zodbwsgi.png?branch=master\n   :target: https://travis-ci.org/zopefoundation/zc.zodbwsgi\n\nWSGI Middleware for Managing ZODB Database Connections\n======================================================\n\nThe zc.zodbwsgi provides middleware for managing connections to a ZODB\ndatabase. It combines several features into a single middleware\ncomponent:\n\n- database configuration\n- database initialization\n- connection management\n- optional transaction management\n- optional request retry on conflict errors (using repoze.retry)\n- optionaly limiting the number of simultaneous database connections\n- applications can take over connection and transaction management on\n  a case-by-case basis, for example to support the occasional\n  long-running request.\n\nIt is designed to work with paste deployment and provides a\n\"filter_app_factory\" entry point, named \"main\".\n\nA number of configuration options are provided. Option values are\nstrings.\n\nconfiguration\n   A required ZConfig formatted ZODB database configuration\n\n   If multiple databases are defined, they will define a\n   multi-database. Connections will be to the first defined database.\n\ninitializer\n   An optional database initialization function of the form\n   ``module:expression``\n\nkey\n   An optional name of a WSGI environment key for database connections\n\n   This defaults to \"zodb.connection\".\n\ntransaction_management\n   An optional flag (either \"true\" or \"false\") indicating whether the\n   middleware manages transactions.\n\n   Transaction management is enabled by default.\n\ntransaction_key\n   An optional name of a WSGI environment key for transaction managers\n\n   This defaults to \"transaction.manager\". The key will only be\n   present if transaction management is enabled.\n\nthread_transaction_manager\n   An option flag (either \"true\" or \"false\") indicating whether the\n   middleware will use a thread-aware transaction mananger (e.g.,\n   thread.TransactionManager).\n\n   Using a thread-aware transaction mananger is convenient if you're\n   using a server that always a request in the same thread, such as\n   servers thaat use thread pools, or that create threads for each\n   request.\n\n   If you're using a server, such as gevent, that handles multiple\n   requests in the same thread or a server that might handle the same\n   request in different threads, then you should set this option to\n   false.\n\n   Defaults to True.\n\nretry\n   An optional retry count\n\n   The default is \"3\", indicating that requests will be retried up to\n   3 times.  Use \"0\" to disable retries.\n\n   Note that when retry is not \"0\", request bodies will be buffered.\n\ndemostorage_manage_header\n   An optional entry that controls whether the filter will support push/pop\n   support for the underlying demostorage.\n\n   If a value is provided, it'll check for that header in the request. If found\n   and its value is \"push\" or \"pop\" it'll perform the relevant operation. The\n   middleware will return a response indicating the action taken _without_\n   processing the rest of the pipeline.\n\n   Also note that this only works if the underlying storage is a DemoStorage.\n\nmax_connections\n   Maximum number of simultaneous connections.\n\n.. contents::\n\nBasic usage\n-----------\n\nLet's look at some examples.\n\nFirst we define an demonstration \"application\" that we can pass to our\nfactory::\n\n    import transaction, ZODB.POSException\n    from sys import stdout\n\n    class demo_app:\n        def __init__(self, default):\n            pass\n        def __call__(self, environ, start_response):\n            start_response('200 OK', [('content-type', 'text/html')])\n            root = environ['zodb.connection'].root()\n            path = environ['PATH_INFO']\n            if path == '/inc':\n                root['x'] = root.get('x', 0) + 1\n                if 'transaction.manager' in environ:\n                    environ['transaction.manager'].get().note('path: %r' % path)\n                else:\n                    transaction.commit() # We have to commit our own!\n            elif path == '/conflict':\n                print >>stdout, 'Conflict!'\n                raise ZODB.POSException.ConflictError\n            elif path == \"/tm\":\n                tm = environ[\"transaction.manager\"]\n                return [\"thread tm: \" + str(tm is transaction.manager)]\n            return [repr(root)]\n\n.. -> src\n\n   >>> import zc.zodbwsgi.tests\n   >>> exec(src, zc.zodbwsgi.tests.__dict__)\n\nNow, we'll define our application factory using a paste deployment\nconfiguration::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n.. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n\nHere, for demonstration purposes, we used an in-memory demo storage.\n\nNow, we'll create an application with paste:\n\n    >>> import paste.deploy, os\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n\nThe resulting applications has a database attribute (mainly for\ntesting) with the created database.\nBeing newly initialized, the database is empty:\n\n    >>> conn = app.database.open()\n    >>> conn.root()\n    {}\n\nLet's do an \"increment\" request.\n\n    >>> import webtest\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 1}\">\n\nNow, if we look at the database, we see that there's now data in the\nroot object:\n\n    >>> conn.sync()\n    >>> conn.root()\n    {'x': 1}\n\nDatabase initialization\n-----------------------\n\nWe can supply a database initialization function using the initializer\noption.  Let's define an initialization function::\n\n    import transaction\n\n    def initialize_demo_db(db):\n        conn = db.open()\n        conn.root()['x'] = 100\n        transaction.commit()\n        conn.close()\n\n.. -> src\n\n   >>> exec(src, zc.zodbwsgi.tests.__dict__)\n\nand update our paste configuration to use it::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   initializer = zc.zodbwsgi.tests:initialize_demo_db\n\n.. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n\nNow, when we use the application, we see the impact of the\ninitializer:\n\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 101}\">\n\n.. Our application updated transaction meta data when called under\n   transaction control.\n\n    >>> print app.database.history(conn.root()._p_oid, 1)[0]['description']\n    GET  /inc\n    path: '/inc'\n\n    We also see that zodbwsgi added transaction information.\n\nDisabling transaction management\n--------------------------------\n\nSometimes, you may not want the middleware to control transactions.\nYou might do this if your application used multiple databases,\nincluding non-ZODB databases [#multidb]_.  You can suppress\ntransaction management by supplying a value of \"false\" for the\ntransaction_management option::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   initializer = zc.zodbwsgi.tests:initialize_demo_db\n   transaction_management = false\n\n.. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 101}\">\n\n    >>> app.database.history('\\0'*8, 1)[0]['description']\n    ''\n\nSuppressing request retry\n-------------------------\n\nBy default, zc.zodbwsgi adds ``repoze.retry`` middleware to retry requests\nwhen there are conflict errors:\n\n    >>> import ZODB.POSException\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> try: testapp.get('/conflict')\n    ... except ZODB.POSException.ConflictError: pass\n    ... else: print 'oops'\n    Conflict!\n    Conflict!\n    Conflict!\n    Conflict!\n\nHere we can see that the request was retried 3 times.\n\nWe can suppress this by supplying a value of \"0\" for the retry option::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   retry = 0\n\n.. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n\nNow, if we run the app, the request won't be retried:\n\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> try: testapp.get('/conflict')\n    ... except ZODB.POSException.ConflictError: pass\n    ... else: print 'oops'\n    Conflict!\n\nUsing non-thread-aware (non thread-local) transaction managers\n--------------------------------------------------------------\n\nBy default, the middleware uses a thread-aware transaction manager::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n   initializer = zc.zodbwsgi.tests:initialize_demo_db\n\n.. -> src\n\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> print testapp.get(\"/tm\").body\n    thread tm: True\n    >>> print testapp.get(\"/tm\").body\n    thread tm: True\n\n\nThis can be controlled via the ``thread_transaction_manager`` key::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n   initializer = zc.zodbwsgi.tests:initialize_demo_db\n   thread_transaction_manager = false\n\n.. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> print testapp.get(\"/tm\").body\n    thread tm: False\n\n\n.. Other tests of corner cases:\n\n  ::\n\n    class demo_app:\n        def __init__(self, default):\n            pass\n        def __call__(self, environ, start_response):\n            start_response('200 OK', [('content-type', 'text/html')])\n            root = environ['connection'].root()\n            path = environ['PATH_INFO']\n            if path == '/inc':\n                root['x'] = root.get('x', 0) + 1\n                environ['manager'].get().note('path: %r' % path)\n\n            return [repr(root)]\n\n  .. -> src\n\n   >>> exec(src, zc.zodbwsgi.tests.__dict__)\n\n  ::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   key = connection\n   transaction_key = manager\n\n  .. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 1}\">\n\n\ndemostorage_manage_header\n-------------------------\n\nProviding an value for this options enables hooks that allow one to push/pop\nthe underlying demostorage.\n\n  ::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   key = connection\n   transaction_key = manager\n   demostorage_manage_header = X-FOO\n\n  .. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 1}\">\n\nIf the push or pop header is provided, the middleware returns a response\nimmediately without sending it to the end of the pipeline.\n\n    >>> testapp.get('/', {}, headers={'X-FOO': 'push'}).body\n    'Demostorage pushed\\n'\n\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 2}\">\n\n    >>> testapp.get('/', {}, {'X-FOO': 'pop'}).body\n    'Demostorage popped\\n'\n\n    >>> testapp.get('/')\n    <200 OK text/html body=\"{'x': 1}\">\n\nIf you have access to the middleware object, you can accomplish the\nsame thing by calling the push and pop methods, which also return the\ndatabase. This is useful when you're running the server in the test\nprocess and have Python access:\n\n    >>> db = app.application.push()\n\nNote that app is a repoze.retry, so we have to use .application to get\nthe wsgi app.\n\n    >>> with db.transaction() as conn:\n    ...     conn.root.x = 41\n\n    >>> testapp.get('/inc')\n    <200 OK text/html body=\"{'x': 42}\">\n\n    >>> db = app.application.pop()\n    >>> with db.transaction() as conn:\n    ...     print conn.root.x\n    1\n\n    >>> testapp.get('/')\n    <200 OK text/html body=\"{'x': 1}\">\n\nThis also works with multiple dbs.\n\n  ::\n\n    class demo_app:\n        def __init__(self, default):\n            pass\n        def __call__(self, environ, start_response):\n            start_response('200 OK', [('content-type', 'text/html')])\n            path = environ['PATH_INFO']\n            root_one = environ['connection'].get_connection('one').root()\n            root_two = environ['connection'].get_connection('two').root()\n            if path == '/inc':\n                root_one['x'] = root_one.get('x', 0) + 1\n                root_two['y'] = root_two.get('y', 0) + 1\n                environ['manager'].get().note('path: %r' % path)\n\n            data = {'one': root_one,\n                    'two': root_two}\n\n            return [repr(data)]\n\n  .. -> src\n\n   >>> exec(src, zc.zodbwsgi.tests.__dict__)\n\n  ::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb one>\n        <demostorage>\n        </demostorage>\n      </zodb>\n      <zodb two>\n        <demostorage>\n        </demostorage>\n      </zodb>\n\n   key = connection\n   transaction_key = manager\n   demostorage_manage_header = X-FOO\n\n  .. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    >>> testapp = webtest.TestApp(app)\n    >>> testapp.get('/inc').body\n    \"{'two': {'y': 1}, 'one': {'x': 1}}\"\n\n    >>> testapp.get('/', {}, {'X-FOO': 'push'}).body\n    'Demostorage pushed\\n'\n\n    >>> testapp.get('/inc').body\n    \"{'two': {'y': 2}, 'one': {'x': 2}}\"\n\n    >>> testapp.get('/', {}, {'X-FOO': 'pop'}).body\n    'Demostorage popped\\n'\n\n    >>> testapp.get('/').body\n    \"{'two': {'y': 1}, 'one': {'x': 1}}\"\n\n\nIf the storage of any of the databases is not a demostorage, an error is\nreturned.\n\n  ::\n\n   [app:main]\n   paste.app_factory = zc.zodbwsgi.tests:demo_app\n   filter-with = zodb\n\n   [filter:zodb]\n   use = egg:zc.zodbwsgi\n   configuration =\n      <zodb one>\n        <demostorage>\n        </demostorage>\n      </zodb>\n      <zodb two>\n        <filestorage>\n          path /tmp/Data.fs\n        </filestorage>\n      </zodb>\n\n   key = connection\n   transaction_key = manager\n   demostorage_manage_header = foo\n\n  .. -> src\n\n    >>> open('paste.ini', 'w').write(src)\n    >>> app = paste.deploy.loadapp('config:'+os.path.abspath('paste.ini'))\n    ... #doctest: +NORMALIZE_WHITESPACE\n    Traceback (most recent call last):\n      ...\n    UserError: Attempting to activate demostorage hooks when one of the\n    storages is not a DemoStorage\n\nLimiting the number of connections\n----------------------------------\n\nIf you're using a threaded server, one that dedicates a thread to each\nactive request, you can limit the number of simultaneous database\nconnections by specifying the number with the ``max_connections``\noption.\n\n(This only works for threaded servers because it uses threaded\nsemaphores. In the future, support for other locking mechanisms, such\nas gevent Semaphores, may be added. In the mean time, if you're\ninclined to monkey patch, you can replace ``zc.zodbwsgi.Semaphore``\nwith an alternative semaphore implementation, like gevent's.)\n\n.. test\n\n    >>> import threading, zc.thread, time\n    >>> events = []\n    >>> def app(environ, start_response):\n    ...     event = threading.Event()\n    ...     events.append(event)\n    ...     event.wait(30)\n    ...     start_response('200 OK', [])\n    ...     return ''\n\n    >>> f = zc.zodbwsgi.make_filter(\n    ...     app, {}, '<zodb>\\n<mappingstorage>\\n</mappingstorage>\\n</zodb>',\n    ...     max_connections='1', retry=0)\n\n    Now, we've said to only allow 1 connection. If we make requests in\n    threads, only one will be active at a time.\n\n    >>> @zc.thread.Thread\n    ... def t1():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> @zc.thread.Thread\n    ... def t2():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> @zc.thread.Thread\n    ... def t3():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> time.sleep(.01)\n\n    Even though there are 3 requests out standing, only 1 has made it\n    to the app:\n\n    >>> len(events)\n    1\n\n    If we complete one, the next will be handled:\n\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n\n    >>> len(events)\n    1\n\n and so on:\n\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n\n    >>> len(events)\n    1\n\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n\n    >>> len(events)\n    0\n\n    >>> t1.join()\n    >>> t2.join()\n    >>> t3.join()\n\n Check the no-transaction case:\n\n    >>> f = zc.zodbwsgi.make_filter(\n    ...     app, {}, '<zodb>\\n<mappingstorage>\\n</mappingstorage>\\n</zodb>',\n    ...     max_connections='1', retry=0, transaction_management='False')\n\n    >>> @zc.thread.Thread\n    ... def t1():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> @zc.thread.Thread\n    ... def t2():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> @zc.thread.Thread\n    ... def t3():\n    ...     webtest.TestApp(f).get('/')\n\n    >>> time.sleep(.01)\n    >>> len(events)\n    1\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n    >>> len(events)\n    1\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n    >>> len(events)\n    1\n    >>> events.pop().set()\n    >>> time.sleep(.01)\n    >>> len(events)\n    0\n    >>> t1.join()\n    >>> t2.join()\n    >>> t3.join()\n\n Verify that we can monkey patch:\n\n    >>> def app(environ, start_response):\n    ...     start_response('200 OK', [])\n    ...     return ''\n    >>> import mock\n    >>> with mock.patch(\"zc.zodbwsgi.Semaphore\") as Semaphore:\n    ...     f = zc.zodbwsgi.make_filter(\n    ...         app, {}, '<zodb>\\n<mappingstorage>\\n</mappingstorage>\\n</zodb>',\n    ...         max_connections='99', retry=0, transaction_management='False')\n    ...     Semaphore.assert_called_with(99)\n    ...     _ = webtest.TestApp(f).get('/')\n    ...     Semaphore.return_value.acquire.assert_called_with()\n    ...     Semaphore.return_value.release.assert_called_with()\n\nEscaping connection and transaction management\n----------------------------------------------\n\nNormally, having connections and transactions managed for you is\nconvenient. Sometimes, however, you want to take over transaction\nmanagement yourself.\n\nIf you close ``environ['zodb.connection']``, then it won't be closed\nby ``zc.zodbwsgi``, nor will ``zc.zodbwsgi`` commit or abort the\ntransaction it started.  If you're using ``max_connections``, closing\n``environ['zodb.connection']`` will make the connection available for\nother requests immediately, rather than waiting for your request to\ncomplete.\n\n.. test\n\n  Normal (no error):\n\n    >>> import sys\n    >>> def app(environ, start_response):\n    ...     print 'about to close'\n    ...     environ['zodb.connection'].close()\n    ...     print 'closed'\n    ...     start_response('200 OK', [])\n    ...     return ''\n\n    >>> with mock.patch('transaction.manager') as manager:\n    ...     with mock.patch(\"zc.zodbwsgi.Semaphore\") as Semaphore:\n    ...             f = zc.zodbwsgi.make_filter(\n    ...                 app, {},\n    ...                 '<zodb>\\n<mappingstorage>\\n</mappingstorage>\\n</zodb>',\n    ...                 max_connections='99', retry=0)\n    ...             Semaphore.assert_called_with(99)\n    ...             Semaphore.return_value.acquire.side_effect = (\n    ...                 lambda : sys.stdout.write('acquire\\n'))\n    ...             Semaphore.return_value.release.side_effect = (\n    ...                 lambda : sys.stdout.write('release\\n'))\n    ...             manager.begin.side_effect = (\n    ...                 lambda : sys.stdout.write('begin\\n'))\n    ...             manager.commit.side_effect = (\n    ...                 lambda *a: sys.stdout.write('commit\\n'))\n    ...             manager.abort.side_effect = (\n    ...                 lambda *a: sys.stdout.write('abort\\n'))\n    ...             _ = webtest.TestApp(f).get('/')\n    acquire\n    begin\n    about to close\n    release\n    closed\n\n  Error:\n\n    >>> def app(environ, start_response):\n    ...     print 'about to close'\n    ...     environ['zodb.connection'].close()\n    ...     print 'closed'\n    ...     raise ValueError('Fail')\n\n    >>> with mock.patch('transaction.manager') as manager:\n    ...     with mock.patch(\"zc.zodbwsgi.Semaphore\") as Semaphore:\n    ...             f = zc.zodbwsgi.make_filter(\n    ...                 app, {},\n    ...                 '<zodb>\\n<mappingstorage>\\n</mappingstorage>\\n</zodb>',\n    ...                 max_connections='99', retry=0)\n    ...             Semaphore.assert_called_with(99)\n    ...             Semaphore.return_value.acquire.side_effect = (\n    ...                 lambda : sys.stdout.write('acquire\\n'))\n    ...             Semaphore.return_value.release.side_effect = (\n    ...                 lambda : sys.stdout.write('release\\n'))\n    ...             manager.begin.side_effect = (\n    ...                 lambda : sys.stdout.write('begin\\n'))\n    ...             manager.commit.side_effect = (\n    ...                 lambda *a: sys.stdout.write('commit\\n'))\n    ...             manager.abort.side_effect = (\n    ...                 lambda *a: sys.stdout.write('abort\\n'))\n    ...             try: webtest.TestApp(f).get('/')\n    ...             except ValueError: pass\n    acquire\n    begin\n    about to close\n    release\n    closed\n\n\nDealing with the occasional long-running requests\n-------------------------------------------------\n\nDatabase connections can be pretty expensive resources, especially if\nthey have large database caches.  For this reason, when using large\ncaches, it's common to limit the number of application threads, to\nlimit the number of connections used.  If your application is compute\nbound, you generally want to use one application thread per process\nand a process per processor on the host machine.\n\nIf your application itself makes network requests (e.g calling\nexternal service APIs), so it's network/server bound rather than\ncompute bound, you should increase the number of application threads\nand decrease the size of the connection caches to compensate.\n\nIf your application is mostly compute bound, but sometimes calls\nexternal services, you can take a hybrid approach:\n\n- Increase the number of application threads.\n- Set ``max_connections`` to 1.\n- In the parts of your application that make external service calls:\n\n  - Close ``environ['zodb.connection']``, committing first, if\n    necessary.\n  - Make your service calls.\n  - Open and close ZODB connections yourself when you need to use the\n    database.\n\n    If you're using ZEO or relstorage, you might want to create\n    separate database clients for use in these calls, configured with\n    smaller caches.\n\nChanges\n=======\n\n1.2.0 (2015-03-08)\n------------------\n\n- Record a request summary in transaction meta-data\n\n- Added dependencies to reflect imports.\n\n1.1.0 (2014-04-22)\n------------------\n\n- Provide Python ``push`` and ``pop`` methods for use when testing and\n  when running the server in the test process.\n\n1.0.0 (2013-09-15)\n------------------\n\n- Added support for occasional long-running requests:\n\n  - You can limit the number of database connections with\n    max_connections.\n\n  - You can take over connection and transaction management to release\n    connections while blocking (typically when calling external\n    services).\n\n- Add an option to use a thread-aware transaction manager, and make it\n  the default.\n\n\n0.3.0 (2013-03-07)\n------------------\n\n- Using the demostorage hook now returns a response immediately without\n  processing the rest of the pipeline. Makes use of this feature less\n  confusing.\n\n0.2.1 (2013-03-06)\n------------------\n\n- Fix reference to a file that was renamed.\n\n0.2.0 (2013-03-06)\n------------------\n\n- Add hooks to manage (push/pop) underlying demostorage based on headers.\n- Refactor filter to use instance attributes instead of a closure.\n\n0.1.0 (2010-02-16)\n------------------\n\nInitial release\n\n\n\n.. [#multidb] If you want to use multiple ZODB databases, you can\n   simply define them in your configuration option.  Just make sure to\n   give them names.  When you want to access a database, use the\n   ``get_connection`` method on the connection in the environment::\n\n      foo_conn = environ['zodb.connection'].get_connection('foo')",
+    "description_content_type": null,
+    "docs_url": null,
+    "download_url": "UNKNOWN",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "UNKNOWN",
+    "keywords": null,
+    "license": "ZPL 2.1",
+    "maintainer": null,
+    "maintainer_email": null,
+    "name": "zc.zodbwsgi",
+    "package_url": "https://pypi.org/project/zc.zodbwsgi/",
+    "platform": "UNKNOWN",
+    "project_url": "https://pypi.org/project/zc.zodbwsgi/",
+    "project_urls": {
+      "Download": "UNKNOWN",
+      "Homepage": "UNKNOWN"
+    },
+    "release_url": "https://pypi.org/project/zc.zodbwsgi/1.2.0/",
+    "requires_dist": null,
+    "requires_python": null,
+    "summary": ".. image:: https://travis-ci.org/zopefoundation/zc.zodbwsgi.png?branch=master",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 1453102,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24c82035ad0634cbb3c450408b6b9c426c7d7ce93b2d5fa89ff1ad133f2faeaf",
+          "md5": "2f302a415f63aa34342f846c491a00d1",
+          "sha256": "e49303b881d8b45477695eefa61f285131552d062dc2f23458540c31b3e88f69"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f302a415f63aa34342f846c491a00d1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6224,
+        "upload_time": "2010-02-16T23:59:44",
+        "upload_time_iso_8601": "2010-02-16T23:59:44.014099Z",
+        "url": "https://files.pythonhosted.org/packages/24/c8/2035ad0634cbb3c450408b6b9c426c7d7ce93b2d5fa89ff1ad133f2faeaf/zc.zodbwsgi-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86ab75b506eeb74c1035e8a9e396ec1fcb42f6ede6a622162238dd323a1e5a30",
+          "md5": "0a5573cabc733a4eccba9fc9e4d42eda",
+          "sha256": "2aebe719d46c8b5f94aa97beffc2bcf27fa336176f0cf6ad9253d6cea4020b8d"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0a5573cabc733a4eccba9fc9e4d42eda",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8406,
+        "upload_time": "2013-03-06T20:47:53",
+        "upload_time_iso_8601": "2013-03-06T20:47:53.774344Z",
+        "url": "https://files.pythonhosted.org/packages/86/ab/75b506eeb74c1035e8a9e396ec1fcb42f6ede6a622162238dd323a1e5a30/zc.zodbwsgi-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c9f0450ac992aa54f2d5254f493970173f8f4e25fb52ccdf2f6b4a1a86103ee8",
+          "md5": "f440175e1c4329ba2ee4c36bae22d1ee",
+          "sha256": "3992f6c02b5f0e5f4378f6628d8cc801a3987d2594e4b2ddcedc28d35e937a20"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f440175e1c4329ba2ee4c36bae22d1ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8196,
+        "upload_time": "2013-03-06T21:23:25",
+        "upload_time_iso_8601": "2013-03-06T21:23:25.752688Z",
+        "url": "https://files.pythonhosted.org/packages/c9/f0/450ac992aa54f2d5254f493970173f8f4e25fb52ccdf2f6b4a1a86103ee8/zc.zodbwsgi-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a83589b59c6ca32d0b998e62829f65fbfc7ec1b92c3733ae8f4b0929f01f1af0",
+          "md5": "232c2d533cb24d35c87bedafc9b44663",
+          "sha256": "19692a5d35667a549e18ec844c86d4169c31c45e6bfb002f5a7f91b650a41ad6"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "232c2d533cb24d35c87bedafc9b44663",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8518,
+        "upload_time": "2013-03-07T14:38:47",
+        "upload_time_iso_8601": "2013-03-07T14:38:47.368243Z",
+        "url": "https://files.pythonhosted.org/packages/a8/35/89b59c6ca32d0b998e62829f65fbfc7ec1b92c3733ae8f4b0929f01f1af0/zc.zodbwsgi-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e3d1cdb5019d9c173985bcb81efb7c415edffabbab4ac83433bf6bb35592e3e",
+          "md5": "6bc97f035025dcf1349b17d24072af9d",
+          "sha256": "7c48f1f118400b78055f512fcf786a99617ce89beba1764b55a840bcdffb5b1f"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6bc97f035025dcf1349b17d24072af9d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15925,
+        "upload_time": "2013-09-15T15:01:32",
+        "upload_time_iso_8601": "2013-09-15T15:01:32.723395Z",
+        "url": "https://files.pythonhosted.org/packages/0e/3d/1cdb5019d9c173985bcb81efb7c415edffabbab4ac83433bf6bb35592e3e/zc.zodbwsgi-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44791639950d572239ab8792210d2c1d231c442e987a86b1146aaadac0038540",
+          "md5": "64ac8c7951462ab00fa2d9fed5874933",
+          "sha256": "5e9e3af355fd12371c9cad6009f9340e7b2d73cbae52aa247dad3a5ab21a6165"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "64ac8c7951462ab00fa2d9fed5874933",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20381,
+        "upload_time": "2014-04-22T14:15:54",
+        "upload_time_iso_8601": "2014-04-22T14:15:54.112650Z",
+        "url": "https://files.pythonhosted.org/packages/44/79/1639950d572239ab8792210d2c1d231c442e987a86b1146aaadac0038540/zc.zodbwsgi-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8b1dc4d29143e557dc51efc39660ed21708603c73d122c303ea18d9e9fba1a62",
+          "md5": "e0dac638d69ef40157718b9a24d925a3",
+          "sha256": "3688c2ab508875c3578f8689048ea2defdab6513bda7af2a90e439f9ecf67ee6"
+        },
+        "downloads": -1,
+        "filename": "zc.zodbwsgi-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e0dac638d69ef40157718b9a24d925a3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17872,
+        "upload_time": "2015-03-08T15:15:36",
+        "upload_time_iso_8601": "2015-03-08T15:15:36.920643Z",
+        "url": "https://files.pythonhosted.org/packages/8b/1d/c4d29143e557dc51efc39660ed21708603c73d122c303ea18d9e9fba1a62/zc.zodbwsgi-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8b1dc4d29143e557dc51efc39660ed21708603c73d122c303ea18d9e9fba1a62",
+        "md5": "e0dac638d69ef40157718b9a24d925a3",
+        "sha256": "3688c2ab508875c3578f8689048ea2defdab6513bda7af2a90e439f9ecf67ee6"
+      },
+      "downloads": -1,
+      "filename": "zc.zodbwsgi-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "e0dac638d69ef40157718b9a24d925a3",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 17872,
+      "upload_time": "2015-03-08T15:15:36",
+      "upload_time_iso_8601": "2015-03-08T15:15:36.920643Z",
+      "url": "https://files.pythonhosted.org/packages/8b/1d/c4d29143e557dc51efc39660ed21708603c73d122c303ea18d9e9fba1a62/zc.zodbwsgi-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
