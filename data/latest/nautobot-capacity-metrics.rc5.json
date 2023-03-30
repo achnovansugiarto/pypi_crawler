@@ -1,0 +1,293 @@
+{
+  "info": {
+    "author": "Network to Code, LLC",
+    "author_email": "opensource@networktocode.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# nautobot-plugin-capacity-metrics\n\nA plugin for [Nautobot](https://github.com/nautobot/nautobot) to expose additional metrics information.\n\nThe plugin is composed of multiple features that can be used independently:\n\n- Application Metrics Endpoint: prometheus endpoint at `/api/plugins/capacity-metrics/app-metrics`\n- RQ Queue Metrics Endpoint: prometheus endpoint at `/api/plugins/capacity-metrics/rq-metrics`\n- RQ Worker Metrics Command: Add prometheus endpoint on each RQ worker\n\n# Application Metrics Endpoint\n\nNautobot already exposes some information via a Prometheus endpoint but the information currently available are mostly at the system level and not at the application level.\n\n- **SYSTEM Metrics** are very useful to instrument code, track ephemeral information and get a better visibility into what is happening. (Example of metrics: nbr of requests, requests per second, nbr of exceptions, response time, etc ...) The idea is that when multiple instances of Nautobot are running behind a load balancer each one will produce a different set of metrics and the monitoring system needs to collect these metrics from all running instances and aggregate them in a dashboard. Nautobot exposes some system metrics at `localhost/metrics` [Nautobot DOC](https://nautobot.readthedocs.io/en/stable/additional-features/prometheus-metrics/).\n- **APPLICATION Metrics** are at a higher level and represent information that is the same across all instances of an application running behind a load balancer. If I have 3 instances of Nautobot running, there is no point to ask each of them how many Device objects I have in the database, since they will always return the same information. In this case, the goal is to expose only 1 endpoint that can be served by any running instance.\n\nSystem metrics and application level metrics are complementary with each other\n\nCurrently the plugin exposes these simple metrics by default:\n\n- RQ Queues stats\n- Jobs stats\n- Models count (configurable via nautobot_config.py)\n\n# Queue System Metrics Endpoint\n\nIn addition to the default Nautobot system metrics which are exposed at `/metrics` which are largely centered around the Django system on which Nautobot is based this plugin provides some additional system metrics around the queuing system Nautobot uses to communicate with the Nautobot worker services.  This endpoint is provided separately via `/api/plugins/capacity-metrics/rq-metrics`, this endpoint can be scraped more frequently than the other application metrics endpoint.\n## Add your own metrics\n\nThis plugin supports some options to generate and publish your own application metrics behind the same endpoint.\n\n### Option 1 - Register function(s) via nautobot_config.py\n\nIt's possible to create your own function to generate some metrics and register it to the plugin in the nautobot_config.py.\nHere is an example where the custom function are centralized in a `metrics.py` file, located next to the main `nautobot_config.py`.\n\n```python\n# metrics.py\nfrom prometheus_client.core import GaugeMetricFamily\n\ndef metric_prefix_utilization():\n    \"\"\"Report prefix utilization as a metric per container.\"\"\"\n    from ipam.models import Prefix  # pylint: disable=import-outside-toplevel\n\n    containers = Prefix.objects.filter(status=\"container\").all()\n    g = GaugeMetricFamily(\n        \"nautobot_prefix_utilization\", \"percentage of utilization per container prefix\", labels=[\"prefix\", \"role\", \"site\"]\n    )\n\n    for container in containers:\n\n        site = \"none\"\n        role = \"none\"\n        if container.role:\n            role = container.role.slug\n\n        if container.site:\n            site = container.site.slug\n\n        g.add_metric(\n            [str(container.prefix), site, role], container.get_utilization(),\n        )\n\n    yield g\n```\n\nThe new function can be imported in the `nautobot_config.py` file and registered with the plugin.\n\n```python\n# nautobot_config.py\nfrom nautobot.metrics import metric_prefix_utilization\nPLUGINS_CONFIG = {\n    \"nautobot_capacity_metrics\": {\n      \"app_metrics\": {\n        \"extras\": [\n          metric_prefix_utilization\n        ]\n      }\n    }\n},\n```\n\n### Option 2 - Registry for third party plugins\n\nAny plugin can include its own metrics to improve the visibility and/or the troubleshooting of the plugin itself.\nThird party plugins can register their own function(s) using the `ready()` function as part of their `PluginConfig` class.\n\n```python\n# my_plugin/__init__.py\nfrom nautobot_capacity_metrics import register_metric_func\nfrom nautobot.metrics import metric_circuit_bandwidth\n\nclass MyPluginConfig(PluginConfig):\n    name = \"nautobot_myplugin\"\n    verbose_name = \"Demo Plugin\"\n    # [ ... ]\n    def ready(self):\n        super().ready()\n        register_metric_func(metric_circuit_bandwidth)\n```\n\n### Option 3 - NOT AVAILABLE YET - Metrics directory\n\nIn the future it will be possible to add metrics by adding them in a predefined directory, similar to jobs.\n\n## Plugin Configuration Parameters\n\nThe behavior of the app_metrics feature can be controlled with the following list of settings (under `nautobot_capacity_metrics > app_metrics`):\n- `gitrepositories` boolean (default **False**), publish stats about the gitrepositories (success, warning, info, failure)\n- `jobs` boolean (default **False**), publish stats about the jobs (success, warning, info, failure)\n- `queues` boolean (default **False**), publish stats about RQ Worker (nbr of worker, nbr and type of job in the different queues)\n- `models` nested dict, publish the count for a given object (Nbr Device, Nbr IP etc.. ). The first level must be the name of the module in lowercase (dcim, ipam etc..), the second level must be the name of the object (usually starting with a uppercase)\n\n    ```python\n    PLUGINS_CONFIG = {\n      \"nautobot_capacity_metrics\": {\n        \"app_metrics\": {\n          \"models\": {\n             \"dcim\": {\"Site\": True, \"Rack\": True, \"Device\": True},\n             \"ipam\": {\"IPAddress\": True, \"Prefix\": True},\n           },\n           \"jobs\": True,\n           \"queues\": True,\n         }\n       }\n    }\n    ```\n\n## Usage\n\nConfigure your Prometheus server to collect the application metrics at `/api/plugins/capacity-metrics/app-metrics/`\n\n```yaml\n# Sample prometheus configuration\nscrape_configs:\n  - job_name: 'nautobot_app'\n    scrape_interval: 120s\n    metrics_path: /api/plugins/capacity-metrics/app-metrics\n    static_configs:\n      - targets: ['nautobot']\n  - job_name: 'nautobot_queue'\n    scrape_interval: 20s\n    metrics_path: /api/plugins/capacity-metrics/rq-metrics\n    static_configs:\n      - targets: ['nautobot']\n```\n\n# RQ Worker Metrics Endpoint\n\nThis plugin add a new django management command `rqworker_metrics` that is behaving identically to the default `rqworker` command except that this command also exposes a prometheus endpoint (default port 8001).\n\nWith this endpoint it become possible to instrument the tasks running asyncronously in the worker.\n\n## Usage\n\nThe new command needs to be executed on the worker as a replacement for the default `rqworker`\n\n```shell\nnautobot-server rqworker_metrics\n```\n\nThe port used to expose the prometheus endpoint can be configured for each worker in CLI.\n\n```shell\nnautobot-server rqworker_metrics --prom-port 8002\n```\n\nSince the rq-worker is based on a fork model, for this feature to work it''s required to use prometheus in multi processes mode.\nTo enable this mode the environment variable `prometheus_multiproc_dir` must be define and point at a valid directory.\n\n# Installation\n\nThe plugin is available as a Python package in pypi and can be installed with pip\n\n```shell\npip install nautobot-capacity-metrics\n```\n\n> The plugin is compatible with Nautobot 1.0.0 and higher\n\nTo ensure Application Metrics Plugin is automatically re-installed during future upgrades, create a file named `local_requirements.txt` (if not already existing) in the Nautobot root directory (alongside `requirements.txt`) and list the `nautobot-capacity-metrics` package:\n\n```no-highlight\n# echo nautobot-capacity-metrics >> local_requirements.txt\n```\n\nOnce installed, the plugin needs to be enabled in your `nautobot_config.py`\n\n```python\n# In your nautobot_config.py\nPLUGINS = [\"nautobot_capacity_metrics\"]\n\n# PLUGINS_CONFIG = {\n#     \"nautobot_capacity_metrics\": {\n#         \"app_metrics\": {\n#             \"gitrepositories\": True,\n#             \"jobs\": True,\n#             \"models\": {\n#                 \"dcim\": {\n#                     \"Site\": True,\n#                     \"Rack\": True,\n#                     \"Device\": True,\n#                     \"Interface\": True,\n#                     \"Cable\": True,\n#                 },\n#                 \"ipam\": {\n#                     \"IPAddress\": True,\n#                     \"Prefix\": True,\n#                 },\n#                 \"extras\": {\n#                     \"GitRepository\": True\n#                 },\n#             },\n#             \"queues\": True,\n#         }\n#     },\n# }\n```\n\nIf you need to modify the plugin configuration away from defaults, please refer back to [Plugin Configuration Parameters](#plugin-configuration-parameters).\n\n## Included Grafana Dashboard\n\nIncluded within this plugin is a Grafana dashboard which will work with the example configuration above. To install this dashboard import the JSON from [Grafana Dashboard](nautobot_grafana_dashboard.json) into Grafana.\n\n![Nautobot Grafana Dashboard](nautobot_grafana_dashboard.png)\n\n# Contributing\n\nPull requests are welcomed and automatically built and tested against multiple version of Python and multiple version of Nautobot through TravisCI.\n\nThe project is packaged with a light development environment based on `docker-compose` to help with the local development of the project and to run the tests within TravisCI.\n\nThe project is following Network to Code software development guideline and is leveraging:\n\n- Black, Pylint, Bandit and pydocstyle for Python linting and formatting.\n- Django unit test to ensure the plugin is working properly.\n\n### CLI Helper Commands\n\nThe project is coming with a CLI helper based on [invoke](http://www.pyinvoke.org/) to help setup the development environment. The commands are listed below in 3 categories `dev environment`, `utility` and `testing`.\n\nEach command can be executed with `invoke <command>`. All commands support the arguments `--nautobot-ver` and `--python-ver` if you want to manually define the version of Python and Nautobot to use. Each command also has its own help `invoke <command> --help`\n\n#### Local dev environment\n\n```no-highlight\n  build            Build all docker images.\n  debug            Start Nautobot and its dependencies in debug mode.\n  destroy          Destroy all containers and volumes.\n  start            Start Nautobot and its dependencies in detached mode.\n  stop             Stop Nautobot and its dependencies.\n```\n\n#### Utility\n\n```no-highlight\n  cli              Launch a bash shell inside the running Nautobot container.\n  create-user      Create a new user in django (default: admin), will prompt for password.\n  makemigrations   Run Make Migration in Django.\n  nbshell          Launch a nbshell session.\n```\n\n#### Testing\n\n```no-highlight\n  tests            Run all tests for this plugin.\n  pylint           Run pylint code analysis.\n  pydocstyle       Run pydocstyle to validate docstring formatting adheres to NTC defined standards.\n  bandit           Run bandit to validate basic static code security analysis.\n  black            Run black to check that Python files adhere to its style standards.\n  unittest         Run Django unit tests for the plugin.\n```\n\n## Questions\n\nFor any questions or comments, please check the [FAQ](FAQ.md) first and feel free to swing by the [Network to Code slack channel](https://networktocode.slack.com/) (channel #networktocode).\nSign up [here](http://slack.networktocode.com/)\n\n## Default Metrics for the application metrics endpoint\n\nThe following metrics will be provided via the `/api/plugins/capacity-metrics/app-metrics` endpoint:\n\n```no-highlight\n# HELP nautobot_gitrepository_task_stats Per Git repository task statistics\n# TYPE nautobot_gitrepository_task_stats gauge\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"main\",status=\"success\"} 1.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"main\",status=\"warning\"} 0.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"main\",status=\"failure\"} 0.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"main\",status=\"info\"} 6.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"total\",status=\"success\"} 1.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"total\",status=\"warning\"} 0.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"total\",status=\"failure\"} 0.0\nnautobot_gitrepository_task_stats{module=\"repo1\",name=\"total\",status=\"info\"} 6.0\n# HELP nautobot_gitrepository_execution_status Git repository completion status\n# TYPE nautobot_gitrepository_execution_status gauge\nnautobot_gitrepository_execution_status{module=\"repo1\",status=\"pending\"} 0.0\nnautobot_gitrepository_execution_status{module=\"repo1\",status=\"running\"} 0.0\nnautobot_gitrepository_execution_status{module=\"repo1\",status=\"completed\"} 1.0\nnautobot_gitrepository_execution_status{module=\"repo1\",status=\"errored\"} 0.0\nnautobot_gitrepository_execution_status{module=\"repo1\",status=\"failed\"} 0.0\n# HELP nautobot_job_task_stats Per Job task statistics\n# TYPE nautobot_job_task_stats gauge\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"total\",status=\"success\"} 1.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"total\",status=\"warning\"} 0.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"total\",status=\"failure\"} 0.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"total\",status=\"info\"} 0.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"test_is_uppercase\",status=\"success\"} 1.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"test_is_uppercase\",status=\"warning\"} 0.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"test_is_uppercase\",status=\"failure\"} 0.0\nnautobot_job_task_stats{module=\"local/users/CheckUser\",name=\"test_is_uppercase\",status=\"info\"} 0.0\n# HELP nautobot_job_execution_status Job completion status\n# TYPE nautobot_job_execution_status gauge\nnautobot_job_execution_status{module=\"local/users/CheckUser\",status=\"pending\"} 0.0\nnautobot_job_execution_status{module=\"local/users/CheckUser\",status=\"running\"} 0.0\nnautobot_job_execution_status{module=\"local/users/CheckUser\",status=\"completed\"} 1.0\nnautobot_job_execution_status{module=\"local/users/CheckUser\",status=\"errored\"} 0.0\nnautobot_job_execution_status{module=\"local/users/CheckUser\",status=\"failed\"} 0.0\n# HELP nautobot_model_count Per Nautobot Model count\n# TYPE nautobot_model_count gauge\nnautobot_model_count{app=\"dcim\",name=\"Site\"} 24.0\nnautobot_model_count{app=\"dcim\",name=\"Rack\"} 24.0\nnautobot_model_count{app=\"dcim\",name=\"Device\"} 46.0\nnautobot_model_count{app=\"ipam\",name=\"IPAddress\"} 58.0\nnautobot_model_count{app=\"ipam\",name=\"Prefix\"} 18.0\nnautobot_model_count{app=\"extras\",name=\"GitRepository\"} 1.0\n# HELP nautobot_app_metrics_processing_ms Time in ms to generate the app metrics endpoint\n# TYPE nautobot_app_metrics_processing_ms gauge\nnautobot_app_metrics_processing_ms 59.48257\n```\n\nThe following metrics will be provided via the `/api/plugins/capacity-metrics/rq-metrics` endpoint:\n\n```no-highlight\n# HELP nautobot_queue_number_jobs Number of Job per RQ queue and status\n# TYPE nautobot_queue_number_jobs gauge\nnautobot_queue_number_jobs{name=\"check_releases\",status=\"finished\"} 0.0\nnautobot_queue_number_jobs{name=\"check_releases\",status=\"started\"} 0.0\nnautobot_queue_number_jobs{name=\"check_releases\",status=\"deferred\"} 0.0\nnautobot_queue_number_jobs{name=\"check_releases\",status=\"failed\"} 0.0\nnautobot_queue_number_jobs{name=\"check_releases\",status=\"scheduled\"} 0.0\nnautobot_queue_number_jobs{name=\"default\",status=\"finished\"} 0.0\nnautobot_queue_number_jobs{name=\"default\",status=\"started\"} 0.0\nnautobot_queue_number_jobs{name=\"default\",status=\"deferred\"} 0.0\nnautobot_queue_number_jobs{name=\"default\",status=\"failed\"} 0.0\nnautobot_queue_number_jobs{name=\"default\",status=\"scheduled\"} 0.0\n# HELP nautobot_queue_number_workers Number of worker per queue\n# TYPE nautobot_queue_number_workers gauge\nnautobot_queue_number_workers{name=\"check_releases\"} 0.0\nnautobot_queue_number_workers{name=\"default\"} 2.0\n# HELP nautobot_rq_metrics_processing_ms Time in ms to generate the app metrics endpoint\n# TYPE nautobot_rq_metrics_processing_ms gauge\nnautobot_rq_metrics_processing_ms 33.34308\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/nautobot/nautobot-plugin-capacity-metrics",
+    "keywords": "nautobot,nautobot-plugin",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "nautobot-capacity-metrics",
+    "package_url": "https://pypi.org/project/nautobot-capacity-metrics/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/nautobot-capacity-metrics/",
+    "project_urls": {
+      "Homepage": "https://github.com/nautobot/nautobot-plugin-capacity-metrics",
+      "Repository": "https://github.com/nautobot/nautobot-plugin-capacity-metrics"
+    },
+    "release_url": "https://pypi.org/project/nautobot-capacity-metrics/2.0.0/",
+    "requires_dist": [
+      "nautobot (>=1.2.0,<2.0.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "Plugin to improve the instrumentation of Nautobot and expose additional metrics (Application Metrics, RQ Worker).",
+    "version": "2.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13494222,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5dd709d9dd3a0ccd6ce58b96457028fb90e88be4dbfa2f5e9c8f1d7306bc5b04",
+          "md5": "f25e485881af2b4c3843d3e23a10c571",
+          "sha256": "05e5e677627b31af613b70d9ad738c445c8d6160231b03cf67e1539fff5def81"
+        },
+        "downloads": -1,
+        "filename": "nautobot-capacity-metrics-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f25e485881af2b4c3843d3e23a10c571",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 522,
+        "upload_time": "2021-02-24T01:21:35",
+        "upload_time_iso_8601": "2021-02-24T01:21:35.693845Z",
+        "url": "https://files.pythonhosted.org/packages/5d/d7/09d9dd3a0ccd6ce58b96457028fb90e88be4dbfa2f5e9c8f1d7306bc5b04/nautobot-capacity-metrics-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5fb9491a6af09845dbb4b43e9a0a7f1048b389de131c44a22999da1a179549e7",
+          "md5": "1b8b476edef29c631019b25db0d846aa",
+          "sha256": "9e0412ee3db2a5ee53e1fbc8996f47a2b8d15b3642a3e74485a788d269f35c6d"
+        },
+        "downloads": -1,
+        "filename": "nautobot_capacity_metrics-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b8b476edef29c631019b25db0d846aa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 19168,
+        "upload_time": "2021-02-24T03:52:56",
+        "upload_time_iso_8601": "2021-02-24T03:52:56.627014Z",
+        "url": "https://files.pythonhosted.org/packages/5f/b9/491a6af09845dbb4b43e9a0a7f1048b389de131c44a22999da1a179549e7/nautobot_capacity_metrics-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c505198600f6306cc36e000558b65afaaf030bd65867975eb8e525051419bbe1",
+          "md5": "9e72cc50710e098f8e3ecc891bc34bd0",
+          "sha256": "becc2d356bc0dcf24fe239765955216fd46324ff2a40904d057c6857b5a3f938"
+        },
+        "downloads": -1,
+        "filename": "nautobot_capacity_metrics-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e72cc50710e098f8e3ecc891bc34bd0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 15890,
+        "upload_time": "2021-02-24T03:52:58",
+        "upload_time_iso_8601": "2021-02-24T03:52:58.618882Z",
+        "url": "https://files.pythonhosted.org/packages/c5/05/198600f6306cc36e000558b65afaaf030bd65867975eb8e525051419bbe1/nautobot_capacity_metrics-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "561dc19a620ee0037c8a426bc73fada5c2ba4c80d4f4711e12334f14d447f504",
+          "md5": "2f3e004d4c4ee19276b69b03e2a39deb",
+          "sha256": "11a5d3686fafa34ddce1d643f54dbd4d205d3c76cb643617b774ff4beb0d3189"
+        },
+        "downloads": -1,
+        "filename": "nautobot_capacity_metrics-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f3e004d4c4ee19276b69b03e2a39deb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 19273,
+        "upload_time": "2021-05-17T18:58:50",
+        "upload_time_iso_8601": "2021-05-17T18:58:50.194781Z",
+        "url": "https://files.pythonhosted.org/packages/56/1d/c19a620ee0037c8a426bc73fada5c2ba4c80d4f4711e12334f14d447f504/nautobot_capacity_metrics-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "687cc773973f7e40945a04f0c65e2d2b7cb384a82cd4d4a302f35102df96f890",
+          "md5": "28ba9bbdb7be7e8eeaafb9bc23e01f89",
+          "sha256": "f6bdde11aedc63c233ad1468b7263a9bc5694938d0f197873fa0abc6a22c2ce5"
+        },
+        "downloads": -1,
+        "filename": "nautobot-capacity-metrics-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28ba9bbdb7be7e8eeaafb9bc23e01f89",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 15938,
+        "upload_time": "2021-05-17T18:58:48",
+        "upload_time_iso_8601": "2021-05-17T18:58:48.336497Z",
+        "url": "https://files.pythonhosted.org/packages/68/7c/c773973f7e40945a04f0c65e2d2b7cb384a82cd4d4a302f35102df96f890/nautobot-capacity-metrics-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e8986817487e90254cc91daf3b7cafb397996c4cd35ac83572388dcc40fb44a6",
+          "md5": "22c4441bde9b97270d61e3a916d709b7",
+          "sha256": "f5a07e6cfc0dc814109f6806a19079d8ac0ce19cc68d5d19c6433dae11370f5c"
+        },
+        "downloads": -1,
+        "filename": "nautobot_capacity_metrics-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "22c4441bde9b97270d61e3a916d709b7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 20049,
+        "upload_time": "2021-09-09T19:45:02",
+        "upload_time_iso_8601": "2021-09-09T19:45:02.462781Z",
+        "url": "https://files.pythonhosted.org/packages/e8/98/6817487e90254cc91daf3b7cafb397996c4cd35ac83572388dcc40fb44a6/nautobot_capacity_metrics-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cd518c06292918efa1735f32cd390166c6dbe993b441d4b2d7a5a11b903a50b7",
+          "md5": "f0334c58cf8f65c988b349e1cdc3f55e",
+          "sha256": "7f39fdc203dec1579902b4972193feace8140addd5360cefadb1dc4895b8a582"
+        },
+        "downloads": -1,
+        "filename": "nautobot-capacity-metrics-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f0334c58cf8f65c988b349e1cdc3f55e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 17214,
+        "upload_time": "2021-09-09T19:45:00",
+        "upload_time_iso_8601": "2021-09-09T19:45:00.618785Z",
+        "url": "https://files.pythonhosted.org/packages/cd/51/8c06292918efa1735f32cd390166c6dbe993b441d4b2d7a5a11b903a50b7/nautobot-capacity-metrics-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44ae9c83bdd9065faa55905ee4fa1b4b3671d1044bb96c60762242a758ca6497",
+          "md5": "e4dd8966cca1c4354c1b2f2c994ba49f",
+          "sha256": "f8cb1e70b876cf7c553b58c7336f7e54bfa492ce29f085436919a7d6dd09cddd"
+        },
+        "downloads": -1,
+        "filename": "nautobot_capacity_metrics-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e4dd8966cca1c4354c1b2f2c994ba49f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 19978,
+        "upload_time": "2022-04-12T20:01:17",
+        "upload_time_iso_8601": "2022-04-12T20:01:17.804531Z",
+        "url": "https://files.pythonhosted.org/packages/44/ae/9c83bdd9065faa55905ee4fa1b4b3671d1044bb96c60762242a758ca6497/nautobot_capacity_metrics-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca5ceddad2036c02399bef1495e17af1306b8261acdfaf977ba5de5a3414c559",
+          "md5": "498e7edc334ec322aa00c25046364e82",
+          "sha256": "02fbf65a335047252fbc25b10d8bb74f764501479a5528b2b02d09f24913cccd"
+        },
+        "downloads": -1,
+        "filename": "nautobot-capacity-metrics-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "498e7edc334ec322aa00c25046364e82",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17171,
+        "upload_time": "2022-04-12T20:01:19",
+        "upload_time_iso_8601": "2022-04-12T20:01:19.694072Z",
+        "url": "https://files.pythonhosted.org/packages/ca/5c/eddad2036c02399bef1495e17af1306b8261acdfaf977ba5de5a3414c559/nautobot-capacity-metrics-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "44ae9c83bdd9065faa55905ee4fa1b4b3671d1044bb96c60762242a758ca6497",
+        "md5": "e4dd8966cca1c4354c1b2f2c994ba49f",
+        "sha256": "f8cb1e70b876cf7c553b58c7336f7e54bfa492ce29f085436919a7d6dd09cddd"
+      },
+      "downloads": -1,
+      "filename": "nautobot_capacity_metrics-2.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e4dd8966cca1c4354c1b2f2c994ba49f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 19978,
+      "upload_time": "2022-04-12T20:01:17",
+      "upload_time_iso_8601": "2022-04-12T20:01:17.804531Z",
+      "url": "https://files.pythonhosted.org/packages/44/ae/9c83bdd9065faa55905ee4fa1b4b3671d1044bb96c60762242a758ca6497/nautobot_capacity_metrics-2.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ca5ceddad2036c02399bef1495e17af1306b8261acdfaf977ba5de5a3414c559",
+        "md5": "498e7edc334ec322aa00c25046364e82",
+        "sha256": "02fbf65a335047252fbc25b10d8bb74f764501479a5528b2b02d09f24913cccd"
+      },
+      "downloads": -1,
+      "filename": "nautobot-capacity-metrics-2.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "498e7edc334ec322aa00c25046364e82",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 17171,
+      "upload_time": "2022-04-12T20:01:19",
+      "upload_time_iso_8601": "2022-04-12T20:01:19.694072Z",
+      "url": "https://files.pythonhosted.org/packages/ca/5c/eddad2036c02399bef1495e17af1306b8261acdfaf977ba5de5a3414c559/nautobot-capacity-metrics-2.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

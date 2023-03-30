@@ -1,0 +1,1513 @@
+{
+  "info": {
+    "author": "SpotlightData",
+    "author_email": "info@spotlightdata.co.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 2",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.4",
+      "Programming Language :: Python :: 3.5",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# nanowire-service-py\n\n<div align=\"center\">\n\n[![Build status](https://github.com/SpotlightData/nanowire-service-py/workflows/build/badge.svg?branch=master&event=push)](https://github.com/SpotlightData/nanowire-service-py/actions?query=workflow%3Abuild)\n[![Python Version](https://img.shields.io/pypi/pyversions/nanowire-service-py.svg)](https://pypi.org/project/nanowire-service-py/)\n[![Dependencies Status](https://img.shields.io/badge/dependencies-up%20to%20date-brightgreen.svg)](https://github.com/SpotlightData/nanowire-service-py/pulls?utf8=%E2%9C%93&q=is%3Apr%20author%3Aapp%2Fdependabot)\n\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n[![Security: bandit](https://img.shields.io/badge/security-bandit-green.svg)](https://github.com/PyCQA/bandit)\n[![Pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/SpotlightData/nanowire-service-py/blob/master/.pre-commit-config.yaml)\n[![Semantic Versions](https://img.shields.io/badge/%F0%9F%9A%80-semantic%20versions-informational.svg)](https://github.com/SpotlightData/nanowire-service-py/releases)\n[![License](https://img.shields.io/github/license/SpotlightData/nanowire-service-py)](https://github.com/SpotlightData/nanowire-service-py/blob/master/LICENSE)\n\nWrapper for interacting with Nanowire platform\n\n</div>\n\n## Usage\n\nInstall the library via `pip install nanowire-service-py`, or by adding it to requirements file and running `pip install -r requirements.txt`\n\nThis library is designed for tight integration with Nanowire platform (created by Spotlight Data).\n\nThe library does not have a hardcode requirement for a specific web server, so a another framework like django or flask could be utilised, however, I'd recommend using [fastapi](https://fastapi.tiangolo.com/) due to it's simplicity and speed\n\n### Environment\n\nThe following environment variables need to be supplied:\n\n```python\nclass Environment(BaseModel):\n    # Dapr spect\n    DAPR_HTTP_PORT: int\n    DAPR_APP_ID: str\n    PUB_SUB: str\n    # Where /pending requests get made\n    SCHEDULER_PUB_SUB: str\n    # Dapr related properties\n    # Whether we should wait for DAPR server to be active before loading\n    NO_WAIT: bool = False\n    # Whether the service should publish to schduler\n    # This shouldn't be done if we have an \"executor\" worker\n    NO_PUBLISH: bool = False\n\n    LOG_LEVEL: Union[str, int] = \"DEBUG\"\n    # Postgres connection details\n    POSTGRES_URL: str\n    POSTGRES_SCHEMA: str\n    # Utilised for healthchecks and identifying the pod\n    SERVICE_ID: str = str(uuid.uuid4())\n```\n\nThis will be verified on service startup.\n\n### Entrypoint\n\nThe primary code logic should be placed in a sub-class of `BaseHandler`. User is expected to implement `validate_args` as well as `handle_body` methods:\n\n```python\nimport os\nfrom dotenv import load_dotenv\nfrom fastapi import FastAPI, Response\n\nfrom pydantic import BaseModel, validator\nfrom typing import Any, List, Optional\n\nimport pandas as pd\n\nfrom nanowire_service_py import BaseHandler, create, TaskBody\nfrom toolbox import ClusterTool\n\nload_dotenv()\n\nallowed_methods = [\"HDBSCAN\", \"DBSCAN\"]\n# pydantic used to verify function body\nclass Arguments(BaseModel):\n    contentUrl: str\n    textCol: str\n    indexCol: str\n    clusterSize: float = 0.2\n    nLabels: int = 10\n    method: str = \"DBSCAN\"\n    customStops: Optional[List[str]] = []\n    maxVocab: int = 5000\n    memSave: bool = False\n    withAnomalous: bool = False\n\n    @validator('method')\n    def method_check(cls, method):\n        if method not in allowed_methods:\n            raise ValueError(\"Method has to be one of: {}, received: {}\".format(\",\".join(allowed_methods), method))\n        return method\n\n# Our custom handler\nclass MyHandler(BaseHandler):\n    def __init__(self, *args):\n        super().__init__(*args)\n        self.cluster_tool = ClusterTool(self.logger)\n\n    def validate_args(self, args: Any, task_id: str) -> Arguments:\n        return Arguments(**args)\n\n    def handle_body(self, args: Arguments, meta: Any, task_id: str):\n        df = pd.read_csv(args.contentUrl, dtype='unicode')\n\n        if args.textCol not in df.columns:\n            raise RuntimeError(\"Could not find text column '{}' in CSV\".format(args.textCol), { \"origin\": \"CSV\"})\n\n        if args.indexCol not in df.columns:\n            raise RuntimeError(\"Could not find index column '{}' in CSV\".format(args.indexCol), { \"origin\": \"CSV\"})\n\n        result = self.cluster_tool.main(df, args)\n        return (result, meta)\n\n# Always handled by the library, pass environment directly\nexecutor = create(os.environ, MyHandler)\n\napp = FastAPI()\n\n# Let's DAPR know which topics should be subscribed to\n@app.get(\"/dapr/subscribe\")\ndef subscribe():\n    return executor.subscriptions\n\n# Primary endpoint, where request will be delivered to\n# TaskBody type here verifies the post body\n@app.post(\"/subscription\")\ndef subscription(body: TaskBody, response: Response):\n    status = executor.handle_request(body.data.id)\n    response.status_code = status\n    # Return empty body so dapr doesn't freak out\n    return {}\n\n# Start heartbeat thread, which will periodically send updates to database\nexecutor.heartbeat()\n```\n\nAssuming the filename is `main.py` the server can then be started via `uvicorn main:app`\n\n### Handling failure\n\nThe primary validation happens within `validate_args` function by `pydantic` models. This is where anything related to input should be checked.\n\nIf at any point you want the current task to fail, raise `RuntimeError` or `Exception`. This will indicate the library, that we should fail and not retry again. For example:\n\n- CSV missing columns or having incorrect text format\n- Not enough data passed\n\nAnything else that raises for a retryable error, should be raised via `RetryError`.\n\n## Versioning\n\nVersioning is based on [semver](https://semver.org/), however, it primarily applies to the `create` function exposed by the package.\nIf you're using any of the internal system parts, make sure to validate before updating the version.\n\n## Contributing\n\nRead [CONTRIBUTING.md](CONTRIBUTING.md)\n\n## 🛡 License\n\n[![License](https://img.shields.io/github/license/SpotlightData/nanowire-service-py)](https://github.com/SpotlightData/nanowire-service-py/blob/master/LICENSE)\n\nThis project is licensed under the terms of the `MIT` license. See [LICENSE](https://github.com/SpotlightData/nanowire-service-py/blob/master/LICENSE) for more details.\n\n## Credits\n\nThis project was generated with [`python-package-template`](https://github.com/TezRomacH/python-package-template).\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/SpotlightData/nanowire-service-py",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "nanowire-service-py",
+    "package_url": "https://pypi.org/project/nanowire-service-py/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/nanowire-service-py/",
+    "project_urls": {
+      "Homepage": "https://github.com/SpotlightData/nanowire-service-py",
+      "Repository": "https://github.com/SpotlightData/nanowire-service-py"
+    },
+    "release_url": "https://pypi.org/project/nanowire-service-py/3.0.2/",
+    "requires_dist": [
+      "pydantic (>=1.8.2,<2.0.0)",
+      "loguru (>=0.5.3,<0.6.0)",
+      "dapr (>=1.2.0,<2.0.0)"
+    ],
+    "requires_python": "",
+    "summary": "Wrapper for interacting with Nanowire platform",
+    "version": "3.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12548684,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c1ee3c6f92438c422854ef24a1f517545eeb58c4062f1588e3a70f17856b21b6",
+          "md5": "07ae0ba48edb9d89d14800ff5a9dff35",
+          "sha256": "1d517e503a26995ce0645b5d1078fe80519f099a5f74cb6b7fcaad25e89b5b0d"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "07ae0ba48edb9d89d14800ff5a9dff35",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 11482,
+        "upload_time": "2021-06-03T14:01:18",
+        "upload_time_iso_8601": "2021-06-03T14:01:18.220413Z",
+        "url": "https://files.pythonhosted.org/packages/c1/ee/3c6f92438c422854ef24a1f517545eeb58c4062f1588e3a70f17856b21b6/nanowire_service_py-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b3a2aec58e86ade70d5cf1aa42606c7b32b63a0f4b028f36bf47d0139b27475d",
+          "md5": "168384aeb31b4e3a4a8c8c4dd48111be",
+          "sha256": "942542474e2cb911ee9b12c3229b28118332d330c00c2af037ad5dada0c01f14"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "168384aeb31b4e3a4a8c8c4dd48111be",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 14665,
+        "upload_time": "2021-06-03T14:01:16",
+        "upload_time_iso_8601": "2021-06-03T14:01:16.798145Z",
+        "url": "https://files.pythonhosted.org/packages/b3/a2/aec58e86ade70d5cf1aa42606c7b32b63a0f4b028f36bf47d0139b27475d/nanowire-service-py-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "321b2a2b4bee55c6a2c033218e660532f5f79d3b8205bf83ddb85d09328fccce",
+          "md5": "cae3e102f76ffc8f5b158eeaa096da9f",
+          "sha256": "0954ff6a6bede981496ee70f1c1cbb37f9093ad6e56cd065c10983dcdb8e9097"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cae3e102f76ffc8f5b158eeaa096da9f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 11454,
+        "upload_time": "2021-06-04T10:46:27",
+        "upload_time_iso_8601": "2021-06-04T10:46:27.908390Z",
+        "url": "https://files.pythonhosted.org/packages/32/1b/2a2b4bee55c6a2c033218e660532f5f79d3b8205bf83ddb85d09328fccce/nanowire_service_py-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef69f7b70ef817d233e25389d7042b5907718aaec29cd1582dc8568c814e4808",
+          "md5": "9cf1a59c36c0f9812629393ae713432a",
+          "sha256": "407a810bf63dbcaef9501693e5c75b3a4dd1ffe2bfdcd587e72de95be4a3ffb4"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9cf1a59c36c0f9812629393ae713432a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 14548,
+        "upload_time": "2021-06-04T10:46:26",
+        "upload_time_iso_8601": "2021-06-04T10:46:26.624033Z",
+        "url": "https://files.pythonhosted.org/packages/ef/69/f7b70ef817d233e25389d7042b5907718aaec29cd1582dc8568c814e4808/nanowire-service-py-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7422d0baa54f66ae020d06926b90f220b3f8c130e62ce2cc66fcd6b19a98103d",
+          "md5": "156314443b08fff0ed68c3fab2c9f7c0",
+          "sha256": "52a0ff02df2a7030770aabdb1818aba894dba24663d65c85aa7f9252db99e1b2"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "156314443b08fff0ed68c3fab2c9f7c0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 11726,
+        "upload_time": "2021-06-04T12:01:38",
+        "upload_time_iso_8601": "2021-06-04T12:01:38.478791Z",
+        "url": "https://files.pythonhosted.org/packages/74/22/d0baa54f66ae020d06926b90f220b3f8c130e62ce2cc66fcd6b19a98103d/nanowire_service_py-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "152916bf78e1fb587441a51c383906143910e88eb4501d50459cbb148937b21c",
+          "md5": "a6d729b1251312df8759b0a12099bea5",
+          "sha256": "f8cb39c1074329b052195fc16e177cb1f8061cbb68f3bb99e0dc701d93a2028a"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a6d729b1251312df8759b0a12099bea5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 14855,
+        "upload_time": "2021-06-04T12:01:36",
+        "upload_time_iso_8601": "2021-06-04T12:01:36.907472Z",
+        "url": "https://files.pythonhosted.org/packages/15/29/16bf78e1fb587441a51c383906143910e88eb4501d50459cbb148937b21c/nanowire-service-py-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be20211cc3b892908eb33b190a8d26528d06306199d7f632190cc59536998c38",
+          "md5": "338b7ac2177352be191a3d9189f9ce49",
+          "sha256": "afdb067d0db5b504ad1a089c9c0a72c9e1320c790b6f03e52905a00357c49adb"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "338b7ac2177352be191a3d9189f9ce49",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 9728,
+        "upload_time": "2021-06-07T12:48:07",
+        "upload_time_iso_8601": "2021-06-07T12:48:07.456702Z",
+        "url": "https://files.pythonhosted.org/packages/be/20/211cc3b892908eb33b190a8d26528d06306199d7f632190cc59536998c38/nanowire_service_py-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7f79ccfea76485a321f3af2a390e88c9e77abf3a885af5a9a8cd86275641f02",
+          "md5": "0afcd0cfd60870122f670e3016a13aba",
+          "sha256": "aa36e227e199d4cef466e2612aeec8e30266f96902fa78f5d07abc7d2c8a8145"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0afcd0cfd60870122f670e3016a13aba",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10206,
+        "upload_time": "2021-06-07T12:48:05",
+        "upload_time_iso_8601": "2021-06-07T12:48:05.987133Z",
+        "url": "https://files.pythonhosted.org/packages/e7/f7/9ccfea76485a321f3af2a390e88c9e77abf3a885af5a9a8cd86275641f02/nanowire-service-py-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16b8156916a211e59d7f01d8d010429625f6dd84d0108e8dca974e4210a29c8f",
+          "md5": "efde3c3c82243296a1a5382c7f157712",
+          "sha256": "542461a9a4ca3a61ad2329ceeae32b20d03ede1d617e4f314fd1cd277b188309"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "efde3c3c82243296a1a5382c7f157712",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 9726,
+        "upload_time": "2021-06-07T14:28:02",
+        "upload_time_iso_8601": "2021-06-07T14:28:02.334810Z",
+        "url": "https://files.pythonhosted.org/packages/16/b8/156916a211e59d7f01d8d010429625f6dd84d0108e8dca974e4210a29c8f/nanowire_service_py-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a2a741d80e6c4129e0a2a504702839986933fbd256729e80063ac5362438c88e",
+          "md5": "495943385603fab6737912cfd8023faf",
+          "sha256": "b5c0b1e493b647e345b6a524cd355bd902d135a4c6390996113b7cbd361d6f1d"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "495943385603fab6737912cfd8023faf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10211,
+        "upload_time": "2021-06-07T14:28:00",
+        "upload_time_iso_8601": "2021-06-07T14:28:00.778938Z",
+        "url": "https://files.pythonhosted.org/packages/a2/a7/41d80e6c4129e0a2a504702839986933fbd256729e80063ac5362438c88e/nanowire-service-py-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f3f36840432cda137da7f8d7532e25995bdd7fcfe7a5cc3a036b3d00555aacb",
+          "md5": "cb90f53c18318cd86de5b6cfe686b509",
+          "sha256": "354f4a191837278c9e050f1ad7eaef18e5c73948c97d01dae10134bf0d814ab0"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cb90f53c18318cd86de5b6cfe686b509",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 9697,
+        "upload_time": "2021-06-07T14:45:50",
+        "upload_time_iso_8601": "2021-06-07T14:45:50.156342Z",
+        "url": "https://files.pythonhosted.org/packages/4f/3f/36840432cda137da7f8d7532e25995bdd7fcfe7a5cc3a036b3d00555aacb/nanowire_service_py-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6017bc4f0bd35a389dbf6a6f22131c0bc0b3bc491212d6c908935c7e05c45fec",
+          "md5": "11a1327a7c95e1373a3a25dcc3a23932",
+          "sha256": "d6a0f1d5c3bdde64add03ff7851a4b3e17248db75a5f57a3e706107a28350aa8"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "11a1327a7c95e1373a3a25dcc3a23932",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10194,
+        "upload_time": "2021-06-07T14:45:48",
+        "upload_time_iso_8601": "2021-06-07T14:45:48.744432Z",
+        "url": "https://files.pythonhosted.org/packages/60/17/bc4f0bd35a389dbf6a6f22131c0bc0b3bc491212d6c908935c7e05c45fec/nanowire-service-py-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32b01e3c708921cc1d879f3d46f272e943ee4447999a8e065da27da11fe1c0b6",
+          "md5": "2f16079b67e9c02953627ab8f111abd2",
+          "sha256": "2e5c456f8cbec387f5d7a939c984c5984f045f434cd1a066392a8a40fe67db0e"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f16079b67e9c02953627ab8f111abd2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10409,
+        "upload_time": "2021-06-08T13:30:18",
+        "upload_time_iso_8601": "2021-06-08T13:30:18.862751Z",
+        "url": "https://files.pythonhosted.org/packages/32/b0/1e3c708921cc1d879f3d46f272e943ee4447999a8e065da27da11fe1c0b6/nanowire_service_py-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a468504b5b9eef057ef779038fa8ad30c83fc39b6c962ce2e84896590e60db60",
+          "md5": "a49bfdae99166c1638f703057807e464",
+          "sha256": "cff2ec2ab06c7fd0e69d392d38e615b895f2f43a1da4a026395cbc07ecbdeb1f"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a49bfdae99166c1638f703057807e464",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10475,
+        "upload_time": "2021-06-08T13:30:15",
+        "upload_time_iso_8601": "2021-06-08T13:30:15.508939Z",
+        "url": "https://files.pythonhosted.org/packages/a4/68/504b5b9eef057ef779038fa8ad30c83fc39b6c962ce2e84896590e60db60/nanowire-service-py-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e55ef60f7ccc1d7ae93fe64d086d2155e342f10c94374fd47279ae60f4274bc",
+          "md5": "b98eca5bccda8a52e3a9c7d3218f1313",
+          "sha256": "d267c1d7b0e2946f15463f7aeb11060cece5044adcbc8c3a22c6bda9fa7f59a9"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b98eca5bccda8a52e3a9c7d3218f1313",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10410,
+        "upload_time": "2021-06-11T11:04:47",
+        "upload_time_iso_8601": "2021-06-11T11:04:47.117703Z",
+        "url": "https://files.pythonhosted.org/packages/1e/55/ef60f7ccc1d7ae93fe64d086d2155e342f10c94374fd47279ae60f4274bc/nanowire_service_py-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7379ba4061a925321dd0dfef19ff6f0f90aaf834fdca98502b054179f67ee96f",
+          "md5": "e0ab372859fce122d1b991ef31627ca8",
+          "sha256": "b690167a01973cc4e7be976733eb5ef9e7bb2e2fee17997e3bb0911e6198d7d7"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e0ab372859fce122d1b991ef31627ca8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10493,
+        "upload_time": "2021-06-11T11:04:45",
+        "upload_time_iso_8601": "2021-06-11T11:04:45.547633Z",
+        "url": "https://files.pythonhosted.org/packages/73/79/ba4061a925321dd0dfef19ff6f0f90aaf834fdca98502b054179f67ee96f/nanowire-service-py-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24170ea0e603ef202bebb238ae85d8035c192a3ec1c25ba7f8ceb84f1c55b829",
+          "md5": "a7a77f3d0d98d23952f8cdcb43232215",
+          "sha256": "2c16748cfab73b8852d948d58e4b33ce30d34b7584ada2b33d54d165994899f8"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a7a77f3d0d98d23952f8cdcb43232215",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10435,
+        "upload_time": "2021-06-16T12:55:50",
+        "upload_time_iso_8601": "2021-06-16T12:55:50.784151Z",
+        "url": "https://files.pythonhosted.org/packages/24/17/0ea0e603ef202bebb238ae85d8035c192a3ec1c25ba7f8ceb84f1c55b829/nanowire_service_py-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f06a31fac917f66df59c0c590bc67ed3adabee8662e17de61a4acc56ef42aeb2",
+          "md5": "003fc7cd84937a549c647e611ad8c2b9",
+          "sha256": "a904416688ed346f537e6d1f30dfbe36cce2dba01c5dc3385cc44a7d50dba689"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "003fc7cd84937a549c647e611ad8c2b9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10512,
+        "upload_time": "2021-06-16T12:55:49",
+        "upload_time_iso_8601": "2021-06-16T12:55:49.669891Z",
+        "url": "https://files.pythonhosted.org/packages/f0/6a/31fac917f66df59c0c590bc67ed3adabee8662e17de61a4acc56ef42aeb2/nanowire-service-py-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e94dad237bc321330fbc7d3163efbcbebbcbfc6cdf7cd1d808eb3ff3b479013",
+          "md5": "2419f212e0e8c943e569749e7eec0e1a",
+          "sha256": "a0dfe0d44a9e12d101ab4c0a008fd1635c09cf67b3b7553318e6d7a567337754"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2419f212e0e8c943e569749e7eec0e1a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10595,
+        "upload_time": "2021-06-24T12:25:49",
+        "upload_time_iso_8601": "2021-06-24T12:25:49.897978Z",
+        "url": "https://files.pythonhosted.org/packages/4e/94/dad237bc321330fbc7d3163efbcbebbcbfc6cdf7cd1d808eb3ff3b479013/nanowire_service_py-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "295822afdeb933e03a5f33155096d042494e5ddb5f9668d62332833e2b61c585",
+          "md5": "49a3e05805a7e6fa1e8e0dcfdbd64cac",
+          "sha256": "58337c5515b38d4adda8991ab1976c426e579ede827b99db1572f65810532134"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "49a3e05805a7e6fa1e8e0dcfdbd64cac",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 10631,
+        "upload_time": "2021-06-24T12:25:48",
+        "upload_time_iso_8601": "2021-06-24T12:25:48.157981Z",
+        "url": "https://files.pythonhosted.org/packages/29/58/22afdeb933e03a5f33155096d042494e5ddb5f9668d62332833e2b61c585/nanowire-service-py-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "524d4f978cf095c58bb025ce10181732e9fd7ea5dd84fb1a4eb0680ef47387a1",
+          "md5": "6f39dccd03ad6591ad79e2de2539a37a",
+          "sha256": "7988be0741cc70906ffce1cc5b6321813986d1a4a493beab48690639ebf9a896"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6f39dccd03ad6591ad79e2de2539a37a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 11992,
+        "upload_time": "2021-06-30T07:49:56",
+        "upload_time_iso_8601": "2021-06-30T07:49:56.366597Z",
+        "url": "https://files.pythonhosted.org/packages/52/4d/4f978cf095c58bb025ce10181732e9fd7ea5dd84fb1a4eb0680ef47387a1/nanowire_service_py-1.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38ce25209669d0d642dcae0ede2c787aedb68d62388398e5fa729828ae014cfc",
+          "md5": "f59be16b285aa4f6b0f00e2253a74ff6",
+          "sha256": "8356c1bc23b5e09df188eeac8e054c64b616546af2afacc9778618ef1b117169"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f59be16b285aa4f6b0f00e2253a74ff6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12135,
+        "upload_time": "2021-06-30T07:49:54",
+        "upload_time_iso_8601": "2021-06-30T07:49:54.525842Z",
+        "url": "https://files.pythonhosted.org/packages/38/ce/25209669d0d642dcae0ede2c787aedb68d62388398e5fa729828ae014cfc/nanowire-service-py-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e088e66cc39ef687a8757c460f71f1592b87a19ea557e6f59ff9e14f761fafb6",
+          "md5": "a505c7d86f84573c1329cac084f88d15",
+          "sha256": "37a9c70fab8afa9a0e50da60ea3dbeb78e190041df7cd4c1e6a4935c46f1436d"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a505c7d86f84573c1329cac084f88d15",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12044,
+        "upload_time": "2021-07-12T13:50:47",
+        "upload_time_iso_8601": "2021-07-12T13:50:47.851520Z",
+        "url": "https://files.pythonhosted.org/packages/e0/88/e66cc39ef687a8757c460f71f1592b87a19ea557e6f59ff9e14f761fafb6/nanowire_service_py-1.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1eaddbcdd0e7e47cb2eb966a740529ebc232070f3206c8d8e5fa68161cb610a6",
+          "md5": "b3cb6d1df365662ae99cc32fdb4006fd",
+          "sha256": "15216d5c5b6419eb082fbcf9eb8aea0b130705205a045dcf0d024bf824ae9396"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b3cb6d1df365662ae99cc32fdb4006fd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12177,
+        "upload_time": "2021-07-12T13:50:46",
+        "upload_time_iso_8601": "2021-07-12T13:50:46.156329Z",
+        "url": "https://files.pythonhosted.org/packages/1e/ad/dbcdd0e7e47cb2eb966a740529ebc232070f3206c8d8e5fa68161cb610a6/nanowire-service-py-1.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93466d9d9df45b077deca1bca18d607b3592e5b991754a0ec068f279439832e7",
+          "md5": "77280609c4f79c86b9d687b580fc0e61",
+          "sha256": "de1ed218a24f2ff0d052a30734ed75b8e37ac9028c2f2ff7c9cee00fcdbe60a9"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "77280609c4f79c86b9d687b580fc0e61",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12573,
+        "upload_time": "2021-07-12T13:54:10",
+        "upload_time_iso_8601": "2021-07-12T13:54:10.015210Z",
+        "url": "https://files.pythonhosted.org/packages/93/46/6d9d9df45b077deca1bca18d607b3592e5b991754a0ec068f279439832e7/nanowire_service_py-1.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "793f4aeebfac19d495e6cba37e716a50912dcf3580b1f89ee052d34d0f242f26",
+          "md5": "b04f8880df119ab7a5baa0d7b95449b8",
+          "sha256": "a9539153b73767747fc18feaf39aaf2269ef9624fcd62ca4b5d57958ecdbabe9"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b04f8880df119ab7a5baa0d7b95449b8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12653,
+        "upload_time": "2021-07-12T13:54:08",
+        "upload_time_iso_8601": "2021-07-12T13:54:08.284042Z",
+        "url": "https://files.pythonhosted.org/packages/79/3f/4aeebfac19d495e6cba37e716a50912dcf3580b1f89ee052d34d0f242f26/nanowire-service-py-1.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a11834d2e2c872c718c5e944bf15e0dde946f658de15f8fe838f0fabc7c777b1",
+          "md5": "9fe67c0079840a52ca400be4bdbfc823",
+          "sha256": "388f956d400101e35b660d3483b964ac3f43fbc78afde51481ebea509ec5dded"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9fe67c0079840a52ca400be4bdbfc823",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12584,
+        "upload_time": "2021-07-13T08:36:18",
+        "upload_time_iso_8601": "2021-07-13T08:36:18.371988Z",
+        "url": "https://files.pythonhosted.org/packages/a1/18/34d2e2c872c718c5e944bf15e0dde946f658de15f8fe838f0fabc7c777b1/nanowire_service_py-1.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c6635caa049bb10bcb2ecd7a7775069269227b8d04f48b8d64f74711b67400a",
+          "md5": "00663b8e6fcd41d681617ca516bbfe2f",
+          "sha256": "4e384e749ba9c293411ab27b676fc336e65e2de4d7f0b714de53c720b096c6f6"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "00663b8e6fcd41d681617ca516bbfe2f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12655,
+        "upload_time": "2021-07-13T08:36:17",
+        "upload_time_iso_8601": "2021-07-13T08:36:17.070865Z",
+        "url": "https://files.pythonhosted.org/packages/0c/66/35caa049bb10bcb2ecd7a7775069269227b8d04f48b8d64f74711b67400a/nanowire-service-py-1.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4d37958df7ae2708069c72c37e820747fff23a3f14f1fddb7342758744ec8b9",
+          "md5": "45298830f7ef2ad101064bf3e54ba62c",
+          "sha256": "defee4c198171097e351d178b03c3ffdfffe648a4df102d37357c850b3e867ce"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "45298830f7ef2ad101064bf3e54ba62c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12653,
+        "upload_time": "2021-07-13T09:51:23",
+        "upload_time_iso_8601": "2021-07-13T09:51:23.217004Z",
+        "url": "https://files.pythonhosted.org/packages/a4/d3/7958df7ae2708069c72c37e820747fff23a3f14f1fddb7342758744ec8b9/nanowire_service_py-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f10560f2307144ed6c41ddcfe859dcda1a40d2734cb819b1eb3dcecc5a87fc8b",
+          "md5": "0f9593cf156412cc9f36669215fd6365",
+          "sha256": "d2fb7054469421148ec280f84e57a6b2085d16faa0fb7ecdf2426fc251b62439"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f9593cf156412cc9f36669215fd6365",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12742,
+        "upload_time": "2021-07-13T09:51:21",
+        "upload_time_iso_8601": "2021-07-13T09:51:21.472292Z",
+        "url": "https://files.pythonhosted.org/packages/f1/05/60f2307144ed6c41ddcfe859dcda1a40d2734cb819b1eb3dcecc5a87fc8b/nanowire-service-py-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24fef2ce0035c45672266ff4f00fbbf0dab276e7bc05c69c3a7987f05ac00f69",
+          "md5": "8cde33537f5ddb03a47b554a5a0dcf73",
+          "sha256": "75bd4cd95c0e7c96d4b4c2c92bb1bf52b4534fce648bda069d563968131b2300"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-1.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8cde33537f5ddb03a47b554a5a0dcf73",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12658,
+        "upload_time": "2021-07-14T12:27:36",
+        "upload_time_iso_8601": "2021-07-14T12:27:36.094674Z",
+        "url": "https://files.pythonhosted.org/packages/24/fe/f2ce0035c45672266ff4f00fbbf0dab276e7bc05c69c3a7987f05ac00f69/nanowire_service_py-1.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "55e08b60357123774e86b5c54dbde3bcf7ccbb5b2223672104dff671d93805f3",
+          "md5": "9e274d9e23cac4c8debcbb6762cd4818",
+          "sha256": "5b0965cf9c6ea997a06db169c23813d7fc191374692a46d9af09b100219ffbe2"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-1.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e274d9e23cac4c8debcbb6762cd4818",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.5,<4.0.0",
+        "size": 12754,
+        "upload_time": "2021-07-14T12:27:34",
+        "upload_time_iso_8601": "2021-07-14T12:27:34.380748Z",
+        "url": "https://files.pythonhosted.org/packages/55/e0/8b60357123774e86b5c54dbde3bcf7ccbb5b2223672104dff671d93805f3/nanowire-service-py-1.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f37d819d4810715a735bc42913b96be05ef9345e70b0ac70907f5c8695f30df6",
+          "md5": "ad9e8b05e3f80d674f63243bbfb863cd",
+          "sha256": "6ab99f8797c217f3f77ad94b3a076457d35c082afb581670fc43b3c2f7b05e0c"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ad9e8b05e3f80d674f63243bbfb863cd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 7905,
+        "upload_time": "2021-09-07T12:40:53",
+        "upload_time_iso_8601": "2021-09-07T12:40:53.641239Z",
+        "url": "https://files.pythonhosted.org/packages/f3/7d/819d4810715a735bc42913b96be05ef9345e70b0ac70907f5c8695f30df6/nanowire_service_py-2.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e031c6fc20eea1a755dd0e7fe118378c604398dbb48fba72f71c969de64f902",
+          "md5": "52640361371711bf375875ac2dcf5dfa",
+          "sha256": "e6c1d0d299c5357365b4c1231e696f36706f213df2965f85f666eb3f484c10d0"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "52640361371711bf375875ac2dcf5dfa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8194,
+        "upload_time": "2021-09-07T12:40:52",
+        "upload_time_iso_8601": "2021-09-07T12:40:52.184584Z",
+        "url": "https://files.pythonhosted.org/packages/1e/03/1c6fc20eea1a755dd0e7fe118378c604398dbb48fba72f71c969de64f902/nanowire-service-py-2.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2f0a6e4a33b94bffe55e38e0aafa06815e7b9a4e4f37b2081be27a782b0a553",
+          "md5": "bea1e0e1a471127c18272657d88269ca",
+          "sha256": "351119eae064f1737c8c82e99706115177e53a704f7048e30e4c40c453400dc4"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bea1e0e1a471127c18272657d88269ca",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 7935,
+        "upload_time": "2021-09-07T13:18:04",
+        "upload_time_iso_8601": "2021-09-07T13:18:04.423735Z",
+        "url": "https://files.pythonhosted.org/packages/e2/f0/a6e4a33b94bffe55e38e0aafa06815e7b9a4e4f37b2081be27a782b0a553/nanowire_service_py-2.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c19e5744778659285bb6b3d32fe1499c105c05293caa38a288afb2c606b4bcec",
+          "md5": "75c8d3f3b4b9e783b31f4172b3d877b8",
+          "sha256": "0ecef016da68c8195aebd499012c0f3e9275cdf052d0eaa2f206416af26f0a8f"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "75c8d3f3b4b9e783b31f4172b3d877b8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8205,
+        "upload_time": "2021-09-07T13:18:02",
+        "upload_time_iso_8601": "2021-09-07T13:18:02.955127Z",
+        "url": "https://files.pythonhosted.org/packages/c1/9e/5744778659285bb6b3d32fe1499c105c05293caa38a288afb2c606b4bcec/nanowire-service-py-2.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff1425b40989977f7738deedccd48233fe2e6d5aa071bcee07909281292b6c8c",
+          "md5": "11d545dcb652b2f0a296733d6dc9d17d",
+          "sha256": "7cafaf77437550237b49d5a50bda55f0995f54cf7e338af6b6b27fa458374744"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "11d545dcb652b2f0a296733d6dc9d17d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 7886,
+        "upload_time": "2021-09-08T08:36:22",
+        "upload_time_iso_8601": "2021-09-08T08:36:22.710354Z",
+        "url": "https://files.pythonhosted.org/packages/ff/14/25b40989977f7738deedccd48233fe2e6d5aa071bcee07909281292b6c8c/nanowire_service_py-2.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "380dc33036a6c046ca8abf68c2300fa4fc026b5d68273d1a1673d6656b449aee",
+          "md5": "bddc56c9426e84b7aea8361d2ac00894",
+          "sha256": "a4371b8c3b3d142cd51de82cc973b89b577792fefca37a8bf82529973a11f207"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bddc56c9426e84b7aea8361d2ac00894",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8169,
+        "upload_time": "2021-09-08T08:36:21",
+        "upload_time_iso_8601": "2021-09-08T08:36:21.395179Z",
+        "url": "https://files.pythonhosted.org/packages/38/0d/c33036a6c046ca8abf68c2300fa4fc026b5d68273d1a1673d6656b449aee/nanowire-service-py-2.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7cec5ebb42da9091b69f98856e56f2a6bc63bf4302ace33482c116d5c75989d1",
+          "md5": "40c2d2df646cbc3ce122fc1a7e028d41",
+          "sha256": "dc21ac2930c9435ad453998a1b3071a53bbbd7c301e1f85b827dc22a7623ad55"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "40c2d2df646cbc3ce122fc1a7e028d41",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8095,
+        "upload_time": "2021-09-08T13:10:58",
+        "upload_time_iso_8601": "2021-09-08T13:10:58.187333Z",
+        "url": "https://files.pythonhosted.org/packages/7c/ec/5ebb42da9091b69f98856e56f2a6bc63bf4302ace33482c116d5c75989d1/nanowire_service_py-2.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2deccfcca29bfce15df6487d33b78ce3da4aea2c6945b26ed7911b8827d46ab7",
+          "md5": "4ddb0338041f8d520995efcc60efc680",
+          "sha256": "91aabc0159d67c5414c31e32b754251ac432da2a2176820e53b6067e0ef66c84"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4ddb0338041f8d520995efcc60efc680",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8318,
+        "upload_time": "2021-09-08T13:10:56",
+        "upload_time_iso_8601": "2021-09-08T13:10:56.727213Z",
+        "url": "https://files.pythonhosted.org/packages/2d/ec/cfcca29bfce15df6487d33b78ce3da4aea2c6945b26ed7911b8827d46ab7/nanowire-service-py-2.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "18bffe3b142d47abc3f77f50cdcd59b9bdf40fbb5007846ba46072547bcd988b",
+          "md5": "aba54aa34402224c9f73465de42e37cb",
+          "sha256": "62f23da46d95783b9603c5ff2683de206b4543fd0c913d4df56d6e7fdee7efd6"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aba54aa34402224c9f73465de42e37cb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8091,
+        "upload_time": "2021-09-08T13:26:13",
+        "upload_time_iso_8601": "2021-09-08T13:26:13.526979Z",
+        "url": "https://files.pythonhosted.org/packages/18/bf/fe3b142d47abc3f77f50cdcd59b9bdf40fbb5007846ba46072547bcd988b/nanowire_service_py-2.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86f7c441042c500b23f781613b63b40a675e968ef34588e5e0676399f33fb120",
+          "md5": "168e734b0758042c7b9aab521ac6d248",
+          "sha256": "05149e10486ea5b1a2182da79510b0f8eeb6329a113b99c4260363757d262da9"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "168e734b0758042c7b9aab521ac6d248",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8319,
+        "upload_time": "2021-09-08T13:26:12",
+        "upload_time_iso_8601": "2021-09-08T13:26:12.210291Z",
+        "url": "https://files.pythonhosted.org/packages/86/f7/c441042c500b23f781613b63b40a675e968ef34588e5e0676399f33fb120/nanowire-service-py-2.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd0a0c6f361a31eeee5469f478434cc600ea59b6cfecc25b2de5e85b74899eda",
+          "md5": "9dfa126d39e6baba0f611bfea2b3e39c",
+          "sha256": "1d9f8fff061c72c5cb3a4b3bdeac824e49089cf6da070cb59f6afe582269b794"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-2.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9dfa126d39e6baba0f611bfea2b3e39c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8072,
+        "upload_time": "2021-09-08T13:29:00",
+        "upload_time_iso_8601": "2021-09-08T13:29:00.293531Z",
+        "url": "https://files.pythonhosted.org/packages/dd/0a/0c6f361a31eeee5469f478434cc600ea59b6cfecc25b2de5e85b74899eda/nanowire_service_py-2.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "70d0c5482ed37d46487cf35635b4dec808f6271b977a08601f1fa81cca69f313",
+          "md5": "7f959b333004a1ed86ba3a4419eb8949",
+          "sha256": "42bbe55f876285f4d31b965e75dfa5f29c329a22fe16526c9995757f40cbf66a"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-2.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7f959b333004a1ed86ba3a4419eb8949",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8294,
+        "upload_time": "2021-09-08T13:28:58",
+        "upload_time_iso_8601": "2021-09-08T13:28:58.417912Z",
+        "url": "https://files.pythonhosted.org/packages/70/d0/c5482ed37d46487cf35635b4dec808f6271b977a08601f1fa81cca69f313/nanowire-service-py-2.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45030f01bc5b01c08d18940e0a0aa91e548775c741b4e615075edbdfd5ad1ecd",
+          "md5": "19c7ff509cb78d7829b0141b4c4ba371",
+          "sha256": "049d168e76849343da9de73ff9eba8eeda0358602f9fa394efd66f7e221cf640"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "19c7ff509cb78d7829b0141b4c4ba371",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9094,
+        "upload_time": "2021-09-09T10:32:48",
+        "upload_time_iso_8601": "2021-09-09T10:32:48.190511Z",
+        "url": "https://files.pythonhosted.org/packages/45/03/0f01bc5b01c08d18940e0a0aa91e548775c741b4e615075edbdfd5ad1ecd/nanowire_service_py-3.0.0a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "768914314e1c108942531d52ed2c059dad135ad8465002966d53fde81aec8801",
+          "md5": "ccbb1857f77b7c10fb23fe41caae563e",
+          "sha256": "03c522c311ef80a0f6f05b804a263f51b44cf603708c54c97154c83b981a210b"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ccbb1857f77b7c10fb23fe41caae563e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 8916,
+        "upload_time": "2021-09-09T10:32:46",
+        "upload_time_iso_8601": "2021-09-09T10:32:46.810079Z",
+        "url": "https://files.pythonhosted.org/packages/76/89/14314e1c108942531d52ed2c059dad135ad8465002966d53fde81aec8801/nanowire-service-py-3.0.0a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eef5a1e334370081ed47ee554fe97e41ea57f5f5a5c8efcca5dc74f528108b47",
+          "md5": "3ea224440b9ba658ca590f8afc1ea218",
+          "sha256": "38a6c174a4bf8f0edbb201b34f59986a2f287b261b541bd72b65db985b17108e"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a10-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ea224440b9ba658ca590f8afc1ea218",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9509,
+        "upload_time": "2021-12-09T11:27:36",
+        "upload_time_iso_8601": "2021-12-09T11:27:36.570169Z",
+        "url": "https://files.pythonhosted.org/packages/ee/f5/a1e334370081ed47ee554fe97e41ea57f5f5a5c8efcca5dc74f528108b47/nanowire_service_py-3.0.0a10-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8e3b6fdde5d0fc703986cb6b1b8521213bdb3761d44c1f0237d380b190fe57c",
+          "md5": "a93d74b81cc1af9b2604aa22d3f908d7",
+          "sha256": "da81d83c0098c110058586ffe37ffd16857bf3befe75208438aad4c7a9f0a153"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a93d74b81cc1af9b2604aa22d3f908d7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10892,
+        "upload_time": "2021-12-09T11:27:35",
+        "upload_time_iso_8601": "2021-12-09T11:27:35.397076Z",
+        "url": "https://files.pythonhosted.org/packages/b8/e3/b6fdde5d0fc703986cb6b1b8521213bdb3761d44c1f0237d380b190fe57c/nanowire-service-py-3.0.0a10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33355cc5ed53e17397ef6b2050a50559cc8b879b5631b5b3333b2d89a7d985da",
+          "md5": "cb6d71767a0720a92f2f71aa3817c51d",
+          "sha256": "ecf44a83b50fc87b52038767019a8e71431f5ab87a1e2509c56b90dd5c170721"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cb6d71767a0720a92f2f71aa3817c51d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9271,
+        "upload_time": "2021-09-09T11:54:31",
+        "upload_time_iso_8601": "2021-09-09T11:54:31.382519Z",
+        "url": "https://files.pythonhosted.org/packages/33/35/5cc5ed53e17397ef6b2050a50559cc8b879b5631b5b3333b2d89a7d985da/nanowire_service_py-3.0.0a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a686db90d07f00895cbba93e3483f656019bde0d54d546e716a5ce86ab8b5c84",
+          "md5": "a1075985ef73d8e48c7ae9449710a1ae",
+          "sha256": "6cef4cfbd64eaa65a10e3dc69e71593e23175242258221f8499dcc82a28b1352"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a1075985ef73d8e48c7ae9449710a1ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 10665,
+        "upload_time": "2021-09-09T11:54:30",
+        "upload_time_iso_8601": "2021-09-09T11:54:30.298750Z",
+        "url": "https://files.pythonhosted.org/packages/a6/86/db90d07f00895cbba93e3483f656019bde0d54d546e716a5ce86ab8b5c84/nanowire-service-py-3.0.0a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56b49fbc1c6313eb0697215d67535c1449443d64b329d8e63f62fe47388a80d2",
+          "md5": "b98b564953aa7e8975bb86dba4e7dccf",
+          "sha256": "1e564f2850a55e875d9a08b9f64671bd70c55ed5ab76d5c5c78ee98ca7fa4afa"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b98b564953aa7e8975bb86dba4e7dccf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9370,
+        "upload_time": "2021-09-09T13:15:30",
+        "upload_time_iso_8601": "2021-09-09T13:15:30.400917Z",
+        "url": "https://files.pythonhosted.org/packages/56/b4/9fbc1c6313eb0697215d67535c1449443d64b329d8e63f62fe47388a80d2/nanowire_service_py-3.0.0a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9cc80282d97c38f4aaf0992f2401c92df1de79b66de8058b7adb8d6a1cbbe192",
+          "md5": "82a2a6fe413285ba8b257387aab0e335",
+          "sha256": "db3197e2ea1816a46d5ae63f97daacdd397a11a0ec272e77b4c63dab9b4bc3c8"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "82a2a6fe413285ba8b257387aab0e335",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 10773,
+        "upload_time": "2021-09-09T13:15:29",
+        "upload_time_iso_8601": "2021-09-09T13:15:29.088486Z",
+        "url": "https://files.pythonhosted.org/packages/9c/c8/0282d97c38f4aaf0992f2401c92df1de79b66de8058b7adb8d6a1cbbe192/nanowire-service-py-3.0.0a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ce3c67c97319ce165e37a3d100516c86f68e99395ca28615ece98a00866fb05",
+          "md5": "e509263026da89eba563af8a3eb591c2",
+          "sha256": "40dd58801ea83f98cecb7ce794683cc7a6c510bfa16d46a1bc6e6d9fe4a8fd0d"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e509263026da89eba563af8a3eb591c2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9382,
+        "upload_time": "2021-09-09T13:30:07",
+        "upload_time_iso_8601": "2021-09-09T13:30:07.298781Z",
+        "url": "https://files.pythonhosted.org/packages/2c/e3/c67c97319ce165e37a3d100516c86f68e99395ca28615ece98a00866fb05/nanowire_service_py-3.0.0a4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b2b57a4c2801f1794ab0d92256f5dce2282236fbb2af444c3d530d422a25e32f",
+          "md5": "28e1dd0b5909ffdd9325947e7c7a42e3",
+          "sha256": "b2916f2ee3b2521e84d0cf267167b084db93b5a7c8a5ce96a27a1e2e5d763999"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28e1dd0b5909ffdd9325947e7c7a42e3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 10816,
+        "upload_time": "2021-09-09T13:30:06",
+        "upload_time_iso_8601": "2021-09-09T13:30:06.000117Z",
+        "url": "https://files.pythonhosted.org/packages/b2/b5/7a4c2801f1794ab0d92256f5dce2282236fbb2af444c3d530d422a25e32f/nanowire-service-py-3.0.0a4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4509c7969fbc2ef8e98eb5976cc56992b8daf7d97ae5428ef729ff40bc992cb0",
+          "md5": "43c96916a87c3c31f4d3c37641fc5e91",
+          "sha256": "7be37aee212dc9074985fdd317e3ee7590d492e656b3af108a6593380035fb1c"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "43c96916a87c3c31f4d3c37641fc5e91",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9410,
+        "upload_time": "2021-09-09T14:58:16",
+        "upload_time_iso_8601": "2021-09-09T14:58:16.990329Z",
+        "url": "https://files.pythonhosted.org/packages/45/09/c7969fbc2ef8e98eb5976cc56992b8daf7d97ae5428ef729ff40bc992cb0/nanowire_service_py-3.0.0a5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "526ee7e15b419fec38f530c3fb3f3f01e5387de94539bdd490b0bb0867b797d2",
+          "md5": "3963b5b9cab963a619da5475a2142ebe",
+          "sha256": "686b0e48be21deb78fc2dbeb8f75d02dc5f86d2f58738a85cf3b6fd00c23b91a"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3963b5b9cab963a619da5475a2142ebe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 10826,
+        "upload_time": "2021-09-09T14:58:15",
+        "upload_time_iso_8601": "2021-09-09T14:58:15.678332Z",
+        "url": "https://files.pythonhosted.org/packages/52/6e/e7e15b419fec38f530c3fb3f3f01e5387de94539bdd490b0bb0867b797d2/nanowire-service-py-3.0.0a5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9fb9621a8dbcd4489deb43421070f9fb0a40e8c664f3877125321efee76f65b2",
+          "md5": "5bc3ef3ed61ec64b3bb24b2f7594bfd1",
+          "sha256": "82957a571a523877dfa84a54c966315e6d26be8b5e926c058792878d4a847a50"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5bc3ef3ed61ec64b3bb24b2f7594bfd1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<3.10",
+        "size": 9460,
+        "upload_time": "2021-09-22T11:22:57",
+        "upload_time_iso_8601": "2021-09-22T11:22:57.466795Z",
+        "url": "https://files.pythonhosted.org/packages/9f/b9/621a8dbcd4489deb43421070f9fb0a40e8c664f3877125321efee76f65b2/nanowire_service_py-3.0.0a7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fc394e0d96982fd664803a5b20fe817d958f67340749b050ab44aaac9cc2a0b",
+          "md5": "5760625777008aff7491c5fda1e27515",
+          "sha256": "28108def468be4b494b18c97451c0997924548f65dbfb06ec67a8f86371d8206"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5760625777008aff7491c5fda1e27515",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<3.10",
+        "size": 10869,
+        "upload_time": "2021-09-22T11:22:56",
+        "upload_time_iso_8601": "2021-09-22T11:22:56.204581Z",
+        "url": "https://files.pythonhosted.org/packages/8f/c3/94e0d96982fd664803a5b20fe817d958f67340749b050ab44aaac9cc2a0b/nanowire-service-py-3.0.0a7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "14641775ee7ea06cce0777ac3f78b0f14ddb3ccdb286294fbabeccac7abbb147",
+          "md5": "4c48a0ea87650fb568a8921c6fb6fce2",
+          "sha256": "c8d654fbf5f9e234097838f5986f285df2aa123d9701244c89334445f1d1bf06"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a8-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4c48a0ea87650fb568a8921c6fb6fce2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9472,
+        "upload_time": "2021-10-07T12:22:48",
+        "upload_time_iso_8601": "2021-10-07T12:22:48.258553Z",
+        "url": "https://files.pythonhosted.org/packages/14/64/1775ee7ea06cce0777ac3f78b0f14ddb3ccdb286294fbabeccac7abbb147/nanowire_service_py-3.0.0a8-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ede9775222980b5e5f36b17c8e0e03eaa528aaf7615621e659771e0f15e4dcf5",
+          "md5": "3a3bec7140ceaa36583e12375f6f266c",
+          "sha256": "8c863274a92ba44d7ab8f4a79366ba862fbf5204896c81c14a935bf01b3c12d5"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3a3bec7140ceaa36583e12375f6f266c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10853,
+        "upload_time": "2021-10-07T12:22:46",
+        "upload_time_iso_8601": "2021-10-07T12:22:46.935824Z",
+        "url": "https://files.pythonhosted.org/packages/ed/e9/775222980b5e5f36b17c8e0e03eaa528aaf7615621e659771e0f15e4dcf5/nanowire-service-py-3.0.0a8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0a9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "613f2bcff3ff5dee4228830f7f2098f5cddec2cff61f53e4deb8c9d6a2b01bc6",
+          "md5": "6df96d9c5312779d955fa1b70c07cf34",
+          "sha256": "54411d31944356e811015c6a377e8015cb3f3e68519c2a86cbf7cf2c5f3026e2"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.0a9-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6df96d9c5312779d955fa1b70c07cf34",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9509,
+        "upload_time": "2021-12-09T11:23:58",
+        "upload_time_iso_8601": "2021-12-09T11:23:58.881225Z",
+        "url": "https://files.pythonhosted.org/packages/61/3f/2bcff3ff5dee4228830f7f2098f5cddec2cff61f53e4deb8c9d6a2b01bc6/nanowire_service_py-3.0.0a9-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88d52083440092f1a17e1c6188104321e6b089e107fb13c1e7c40c4af815eb9d",
+          "md5": "de551d64f210a92f4725f4951750c9ae",
+          "sha256": "8bff5e7435551d9f5e342237733442a7aea2a04243d9d46425e4254324aebcf9"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.0a9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "de551d64f210a92f4725f4951750c9ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10887,
+        "upload_time": "2021-12-09T11:23:57",
+        "upload_time_iso_8601": "2021-12-09T11:23:57.519649Z",
+        "url": "https://files.pythonhosted.org/packages/88/d5/2083440092f1a17e1c6188104321e6b089e107fb13c1e7c40c4af815eb9d/nanowire-service-py-3.0.0a9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff665fdbfc80a4bf6f3c35331d29d5cc2467bb0923a9c0053cab81f330c22b44",
+          "md5": "7c73814b4c4f54d745bc9b45d14e9332",
+          "sha256": "e30a083d3a44c8b38b26188d2b7a86553fa3c6959217e134518a94c6b7bc39d8"
+        },
+        "downloads": -1,
+        "filename": "nanowire_service_py-3.0.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7c73814b4c4f54d745bc9b45d14e9332",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 9634,
+        "upload_time": "2022-01-12T08:25:33",
+        "upload_time_iso_8601": "2022-01-12T08:25:33.122458Z",
+        "url": "https://files.pythonhosted.org/packages/ff/66/5fdbfc80a4bf6f3c35331d29d5cc2467bb0923a9c0053cab81f330c22b44/nanowire_service_py-3.0.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "95617a6a65eecf46a684cb1bdd200bada897de31d03df79f53f4e1a54de79af6",
+          "md5": "30e72f7edcef6cd4a491d5b53b7150ff",
+          "sha256": "e08a8c1ad6895718faf5f43ba9b7f68e5665bf3cb08719a5f046fc1b18310a75"
+        },
+        "downloads": -1,
+        "filename": "nanowire-service-py-3.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30e72f7edcef6cd4a491d5b53b7150ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11020,
+        "upload_time": "2022-01-12T08:25:31",
+        "upload_time_iso_8601": "2022-01-12T08:25:31.891417Z",
+        "url": "https://files.pythonhosted.org/packages/95/61/7a6a65eecf46a684cb1bdd200bada897de31d03df79f53f4e1a54de79af6/nanowire-service-py-3.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ff665fdbfc80a4bf6f3c35331d29d5cc2467bb0923a9c0053cab81f330c22b44",
+        "md5": "7c73814b4c4f54d745bc9b45d14e9332",
+        "sha256": "e30a083d3a44c8b38b26188d2b7a86553fa3c6959217e134518a94c6b7bc39d8"
+      },
+      "downloads": -1,
+      "filename": "nanowire_service_py-3.0.2-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7c73814b4c4f54d745bc9b45d14e9332",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 9634,
+      "upload_time": "2022-01-12T08:25:33",
+      "upload_time_iso_8601": "2022-01-12T08:25:33.122458Z",
+      "url": "https://files.pythonhosted.org/packages/ff/66/5fdbfc80a4bf6f3c35331d29d5cc2467bb0923a9c0053cab81f330c22b44/nanowire_service_py-3.0.2-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "95617a6a65eecf46a684cb1bdd200bada897de31d03df79f53f4e1a54de79af6",
+        "md5": "30e72f7edcef6cd4a491d5b53b7150ff",
+        "sha256": "e08a8c1ad6895718faf5f43ba9b7f68e5665bf3cb08719a5f046fc1b18310a75"
+      },
+      "downloads": -1,
+      "filename": "nanowire-service-py-3.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "30e72f7edcef6cd4a491d5b53b7150ff",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 11020,
+      "upload_time": "2022-01-12T08:25:31",
+      "upload_time_iso_8601": "2022-01-12T08:25:31.891417Z",
+      "url": "https://files.pythonhosted.org/packages/95/61/7a6a65eecf46a684cb1bdd200bada897de31d03df79f53f4e1a54de79af6/nanowire-service-py-3.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

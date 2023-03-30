@@ -1,0 +1,363 @@
+{
+  "info": {
+    "author": "Qosmo",
+    "author_email": "contact@qosmo.jp",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: Other/Proprietary License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Neutone SDK\n\nWe open source this SDK so researchers can wrap their own audio models and run them in a DAW using our [Neutone Plugin](https://neutone.space/). We offer both functionality for loading the models locally in the plugin as well as contributing them to the default list of models that is available to anyone running the plugin. We hope this will both give an opportunity for researchers to easily try their models in a DAW, but also provide creators with a collection of interesting models.\n\n<a name=\"examples\"/>\n\n## Examples and Notebooks\n\n- Full clipper distortion model example can be found [here](examples/example_clipper.py).\n- Example of a random overdrive model based on [micro-tcn](https://github.com/csteinmetz1/micro-tcn) can be found [here](examples/example_overdrive-random.py)\n- Notebooks for different models showing the entire workflow from training to exporting it using Neutone\n    - [DDSP](https://colab.research.google.com/drive/15FuafmtGWEyvTOOQbN1AMIQRhGLy23Pg)\n    - [RAVE](https://colab.research.google.com/drive/1hty5Bd7rJJ70hlI-5720sEY3kylNxBIt)\n\n## v1 Release\n\nThe Neutone SDK is currently on version 1.0.0. Models exported with this version of the SDK will be incompatible with beta versions of the plugin to please make sure you are using the right version. \n\n\nThe restriction for a sampling rate of 48kHz and a buffer size of 2048 is now gone and the SDK contains a wrapper that supports on the fly resampling and queueing to accomodate the requirements of both the models and the DAW thanks to great work by [@christhetree](https://github.com/christhetree).\n\n\nThe following are known shortcomings:\n- Freezing models on save can cause instabilities, we recommend trying to save models both with and without freeze.\n- Displaying metadata information does not currently work with local model loading in the plugin.\n- Lookahead and on the fly STFT transforms will be implemented at the SDK level in the near future but is currently possible with additional code.\n- Windows and M1 acceleration are currently not supported.\n\nLogs are currently dumped to `/Users/<username>/Library/Application Support/Qosmo/Neutone/neutone.log`\n\n## Table of Contents\n- [Downloading the Neutone Plugin](#download)\n- [Installing the SDK](#install)\n- [SDK Description](#description)\n- [SDK Usage](#usage)\n- [Examples](#examples)\n- [Contributing to the SDK](#contributing)\n- [Credits](#credits)\n\n--- \n\n\n<a name=\"download\"/>\n\n## Downloading the Plugin\n\nThe Neutone Plugin is available at [https://neutone.space](https://neutone.space). We currently offer VST3 and AU plugins that can be used to load the models created with this SDK. Please visit the website for more information.\n\n\n## Installing the SDK\n\n<a name=\"install\"/>\n\nYou can install `neutone_sdk` using pip: \n\n```\npip install neutone_sdk\n```\n\n<a name=\"description\"/>\n\n## SDK Description\n\nThe SDK provides functionality for wrapping existing PyTorch models in a way that can make them executable within the VST plugin. At its core the plugin is sending chunks of audio samples at a certain sample rate as an input and expects the same amount of samples at the output. Thus the simplest models also follow this input-output format and an example can be seen in [example_clipper.py](https://github.com/QosmoInc/neutone_sdk/blob/main/examples/example_clipper.py).\n\n<a name=\"usage\"/>\n\n## SDK Usage\n\n### General Usage\n\nWe provide several models in the [examples](https://github.com/QosmoInc/neutone-sdk/blob/main/examples) directory. We will go through one of the simplest models, a distortion model, to illustrate.\n\nAssume we have the following PyTorch model. Parameters will be covered later on, we will focus on the inputs and outputs for now. Assume this model receives a Tensor of shape `(2, buffer_size)` as an input where `buffer_size` is a parameter that can be specified.\n\n```python\nclass ClipperModel(nn.Module):\n    def forward(self, x: Tensor, min_val: float, max_val: float, gain: float) -> Tensor:\n        return torch.clip(x, min=min_val * gain, max=max_val * gain)\n```\n\nTo run this inside the VST the simplest wrapper we can write is by subclassing the WaveformToWaveformBase baseclass.\n```python\nclass ClipperModelWrapper(WaveformToWaveformBase):\n    @torch.jit.export  \n    def is_input_mono(self) -> bool:\n        return False\n    \n    @torch.jit.export\n    def is_output_mono(self) -> bool:\n        return False\n    \n    @torch.jit.export\n    def get_native_sample_rates(self) -> List[int]:\n        return []  # Supports all sample rates\n    \n    @torch.jit.export\n    def get_native_buffer_sizes(self) -> List[int]:\n        return []  # Supports all buffer sizes\n\n    def do_forward_pass(self, x: Tensor, params: Dict[str, Tensor]) -> Tensor:\n        # ... Parameter unwrap logic\n        x = self.model.forward(x, min_val, max_val, gain)\n        return x\n ```\n\nThe method that does most of the work is `do_forward_pass`. In this case it is just a simple passthrough, but we will use it to handle parameters later on.\n\nBy default the VST runs as `stereo-stereo` but when mono is desired for the model we can use the `is_input_mono` and `is_output_mono` to inform the SDK and have the inputs and outputs converted automatically. If `is_input_mono` is toggled an averaged `(1, buffer_size)` shaped Tensor will be passed as an input instead of `(2, buffer_size)`. If `is_output_mono` is toggled, `do_forward_pass` is expected to return a mono Tensor (shape `(1, buffer_size)`) that will then be duplicated across both channels at the output of the VST. This is done within the SDK to avoid unnecessary memory allocations on each pass.\n\n`get_native_sample_rates` and `get_native_buffer_sizes` can be used to specify any preferred sample rates or buffer sizes. In most cases these are expected to only have one element but extra flexibility is provided for more complex models. In case multiple options are provided the SDK will try to find the best one for the current setting of the DAW. Whenever the sample rate or buffer size is different from the one of the DAW a wrapper is automatically triggered that converts to the correct sampling rate or implements a FIFO queue for the requested buffer size or both. This will incur a small performance penalty and add some amount of delay. In case a model is compatible with any sample rate and/or buffer_size these lists can be left empty.\n\nThis means that the tensor `x` in the `do_forward_pass` method is guaranteed to be of shape `(1 if is_input_mono else 2, buffer_size)`  where `buffer_size` will be chosen at runtime from the list provided in the `get_native_buffer_sizes` method.\n\n### Exporting models and loading in the plugin\n\nWe provide a `save_neutone_model` helper function that saves models to disk. By default this will convert models to TorchScript and run them through a series of checks to ensure they can be loaded by the plugin. The resulting `model.nm` file can be loaded within the plugin using the `load your own` button. Read below for how to submit models to the default collection.\n\n### Parameters\n\nFor models that can use conditioning signals we currently provide four configurable knob parameters. Within the `ClipperModelWrapper` defined above we can include the following:\n```python\nclass ClipperModelWrapper(WaveformToWaveformBase):\n    ...\n    \n    def get_neutone_parameters(self) -> List[NeutoneParameter]:\n        return [NeutoneParameter(name=\"min\", description=\"min clip threshold\", default_value=0.5),\n                NeutoneParameter(name=\"max\", description=\"max clip threshold\", default_value=1.0),\n                NeutoneParameter(name=\"gain\", description=\"scale clip threshold\", default_value=1.0)]\n         \n    def do_forward_pass(self, x: Tensor, params: Dict[str, Tensor]) -> Tensor:\n        min_val, max_val, gain = params[\"min\"], params[\"max\"], params[\"gain\"]\n        x = self.model.forward(x, min_val, max_val, gain)\n        return x\n```\n\nDuring the forward pass the `params` variable will be a dictionary like the following:\n```python\n{\n    \"min\": torch.Tensor([0.5] * buffer_size),\n    \"max\": torch.Tensor([1.0] * buffer_size),\n    \"gain\": torch.Tensor([1.0] * buffer_size)\n}\n```\nThe keys of the dictionary are specified in the `get_parameters` function.\n\nThe parameters will always take values between 0 and 1 and the `do_forward_pass` function can be used to do any necessary rescaling before running the internal forward method of the model.\n\nMoreover, the parameters sent by the plugin come in at a sample level granularity. By default, we take the mean of each buffer and return a single float (as a Tensor), but the `aggregate_param` method can be used to override the aggregation method. See the full clipper export file for an example of preserving this granularity.\n\n\n### Submitting models\n\nThe plugin contains a default list of models aimed at creators that want to make use of them during their creative process. We encourage users to submit their models once they are happy with the results they get so they can be used by the community at large. For submission we require some additional metadata that will be used to display information about the model aimed at both creators and other researchers. This will be displayed on both the [Neutone website](https://neutone.space) and inside the plugin.\n\nSkipping the previous clipper model, here is a more realistic example based on a random TCN overdrive model inspired by [micro-tcn](https://github.com/csteinmetz1/micro-tcn).\n\n```python\nclass OverdriveModelWrapper(WaveformToWaveformBase):\n    def get_model_name(self) -> str:\n        return \"conv1d-overdrive.random\"\n\n    def get_model_authors(self) -> List[str]:\n        return [\"Nao Tokui\"]\n\n    def get_model_short_description(self) -> str:\n        return \"Neural distortion/overdrive effect\"\n\n    def get_model_long_description(self) -> str:\n        return \"Neural distortion/overdrive effect through randomly initialized Convolutional Neural Network\"\n\n    def get_technical_description(self) -> str:\n        return \"Random distortion/overdrive effect through randomly initialized Temporal-1D-convolution layers. You'll get different types of distortion by re-initializing the weight or changing the activation function. Based on the idea proposed by Steinmetz et al.\"\n\n    def get_tags(self) -> List[str]:\n        return [\"distortion\", \"overdrive\"]\n\n    def get_model_version(self) -> str:\n        return \"1.0.0\"\n\n    def is_experimental(self) -> bool:\n        return False\n\n    def get_technical_links(self) -> Dict[str, str]:\n        return {\n            \"Paper\": \"https://arxiv.org/abs/2010.04237\",\n            \"Code\": \"https://github.com/csteinmetz1/ronn\"\n        }\n\n    def get_citation(self) -> str:\n        return \"Steinmetz, C. J., & Reiss, J. D. (2020). Randomized overdrive neural networks. arXiv preprint arXiv:2010.04237.\"\n```\n\nCheck out the documentation of the methods inside [core.py](neutone_sdk/core.py), as well as the random overdrive model on the [website](https://neutone.space/models/) and in the plugin to understand where each field will be displayed.\n\nTo submit a model, please [open an issue on the GitHub repository](https://github.com/QosmoInc/neutone_sdk/issues/new?assignees=bogdanteleaga%2C+christhetree&labels=enhancement&template=request-add-model.md&title=%5BMODEL%5D+%3CNAME%3E). We currently need the following:\n- A short description of what the model does and how it can contribute to the community\n- A link to the `model.nm` file outputted by the `save_neutone_model` helper function\n\n<a name=\"contributing\"/>\n\n## Contributing to the SDK\n\nWe welcome any contributions to the SDK. Please add types wherever possible and use the `black` formatter for readability.\n\nThe current roadmap is:\n- Additional testing and benchmarking of models during or after exporting\n- Implement lookahead and on the fly STFT transforms\n\n<a name=\"credits\"/>\n\n## Credits\n\nThe audacitorch project was a major inspiration for the development of the SDK. [Check it out here](\nhttps://github.com/hugofloresgarcia/audacitorch)\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/QosmoInc/neutone_sdk.git",
+    "keywords": "",
+    "license": "LGPL",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "neutone-sdk",
+    "package_url": "https://pypi.org/project/neutone-sdk/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/neutone-sdk/",
+    "project_urls": {
+      "Homepage": "https://github.com/QosmoInc/neutone_sdk.git"
+    },
+    "release_url": "https://pypi.org/project/neutone-sdk/1.1.3/",
+    "requires_dist": [
+      "numpy (>=1.21.6,<2.0.0)",
+      "torch (>=1.11.0,<2.0.0)",
+      "torchaudio (>=0.11.0,<2.0.0)",
+      "soundfile (>=0.12.1)",
+      "jsonschema (>=4.4.0,<5.0.0)",
+      "requests (>=2.27.1,<3.0.0)",
+      "tqdm (>=4.63.1,<5.0.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "SDK for wrapping deep learning models for usage in the Neutone plugin",
+    "version": "1.1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17439567,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e576da019e1ea19eaffc9b263b5be2256d386da7267ac5008f5b54d2cd9d65f7",
+          "md5": "e4ab3f271a5ec49e5c69f848287689e3",
+          "sha256": "4b475be5d04d60fe5ff684fd73927cdbf90f085a549e029b184eb3011d2fb790"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e4ab3f271a5ec49e5c69f848287689e3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 387249,
+        "upload_time": "2022-09-07T08:21:54",
+        "upload_time_iso_8601": "2022-09-07T08:21:54.027742Z",
+        "url": "https://files.pythonhosted.org/packages/e5/76/da019e1ea19eaffc9b263b5be2256d386da7267ac5008f5b54d2cd9d65f7/neutone_sdk-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60bd1c413eba86361536def24e779544aeb5ad06effa33f278ff654a609f6007",
+          "md5": "bf9ca4516923bcfd7692251676d1a7c8",
+          "sha256": "453f752a907727b3610a53665ea63be06efa0404329f525ac0c51717d166f106"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bf9ca4516923bcfd7692251676d1a7c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 389415,
+        "upload_time": "2022-09-07T08:21:57",
+        "upload_time_iso_8601": "2022-09-07T08:21:57.026641Z",
+        "url": "https://files.pythonhosted.org/packages/60/bd/1c413eba86361536def24e779544aeb5ad06effa33f278ff654a609f6007/neutone_sdk-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3826a5a4b6f91dce46a753cc98faec6e7ffce1263e29193497533470da010fa6",
+          "md5": "73fd04e774928658d5e8d85e49e39b57",
+          "sha256": "2e430e59e851f598ee7c40234dcf07272edcc8a5de852731f6e0ac0aa2fa025e"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "73fd04e774928658d5e8d85e49e39b57",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 387174,
+        "upload_time": "2022-09-07T08:30:09",
+        "upload_time_iso_8601": "2022-09-07T08:30:09.201072Z",
+        "url": "https://files.pythonhosted.org/packages/38/26/a5a4b6f91dce46a753cc98faec6e7ffce1263e29193497533470da010fa6/neutone_sdk-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ed550769713efa79e430a0a90f6f44b2ea00214b2f827c2fe1a8d812d0f72d7",
+          "md5": "05ed7e3d7f9d2a91149510bcf39d6adf",
+          "sha256": "1febd66c45a7e063aa849905761e82648dafd5d7b30b4db4df26a47cc85601f4"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05ed7e3d7f9d2a91149510bcf39d6adf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 389287,
+        "upload_time": "2022-09-07T08:30:12",
+        "upload_time_iso_8601": "2022-09-07T08:30:12.612790Z",
+        "url": "https://files.pythonhosted.org/packages/2e/d5/50769713efa79e430a0a90f6f44b2ea00214b2f827c2fe1a8d812d0f72d7/neutone_sdk-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48f64eb9e1f1268df04c9598f30c2851ffdf9f0f596a944d9e6d77c087027a11",
+          "md5": "a814c76796ebf4e8e439138279d0c091",
+          "sha256": "9d08fcee6e4e8d05e16b0bf90e9cac88f01ecf16fc1faa51a6b99ad18ac9c238"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a814c76796ebf4e8e439138279d0c091",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 391033,
+        "upload_time": "2022-11-01T10:22:27",
+        "upload_time_iso_8601": "2022-11-01T10:22:27.976932Z",
+        "url": "https://files.pythonhosted.org/packages/48/f6/4eb9e1f1268df04c9598f30c2851ffdf9f0f596a944d9e6d77c087027a11/neutone_sdk-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5f86ee3253b4a66803011f38b648440a1f1cc3a210a369f99fa37a062b49e79",
+          "md5": "db6454c9416ea5082bddc10abc38fa0e",
+          "sha256": "ba898392c3706cc24b6e5ad73814893e712b7753fa10cb770ea765b27c00bc90"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db6454c9416ea5082bddc10abc38fa0e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 392754,
+        "upload_time": "2022-11-01T10:22:32",
+        "upload_time_iso_8601": "2022-11-01T10:22:32.244496Z",
+        "url": "https://files.pythonhosted.org/packages/c5/f8/6ee3253b4a66803011f38b648440a1f1cc3a210a369f99fa37a062b49e79/neutone_sdk-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec6e606fc090c7b2872fd8b7ef51f90f5c36bf15da1a25ff6654e818323a7ab9",
+          "md5": "18b29a2a50d1a978618304e06bbcc2d2",
+          "sha256": "b36e83b3348ccdcc35919d6d8934563ab717621bb60a2b3b252cbeca1f67d303"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "18b29a2a50d1a978618304e06bbcc2d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 391129,
+        "upload_time": "2022-11-04T08:38:47",
+        "upload_time_iso_8601": "2022-11-04T08:38:47.797903Z",
+        "url": "https://files.pythonhosted.org/packages/ec/6e/606fc090c7b2872fd8b7ef51f90f5c36bf15da1a25ff6654e818323a7ab9/neutone_sdk-1.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "58cac36c409125ce618a9816fa8a66a1404eb7b25797354a2f83da1b897bc441",
+          "md5": "a1fdb8b27a55a7e03d64d29144307cd6",
+          "sha256": "63296ed948c0dba7875a5052470bdae24b445d3765c416d47832c2500fbd0a76"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a1fdb8b27a55a7e03d64d29144307cd6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 392864,
+        "upload_time": "2022-11-04T08:38:49",
+        "upload_time_iso_8601": "2022-11-04T08:38:49.230199Z",
+        "url": "https://files.pythonhosted.org/packages/58/ca/c36c409125ce618a9816fa8a66a1404eb7b25797354a2f83da1b897bc441/neutone_sdk-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c888f15a5d2588922bde8486035dc8a004ad39d877454f36cae6cc3e17045ae",
+          "md5": "9096c3e3dffef3de939814f54e87eeb1",
+          "sha256": "c343603eedbc1acd623bcbe8bb878312dec1ed2fae22c13650b72b2e6fbeebee"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9096c3e3dffef3de939814f54e87eeb1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 391904,
+        "upload_time": "2023-03-02T09:26:51",
+        "upload_time_iso_8601": "2023-03-02T09:26:51.442231Z",
+        "url": "https://files.pythonhosted.org/packages/0c/88/8f15a5d2588922bde8486035dc8a004ad39d877454f36cae6cc3e17045ae/neutone_sdk-1.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b4fc5f1a035bcd718d80328e61bd27e2db636808f1bc9efb6bc801dbf11b0520",
+          "md5": "eef39b2379f9dcb5d90e692899ae9604",
+          "sha256": "cc8df14e5b6d5dc72b2b20fe0d53e02656e9dad8eea4c2545802732c880b74f9"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eef39b2379f9dcb5d90e692899ae9604",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 393571,
+        "upload_time": "2023-03-02T09:26:53",
+        "upload_time_iso_8601": "2023-03-02T09:26:53.043962Z",
+        "url": "https://files.pythonhosted.org/packages/b4/fc/5f1a035bcd718d80328e61bd27e2db636808f1bc9efb6bc801dbf11b0520/neutone_sdk-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75cd861735a4f8129dfbe22b2a02ce6ce315ccce21d3f91ece7b84f34c657857",
+          "md5": "b2bec0e05a220dbf020f9d4846b5267a",
+          "sha256": "049b7e3694efda6ec83d5a6603861967ab6c40e25a53cd822a49121d29cc026f"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b2bec0e05a220dbf020f9d4846b5267a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 377332,
+        "upload_time": "2023-03-25T04:32:06",
+        "upload_time_iso_8601": "2023-03-25T04:32:06.549796Z",
+        "url": "https://files.pythonhosted.org/packages/75/cd/861735a4f8129dfbe22b2a02ce6ce315ccce21d3f91ece7b84f34c657857/neutone_sdk-1.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5109af8b8ff063596260f7a23dcaddd3a4151a4c627b7627cde40a7584a11a7e",
+          "md5": "88ec5fd0c1d34addbf0120fb70fd9c9d",
+          "sha256": "c824791e841ce2bb79b723d363bb63060ef20d2fa05505c8e71ad20e434581d4"
+        },
+        "downloads": -1,
+        "filename": "neutone_sdk-1.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "88ec5fd0c1d34addbf0120fb70fd9c9d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 378842,
+        "upload_time": "2023-03-25T04:32:08",
+        "upload_time_iso_8601": "2023-03-25T04:32:08.830681Z",
+        "url": "https://files.pythonhosted.org/packages/51/09/af8b8ff063596260f7a23dcaddd3a4151a4c627b7627cde40a7584a11a7e/neutone_sdk-1.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "75cd861735a4f8129dfbe22b2a02ce6ce315ccce21d3f91ece7b84f34c657857",
+        "md5": "b2bec0e05a220dbf020f9d4846b5267a",
+        "sha256": "049b7e3694efda6ec83d5a6603861967ab6c40e25a53cd822a49121d29cc026f"
+      },
+      "downloads": -1,
+      "filename": "neutone_sdk-1.1.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b2bec0e05a220dbf020f9d4846b5267a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 377332,
+      "upload_time": "2023-03-25T04:32:06",
+      "upload_time_iso_8601": "2023-03-25T04:32:06.549796Z",
+      "url": "https://files.pythonhosted.org/packages/75/cd/861735a4f8129dfbe22b2a02ce6ce315ccce21d3f91ece7b84f34c657857/neutone_sdk-1.1.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5109af8b8ff063596260f7a23dcaddd3a4151a4c627b7627cde40a7584a11a7e",
+        "md5": "88ec5fd0c1d34addbf0120fb70fd9c9d",
+        "sha256": "c824791e841ce2bb79b723d363bb63060ef20d2fa05505c8e71ad20e434581d4"
+      },
+      "downloads": -1,
+      "filename": "neutone_sdk-1.1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "88ec5fd0c1d34addbf0120fb70fd9c9d",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 378842,
+      "upload_time": "2023-03-25T04:32:08",
+      "upload_time_iso_8601": "2023-03-25T04:32:08.830681Z",
+      "url": "https://files.pythonhosted.org/packages/51/09/af8b8ff063596260f7a23dcaddd3a4151a4c627b7627cde40a7584a11a7e/neutone_sdk-1.1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

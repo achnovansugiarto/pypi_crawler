@@ -1,0 +1,379 @@
+{
+  "info": {
+    "author": "Information Fusion Lab",
+    "author_email": "rzabounidis@cs.umass.edu",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# NuX - Normalizing Flows using JAX\n\n## What is NuX?\nNuX is a library for building [normalizing flows](https://arxiv.org/pdf/1912.02762.pdf) using [JAX](https://github.com/google/jax).\n\n## What are normalizing flows?\nNormalizing flows learn a parametric model over an unknown probability density function using data.  We assume that data points are sampled i.i.d. from an unknown distribution p(x).  Normalizing flows learn a parametric approximation of the true data distribution, q(x), using maximum likelihood learning.  The resulting q(x) can be efficiently sampled from and evaluated exactly.\n\n## Why use NuX?\nNuX has many normalizing flow layers implemented with an easy to use interface.\n\n```python\nimport nux.flows as nux\nimport jax\nfrom jax import random\nimport jax.numpy as jnp\nkey = random.PRNGKey(0)\n\n# Build a dummy dataset\nx_train, x_test = jnp.ones((2, 100, 4))\n\n# Build a simple normalizing flow\ninit_fun = nux.sequential(nux.Coupling(),\n                          nux.ActNorm(),\n                          nux.UnitGaussianPrior())\n\n# Perform data-dependent initialization\n_, flow = init_fun(key, {'x': x_train}, batched=True)\n\n# Run data through the flow\ninputs = {'x': x_test}\noutputs, _ = flow.apply(flow.params, flow.state, inputs)\nz, log_likelihood = outputs['x'], outputs['log_pz'] + outputs['log_det']\n\n# Check the reconstructions\nreconst, _ = flow.apply(flow.params, flow.state, {'x': z}, reverse=True)\n\nassert jnp.allclose(x_test, reconst['x'])\n```\n\n## What's implemented?\nCheck out the [bijective](https://github.com/Information-Fusion-Lab-Umass/NuX/blob/master/nux/flows/bijective/README.md), [injective](https://github.com/Information-Fusion-Lab-Umass/NuX/blob/master/nux/flows/injective/README.md) and [surjective](https://github.com/Information-Fusion-Lab-Umass/NuX/blob/master/nux/flows/surjective/README.md) transformations that are implemented.  Any contributions are welcome!\n\n## How does it work?\nThe modularity of normalizing flows allows us to construct complex flows using code that is made simple using JAX.  \n\n### Create complex flows\nFlow layers can be imported from nux.flows and chained together sequentially using ```nux.flows.sequential```.  For more complex flows, we can split the flow using the [probability chain rule](https://en.wikipedia.org/wiki/Chain_rule_(probability)) in ```nux.flows.ChainRule``` and then run multiple flows in parallel using ```nux.flows.parallel```.\n\nUsing these basic transformations, we can easily create complex flows.  For example, a [multiscale](https://arxiv.org/pdf/1605.08803.pdf) [GLOW](https://arxiv.org/pdf/1807.03039.pdf) normalizing flow can be implemented easily:\n\n```python\nimport nux.flows as nux\n\ndef multi_scale(flow, existing_flow):\n    # This is implemented in nux.flows.compose\n    return nux.sequential(flow,\n                          nux.Squeeze(),\n                          nux.ChainRule(2, factor=True),\n                          nux.factored(existing_flow, nux.Identity()),\n                          nux.ChainRule(2, factor=False),\n                          nux.UnSqueeze())\n\ndef GLOWBlock():\n    return nux.sequential(nux.ActNorm(),\n                          nux.OnebyOneConv(),\n                          nux.Coupling(n_channels=512))\n\ndef GLOW(num_blocks=4):\n    layers = [GLOWBlock() for _ in range(num_blocks)]\n    return nux.sequential(*layers)\n\ndef MultiscaleGLOW(quantize_bits=3):\n    flow = nux.Identity()\n    flow = multi_scale(GLOW(), flow)\n    flow = multi_scale(GLOW(), flow)\n    flow = multi_scale(GLOW(), flow)\n    flow = multi_scale(GLOW(), flow)\n\n    flow = nux.sequential(nux.UniformDequantization(scale=2**quantize_bits),\n                          nux.Logit(),\n                          nux.Squeeze(), # So that the channel is divisible by 2\n                          flow,\n                          nux.Flatten(),\n                          nux.AffineGaussianPriorDiagCov(out_dim=128)) # Use a low dimensional prior for best results!\n\n    flow_init_fun = flow # The result of creating layers is an initializer\n    return flow_init_fun\n```\n\n### Initialize your flow with data\nNuX initializes flows using data to infer the input and output shapes at each flow layer and to help initialize layers like [Actnorm](https://arxiv.org/pdf/1807.03039.pdf).  NuX uses dictionaries as the primary data-structure to pass data between flow layers.  \n\n```python\nimport jax\nimport jax.numpy as jnp\n\nflow_init_fun = MultiscaleGLOW()\nkey = jax.random.PRNGKey(0)\ninputs = {'x': jnp.zeros(64, 32, 32, 3)} # Create a dummy dataset\noutputs, flow = flow_init_fun(key, inputs, batched=True) # Must specify if the input data is batched or not\n```\n\n#### Inputs/Outputs\nEach flow application expects an input dictionary.  The key 'x' should correspond to the data that is passed between flow layers.  Furthermore all elements of the input dictionary are passed to each flow layer.  For example, in classification we can pass labels to any layer using:\n```python\ninputs = {'x': data, 'y': labels}\n```\n\nEvery flow layer returns a dictionary of outputs that contains the transformed data in key 'x' and a log likelihood contribution term.  For standard transformations, the log likelihood contribution term is under 'log_det' and 'log_pz' for priors.  Like the inputs, flow layers can also output other key value pairs.\n\n#### Flow data structure\nThe second value returned by an initializer call is the [flow data structure](https://github.com/Information-Fusion-Lab-Umass/NuX/blob/master/nux/flows/base.py#L10).  This data structure contains the name of a layer and dictionaries of the input/output shapes/dims, parameters, state and apply function.  The shapes/dims aid auto-batching while the parameters and state parametrize the flow.  The difference between parameters and state is that parameters is intended to contain the parameters that will be trained with gradient descent while the state values do not (like the running statistics in batch normalization).  ```jax.tree_util.tree_map``` and ```jax.tree_util.tree_multimap``` are your friend when working with dictionaries!\n\nThe apply function is called with the parameters, state, inputs, keyword arguments and a flag that specifies which direction to run the flow:\n```python\n# Run the flow forwards (x -> z)\noutputs, updated_state = flow.apply(flow.params, flow.state, inputs, key=key, reverse=False)\nlog_px = outputs['log_pz'] + outputs['log_det']\n\n# Run the flow forwards in reverse (z -> x)\nreconstr_inputs, _ = flow.apply(flow.params, flow.state, outputs, key=key, reverse=True)\n```\n\n### Use [Haiku](https://github.com/deepmind/dm-haiku) to create deep flow layers\nFlow layers, like ```nux.flows.Coupling```, can use a neural network to introduce complex non-linearities.  These neural networks must constructed using [Haiku](https://github.com/deepmind/dm-haiku).  There are default networks that flow layers default to, but any Haiku network can be used.  For example, we can construct a transformation for image coupling layers as follows:\n```python\nclass SimpleConv(hk.Module):\n\n    def __init__(self, out_shape, n_hidden_channels, name=None):\n        super().__init__(name=name)\n        _, _, out_channels = out_shape\n        self.out_channels = out_channels\n        self.n_hidden_channels = n_hidden_channels\n        self.last_channels = 2*out_channels\n\n    def __call__(self, x, **kwargs):\n        H, W, C = x.shape # NuX ensures that the input will be unbatched!\n\n        x = hk.Conv2D(output_channels=self.n_hidden_channels,\n                      kernel_shape=(3, 3),\n                      stride=(1, 1))(x[None])[0]\n        x = jax.nn.relu(x)\n        x = hk.Conv2D(output_channels=self.n_hidden_channels,\n                      kernel_shape=(1, 1),\n                      stride=(1, 1))(x[None])[0]\n        x = jax.nn.relu(x)\n        x = hk.Conv2D(output_channels=self.last_channels,\n                      kernel_shape=(3, 3),\n                      stride=(1, 1),\n                      w_init=hk.initializers.Constant(0),\n                      b_init=hk.initializers.Constant(0))(x[None])[0]\n\n        mu, alpha = jnp.split(x, 2, axis=-1)\n        alpha = jnp.tanh(alpha)\n        return mu, alpha\n```\nNuX handles batching internally, so every flow and network is guaranteed to be passed an unbatched input.\n\n### Using JAX\nNuX is built using JAX so all of its features can be used on a flow.\n\n## Creating custom flow layers\nCustom flows are easy to create in NuX. NuX can internally handle batch dimensions, so custom layers can be implemented assuming the input is unbatched:\n```python\nimport jax.numpy as jnp\nimport jax.nn.initializers as jaxinit\nimport nux.flows.base as base\n\n@base.auto_batch # Ensure that apply_fun receives unbatched inputs.\ndef OnebyOneConvDense(W_init=jaxinit.glorot_normal(), name='1x1conv_dense'):\n\n    def apply_fun(params, state, inputs, reverse=False, **kwargs):\n        x = inputs['x']                  # Unpack the inputs\n        W = params['W']                  # Unpack the parameters\n        height, width, channel = x.shape # auto_batch ensures x is unbatched!\n\n        # Compute the transformation\n        if(reverse == False):\n            z = jnp.einsum('ij,hwj->hwi', W, x)\n        else:\n            W_inv = jnp.linalg.inv(W)\n            z = jnp.einsum('ij,hwj->hwi', W_inv, x)\n\n        # Compute the log Jacobian determinant\n        log_det = jnp.linalg.slogdet(W)[1]\n        log_det *= height*width\n\n        # Return the outputs and update the state if necessary.\n        outputs = {'x': z, 'log_det': log_det}\n        updated_state = state\n        return outputs, updated_state\n\n    def create_params_and_state(key, input_shapes):\n        # The data_dependent=False flag below ensures that input_shapes is unbatched.\n        height, width, channel = input_shapes['x']\n\n        # Initialize the parameters\n        W = W_init(key, (channel, channel))\n\n        params, state = {'W': W}, {}\n        return params, state\n\n    return base.initialize(name, apply_fun, create_params_and_state, data_dependent=False) # Helper to put everything together.\n```\nUnder the hood, ```base.initialize``` extracts the shapes from the input to the initializer.  These shapes are passed to ```create_params_and_state``` to generate the parameters and state.  The inputs, parameters and state are then passed to ```apply_fun``` to compute the outputs.  Finally, the shapes/dimensions of the outputs are retrieved and stored.\n\nAt runtime, ```base.auto_batch``` has access to the unbatched input dimensions for each flow.  With this information, it recursively applies ```jax.vmap``` to correctly handle nested batching.\n\nThe ```data_dependent``` flag can be set to in order to pass the batched inputs to ```create_params_and_state```.  For ```Actnorm```, this looks like:\n```python\n\n@base.auto_batch\ndef ActNorm(log_s_init=jaxinit.zeros, b_init=jaxinit.zeros, name='act_norm'):\n    multiply_by = None # We can store initialize time constants in this outer scope.\n\n    def apply_fun(params, state, inputs, reverse=False, **kwargs):\n        if(reverse == False):\n            z = (inputs['x'] - params['b'])*jnp.exp(-params['log_s'])\n        else:\n            z = jnp.exp(params['log_s'])*inputs['x'] + params['b']\n        log_det = -params['log_s'].sum()*multiply_by\n        outputs = {'x': z, 'log_det': log_det}\n        return outputs, state\n\n    def create_params_and_state(key, inputs, batch_depth):\n        # The shape of x is the unbatched shape of x prepended with batch_depth dimensions.\n        x = inputs['x'] \n\n        # Need to keep track of the dimensionality of all but the last axis in case we pass in an image.\n        nonlocal multiply_by\n        multiply_by = jnp.prod([s for i, s in enumerate(x.shape) if i >= batch_depth and i < len(x.shape) - 1])\n\n        # Create the parameters using the batch of data\n        axes = tuple(jnp.arange(len(x.shape) - 1))\n        params = {'b'    : jnp.mean(x, axis=axes),\n                  'log_s': jnp.log(jnp.std(x, axis=axes) + 1e-5)}\n        state = {}\n        return params, state\n\n    return base.initialize(name, apply_fun, create_params_and_state, data_dependent=True)\n```\n\n### Testing a custom flow\n```nux.tests.nf_test.flow_test``` is a simple function to test the correctness of a flow.  It checks unbatched/batched/doubly-batched reconstructions by running a flow forwards then in reverse and checks the log Jacobian determinant against the brute force solution computed using ```jax.jacobian```.\n```python\ninit_fun = Flow()\nunbatched_inputs = {'x': data}\nflow_test(init_fun, unbatched_inputs, key)\n```\n\n## Installation\nFor the moment, NuX only works with python 3.7.  The steps to install are:\n\n     pip install nux\n     pip install git+https://github.com/deepmind/dm-haiku\n\nIf you want GPU support for JAX, follow the intructions here https://github.com/google/jax#installation\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Information-Fusion-Lab-Umass/NuX",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "nux",
+    "package_url": "https://pypi.org/project/nux/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/nux/",
+    "project_urls": {
+      "Homepage": "https://github.com/Information-Fusion-Lab-Umass/NuX"
+    },
+    "release_url": "https://pypi.org/project/nux/1.0.3/",
+    "requires_dist": [
+      "numpy (>=1.12)",
+      "jax",
+      "jaxlib"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Normalizing Flows using Jax",
+    "version": "1.0.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8232865,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e86be66e873578fbd73fdd930dc89f3d41dbd304f0a5cf9a78a030245485c851",
+          "md5": "eb9714db895b6e2761b79cb843371b7f",
+          "sha256": "f795d75ac5fab81ce9538243539f71f3652e75045e68b581fca6529e2ca764d9"
+        },
+        "downloads": -1,
+        "filename": "nux-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eb9714db895b6e2761b79cb843371b7f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 32726,
+        "upload_time": "2020-04-26T02:38:11",
+        "upload_time_iso_8601": "2020-04-26T02:38:11.949580Z",
+        "url": "https://files.pythonhosted.org/packages/e8/6b/e66e873578fbd73fdd930dc89f3d41dbd304f0a5cf9a78a030245485c851/nux-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6191b2a6b4021d0a80598c040ad2d1228d6476964306789f0abf3736700ca6e5",
+          "md5": "e7678c021b43b4f9ac0980096e2849b5",
+          "sha256": "1aae24b87cefd60fe75c1a3db5b6337271fd6a5e9037ff5e10fa9114731828b6"
+        },
+        "downloads": -1,
+        "filename": "nux-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e7678c021b43b4f9ac0980096e2849b5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 32728,
+        "upload_time": "2020-04-26T02:39:47",
+        "upload_time_iso_8601": "2020-04-26T02:39:47.893570Z",
+        "url": "https://files.pythonhosted.org/packages/61/91/b2a6b4021d0a80598c040ad2d1228d6476964306789f0abf3736700ca6e5/nux-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6df87181563d2f242c5eae8c8bef457058ba9b1f74ab45064db8c5f9ca42bed9",
+          "md5": "d4211f9f7bc74e3ee1b46b32d7fc261b",
+          "sha256": "ce98b62fd8b9e5ada6993afcdcabf6f79c76195fcf5bb4dfc25f271b6069dc62"
+        },
+        "downloads": -1,
+        "filename": "nux-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d4211f9f7bc74e3ee1b46b32d7fc261b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30173,
+        "upload_time": "2020-04-26T02:39:49",
+        "upload_time_iso_8601": "2020-04-26T02:39:49.034137Z",
+        "url": "https://files.pythonhosted.org/packages/6d/f8/7181563d2f242c5eae8c8bef457058ba9b1f74ab45064db8c5f9ca42bed9/nux-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f197a214d73e9bffc9a66b48f6e5e6c66c468fc1ae48760c4c38409a65b59b5",
+          "md5": "7432452a4f9bd4e4c375f925a50a2b58",
+          "sha256": "09eb0b4f8f5f3f940b6e5690bfa2adec86afa47864f05eb797efe3c2c3cc6bea"
+        },
+        "downloads": -1,
+        "filename": "nux-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7432452a4f9bd4e4c375f925a50a2b58",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 59269,
+        "upload_time": "2020-09-21T06:07:28",
+        "upload_time_iso_8601": "2020-09-21T06:07:28.359010Z",
+        "url": "https://files.pythonhosted.org/packages/2f/19/7a214d73e9bffc9a66b48f6e5e6c66c468fc1ae48760c4c38409a65b59b5/nux-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c61c786ecdff66c148bc64edb56035022af3fd1720ecb4870c3f4bf177cd2f3b",
+          "md5": "01b897cc4992c081912cd5b5b6da5796",
+          "sha256": "22d546bf20ca740bd0b25b8c6c00477be200444a155d741bbeefe1ab1cf1c03a"
+        },
+        "downloads": -1,
+        "filename": "nux-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "01b897cc4992c081912cd5b5b6da5796",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 31372,
+        "upload_time": "2020-09-21T06:07:30",
+        "upload_time_iso_8601": "2020-09-21T06:07:30.508304Z",
+        "url": "https://files.pythonhosted.org/packages/c6/1c/786ecdff66c148bc64edb56035022af3fd1720ecb4870c3f4bf177cd2f3b/nux-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03d48b43c1d6c19648f967506ff6817fcc8486a5358f8d93130efaa4b2c3bc2e",
+          "md5": "ab511840374916c7ef8b9f5e75d4d7b2",
+          "sha256": "659bfad646d2edb5427f4fe17c651d2525b47fe26e8170f7a86275cfc364fd8a"
+        },
+        "downloads": -1,
+        "filename": "nux-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ab511840374916c7ef8b9f5e75d4d7b2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 37295,
+        "upload_time": "2020-07-08T23:15:59",
+        "upload_time_iso_8601": "2020-07-08T23:15:59.862789Z",
+        "url": "https://files.pythonhosted.org/packages/03/d4/8b43c1d6c19648f967506ff6817fcc8486a5358f8d93130efaa4b2c3bc2e/nux-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "564ad79a4c9f0e88ec4a3c31f19a05207306005185ff2050beee177586edc894",
+          "md5": "1a60e2e0f25cc394613f3423db70ba3a",
+          "sha256": "554e2eaa9231646f2205b46c434438cf043233c96c5190ab00c31187bd4247dd"
+        },
+        "downloads": -1,
+        "filename": "nux-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a60e2e0f25cc394613f3423db70ba3a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25468,
+        "upload_time": "2020-07-08T23:16:00",
+        "upload_time_iso_8601": "2020-07-08T23:16:00.922898Z",
+        "url": "https://files.pythonhosted.org/packages/56/4a/d79a4c9f0e88ec4a3c31f19a05207306005185ff2050beee177586edc894/nux-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f06f252ee067c60adb33bdcadd358b1aef35648495bce9a1e326bec65acee8a",
+          "md5": "4afe8ce942e7f87748937fd9194f25d3",
+          "sha256": "643c79c8f5b0858222e2d24faff736824328c4ad2f6b8bbf286d9c4a0626a38a"
+        },
+        "downloads": -1,
+        "filename": "nux-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4afe8ce942e7f87748937fd9194f25d3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 41227,
+        "upload_time": "2020-07-10T00:12:23",
+        "upload_time_iso_8601": "2020-07-10T00:12:23.388616Z",
+        "url": "https://files.pythonhosted.org/packages/8f/06/f252ee067c60adb33bdcadd358b1aef35648495bce9a1e326bec65acee8a/nux-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea90e81781fee4f910ea1f3887dd4a00dda28255e9554144e75e75c581791867",
+          "md5": "923f6abba2b999128f0cec24f9131cd2",
+          "sha256": "0a023a02a193179aa2c40280068c93732f94c80733a551cd62a082d0c3844c65"
+        },
+        "downloads": -1,
+        "filename": "nux-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "923f6abba2b999128f0cec24f9131cd2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28769,
+        "upload_time": "2020-07-10T00:12:24",
+        "upload_time_iso_8601": "2020-07-10T00:12:24.437069Z",
+        "url": "https://files.pythonhosted.org/packages/ea/90/e81781fee4f910ea1f3887dd4a00dda28255e9554144e75e75c581791867/nux-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f92bb5498829b352d8b2aea41c33448b65636c8ce81b3a98d31d085f033beffb",
+          "md5": "167a06a5c605d696422c9b83aee35abc",
+          "sha256": "12b9ad98baf7897ce84a04b4ea244695e8834a143ee0b3229bcdabcad07680fc"
+        },
+        "downloads": -1,
+        "filename": "nux-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "167a06a5c605d696422c9b83aee35abc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 41333,
+        "upload_time": "2020-07-10T03:51:35",
+        "upload_time_iso_8601": "2020-07-10T03:51:35.777679Z",
+        "url": "https://files.pythonhosted.org/packages/f9/2b/b5498829b352d8b2aea41c33448b65636c8ce81b3a98d31d085f033beffb/nux-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6279745b051105f5177e8c0c5d193e5dae14cfb61e25294c11eff302749cf755",
+          "md5": "253d87ecf7ab743e96ae77085ab124e2",
+          "sha256": "da3f3ad57fce50fa7cd4068015d7ce38135eb6f480b027e448acab123772c395"
+        },
+        "downloads": -1,
+        "filename": "nux-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "253d87ecf7ab743e96ae77085ab124e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28808,
+        "upload_time": "2020-07-10T03:51:37",
+        "upload_time_iso_8601": "2020-07-10T03:51:37.177395Z",
+        "url": "https://files.pythonhosted.org/packages/62/79/745b051105f5177e8c0c5d193e5dae14cfb61e25294c11eff302749cf755/nux-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "82d12ec276ec239df1d35d985453598772147d96a058f3b848e87cbe31b2a278",
+          "md5": "cbd68b06e3d75c26eefd4ac48422155e",
+          "sha256": "7ecc4827ddf5c972dfdc9da1ba2dbcce39cb0fa68a5039bf40eb74d973c610b0"
+        },
+        "downloads": -1,
+        "filename": "nux-1.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cbd68b06e3d75c26eefd4ac48422155e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 44387,
+        "upload_time": "2020-07-16T22:24:16",
+        "upload_time_iso_8601": "2020-07-16T22:24:16.289340Z",
+        "url": "https://files.pythonhosted.org/packages/82/d1/2ec276ec239df1d35d985453598772147d96a058f3b848e87cbe31b2a278/nux-1.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df6e5d0157d2bb59f019a853a45ac999ceda78b6d97ebf8363bf2581c8b6f727",
+          "md5": "1e9c42b3b9a24ba3338a0eac58cb2ee5",
+          "sha256": "e9807ab03301fb702e50271196e9635718dfb7b8279fb1b16684b7600bd61565"
+        },
+        "downloads": -1,
+        "filename": "nux-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1e9c42b3b9a24ba3338a0eac58cb2ee5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35528,
+        "upload_time": "2020-07-16T22:24:18",
+        "upload_time_iso_8601": "2020-07-16T22:24:18.894940Z",
+        "url": "https://files.pythonhosted.org/packages/df/6e/5d0157d2bb59f019a853a45ac999ceda78b6d97ebf8363bf2581c8b6f727/nux-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "82d12ec276ec239df1d35d985453598772147d96a058f3b848e87cbe31b2a278",
+        "md5": "cbd68b06e3d75c26eefd4ac48422155e",
+        "sha256": "7ecc4827ddf5c972dfdc9da1ba2dbcce39cb0fa68a5039bf40eb74d973c610b0"
+      },
+      "downloads": -1,
+      "filename": "nux-1.0.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "cbd68b06e3d75c26eefd4ac48422155e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 44387,
+      "upload_time": "2020-07-16T22:24:16",
+      "upload_time_iso_8601": "2020-07-16T22:24:16.289340Z",
+      "url": "https://files.pythonhosted.org/packages/82/d1/2ec276ec239df1d35d985453598772147d96a058f3b848e87cbe31b2a278/nux-1.0.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "df6e5d0157d2bb59f019a853a45ac999ceda78b6d97ebf8363bf2581c8b6f727",
+        "md5": "1e9c42b3b9a24ba3338a0eac58cb2ee5",
+        "sha256": "e9807ab03301fb702e50271196e9635718dfb7b8279fb1b16684b7600bd61565"
+      },
+      "downloads": -1,
+      "filename": "nux-1.0.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1e9c42b3b9a24ba3338a0eac58cb2ee5",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 35528,
+      "upload_time": "2020-07-16T22:24:18",
+      "upload_time_iso_8601": "2020-07-16T22:24:18.894940Z",
+      "url": "https://files.pythonhosted.org/packages/df/6e/5d0157d2bb59f019a853a45ac999ceda78b6d97ebf8363bf2581c8b6f727/nux-1.0.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
