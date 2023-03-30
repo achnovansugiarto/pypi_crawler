@@ -1,0 +1,669 @@
+{
+  "info": {
+    "author": "Martin Roukala",
+    "author_email": "martin.roukala@mupuf.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Valve Traces\n\nThis tool allows allows downloading/running game traces on test machines\nexposed using valve gfx ci's executor. Once execution is complete, the\nresulting frames are uploading to the valvetraces website for review.\n\nThe tool can be run locally, but it is best run from a GitLab pipeline.\n\n## Installing the tool\n\nThis should be as simple as:\n\n    $ pip install --user valve-gfx-ci.valvetraces\n    $ export PATH=~/.local/bin:$PATH\n\n    $ valvetraces -h\n    usage: Valve trace runner [-h] [-s VALVETRACES_URL] [-u VALVETRACES_USER] -r RUN_NAME [--mesa MESA] [--dxvk DXVK] {run,report} ...\n\n    positional arguments:\n    {run,report}\n        run                 Run the traces and report\n        report              Report an already-created run\n\n    options:\n    -h, --help            show this help message and exit\n    -s VALVETRACES_URL, --valvetraces-url VALVETRACES_URL\n    -u VALVETRACES_USER, --valvetraces-user VALVETRACES_USER\n    -r RUN_NAME, --run-name RUN_NAME\n    --mesa MESA           Path to the mesa repo\n    --dxvk DXVK           Path to the dxvk repo\n\n## How to run traces\n\nThere are a number of steps you need to take to setup the execution environment:\n\n### Authenticate to the web service\n\nFirst, you need to create an [account on the service](https://linux-perf.steamos.cloud/),\nthen set a username and password.\n\nSet the following environment variables:\n\n - `VALVETRACES_USERNAME`: The username you set on the web service\n - `VALVETRACES_PASSWORD`: The password you set on the web service\n\nYou should now be able to list and download traces from the service.\n\n### Create a MinIO bucket to host traces locally\n\nThe game traces will need to be downloaded by every single test machine in the\nCI system. It is thus important to cache them locally.\n\nValvetraces will take care of downloading/caching traces for you, as part of\nits normal operations, but it requires a MinIO address/bucket name/credentials:\n\n - `VALVETRACES_MINIO_URL` / `-m` / `--minio-url`: The URL to your MinIO server. Default: `http://localhost:9000`\n - `VALVETRACES_BUCKET` / `-b` / `--bucket`: The name of the bucket that you want to use\n - `VALVETRACES_BUCKET_USER` / `-u` / `--user`: The username to use to access the MinIO bucket\n - `VALVETRACES_BUCKET_PASSWORD` / `-p` / `--access-token`: The password to use to access the MinIO bucket\n\nFinally, we need to give read access to the traces to the jobs running on the\ntest machines. This can be achieved by embedding the credentials specified\nabove in the job description yaml file specified using\n`VALVETRACES_EXECUTOR_JOB` / `--executor-job-path`, or you could create a\nMinIO group which would have read-only access and ask the executor to add\nthe MinIO user created for the job to be added to to this group.\n\nIf you are using the Valve-infra project for your gateway, the valvetraces-ro\ngroup will be created and granted read access to the valvetraces bucket\nautomatically. If you are using another infrastructure or want to change the\nname of the group the job user should be added to, you can set it using\n`VALVETRACES_GROUP_NAME` / `--minio-valvetraces-group-name`.\n\n### Creating a container for the test environment\n\nValvetraces will need to run game traces in a test environment which you need\nto setup yourself. This gives you the most flexibility but may be a little\noverwhelming, so let's review what are the actual dependencies:\n\n - Drivers: OpenGL / Vulkan\n - Tracing tools in $PATH: apitrace / apitrace.exe (use binfmt) / gfxreconstruct\n - A working desktop environment: Xorg / Wayland\n - Python packages: valve-gfx-ci.gfxinfo / valve-gfx-ci.executor.client\n - Debug tools: vulkaninfo / glxinfo\n - Call `$job_folder_mount_point/valvetraces-run.sh`\n\nSo, how would it look in practice? Let's check a script that would give you a\nworking test environment when run inside an Arch-linux based container:\n\n    pacman --noconfirm -S python-pip\n    pip install valve-gfx-ci.gfxinfo valve-gfx-ci.executor.client\n\n    # Install the tracing tools\n    pacman --noconfirm -S wget p7zip unzip apitrace\n    cd /opt\n    wget https://github.com/apitrace/apitrace/releases/download/10.0/apitrace-10.0-win64.7z\n    7z x apitrace-10.0-win64.7z\n    rm apitrace-10.0-win64.7z\n    chmod +x apitrace-10.0-win64/bin/*.exe\n\n    wget https://github.com/LunarG/gfxreconstruct/releases/download/v0.9.10/gfxreconstruct-v0.9.10-windows-msvc.zip\n    unzip gfxreconstruct-v0.9.10-windows-msvc.zip\n    rm gfxreconstruct-v0.9.10-windows-msvc.zip\n    chmod +x gfxreconstruct-v0.9.10/*.exe\n\n    # Setup Wine\n    pacman --noconfirm -S wine pipewire-jack pipewire-media-session wine-mono wine-gecko\n    export WINEPREFIX=/wineprefix\n    cat >crashdialog.reg <<EOF\n    Windows Registry Editor Version 5.00\n\n    [HKEY_CURRENT_USER\\Software\\Wine\\WineDbg]\n    \"ShowCrashDialog\"=dword:00000000\n\n    EOF\n    wine regedit crashdialog.reg\n    rm crashdialog.reg\n\n    # Add all the graphics drivers and test environments we may possibly need\n    pacman --noconfirm -S xorg-server xorg-xset xf86-video-amdgpu [...]\n    pacman --noconfirm -S mesa vulkan-radeon vulkan-tools mesa-demos mesa-utils\n\n    # Create a setup script which will set up the container\n    cat <<EOT >> /entrypoint\n    #!/bin/sh\n\n    set -eux\n\n    # Setup auto execution of Windows executables (and let it fail, in case we already did)\n    mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc || /bin/true\n    echo ':DOSWin:M::MZ::/usr/bin/wine:' > /proc/sys/fs/binfmt_misc/register || /bin/true\n    echo 1 > /proc/sys/fs/binfmt_misc/status || /bin/true\n\n    # environment variables\n    export PATH=\"/opt/apitrace-10.0-win64/bin/:/opt/gfxreconstruct-v0.9.10/:$PATH\"\n    export PYTHONUNBUFFERED=1\n\n    export WINEPREFIX=$WINEPREFIX\n    export WINEDEBUG=-all\n    export WINEESYNC=1\n\n    # Disable vsync\n    export MESA_VK_WSI_PRESENT_MODE=mailbox\n    export vblank_mode=0\n\n    # Wait for amdgpu to be fully loaded\n    sleep 1\n\n    # Start X, and wait 5 seconds for it to start\n    /usr/bin/Xorg vt45 -noreset -s 0 -dpms -logfile /Xorg.0.log &\n    export DISPLAY=:0\n    for i in {50..0..-1}\n    do\n        xset s off -dpms 2> /dev/null && break\n        if [ $i -eq 0 ]; then\n            xset s off -dpms\n            echo \"Failed to wait for X to start\"\n            exit 1\n        fi\n        sleep 0.1\n    done\n\n    # Start the valvetraces\n    exec ./valvetraces-run.sh\n    EOT\n    chmod +x /entrypoint\n\nFinally, make sure that `/entrypoint` is set as the entrypoint of the\ncontainer, then push it to a container registry that is accessible to the test\nmachines.\n\n### Create the job description for executorctl\n\nValvetraces has no idea about how to boot and manage the test machine, so it\nrequires this information in the form of a job description, compatible with\nexecutorctl.\n\nOf course, this is highly-dependent on your infrastructure, but here is an\nexample one, that would be targeted towards the valve-ci-gfx infra:\n\n    version: 1\n    # Rules to match for a machine to qualify\n    tags:\n        - amdgpu:codename:RENOIR\n    timeouts:\n    first_console_activity:  # This limits the time it can take to receive the first console log\n        minutes: 5\n        retries: 3\n    console_activity:        # Reset every time we receive a message from the logs\n        minutes: 1\n        retries: 99\n    boot_cycle:\n        hours: 4\n        retries: 3\n    overall:                 # Maximum time the job can take, not overrideable by the \"continue\" deployment\n        hours: 360\n        retries: 0\n        # no retries possible here\n    console_patterns:\n        session_end:\n            regex: '^.*It''s now safe to turn off your computer\\r$'\n        session_reboot:\n            regex: 'GPU hang detected!'\n        job_success:\n            regex: '\\[.*\\]: Execution is over, pipeline status: 0\\r$'\n    # Environment to deploy\n    deployment:\n    # Initial boot\n    start:\n        kernel:\n        url: 'http://10.42.0.1:9000/boot/default_kernel'\n        cmdline:\n            - SALAD.machine_id={{ machine_id }}\n            - console={{ local_tty_device }},115200 earlyprintk=vga,keep loglevel=6\n            - b2c.ntp_peer=10.42.0.1 b2c.pipefail b2c.cache_device=auto b2c.poweroff_delay=15\n            - b2c.minio=\"gateway,{{ minio_url }},{{ job_bucket_access_key }},{{ job_bucket_secret_key }}\"\n            - b2c.volume=\"{{ job_bucket }}-job,mirror=gateway/{{ job_bucket}},pull_on=pipeline_start,push_on=changes,overwrite,preserve,remove,expiration=pipeline_end\"\n            - b2c.volume=valvetraces,mirror=gateway/valvetraces,pull_on=pipeline_start,overwrite,preserve,remove,fscrypt_key=$FSCRYPT_KEY\n            - b2c.container=\"-ti --tls-verify=false docker://{{ fdo_proxy_registry }}/mupuf/valve-infra/machine_registration:latest check\"\n            - b2c.container=\"-v {{ job_bucket }}-job:/job -w /job -v valvetraces:/traces --tls-verify=false -w /job docker://10.42.0.1:8002/$PATH_TO_YOUR_CONTAINER  /entrypoint-dxvk\"\n        initramfs:\n        url: 'https://gitlab.freedesktop.org/mupuf/boot2container/-/releases/v0.9.5/downloads/initramfs.linux_amd64.cpio.xz'\n\n### Running valvetraces\n\nNow that we set up all the dependencies for Valvetraces, let's run it:\n\n    $ valvetraces run job.yml\n\nThat being said, if we don't give any information about what project is being\ntested and what is its version, then valvetraces will not be able to know if\na the produced frames are known to be stable or not. This means valvetraces\nwill never return with a `1` exit code.\n\nIf you would like to integrate valvetraces in your GitLab CI pipeline, you will\nthus need to specify which component you are testing:\n\n    $ valvetraces --mesa ~/src/mesa run job.yml\n    or\n    $ valvetraces --dxvk ~/src/dxvk run job.yml\n\nIf for some reason, you would like to locally re-report a valvetraces run, you\nmay do so by doing:\n\n    $ valvetraces [--dxvk/--mesa] report <job folder>\n\nThat should be all!\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.freedesktop.org/mupuf/valve-infra/-/tree/master/valvetraces",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "valve-gfx-ci.valvetraces",
+    "package_url": "https://pypi.org/project/valve-gfx-ci.valvetraces/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/valve-gfx-ci.valvetraces/",
+    "project_urls": {
+      "Bug Tracker": "https://gitlab.freedesktop.org/mupuf/valve-infra/issues",
+      "Homepage": "https://gitlab.freedesktop.org/mupuf/valve-infra/-/tree/master/valvetraces"
+    },
+    "release_url": "https://pypi.org/project/valve-gfx-ci.valvetraces/0.0.18/",
+    "requires_dist": [
+      "requests (<3,>=2)",
+      "humanize (>=3.3.0)",
+      "Pillow (>=5.4.0)",
+      "pygit2 (>=1.4.0)",
+      "minio (>=7.1.0)",
+      "valve-gfx-ci.executor.client",
+      "backports.cached-property ; python_version < \"3.8\""
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Interact with Valve's GFX trace system",
+    "version": "0.0.18",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16576461,
+  "releases": {
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "685736779573131d5e87fe5ae31fb42c3b4d2b7f546c7c566eb0722b9cd66bef",
+          "md5": "8f4a0d7e77c8d0524fde0dcef7c1c655",
+          "sha256": "4f5c1c64d76dfedf44d671d316384fbe1c9fedd507504bb253087ff9ead29b1d"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8f4a0d7e77c8d0524fde0dcef7c1c655",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19368,
+        "upload_time": "2022-02-01T14:41:20",
+        "upload_time_iso_8601": "2022-02-01T14:41:20.834898Z",
+        "url": "https://files.pythonhosted.org/packages/68/57/36779573131d5e87fe5ae31fb42c3b4d2b7f546c7c566eb0722b9cd66bef/valve_gfx_ci.valvetraces-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32572a6d7c58088b1f55c367e0d107cf2d8b270b7e8fdbdf2edbfd2380b33ba1",
+          "md5": "8c0b6dc9b9fc2530e198b94a90e55ce8",
+          "sha256": "18f34384f10bf43420ffe7bbefb573cbed5c09e7e5a333a02e6e60f42daa35ad"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8c0b6dc9b9fc2530e198b94a90e55ce8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 20133,
+        "upload_time": "2022-02-01T14:41:22",
+        "upload_time_iso_8601": "2022-02-01T14:41:22.239662Z",
+        "url": "https://files.pythonhosted.org/packages/32/57/2a6d7c58088b1f55c367e0d107cf2d8b270b7e8fdbdf2edbfd2380b33ba1/valve_gfx_ci.valvetraces-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e91d85b2ef2a6d7ed4c0f9f4bd14b747fd8d03b4e442f052a1e7f48852ca28c3",
+          "md5": "4a146039fde0ca4a03c64200d67779e0",
+          "sha256": "9e0f769679e1c69bde3b2171ce166b7573291c7b68ee0f1eabb68a7d4fa28abe"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a146039fde0ca4a03c64200d67779e0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24355,
+        "upload_time": "2022-02-11T07:10:01",
+        "upload_time_iso_8601": "2022-02-11T07:10:01.856023Z",
+        "url": "https://files.pythonhosted.org/packages/e9/1d/85b2ef2a6d7ed4c0f9f4bd14b747fd8d03b4e442f052a1e7f48852ca28c3/valve_gfx_ci.valvetraces-0.0.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f53954adfa8300d5084af790e410d090d8c86f297626d189ccfaf29fe32e375",
+          "md5": "4c9f08c5e7ce3cc76e83d12c6902c1f8",
+          "sha256": "12f611bab5318026219e4f79def85d876dc5c2e542d723f1ef62f1292287e9b1"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c9f08c5e7ce3cc76e83d12c6902c1f8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28304,
+        "upload_time": "2022-02-11T07:10:03",
+        "upload_time_iso_8601": "2022-02-11T07:10:03.209590Z",
+        "url": "https://files.pythonhosted.org/packages/3f/53/954adfa8300d5084af790e410d090d8c86f297626d189ccfaf29fe32e375/valve_gfx_ci.valvetraces-0.0.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b6f62b08a8c8221471f58851705ad2fc3647ab46d42f113eecdfd99aa8f3739",
+          "md5": "c6e011fbc8f437eb02822b8f25563e96",
+          "sha256": "e93e113bfe85c86ca428adcc796013e393154a380bd8c1459bbcf7c76e356578"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c6e011fbc8f437eb02822b8f25563e96",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24391,
+        "upload_time": "2022-02-11T14:27:17",
+        "upload_time_iso_8601": "2022-02-11T14:27:17.555433Z",
+        "url": "https://files.pythonhosted.org/packages/0b/6f/62b08a8c8221471f58851705ad2fc3647ab46d42f113eecdfd99aa8f3739/valve_gfx_ci.valvetraces-0.0.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8a1bdb9321b3c6b0b6a2da75dddfe81b7b0af85864f691027db598da6dede58",
+          "md5": "4af60713f19fa64ff1e694ff43e7b043",
+          "sha256": "635b3a0a20ae5ab21881ca72310e02d067a1c372f9402ecd35846a2eff811480"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4af60713f19fa64ff1e694ff43e7b043",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28350,
+        "upload_time": "2022-02-11T14:27:19",
+        "upload_time_iso_8601": "2022-02-11T14:27:19.932707Z",
+        "url": "https://files.pythonhosted.org/packages/a8/a1/bdb9321b3c6b0b6a2da75dddfe81b7b0af85864f691027db598da6dede58/valve_gfx_ci.valvetraces-0.0.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6665bdf5daa3b27abbe337ed4a9cbdecb115abd4cda8a2917364235c4ed3ab7a",
+          "md5": "8fcdc81a51d1f855521dbe6a9ece1d90",
+          "sha256": "fa532ad8b5b2ec6f645cb87668c003a1aa426a8f15a7bf5394de6af34f23219e"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8fcdc81a51d1f855521dbe6a9ece1d90",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24499,
+        "upload_time": "2022-02-15T10:50:02",
+        "upload_time_iso_8601": "2022-02-15T10:50:02.024140Z",
+        "url": "https://files.pythonhosted.org/packages/66/65/bdf5daa3b27abbe337ed4a9cbdecb115abd4cda8a2917364235c4ed3ab7a/valve_gfx_ci.valvetraces-0.0.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d7b49abece3e3f3cc9f2d10a19a8b33e1728fa9a2e2a4dc3f80def7cbbc30c85",
+          "md5": "c0531a35beaee2b807093b379d75d4a2",
+          "sha256": "540544e08cdc293993db782a76c44b5a14733a8e49ec4f8166acc7850cd221bb"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c0531a35beaee2b807093b379d75d4a2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28466,
+        "upload_time": "2022-02-15T10:50:03",
+        "upload_time_iso_8601": "2022-02-15T10:50:03.634213Z",
+        "url": "https://files.pythonhosted.org/packages/d7/b4/9abece3e3f3cc9f2d10a19a8b33e1728fa9a2e2a4dc3f80def7cbbc30c85/valve_gfx_ci.valvetraces-0.0.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e6c7915b8a9f385fed75fb0f28ae1f17fc39870e0b374aae8a859d9768b84a8",
+          "md5": "8ad9e79f8f3f8c32a6c2615c15fa218c",
+          "sha256": "3ba63bd8822a51dfce291208fa88f25ad8ab45779a9394a743070db8ad61b402"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ad9e79f8f3f8c32a6c2615c15fa218c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24495,
+        "upload_time": "2022-02-15T14:30:27",
+        "upload_time_iso_8601": "2022-02-15T14:30:27.764076Z",
+        "url": "https://files.pythonhosted.org/packages/3e/6c/7915b8a9f385fed75fb0f28ae1f17fc39870e0b374aae8a859d9768b84a8/valve_gfx_ci.valvetraces-0.0.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa1edba1bc059ef08ddcee42566ce3940e633c1920c8955227b215412adabbc4",
+          "md5": "cf66daeb604392a4d21ba83cc3e6e879",
+          "sha256": "96be2aa166cca7fcae404f5e0425998c350ecb67eec268079982a52fb2b1c121"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf66daeb604392a4d21ba83cc3e6e879",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28488,
+        "upload_time": "2022-02-15T14:30:29",
+        "upload_time_iso_8601": "2022-02-15T14:30:29.095527Z",
+        "url": "https://files.pythonhosted.org/packages/aa/1e/dba1bc059ef08ddcee42566ce3940e633c1920c8955227b215412adabbc4/valve_gfx_ci.valvetraces-0.0.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e39cc8f804dbfcd11ddb8c5cde1a9cd8d30877946d7cb83b63bb3f59139e589",
+          "md5": "eb9cd2a5474dba1d18c21445c05733d2",
+          "sha256": "545e91ed874dbc4bee1ce822b058a1727f61041597e4699f287de22660291dde"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eb9cd2a5474dba1d18c21445c05733d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24532,
+        "upload_time": "2022-03-01T13:42:08",
+        "upload_time_iso_8601": "2022-03-01T13:42:08.958661Z",
+        "url": "https://files.pythonhosted.org/packages/7e/39/cc8f804dbfcd11ddb8c5cde1a9cd8d30877946d7cb83b63bb3f59139e589/valve_gfx_ci.valvetraces-0.0.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c61d65acde0481569f323cf84bbb8ce63985e8b0b9efc3b95b9c9fcf58a95a40",
+          "md5": "03898653432cb4186dbf39e45ea9b520",
+          "sha256": "07a75be2bbb043110c23e451845d8c5c67ff70782e33b318817d6399d45ff287"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03898653432cb4186dbf39e45ea9b520",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28514,
+        "upload_time": "2022-03-01T13:42:10",
+        "upload_time_iso_8601": "2022-03-01T13:42:10.797694Z",
+        "url": "https://files.pythonhosted.org/packages/c6/1d/65acde0481569f323cf84bbb8ce63985e8b0b9efc3b95b9c9fcf58a95a40/valve_gfx_ci.valvetraces-0.0.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "229adcb572ce28b7fe9c6b4e6a53b2993b36971b7d085d203ea30b4b7411f748",
+          "md5": "4ad870e90b12d7291b41a6bfadc3cf1f",
+          "sha256": "4d775aed8d1efc1acd1aefbb115622404bff8241c0028b83f1dd3f6a546741b7"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4ad870e90b12d7291b41a6bfadc3cf1f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24524,
+        "upload_time": "2022-03-03T15:19:38",
+        "upload_time_iso_8601": "2022-03-03T15:19:38.240159Z",
+        "url": "https://files.pythonhosted.org/packages/22/9a/dcb572ce28b7fe9c6b4e6a53b2993b36971b7d085d203ea30b4b7411f748/valve_gfx_ci.valvetraces-0.0.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "27be0127130df70115af216f8ee8651d985cbe5e2aab199ef89cfc237845124d",
+          "md5": "813abe389d884abf605d2da4862d931b",
+          "sha256": "0c0d1f08d5579c415f44ada0f4bfb99de0beea115f3ba920f9974f607bc64591"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "813abe389d884abf605d2da4862d931b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28493,
+        "upload_time": "2022-03-03T15:19:39",
+        "upload_time_iso_8601": "2022-03-03T15:19:39.816792Z",
+        "url": "https://files.pythonhosted.org/packages/27/be/0127130df70115af216f8ee8651d985cbe5e2aab199ef89cfc237845124d/valve_gfx_ci.valvetraces-0.0.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7857b10dcae0a4b1b4ac5a05154fadec4b7890957459bc4187adad9bf3c9a4b",
+          "md5": "e16b1c7133111e50d8eeabf5281165bd",
+          "sha256": "d5f59a852136b033d8dad0d7c79b9299f1679b5e8c80232ca79b6c44cfb0ce45"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e16b1c7133111e50d8eeabf5281165bd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 26358,
+        "upload_time": "2022-04-14T10:58:51",
+        "upload_time_iso_8601": "2022-04-14T10:58:51.094651Z",
+        "url": "https://files.pythonhosted.org/packages/a7/85/7b10dcae0a4b1b4ac5a05154fadec4b7890957459bc4187adad9bf3c9a4b/valve_gfx_ci.valvetraces-0.0.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eff0cc32630b5d7fc0bd0780277dd0ec657a2dfd2261327666e4df2edf7839cc",
+          "md5": "90b22d4feaa5bb4cb69914f14a78709b",
+          "sha256": "5dd8391ba686c2d4aa2c326b20fda71b69efcdfdcab6e9fd3d2a468526b491ed"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "90b22d4feaa5bb4cb69914f14a78709b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30333,
+        "upload_time": "2022-04-14T10:58:52",
+        "upload_time_iso_8601": "2022-04-14T10:58:52.442164Z",
+        "url": "https://files.pythonhosted.org/packages/ef/f0/cc32630b5d7fc0bd0780277dd0ec657a2dfd2261327666e4df2edf7839cc/valve_gfx_ci.valvetraces-0.0.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e52b7ab0da2265dfae7b07a0c3762194bcfae69de487dbcc3248e74c3e3d2ad1",
+          "md5": "f5e51f74d890074d13666598b954acc5",
+          "sha256": "c3b3db222ab995690916f3d8c4b159510842545d65312c55b16c747afa41638d"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f5e51f74d890074d13666598b954acc5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 26558,
+        "upload_time": "2023-01-26T14:56:47",
+        "upload_time_iso_8601": "2023-01-26T14:56:47.364287Z",
+        "url": "https://files.pythonhosted.org/packages/e5/2b/7ab0da2265dfae7b07a0c3762194bcfae69de487dbcc3248e74c3e3d2ad1/valve_gfx_ci.valvetraces-0.0.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76d1d5d572a86dbfc7bc3d4dab596e8c917135733e40609c3d9ceba97f864aea",
+          "md5": "bdbda809f277ee90cb82e3f839ddd829",
+          "sha256": "fd0c3fbb3bd3cf91433bd79045b9acdf63b86eb4a2c48e73c76e2509c7a2079b"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bdbda809f277ee90cb82e3f839ddd829",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30471,
+        "upload_time": "2023-01-26T14:56:50",
+        "upload_time_iso_8601": "2023-01-26T14:56:50.315166Z",
+        "url": "https://files.pythonhosted.org/packages/76/d1/d5d572a86dbfc7bc3d4dab596e8c917135733e40609c3d9ceba97f864aea/valve_gfx_ci.valvetraces-0.0.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b8b90cc68e3d61af92e1a34a00694dec2212dba9dd958daa51426e3fc20126d",
+          "md5": "25fcb48f094b27958285fba22490dab4",
+          "sha256": "f4dacd067973e4e9b3107e6908373a4e81ac02fe6d6ed8b9bb9b66222112194b"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "25fcb48f094b27958285fba22490dab4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19425,
+        "upload_time": "2022-01-20T12:49:41",
+        "upload_time_iso_8601": "2022-01-20T12:49:41.504942Z",
+        "url": "https://files.pythonhosted.org/packages/3b/8b/90cc68e3d61af92e1a34a00694dec2212dba9dd958daa51426e3fc20126d/valve_gfx_ci.valvetraces-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44ca262724c9780a5391f867ea94c9c4b996c2becfb997afa7857b767ca7d486",
+          "md5": "0847aaa7b3cc09275cfb3d75b4a8cc1e",
+          "sha256": "d8b0aeff1ff5feb9be3eec6bc08469092bfd315b020b9afe03984fec97f30f0e"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0847aaa7b3cc09275cfb3d75b4a8cc1e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 20025,
+        "upload_time": "2022-01-20T12:49:43",
+        "upload_time_iso_8601": "2022-01-20T12:49:43.230174Z",
+        "url": "https://files.pythonhosted.org/packages/44/ca/262724c9780a5391f867ea94c9c4b996c2becfb997afa7857b767ca7d486/valve_gfx_ci.valvetraces-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5127892df324f13ab636e763e3706dbddbaacbcbdc93f6e7dd4f5ae8a0c719da",
+          "md5": "171a97da6fbe37a848fd3336b2345a64",
+          "sha256": "261d1c1be6fb3b2453b6b29713888c2c95b53608fa7650b2842ace4a7bbb8957"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "171a97da6fbe37a848fd3336b2345a64",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19407,
+        "upload_time": "2022-01-20T14:55:32",
+        "upload_time_iso_8601": "2022-01-20T14:55:32.736355Z",
+        "url": "https://files.pythonhosted.org/packages/51/27/892df324f13ab636e763e3706dbddbaacbcbdc93f6e7dd4f5ae8a0c719da/valve_gfx_ci.valvetraces-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "664b672afce86974560a2b643d9789ae20b52da02c5bb8eff38f6a0882b29922",
+          "md5": "8f77b48c2996e5d9713ca44e58d41b1b",
+          "sha256": "9e8a873ca600659f97471c8c4e7ffdf6056985bd530efee434e8034afbc9b845"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8f77b48c2996e5d9713ca44e58d41b1b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19974,
+        "upload_time": "2022-01-20T14:55:33",
+        "upload_time_iso_8601": "2022-01-20T14:55:33.874896Z",
+        "url": "https://files.pythonhosted.org/packages/66/4b/672afce86974560a2b643d9789ae20b52da02c5bb8eff38f6a0882b29922/valve_gfx_ci.valvetraces-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b03a16a163e25e5dc69ee3f7b178c7ec5631b4383744d6af69328efaac23b978",
+          "md5": "5d37c7f3fce1bf3ee2696dccd57f26fa",
+          "sha256": "36a0360c616124219fdc1e7b5cf65d8c133e235d517364211588c63cfdfe18f1"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5d37c7f3fce1bf3ee2696dccd57f26fa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19241,
+        "upload_time": "2022-01-24T11:49:45",
+        "upload_time_iso_8601": "2022-01-24T11:49:45.826879Z",
+        "url": "https://files.pythonhosted.org/packages/b0/3a/16a163e25e5dc69ee3f7b178c7ec5631b4383744d6af69328efaac23b978/valve_gfx_ci.valvetraces-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f03ed88336e08334cde03e325ea60454bc25cd9e98762eaab8d9abe2315c4bd",
+          "md5": "bc519f25eea3511942f3e74852216980",
+          "sha256": "b7515d8e4278a916a9e0b1dbf37f1bcc60f43074ba9d27255db72364210da65e"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bc519f25eea3511942f3e74852216980",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19940,
+        "upload_time": "2022-01-24T11:49:46",
+        "upload_time_iso_8601": "2022-01-24T11:49:46.794328Z",
+        "url": "https://files.pythonhosted.org/packages/9f/03/ed88336e08334cde03e325ea60454bc25cd9e98762eaab8d9abe2315c4bd/valve_gfx_ci.valvetraces-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "671d66757288524665a9071fddcb2e70316b24cd3fc85fc166e5f9d972af87a1",
+          "md5": "2d093a9cb01ced506bb0f7389330f37a",
+          "sha256": "5b5811d1e03a04c989bcd2c5b99d1f3e4a350bae05961ec4db98dbb80051dcb0"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2d093a9cb01ced506bb0f7389330f37a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 19243,
+        "upload_time": "2022-01-25T09:47:28",
+        "upload_time_iso_8601": "2022-01-25T09:47:28.114167Z",
+        "url": "https://files.pythonhosted.org/packages/67/1d/66757288524665a9071fddcb2e70316b24cd3fc85fc166e5f9d972af87a1/valve_gfx_ci.valvetraces-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88f7c4c888f7f0eca6d5ce069e08a310e07dc56581b285dbe39e3e759a4a9631",
+          "md5": "a4f0f65042dce6b8353c96153ce208ab",
+          "sha256": "ffe7484db1acf4217f832db106f720338d29372cde30008d750a8f2ac4928718"
+        },
+        "downloads": -1,
+        "filename": "valve_gfx_ci.valvetraces-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a4f0f65042dce6b8353c96153ce208ab",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 20033,
+        "upload_time": "2022-01-25T09:47:29",
+        "upload_time_iso_8601": "2022-01-25T09:47:29.708074Z",
+        "url": "https://files.pythonhosted.org/packages/88/f7/c4c888f7f0eca6d5ce069e08a310e07dc56581b285dbe39e3e759a4a9631/valve_gfx_ci.valvetraces-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e52b7ab0da2265dfae7b07a0c3762194bcfae69de487dbcc3248e74c3e3d2ad1",
+        "md5": "f5e51f74d890074d13666598b954acc5",
+        "sha256": "c3b3db222ab995690916f3d8c4b159510842545d65312c55b16c747afa41638d"
+      },
+      "downloads": -1,
+      "filename": "valve_gfx_ci.valvetraces-0.0.18-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "f5e51f74d890074d13666598b954acc5",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 26558,
+      "upload_time": "2023-01-26T14:56:47",
+      "upload_time_iso_8601": "2023-01-26T14:56:47.364287Z",
+      "url": "https://files.pythonhosted.org/packages/e5/2b/7ab0da2265dfae7b07a0c3762194bcfae69de487dbcc3248e74c3e3d2ad1/valve_gfx_ci.valvetraces-0.0.18-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "76d1d5d572a86dbfc7bc3d4dab596e8c917135733e40609c3d9ceba97f864aea",
+        "md5": "bdbda809f277ee90cb82e3f839ddd829",
+        "sha256": "fd0c3fbb3bd3cf91433bd79045b9acdf63b86eb4a2c48e73c76e2509c7a2079b"
+      },
+      "downloads": -1,
+      "filename": "valve_gfx_ci.valvetraces-0.0.18.tar.gz",
+      "has_sig": false,
+      "md5_digest": "bdbda809f277ee90cb82e3f839ddd829",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 30471,
+      "upload_time": "2023-01-26T14:56:50",
+      "upload_time_iso_8601": "2023-01-26T14:56:50.315166Z",
+      "url": "https://files.pythonhosted.org/packages/76/d1/d5d572a86dbfc7bc3d4dab596e8c917135733e40609c3d9ceba97f864aea/valve_gfx_ci.valvetraces-0.0.18.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

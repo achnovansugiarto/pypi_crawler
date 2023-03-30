@@ -1,0 +1,205 @@
+{
+  "info": {
+    "author": "Chris Larson",
+    "author_email": "chris7larson@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "Programming Language :: Python :: 3",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence"
+    ],
+    "description": "## Virtex\nVirtex is a ML serving framework for running inference on GPUs in poduction.\n\n![release](https://github.com/virtexlabs/virtex/workflows/release/badge.svg)\n\n### Contents\n|                     Section                      |               Description             |\n|:------------------------------------------------:|:-------------------------------------:|\n| [Design Principles](#design-principles)          | Philosopy & implementation            |\n| [Features](#features)                            | Feature overview                      |\n| [Installation](#installation)                    | How to install the package            |\n| [Framework](#framework)                          | Virtex overview                       |\n| [Prometheus](#prometheus)                        | Prometheus metrics integration        |\n| [Examples](#examples)                            | Link to full examples                 |\n| [Performance](#performance)                      | Performance comparison                |\n| [Documentation][(0.1.4)](http://virtex.ai/docs)  | Full API documentation and more       |\n\n### Design principles\n\n##### Philosophy\n- Flexibility: Python native serving implementation no vendor lock-in. Use your packages of choice.\n- Shared-nothing: Performant serving implementation on an event loop, offload expensive compute to an accelerator. No interprocess communication!\n\n##### Implementation\n- Dynamic batching\n- Asyncronous serving built on top of [uvicorn](https://www.uvicorn.org/) and [uvloop](https://github.com/MagicStack/uvloop).\n- Serving and model execution on same thread via coroutines and futures.\n- Parallelism via gunicorn process manager\n\n### Features\n- A completely abstracted networking plane.\n- Prometheus metrics with support for scraping and push consumption models.\n- Built-in (de)serialization for transporting commonly used Python data structures:\n    - Numpy arrays\n    - Pandas objects\n    - PIL Images\n    - Torch Tensors\n    - Tensorflow Tensors\n    - MxNet ND Arrays\n    - Pickled Python data/code\n    - Bytes\n\n### Installation\nVirtex is Python 3.6.5+ compatible.\n\n#### With pip\n```bash\n$ pip install virtex\n```\n\n#### From source\n```bash\n$ git clone https://github.com/virtexlabs/virtex-python.git && cd virtex && pip install .\n```\n\n### Framework\n\nSee <a href=\"https://virtex.ai/docs/virtex/types\">API documentation</a> for full details.\n\nVirtex consists of four primary components: (1) an `HttpClient` for sending data to the server, (2) an `http_server` function that returns an http endpoint for handling client requests, (3) a `RequestHandler` to define the computation that runs on the server, and (4) an `HttpMessage` that defines the client/server messaging format. These components are described below.\n\n#### HttpMessage\n\nHttp requests and responses are built on top of the `HttpMessage` class. It uses a `.data` attribute to store data sent between client and server. It takes the form\n\n `data: [ x1, ..., xn ]`\n \nwhere `xi` is the *ith* data element of the message. Virtex sends json formatted data internally, so each element in `.data` must be encoded into a valid json datatype. `HttpMessage` has built-in methods to support this in a flexible way via the `.encode(func)` and `.decode(func)` methods, where `func` is a callback that encodes or decodes the elements in `data`, operating on data elements, not the entire `.data` array. Virtex comes with out-of-the-box serialization functions for commonly used data structures such as numpy arrays, pandas objects (dataframes and series), tensorflow tensors (v2.0+), torch tensors, mxnet ndarrays, as well as pickled python objects and bytes. These are contained in the `virtex.serial` module. Below is an example of how to construct a batched message with two numpy array, serialize it into a json string, and then deserialize the json string back into the original message.\n\n```python\nimport numpy as np\nimport orjson as json\n\nfrom virtex import HttpMessage\nfrom virtex.serial import encode_numpy, decode_numpy\n\n# Request data\nreq1 = np.array([[0.3, 0.1],\n                 [1.0, 0.5]], dtype=np.float32)\nreq2 = np.array([[0.0, 0.4], \n                 [0.0, 0.2]], dtype=np.float32)\n\n# Request message\nmsg = HttpMessage(data=[req1, req2])\n\n# Encode numpy array to bytestring\nmsg.encode(encode_numpy)\n\n# Validate that the message is serializable\nmsg.validate()\n\n# Get json string\nmsg_str = msg.json\n\n# Recover original message\nmsg = HttpMessage(**json.loads(msg_str))\n\n# Recover the original data\nmsg.decode(decode_numpy)\nreq1_decoded = msg.data[0]\nreq2_decoded = msg.data[1]\n```\n\n#### RequestHandler\n\nInference on the server is defined using the `RequestHandler` class, which has three abstract methods:\n\n##### `.process_request(self, data: List[Union[str, int, float, bool]]) -> Any`\nWhen triggered, the server will remove items from it's internal request queue (up to `max_batch_size`) and pass them to the `.process_request()` function. This method always accepts a list of json serialized data elements, and returns a batched input. Note that the number of items in the `data` argument will vary from 1 to `max_batch_size` when running on the server, and is decoupled from the size of `HttpMessage.data`. Within the context of machine learning applications, this method invariably consist of some variant of the following: (1) deserialize the data, and (2) stack the individual inputs into a batched model input. \n\n##### `.run_inference(self,  model_input: Any) -> Iterable[Any]`\nModel execution, or inference, gets invoked in this function. Typically a one-liner (something akin to `model.predict(batch)`), this function should consist of model execution code, and little if not nothing more. Importantly, it must return an object that, when iterated over, is ordered w.r.t. `model_input`. Keep in mind that common data structures from numpy, pandas, tensorflow, torch, and mxnet are iterateable in this way so long as the zeroth dimension is the batch dimension.\n\n##### `.process_response(self, model_output_item : Any) -> Union[str, int, float, bool]`\nThe server takes the batched output of the inference method, iterates through it along the batch dimension, passing each output to the `process_response()` function, which performs post-processing and serialization necessary to form each response data element. In many cases, this function will simply return `encode_fn(model_output_item)`, where `encode_fn` produces a valid json datatype from the model output item.\n\n##### Testing a request handler\n\nTo ensure that a given request handler will run on the server, use the `RequestHandler.validate()` method, which accepts an HttpMessage with encoded data elements and executes the computational pipeline that you've defined. In unit tests, keep the following in mind:\n\n* Always validate on data of length equal to 1 and ``max_batch_size`` (which you set on the server).\n* For large models with variable sized inputs along any feature dimension (as is common when processing batched LM inputs), make sure to run tests on data of maximum length along those dimension in combination with the maximum batch size to avoid OOM errors.\n* Always include a unit test that runs these validations in a loop to ensure that GPU memory behaves as expected over multiple model executions.\n\n\n#### http_server\nThe `http_server` function returns a Uvicorn web application. Incoming requests get deserialzed into a `HttpMessage`, and the `data` elements in that message get unpacked onto an input queue. A coroutine continously polls the input queue; its behavior is controlled through the `max_batch_size` and `max_time_on_queue` flags, which specify the maximum queue size and maximum time (in seconds) between successesive model executions. The server will accumulate items on the queue until one of these conditions is met, and then proceed to run the request handler. In the below example, we instantiate a service called `service_x` and specify these two parameters:\n\n```python \n# server.py\n\nfrom virtex.http import Server\n\napp = http_server(\n    name='service_x',\n    handler=request_handler_x,\n    max_batch_size=128,\n    max_time_on_queue=0.01\n)\n```\n\nTo run Virtex servers, we use the Gunicorn process manager to fork our server (`app` in `server.py`) into multiple application instances. Any of the configuration options in Gunicorn can be utilized here; the only requirement is that we specify a special `--worker-class=virtex.VirtexWorker` to ensure that the correct event loop and http networking components get used in the ASGI. As an example, the following bash command will spin up 10 instances of our `service_x` application:\n\n```bash\ngunicorn server:app \\\n  --workers 10 \\\n  --worker-class virtex.VirtexWorker \\\n  --bind 0.0.0.0:8081 \\\n  --worker-connections 100000 \\\n  --timeout 120 \\\n  --log-level CRITICAL\n```\n\n#### HttpClient\nData is posted to the Virtex server using the `HttpClient`. Let's assume that our inference pipeline accepts pillow image inputs and returns numpy array responses. The flow will look something like:\n\n```python \nimport numpy as np\nfrom PIL import Image\n\nfrom virtex import HttpMessage, HttpClient\nfrom virtex.serial import encode_pil, decode_numpy\n\nimg = Image.load_img(\"path/to/image_file\")\nmsg = HttpMessage(data=[img])\nmsg.encode(encode_pil)\n\nclient = HttpClient()\nresp = client.post(msg)\nresp.decode(decode_numpy)\n\n# The response data elements are here\nprediction = resp.data\n```\n\n### Prometheus\n\nVirtex comes with a built-in Prometheus metrics integration that supports both `scrape` and `push` consumption models. Prometheus metrics are turned off by default. Metrics can be configured using the `prom_host` (default='http://127.0.0.1'), `prom_port` (default=9090), `prom_mode` (default='off'), and `prom_interval` (default=0.01, seconds) arguments in `http_server`. \n\n#### Scrape\n\nTo launch your server in scrape mode use the following:\n\n```python\nfrom virtex import http_server\n\napp = http_server(\n    name='service_x',\n    handler=request_handler_x,\n    prom_host='127.0.0.1',\n    prom_port=9090,\n    prom_mode='scrape',\n    prom_push_interval=0.01\n)\n```\n\n#### Push gateway\nEnsure that you have a Prometheus pushgateway to push to. To test locally run the following:\n\n```bash\n$ docker run -d -p 9091:9091 prom/pushgateway\n```\n\nAnd then run the server in push-mode:\n\n```python\nfrom virtex import http_server\n\napp = http_server(\n    name='service_x',\n    handler=request_handler_x,\n    prom_host='127.0.0.1',\n    prom_port=9091,\n    prom_mode='push',\n    prom_push_interval=0.01\n)\n```\n\n### Examples\n\nExamples are a WIP, two full deep learning examples can be found in the [virtex-benchmarks repository](https://github.com/virtexlabs/virtex-benchmarks.git).\n\n### Load testing\n\nVirtex come out-of-the-box with a bare-bones load testing client (`HttpLoadTest`) that can be used to profile performance when building and configuring servers. At the moment it is limited to a single thread (i.e., it's not distributed to simultate multiple clients, this is todo), but even on a single thread it can produce about 3500 requests per second which should be sufficient to evaluate the throughput of most servers running largeish models. Each of the examples in the examples folder demonstrate its use.\n\n\n### Performance\nComing soon.\n\n\n### Citation\nIf you use Virtex in your research, feel free to cite it!\n```bibtex\n@misc{Larson2021,\n  author = {Larson, Chris},\n  title = {Virtex},\n  year = {2021},\n  publisher = {GitHub},\n  journal = {GitHub repository},\n  howpublished = {\\url{https://github.com/virtexlabs/virtex}},\n  commit = {}\n}\n```",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/virtexlabs/virtex.git",
+    "keywords": "machine deep learning ai serving asyncronous microservice",
+    "license": "Apache Version 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "virtex",
+    "package_url": "https://pypi.org/project/virtex/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/virtex/",
+    "project_urls": {
+      "Homepage": "https://github.com/virtexlabs/virtex.git"
+    },
+    "release_url": "https://pypi.org/project/virtex/0.1.4/",
+    "requires_dist": null,
+    "requires_python": ">=3.6.5",
+    "summary": "Serving for computational workloads",
+    "version": "0.1.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9960168,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "138c19cee795fa847e69fb09a42bf105b4a9e970019a57445afdf0cd5e774f74",
+          "md5": "09541ab1c460cbe04a95f846b74ad7cf",
+          "sha256": "a957214d5b4b0ff5f155dbec405eaf91b2d3dffae123ca80239ac4786d0e1cd1"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09541ab1c460cbe04a95f846b74ad7cf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5",
+        "size": 25597,
+        "upload_time": "2021-02-15T19:14:34",
+        "upload_time_iso_8601": "2021-02-15T19:14:34.719250Z",
+        "url": "https://files.pythonhosted.org/packages/13/8c/19cee795fa847e69fb09a42bf105b4a9e970019a57445afdf0cd5e774f74/virtex-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e1587b1eaf2e4487f8fab30ecb3efd40b494f941ad032e27549e2ba146e8d63",
+          "md5": "dbc79f0384ae7935300f726d3ea567b3",
+          "sha256": "57d0d48157f81c7b0e22e75d20d650dda9b0989c271ae095d06f5174ca85ce6b"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dbc79f0384ae7935300f726d3ea567b3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5",
+        "size": 25557,
+        "upload_time": "2021-03-24T02:55:50",
+        "upload_time_iso_8601": "2021-03-24T02:55:50.302692Z",
+        "url": "https://files.pythonhosted.org/packages/9e/15/87b1eaf2e4487f8fab30ecb3efd40b494f941ad032e27549e2ba146e8d63/virtex-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4424cd7a036f733539c08c23a73d62bba8fccc784768cbcdb0055941e5ab7235",
+          "md5": "726de4a139377f199d0210e0dbb56208",
+          "sha256": "9b5a2124710e00a20a0a2bf895e6563c8bb1253b0cfe89587f2336a922a00a64"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "726de4a139377f199d0210e0dbb56208",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5",
+        "size": 25669,
+        "upload_time": "2021-03-24T15:22:29",
+        "upload_time_iso_8601": "2021-03-24T15:22:29.103124Z",
+        "url": "https://files.pythonhosted.org/packages/44/24/cd7a036f733539c08c23a73d62bba8fccc784768cbcdb0055941e5ab7235/virtex-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f3c190bea06d5de067b73f38415bae5a6261bb2f4ffda2e8500a37939e8e1d6",
+          "md5": "056622c5f187516458d9c12b04d297a6",
+          "sha256": "4b91c5d55ba27e93585ab9026a35efa202eb99521f743fd1467464a3ed7cf1d6"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "056622c5f187516458d9c12b04d297a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5",
+        "size": 25666,
+        "upload_time": "2021-03-24T17:42:57",
+        "upload_time_iso_8601": "2021-03-24T17:42:57.948111Z",
+        "url": "https://files.pythonhosted.org/packages/3f/3c/190bea06d5de067b73f38415bae5a6261bb2f4ffda2e8500a37939e8e1d6/virtex-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d29da981c8cd533c5405c990eadbb3cdfaabd09ef7f74ab7af0a097034b43ed",
+          "md5": "e4b5c5b00ac018361b0aa7dbd7b71557",
+          "sha256": "fff309dd260e4b67fab3aa7d578bf6761f86c2ec22a9abd34ad47a13911ee93e"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e4b5c5b00ac018361b0aa7dbd7b71557",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5",
+        "size": 25261,
+        "upload_time": "2021-04-02T03:03:42",
+        "upload_time_iso_8601": "2021-04-02T03:03:42.989025Z",
+        "url": "https://files.pythonhosted.org/packages/2d/29/da981c8cd533c5405c990eadbb3cdfaabd09ef7f74ab7af0a097034b43ed/virtex-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c95780bb141ecd558bc51a0fb1852afbce5e17b5e5ba9465da011f2cbf25448d",
+          "md5": "82457664af5617f284114010a0fa50b1",
+          "sha256": "0c4f64cefb05fe693ff986d514e6c462d76253cb08d88697b01691424ce4a302"
+        },
+        "downloads": -1,
+        "filename": "virtex-0.1.5rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "82457664af5617f284114010a0fa50b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.6",
+        "size": 25130,
+        "upload_time": "2021-04-02T20:20:54",
+        "upload_time_iso_8601": "2021-04-02T20:20:54.906071Z",
+        "url": "https://files.pythonhosted.org/packages/c9/57/80bb141ecd558bc51a0fb1852afbce5e17b5e5ba9465da011f2cbf25448d/virtex-0.1.5rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2d29da981c8cd533c5405c990eadbb3cdfaabd09ef7f74ab7af0a097034b43ed",
+        "md5": "e4b5c5b00ac018361b0aa7dbd7b71557",
+        "sha256": "fff309dd260e4b67fab3aa7d578bf6761f86c2ec22a9abd34ad47a13911ee93e"
+      },
+      "downloads": -1,
+      "filename": "virtex-0.1.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "e4b5c5b00ac018361b0aa7dbd7b71557",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6.5",
+      "size": 25261,
+      "upload_time": "2021-04-02T03:03:42",
+      "upload_time_iso_8601": "2021-04-02T03:03:42.989025Z",
+      "url": "https://files.pythonhosted.org/packages/2d/29/da981c8cd533c5405c990eadbb3cdfaabd09ef7f74ab7af0a097034b43ed/virtex-0.1.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
