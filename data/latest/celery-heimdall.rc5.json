@@ -1,0 +1,319 @@
+{
+  "info": {
+    "author": "Tyler Kennedy",
+    "author_email": "tk@tkte.ch",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# celery-heimdall\n\n[![codecov](https://codecov.io/gh/TkTech/celery-heimdall/branch/main/graph/badge.svg?token=1A2CVHQ25Q)](https://codecov.io/gh/TkTech/celery-heimdall)\n![GitHub](https://img.shields.io/github/license/tktech/celery-heimdall)\n![PyPI - Python Version](https://img.shields.io/pypi/pyversions/celery-heimdall)\n\nCelery Heimdall is a set of common utilities useful for the Celery background\nworker framework, built on top of Redis. It's not trying to handle every use\ncase, but to be an easy, modern, and maintainable drop-in solution for 90% of\nprojects.\n\n## Features\n\n- Globally unique tasks, allowing only 1 copy of a task to execute at a time, or\n  within a time period (ex: \"Don't allow queuing until an hour has passed\")\n- Global rate limiting. Celery has built-in rate limiting, but it's a rate limit\n  _per worker_, making it unsuitable for purposes such as limiting requests to\n  an API.\n\n## Installation\n\n`pip install celery-heimdall`\n\n## Usage\n\n### Unique Tasks\n\nImagine you have a task that starts when a user presses a button. This task\ntakes a long time and a lot of resources to generate a report. You don't want\nthe user to press the button 10 times and start 10 tasks. In this case, you\nwant what Heimdall calls a unique task:\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask\n\n@shared_task(base=HeimdallTask, heimdall={'unique': True})\ndef generate_report(customer_id):\n    pass\n```\n\nAll we've done here is change the base Task class that Celery will use to run\nthe task, and passed in some options for Heimdall to use. This task is now\nunique - for the given arguments, only 1 will ever run at the same time.\n\n#### Expiry\n\nWhat happens if our task dies, or something goes wrong? We might end up in a\nsituation where our lock never gets cleared, called [deadlock][]. To work around\nthis, we add a maximum time before the task is allowed to be queued again:\n\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    'unique': True,\n    'unique_timeout': 60 * 60\n  }\n)\ndef generate_report(customer_id):\n  pass\n```\n\nNow, `generate_report` will be allowed to run again in an hour even if the\ntask got stuck, the worker ran out of memory, the machine burst into flames,\netc...\n\n#### Custom Keys\n\nBy default, a hash of the task name and its arguments is used as the lock key.\nBut this often might not be what you want. What if you only want one report at\na time, even for different customers? Ex:\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    'unique': True,\n    'key': lambda args, kwargs: 'generate_report'\n  }\n)\ndef generate_report(customer_id):\n  pass\n```\nBy specifying our own key function, we can completely customize how we determine\nif a task is unique.\n\n#### The Existing Task\n\nBy default, if you try to queue up a unique task that is already running,\nHeimdall will return the existing task's `AsyncResult`. This lets you write\nsimple code that doesn't need to care if a task is unique or not. Imagine a\nsimple API endpoint that starts a report when it's hit, but we only want it\nto run one at a time. The below is all you need:\n\n```python\nimport time\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask\n\n@shared_task(base=HeimdallTask, heimdall={'unique': True})\ndef generate_report(customer_id):\n  time.sleep(10)\n\ndef my_api_call(customer_id: int):\n  return {\n    'status': 'RUNNING',\n    'task_id': generate_report.delay(customer_id).id\n  }\n```\n\nEverytime `my_api_call` is called with the same `customer_id`, the same\n`task_id` will be returned by `generate_report.delay()` until the original task\nhas completed.\n\nSometimes you'll want to catch that the task was already running when you tried\nto queue it again. We can tell Heimdall to raise an exception in this case:\n\n```python\nimport time\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask, AlreadyQueuedError\n\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    'unique': True,\n    'unique_raises': True\n  }\n)\ndef generate_report(customer_id):\n  time.sleep(10)\n\n\ndef my_api_call(customer_id: int):\n  try:\n    task = generate_report.delay(customer_id)\n    return {'status': 'STARTED', 'task_id': task.id}\n  except AlreadyQueuedError as exc:\n    return {'status': 'ALREADY_RUNNING', 'task_id': exc.likely_culprit}\n```\n\nBy setting `unique_raises` to `True` when we define our task, an\n`AlreadyQueuedError` will be raised when you try to queue up a unique task\ntwice. The `AlreadyQueuedError` has two properties:\n\n- `likely_culprit`, which contains the task ID of the already-running task,\n- `expires_in`, which is the time remaining (in seconds) before the \n  already-running task is considered to be expired.\n\n#### Unique Interval Task\n\nWhat if we want the task to only run once in an hour, even if it's finished?\nIn those cases, we want it to run, but not clear the lock when it's finished:\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    'unique': True,\n    'unique_timeout': 60 * 60,\n    'unique_wait_for_expiry': True\n  }\n)\ndef generate_report(customer_id):\n  pass\n```\n\nBy setting `unique_wait_for_expiry` to `True`, the task will finish, and won't\nallow another `generate_report()` to be queued until `unique_timeout` has\npassed.\n\n### Rate Limiting\n\nCelery offers rate limiting out of the box. However, this rate limiting applies\non a per-worker basis. There's no reliable way to rate limit a task across all\nyour workers. Heimdall makes this easy:\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask, RateLimit\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    'rate_limit': RateLimit((2, 60))\n  }\n)\ndef download_report_from_amazon(customer_id):\n  pass\n```\n\nThis says \"every 60 seconds, only allow this task to run 2 times\". If a task\ncan't be run because it would violate the rate limit, it'll be rescheduled.\n\nIt's important to note this does not guarantee that your task will run _exactly_\ntwice a second, just that it won't run _more_ than twice a second. Tasks are\nrescheduled with a random jitter to prevent the [thundering herd][] problem.\n\n\n#### Dynamic Rate Limiting\n\nJust like you can dynamically provide a key for a task, you can also\ndynamically provide a rate limit based off that key.\n\n\n```python\nfrom celery import shared_task\nfrom celery_heimdall import HeimdallTask, RateLimit\n\n\n@shared_task(\n  base=HeimdallTask,\n  heimdall={\n    # Provide a lower rate limit for the customer with the ID 10, for everyone\n    # else provide a higher rate limit.\n    'rate_limit': RateLimit(lambda args: (1, 30) if args[0] == 10 else (2, 30)),\n    'key': lambda args, kwargs: f'customer_{args[0]}'\n  }\n)\ndef download_report_from_amazon(customer_id):\n  pass\n```\n\n\n## Inspirations\n\nThese are more mature projects which inspired this library, and which may\nsupport older versions of Celery & Python then this project.\n\n- [celery_once][], which is unfortunately abandoned and the reason this project\n  exists.\n- [celery_singleton][]\n- [This snippet][snip] by Vigrond, and subsequent improvements by various\n  contributors.\n\n\n[celery_once]: https://github.com/cameronmaske/celery-once\n[celery_singleton]: https://github.com/steinitzu/celery-singleton\n[deadlock]: https://en.wikipedia.org/wiki/Deadlock\n[thundering herd]: https://en.wikipedia.org/wiki/Thundering_herd_problem\n[snip]: https://gist.github.com/Vigrond/2bbea9be6413415e5479998e79a1b11a",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/tktech/celery-heimdall",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "celery-heimdall",
+    "package_url": "https://pypi.org/project/celery-heimdall/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/celery-heimdall/",
+    "project_urls": {
+      "Homepage": "https://github.com/tktech/celery-heimdall",
+      "Repository": "https://github.com/tktech/celery-heimdall"
+    },
+    "release_url": "https://pypi.org/project/celery-heimdall/0.5.0/",
+    "requires_dist": [
+      "celery (>=5.2.7,<6.0.0)",
+      "redis (>=4.3.4,<5.0.0)",
+      "click (>=8.1.3,<9.0.0) ; extra == \"inspector\"",
+      "SQLAlchemy (>=1.4.40,<2.0.0) ; extra == \"inspector\"",
+      "importlib-metadata (<=4.13)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "Helpful celery extensions.",
+    "version": "0.5.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16360468,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c57cfa4c46781a5b915a4c427f066acddb19db498fa010ce121f7d79b98bae16",
+          "md5": "0741512fda115bbc4a74339003d34505",
+          "sha256": "b38eead472ef45f66432e46d0ca9175cab971456a3d539143a982c23bc30aa16"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0741512fda115bbc4a74339003d34505",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8199,
+        "upload_time": "2022-08-20T01:40:50",
+        "upload_time_iso_8601": "2022-08-20T01:40:50.006076Z",
+        "url": "https://files.pythonhosted.org/packages/c5/7c/fa4c46781a5b915a4c427f066acddb19db498fa010ce121f7d79b98bae16/celery_heimdall-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d23726f09e1ca7e832a796786d856aa770b129dcf587ec27439973ceed21d07c",
+          "md5": "86746fad7670dceb79894725830a66bc",
+          "sha256": "c463afe987667b38a5486a5d54e7d8af270b4d9dc985df3f96bc26c71976945e"
+        },
+        "downloads": -1,
+        "filename": "celery-heimdall-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "86746fad7670dceb79894725830a66bc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8059,
+        "upload_time": "2022-08-20T01:40:48",
+        "upload_time_iso_8601": "2022-08-20T01:40:48.825634Z",
+        "url": "https://files.pythonhosted.org/packages/d2/37/26f09e1ca7e832a796786d856aa770b129dcf587ec27439973ceed21d07c/celery-heimdall-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a12679a191a73ecbc8268f708a47cccf34e2dda6cbd84ee99effb0a1781e9f63",
+          "md5": "750ece2135e83d9accb7ac55404a7bdd",
+          "sha256": "da44e75f14b8723455947bf7a08b021f96ba6016547dfb7cb6b5c1443c3cea75"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "750ece2135e83d9accb7ac55404a7bdd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8998,
+        "upload_time": "2022-08-21T00:47:59",
+        "upload_time_iso_8601": "2022-08-21T00:47:59.246513Z",
+        "url": "https://files.pythonhosted.org/packages/a1/26/79a191a73ecbc8268f708a47cccf34e2dda6cbd84ee99effb0a1781e9f63/celery_heimdall-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e541236614f88a14ca0114679e14bf90f120eb01a08f6d896b1e6fcdb54f01f",
+          "md5": "c66dd8531894da58c34c21a2ac221cdb",
+          "sha256": "2cc7a8a86b047882342c86d18ee0328700d5d795e42d4cd26d3fc1a9cd49dedc"
+        },
+        "downloads": -1,
+        "filename": "celery-heimdall-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c66dd8531894da58c34c21a2ac221cdb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9253,
+        "upload_time": "2022-08-21T00:47:57",
+        "upload_time_iso_8601": "2022-08-21T00:47:57.874030Z",
+        "url": "https://files.pythonhosted.org/packages/5e/54/1236614f88a14ca0114679e14bf90f120eb01a08f6d896b1e6fcdb54f01f/celery-heimdall-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e47160ea5548475b161810a6d61be149efd2050e8671e6f715bf02b460565559",
+          "md5": "ced7fcf90b1a602049302cd332026c1e",
+          "sha256": "09ece2f71c22cf4cf6a9ab1152f523d9c77d50ade9ed6ac782326502318c9ddc"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ced7fcf90b1a602049302cd332026c1e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9084,
+        "upload_time": "2022-08-24T06:32:23",
+        "upload_time_iso_8601": "2022-08-24T06:32:23.216883Z",
+        "url": "https://files.pythonhosted.org/packages/e4/71/60ea5548475b161810a6d61be149efd2050e8671e6f715bf02b460565559/celery_heimdall-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5aae9b6df8d8746efa5c4e5052ced9bc0413037bc01c067812f9a8a44866c8d2",
+          "md5": "4d638e927284b7b1068fb59caa9a2df5",
+          "sha256": "52f323abbbccbbb24dbbdf732c7d2d61f0f60a05b866716f81cfad9770405124"
+        },
+        "downloads": -1,
+        "filename": "celery-heimdall-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4d638e927284b7b1068fb59caa9a2df5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9347,
+        "upload_time": "2022-08-24T06:32:21",
+        "upload_time_iso_8601": "2022-08-24T06:32:21.338494Z",
+        "url": "https://files.pythonhosted.org/packages/5a/ae/9b6df8d8746efa5c4e5052ced9bc0413037bc01c067812f9a8a44866c8d2/celery-heimdall-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0c1d9821d286188edc86e20dab3375f8bd945d042e22efc49d0df5772ee61f0",
+          "md5": "a9d739f6d5cb627462b9a51db47a2445",
+          "sha256": "f356b658f27b14e335321a9222a942d89f8c4c925e80e0e3a57095f7609fe1f0"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a9d739f6d5cb627462b9a51db47a2445",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9382,
+        "upload_time": "2022-10-06T23:46:55",
+        "upload_time_iso_8601": "2022-10-06T23:46:55.735647Z",
+        "url": "https://files.pythonhosted.org/packages/d0/c1/d9821d286188edc86e20dab3375f8bd945d042e22efc49d0df5772ee61f0/celery_heimdall-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2cfae44e810051ce87b27fce7d1f362a657471824b96588505035bed1e9ff267",
+          "md5": "57d6e48ceb4da590bd3aa0b24392e584",
+          "sha256": "6aee732bc8c9647be553b2d2fabd1493b09a53f4d689cc81a3716b5300f8eb88"
+        },
+        "downloads": -1,
+        "filename": "celery-heimdall-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "57d6e48ceb4da590bd3aa0b24392e584",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9591,
+        "upload_time": "2022-10-06T23:46:54",
+        "upload_time_iso_8601": "2022-10-06T23:46:54.209144Z",
+        "url": "https://files.pythonhosted.org/packages/2c/fa/e44e810051ce87b27fce7d1f362a657471824b96588505035bed1e9ff267/celery-heimdall-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "35d4722836a403b824229c378d00c5e2e1e2db3f1e69e1985007f75bb1e2acb9",
+          "md5": "b25c90c70ca6b6488b9209feb24b8a3e",
+          "sha256": "6402224bb21780821e5c0898278ee08c731ff3207301f3c18a753888ebaba970"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b25c90c70ca6b6488b9209feb24b8a3e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 14592,
+        "upload_time": "2023-01-09T13:56:57",
+        "upload_time_iso_8601": "2023-01-09T13:56:57.118396Z",
+        "url": "https://files.pythonhosted.org/packages/35/d4/722836a403b824229c378d00c5e2e1e2db3f1e69e1985007f75bb1e2acb9/celery_heimdall-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a0ece7901cc6f4dce4ade9d6b163ec46e4e44db7a2ffdf1a4c685e8af5e70b4",
+          "md5": "316da8e5706229b36372ca5089890698",
+          "sha256": "d75d20c262baf97c8fd8aee1895c9cf3004ab355539f86e7dc0ab7de0171b810"
+        },
+        "downloads": -1,
+        "filename": "celery_heimdall-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "316da8e5706229b36372ca5089890698",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 14985,
+        "upload_time": "2023-01-09T13:56:58",
+        "upload_time_iso_8601": "2023-01-09T13:56:58.473218Z",
+        "url": "https://files.pythonhosted.org/packages/7a/0e/ce7901cc6f4dce4ade9d6b163ec46e4e44db7a2ffdf1a4c685e8af5e70b4/celery_heimdall-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "35d4722836a403b824229c378d00c5e2e1e2db3f1e69e1985007f75bb1e2acb9",
+        "md5": "b25c90c70ca6b6488b9209feb24b8a3e",
+        "sha256": "6402224bb21780821e5c0898278ee08c731ff3207301f3c18a753888ebaba970"
+      },
+      "downloads": -1,
+      "filename": "celery_heimdall-0.5.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b25c90c70ca6b6488b9209feb24b8a3e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 14592,
+      "upload_time": "2023-01-09T13:56:57",
+      "upload_time_iso_8601": "2023-01-09T13:56:57.118396Z",
+      "url": "https://files.pythonhosted.org/packages/35/d4/722836a403b824229c378d00c5e2e1e2db3f1e69e1985007f75bb1e2acb9/celery_heimdall-0.5.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7a0ece7901cc6f4dce4ade9d6b163ec46e4e44db7a2ffdf1a4c685e8af5e70b4",
+        "md5": "316da8e5706229b36372ca5089890698",
+        "sha256": "d75d20c262baf97c8fd8aee1895c9cf3004ab355539f86e7dc0ab7de0171b810"
+      },
+      "downloads": -1,
+      "filename": "celery_heimdall-0.5.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "316da8e5706229b36372ca5089890698",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 14985,
+      "upload_time": "2023-01-09T13:56:58",
+      "upload_time_iso_8601": "2023-01-09T13:56:58.473218Z",
+      "url": "https://files.pythonhosted.org/packages/7a/0e/ce7901cc6f4dce4ade9d6b163ec46e4e44db7a2ffdf1a4c685e8af5e70b4/celery_heimdall-0.5.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

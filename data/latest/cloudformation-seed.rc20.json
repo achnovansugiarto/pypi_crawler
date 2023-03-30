@@ -1,0 +1,973 @@
+{
+  "info": {
+    "author": "Alex Bukharov",
+    "author_email": "alex.bukharov@innablr.com.au",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "Cloudformation Seed\n======\n[![Build and test](https://github.com/Innablr/cloudformation-seed/actions/workflows/build-and-test.yaml/badge.svg)](https://github.com/Innablr/cloudformation-seed/actions/workflows/build-and-test.yaml)\n[![PyPI version shields.io](https://img.shields.io/pypi/v/cloudformation-seed.svg)](https://pypi.python.org/pypi/cloudformation-seed/)\n\nPreface\n------\n\nThis is a script that will help you deploy your Cloudformation project without hassle:\n\n* Handle Cloudformation deployments of any scale\n* Allow to do multiple deployments of the same code with a different installation name\n* Automate Lambda code handling\n* Get rid of hard dependencies of Cloudformation Exports, instead pass around Output values between stacks\n* Package the whole deployment in a Docker image and version it\n\nIt will:\n\n* Automatically create an S3 bucket according to the project name\n* Upload the Cloudformation templates into the bucket\n* Package and checksum your Lambda code and upload it into the bucket\n* Upload arbitrary artifacts into the bucket so that they are available to your deployment\n* Create and manage Cloudformation stacks\n* Create, roll out and manage Stacksets\n\nRequirements\n------\n\nYou need a Mac, Linux or Windows machine/VM to run the Seed. On Windows it runs natively, as well as in WSL/WSL2.\n\nInstallation\n------\n\nInstall it from PyPI:\n```\n$ pip install cloudformation-seed\n$ cloudformation-seed --version\n```\n\nOr use a docker image from ghcr.io (use the version number instead of `latest` for stability):\n```\n$ docker pull ghcr.io/innablr/cloudformation-seed:latest\n$ docker run ghcr.io/innablr/cloudformation-seed:latest cloudformation-seed --version\n```\n\nQuick start\n------\n\n### First things first:\n\n1. Create a new directory for your project\n2. Copy everything from the `examples` directory to the root of the project\n3. Edit `parameters/dev.yaml` to your needs\n4. Add more templates with `.cf.yaml` extensions under the `cloudformation` directory and include them in `parameters/dev.yaml`\n\n### Finally:\n\nAuthenticate to AWS using your method of choice, make sure that you have set the AWS Region you need for deployment. Run `cloudformation-seed -c my-project -i x0 -e dev -d my.domain.cld deploy`\n\n### Optionally:\n\nTake the dockerfiles and makefiles from the `examples` directory and massage them around to suit your needs.\n\nDeep dive\n------\n\n### Mandatory Cloudformation stack parameters\n\nEvery Cloudformation template you use has to have 4 mandatory parameters that will be supplied by the Seed:\n\n1. `TemplatesS3Bucket` - the Seed will automatically create an S3 bucket and every template will have its name passed down in this parameter, so it can be made available to Lambda functions, autoscaling groups, e.t.c.\n2. `InstallationName` - installation name is what makes you able to deploy your project multiple times without name clashes. Every template will have it in this parameter and you have to use it in the names of your resources to make them unique across multiple installations\n3. `RuntimeEnvironment` - name of the runtime environment (read *Deployment configuration*)\n4. `Route53ZoneDomain` - DNS domain associated with your deployment. The Seed doesn't require it to exist, you can use it as part of your resource naming convention\n\nThere are other builtin parameters that are populated automatically by the Seed if you declare them in your Cloudformation templates:\n\n* `ProductName` - if you are using Seed's SSM parameter management, they are always references through `/product_name/installation_name/parameter_name` path. Product Name can be set through the `-c` parameter on the Seed command line. You can also have this value available to your Cloudformation templates through the `ProductName` builtin parameter\n* `AWSOrganizationID` and `AWSOrganizationARN` - you can set the AWS Organization ID on the Seed command line. This will make the templates S3 bucket available to the entire AWS Organization, so you can use your lambdas in Cloudformation stacksets. You can also have these values available to your Cloudformation templates through the above parameters\n\nHere's a snippet you can copy and paste:\n\n```\nParameters:\n  TemplatesS3Bucket:\n    Type: String\n    Description: S3 Bucket with the components templates\n  InstallationName:\n    Type: String\n    Description: Unique DNS stack installation name\n  RuntimeEnvironment:\n    Type: String\n    Description: The runtime environment config tag\n    Default: dev\n  Route53ZoneDomain:\n    Type: String\n    Description: Route53 zone domain that represents the environment\n```\n\n### Seed bucket\n\nThe Seed will automatically create an S3 bucket for operating the deployment. The name of the bucket is derived from the installation name and project name from `Makefile.particulars`. The name of the bucket will be passed down to every Cloudformation template in your deployment as `TemplatesS3Bucket`\n\nIf you specify the ARN of your AWS Organization on the commandline the bucket will be shared with the entire Organization. This will allow you to use uploaded Lambda code in your stacksets (see lambda code handling below).\n\n### Deployment configuration\n\nThe `-e dev` parameter in the deployment directive above points to the configuration file `dev.yaml` located under the `parameters` directory.\n\nYou can have multiple runtime environments for the same project with different configuration, for example if you have *dev*, *test* and *prod* environments that reuse the same Cloudformation but need different configuration, for example VPC and subnet IDs.\n\nA runtime environment is a YAML file that:\n* defines the sequence in which the Cloudformation stacks will be deployed\n* sets parameters for the Cloudformation stacks\n\nYou can also factor common configuration into separate YAML files and include them into one another using the `!Include` YAML tag:\n\n```\n  - name: centralservices-iam-set\n    type: stackset                                       # set type to stackset\n    template: sets/iam.cf.yaml\n    parameters:                                          # parameters to the StackSet\n      SSMLogsLambdaS3Key: !LambdaZip ssmLogsConfig.zip\n      SAMLUsername: *SAML_USERNAME\n      SAMLProviderName: *SAML_PROVIDER_NAME\n    pilot:                                               # when StackSet is updated only update instances in these accounts\n      accounts:\n        - '000000000000'\n    rollout: !Include rollout.yaml                       # manage StackSet instances\n```\n\nThe runtime environment contains two sections:\n\n#### `common-parameters`\n\nIn this section you can specify Cloudformation parameters that will be picked up by every stack in the deployment as a default value (i.e. if a stack has the same parameter on it it will take precedence)\n\nExample:\n\n```\ncommon-parameters:\n  VpcId: vpc-00000000\n```\n\nYou can use `!StackOutput` (read below) in `common-parameters` and it will work as expected.\n\nInstead of `common-parameters` you can also use YAML anchors like this:\n\n```\nSAMLUsername: &SAML_USERNAME okta_sso\n\nstacks:\n  - name: centralservices-iam-set\n    type: stackset\n    template: sets/iam.cf.yaml\n    parameters:\n      SSMLogsLambdaS3Key: !LambdaZip ssmLogsConfig.zip\n      SAMLUsername: *SAML_USERNAME\n```\n\nYou can also tag your stacks/stacksets by defining your tags as a dictionary and referencing them using the YAML anchors within your stacks like this:\n\n```\ntags_a: &TAGSA\n  testkey1: testvalue1\n  testkey2: testvalue2\n\ntags_b: &TAGSB\n  testkey3: testvalue3\n\n  stacks:\n    - name: example-stackset-template\n      type: stackset\n      template: sets/example-stackset-template.cf.yaml\n      rollout:\n        - account: '000000000000'\n      tags: *TAGSA\n\n    - name: my-project-kms-decrypt-lambda\n      template: support/kms-parameters-lambda.cf.yaml\n      parameters:\n        LambdaSourceS3Key: !LambdaZip kmsParameters.zip\n      tags: *TAGSB\n```\n\n#### `stacks`\n\nMain configuration where you describe the Cloudformation stacks you want to deploy.\n\nExample:\n\n```\nstacks:\n  - name: in-cld-managed-zone                            # name of the CF stack, INSTALLATION_NAME will be prepended\n    template: centralservices/r53-zone.cf.yaml           # CF template relative to cloudformation directory\n    parameters:                                          # Parameters to the CF stack\n      ManagedZoneDomainName: in.cld\n      ManagingAccountArns:                               # List parameters turn into comma-separated values\n        - arn:aws:iam::000000000000:root\n        - arn:aws:iam::111111111111:root\n        - arn:aws:iam::222222222222:root\n\n  - name: in-cld-provisioning                            # name of CF stack, INSTALLATION_NAME will be prepended\n    template: centralservices/r53-provisioning.cf.yaml   # CF template relative to cloudformation directory\n    parameters:\n      LambdaSourceS3Key: !LambdaZip provisionR53.zip     # points to the lambda function under src/provisionR53 (read below)\n      SharedServiceR53ZoneRoleArn: !StackOutput in-cld-managed-zone.ManagedZoneCrossAccountRole    # will take the output called ManagedZoneCrossAccountRole from the above stack called in-cld-managed-zone\n      Route53DomainName: !StackOutput in-cld-managed-zone.ManagedZoneDomainName\n      ExportOutputs: 'false'                             # put numbers and booleans in quotes\n\n  # Self-managed stackset\n\n  - name: centralservices-iam-set\n    type: stackset                                       # set type to stackset\n    template: sets/iam.cf.yaml\n    parameters:                                          # parameters to the StackSet\n      SSMLogsLambdaS3Key: !LambdaZip ssmLogsConfig.zip\n      SAMLUsername: *SAML_USERNAME\n      SAMLProviderName: *SAML_PROVIDER_NAME\n    pilot:                                               # when StackSet is updated only update instances in these accounts\n      accounts:\n        - '000000000000'\n    rollout_strategy: accounts                           # set to organization for AWS Organisation-managed stackset\n    rollout:                                             # manage StackSet instances\n      - account: '000000000000'\n        override:                                        # parameter override\n          Route53ZoneDomain: prod.innablr.lan\n      - account: '111111111111'\n        regions:                                         # in this account it goes into two regions\n          - ap-southeast-2\n          - eu-west-1\n        override:\n          Route53ZoneDomain: preprod.innablr.lan\n      - account: '222222222222'\n        override:\n          Route53ZoneDomain: dev.innablr.lan\n      - account: '999999999999'\n        regions: []                                      # this is how you delete an instance\n        override:\n          Route53ZoneDomain: dontwant.innablr.lan\n\n  # Stackset managed by the AWS Organization\n\n  - name: centralservices-org-iam-set\n    type: stackset                                       # set type to stackset\n    template: sets/iam.cf.yaml\n    parameters:                                          # parameters to the StackSet\n      SSMLogsLambdaS3Key: !LambdaZip ssmLogsConfig.zip\n      SAMLUsername: *SAML_USERNAME\n      SAMLProviderName: *SAML_PROVIDER_NAME\n    call_as: self                                        # delegated_admin is also supported\n    rollout_strategy: organization\n    rollout_autodeploy:\n      enable: true\n      retain_on_removal: false\n    rollout:                                             # manage StackSet instances\n      - ou: ou-xxxx-xw09483h\n        override:                                        # parameter override\n          Route53ZoneDomain: prod.innablr.lan\n      - ou: ou-xxxx-u49ogrw9\n        regions:                                         # in this account it goes into two regions\n          - ap-southeast-2\n          - eu-west-1\n        override:\n          Route53ZoneDomain: preprod.innablr.lan\n      - ou: ou-xxxx-rj3kl2ur\n        override:\n          Route53ZoneDomain: dev.innablr.lan\n      - ou: ou-xxxx-h3kj57gk\n        regions: []                                      # this is how you delete an instance\n        override:\n          Route53ZoneDomain: dontwant.innablr.lan\n\n```\n\n### Automated Lambda functions\n\nIf your deployment contains Lambda function they can be handled by the Seed automatically. In the `examples` directory you can find an example of a Lambda function called `kmsParameters`\n\n1. Create a directory under `src` for your Lambda, say `kmsParameters`\n2. Do the development\n3. Create a `Makefile` in the directory you have created and make sure that **the default target of the Makefile produces a zip-file**, say `kmsParameters.zip`\n4. In your runtime environment configuration use `!LambdaZip kmsParameters.zip` to pass the zip-file name to the CloudFormation template (see the example above)\n\nIf your Lambda function is used in a StackSet and needs to be available from other AWS accounts make sure that you give access to the Seed bucket from those accounts. Refer to the stack `bucket-policy.cf.yaml` that is included in the examples.\n\nInstead you can specify your AWS Organization ARN on the Seed command line using the `-o` parameter and the bucket will be shared to the entire AWS Organization automatically.\n\n### Arbitrary artifacts\n\nIf you want to include any configuration objects for your software or other relatively lightweight artifacts you can create a directory called `config/<runtime_environment>` under the root of your project and anything you put in this directory will be uploaded in the Seed S3 bucket under a key called `config`.\n\nLet's say you have `config/dev/myapp_cert.pem` and you deploy a runtime configuration called `dev`. The file will be uploaded in the bucket as `config/myapp_cert.pem`.\n\n### Configuration tags\n\nIn the environment configuration you can use the following tags in stack parameters specification:\n\n1. `!IncludeAll [concat, tenants/*.yaml]` - will include all files by the specified wildcard. You may either choose to `concat` and you will get a list as a result, or `merge` and get a dict\n\n2. `!ObjectPath [*CONFIG_OBJECT, '$.stacks.\"test-stack\"']` - runs an ObjectPath expression on the specified data structure\n\n3. `!LambdaZip kmsParameters.zip` - will pass the correct S3 key to the uploaded kmsParameters.zip, so you can use it in your Lambda resources together with `TemplatesS3Bucket`\n\n4. `!CloudformationTemplateS3Key support/bucket-policy.cf.yaml` - works very similar to `!Lambdazip` but for Cloudformation templates. Will pass down the correct S3 key to the specified CloudFormation stack. You can use it for managing nested stacks.\n\n5. `!CloudformationTemplateS3Url support/bucket-policy.cf.yaml` - similar to the above, but contains the full S3 URL of the specified template.\n\n6. `!StackOutput stack-name.OutputName` - will read the corresponding output from the specified stack and pass it down here. The stack needs to have been created above in the sequence.\n\n7. `!Builtin TemplatesS3Bucket` - returns the value of a builtin parameter. This allows you to pass the builtin Seed parameters like `TemplatesS3Bucket` as different Cloudformation parameter names should you need to do so.\n\n8. `!EnvironmentVariable DOMAIN_NAME` - returns the value of an environment variable. If the variable is not set the deployment will abort.\n\n9. `!SSMParameterDirect` - reads the value of the specified SSM parameter prefixed with `/product_name/installation_name/` from SSM and pushes it into the Cloudformation stack\n\n10. `!SSMParameterDeclared` - instead of reading the SSM parameter value this directive will construct its name prefixed with `/product_name/installation_name/` and pass it down to the Cloudformation stack, so you can use Cloudformation native SSM parameter handling\n\n11. `!ArtifactVersion`, `!ArtifactRepo` and `!ArtifactImage` - these three tags are used together with a release manifest in release management\n\nRelease management\n------\n\ncloudformation-seed also can read a release manifest file if you specify it in the `-m` commandline argument. Release manifest contains artifact names, their versions and other information about the software that is being deployed by the Seed. You can then inform your Cloudformation stacks about the versions and images you are deploying using the `!ArtifactVersion`, `!ArtifactRepo` and `!ArtifactImage` tags in the runtime environment configuration.\n\nMore documentation about release management is coming soon.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Innablr/cloudformation-seed",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cloudformation-seed",
+    "package_url": "https://pypi.org/project/cloudformation-seed/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/cloudformation-seed/",
+    "project_urls": {
+      "Homepage": "https://github.com/Innablr/cloudformation-seed"
+    },
+    "release_url": "https://pypi.org/project/cloudformation-seed/1.3.6/",
+    "requires_dist": [
+      "boto3 (>=1.9.64)",
+      "PyYAML (>=5.1)",
+      "colorama (>=0.4.1)",
+      "objectpath (==0.6.1)"
+    ],
+    "requires_python": "",
+    "summary": "Orchestrates large Cloudformation deployments",
+    "version": "1.3.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14810007,
+  "releases": {
+    "0.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49916c6f9140965da86a937703feff6104e928a9426888bab9730404e4bf0064",
+          "md5": "6844a78db0c2cea821fe5eb22bff5311",
+          "sha256": "d4125383ca1b13f76843644d86318219cfde2389be0a7e1bb65ed27ff9d34498"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.10.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6844a78db0c2cea821fe5eb22bff5311",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24651,
+        "upload_time": "2019-08-23T19:54:53",
+        "upload_time_iso_8601": "2019-08-23T19:54:53.387949Z",
+        "url": "https://files.pythonhosted.org/packages/49/91/6c6f9140965da86a937703feff6104e928a9426888bab9730404e4bf0064/cloudformation_seed-0.10.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f1ab3c0271b95cfdbcc3feace7d26660199fcffc99e47a20b0d93fc3a2d1aad",
+          "md5": "90a91da12eeb12a8ff46415bde88dbff",
+          "sha256": "cbf4b9cd308aac169d01825b7d240e83d1df670ec38ffd863e5d16e7dcf532e4"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.10.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "90a91da12eeb12a8ff46415bde88dbff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24821,
+        "upload_time": "2019-08-23T19:54:55",
+        "upload_time_iso_8601": "2019-08-23T19:54:55.063640Z",
+        "url": "https://files.pythonhosted.org/packages/2f/1a/b3c0271b95cfdbcc3feace7d26660199fcffc99e47a20b0d93fc3a2d1aad/cloudformation-seed-0.10.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6a39741fc5a365a712f49a331e9b4d318e81f15e8c47515f415cc6e7d4df0d3",
+          "md5": "760699b539d70f223708f80d01fe78a0",
+          "sha256": "fc786e002e3b807051715eace8df28f4d4bee894326b80b298561e24cf9cb206"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.11.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "760699b539d70f223708f80d01fe78a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24731,
+        "upload_time": "2020-02-15T04:10:33",
+        "upload_time_iso_8601": "2020-02-15T04:10:33.139128Z",
+        "url": "https://files.pythonhosted.org/packages/d6/a3/9741fc5a365a712f49a331e9b4d318e81f15e8c47515f415cc6e7d4df0d3/cloudformation_seed-0.11.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "318ac9b1fc68f8cfd90d66373f8633c6be113580a45393a51aab69f3979e8ff9",
+          "md5": "1243c7ab1d2126db50b180285465f120",
+          "sha256": "f598d058c7334b4e8c85b424f8e098783ef255a8d3d0e5c3f2b64e83c54d483c"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.11.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1243c7ab1d2126db50b180285465f120",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25465,
+        "upload_time": "2020-02-15T04:07:29",
+        "upload_time_iso_8601": "2020-02-15T04:07:29.442786Z",
+        "url": "https://files.pythonhosted.org/packages/31/8a/c9b1fc68f8cfd90d66373f8633c6be113580a45393a51aab69f3979e8ff9/cloudformation-seed-0.11.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fc636bbbd8177ed9e3a5345db598f5b0a999768a5e28d4a5386443892432952",
+          "md5": "41a755074aa96d275736c42e3db67560",
+          "sha256": "ef605b409ff247b7feee185f4db587cd464aca5cd70244d3c0a6ff274a9c1d40"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.12.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "41a755074aa96d275736c42e3db67560",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25228,
+        "upload_time": "2020-05-09T07:37:57",
+        "upload_time_iso_8601": "2020-05-09T07:37:57.374958Z",
+        "url": "https://files.pythonhosted.org/packages/6f/c6/36bbbd8177ed9e3a5345db598f5b0a999768a5e28d4a5386443892432952/cloudformation_seed-0.12.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "15445865ec89799349006cacad11c7a4eb2da3eb396cdaf3473c903d4695b44e",
+          "md5": "d0d40660e8ab8edf8f23719fda4beb39",
+          "sha256": "d3e7ef515196f3d0984b077331cb22015e7b40f2678440a9224aa7d359ba0449"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.12.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d0d40660e8ab8edf8f23719fda4beb39",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25704,
+        "upload_time": "2020-05-09T07:37:58",
+        "upload_time_iso_8601": "2020-05-09T07:37:58.697805Z",
+        "url": "https://files.pythonhosted.org/packages/15/44/5865ec89799349006cacad11c7a4eb2da3eb396cdaf3473c903d4695b44e/cloudformation-seed-0.12.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.13.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dc96060e7e8577034922c99aa1a73a93abb1b6b42de30e6a9a641a08129e971e",
+          "md5": "9638fbf89c6b6077f59a2bf1d0fc572f",
+          "sha256": "548a9b1ccfcf843a07f6068593e837ef4955bdab3c9004f6462bc448df435fe9"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.13.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9638fbf89c6b6077f59a2bf1d0fc572f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24977,
+        "upload_time": "2021-09-15T03:54:28",
+        "upload_time_iso_8601": "2021-09-15T03:54:28.431167Z",
+        "url": "https://files.pythonhosted.org/packages/dc/96/060e7e8577034922c99aa1a73a93abb1b6b42de30e6a9a641a08129e971e/cloudformation_seed-0.13.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "594291348297b39585fbdaf1ed7ef1cddd005ad1b63eb7a3837742b2d2d5a8b8",
+          "md5": "695949705164482e9bb7d30bbe7204ff",
+          "sha256": "ca3cba3c0c254d20ca5cc1a1e4edc233a1acaa8abfbfe4aba3d528459e597920"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.13.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "695949705164482e9bb7d30bbe7204ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25655,
+        "upload_time": "2021-09-15T03:54:29",
+        "upload_time_iso_8601": "2021-09-15T03:54:29.420602Z",
+        "url": "https://files.pythonhosted.org/packages/59/42/91348297b39585fbdaf1ed7ef1cddd005ad1b63eb7a3837742b2d2d5a8b8/cloudformation-seed-0.13.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.13.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "009d1284d18477d245cfac0e6ef00105e49380120b38e810ddf0ef8800b62666",
+          "md5": "849eedbe389574c685b8e2d67ac32872",
+          "sha256": "980fa2767fe76cb0f8cef3f6743931f6da39216fe1730e57ff95f2a7aaa3539c"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.13.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "849eedbe389574c685b8e2d67ac32872",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24971,
+        "upload_time": "2021-09-15T07:20:46",
+        "upload_time_iso_8601": "2021-09-15T07:20:46.572911Z",
+        "url": "https://files.pythonhosted.org/packages/00/9d/1284d18477d245cfac0e6ef00105e49380120b38e810ddf0ef8800b62666/cloudformation_seed-0.13.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03e696ab2a96ab381510686c703cff76ef450f61fe490fa5a556b5bd27ddaf91",
+          "md5": "3d64ad0f81fea354665809f02d65a7c4",
+          "sha256": "5272c849571f00796236ac7c90100c553f078d4efd54989d1c4355d764521084"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.13.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3d64ad0f81fea354665809f02d65a7c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25665,
+        "upload_time": "2021-09-15T07:20:48",
+        "upload_time_iso_8601": "2021-09-15T07:20:48.159308Z",
+        "url": "https://files.pythonhosted.org/packages/03/e6/96ab2a96ab381510686c703cff76ef450f61fe490fa5a556b5bd27ddaf91/cloudformation-seed-0.13.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c467dcd15ebc95ad472c86ead9d87becae8738d8d091e9d5484b184cdb38398",
+          "md5": "46831f782a0f3a71465df27880812ee3",
+          "sha256": "742a19467f2e6414c60c0a2d678506b2ebbcd410cd671d5cb729e1ea6111d830"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "46831f782a0f3a71465df27880812ee3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 19220,
+        "upload_time": "2019-03-12T08:21:13",
+        "upload_time_iso_8601": "2019-03-12T08:21:13.890839Z",
+        "url": "https://files.pythonhosted.org/packages/2c/46/7dcd15ebc95ad472c86ead9d87becae8738d8d091e9d5484b184cdb38398/cloudformation_seed-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5306c5982055047e1e31877b1c984245030b69446c2039d3cc5befd8c9ac3ae1",
+          "md5": "b8830812c7b1e0190e3b23678bf38641",
+          "sha256": "4fa91391b374e01591c5b65ec48e8fe799c8553c2c7125175e7f8e842b11347b"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8830812c7b1e0190e3b23678bf38641",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19151,
+        "upload_time": "2019-03-12T08:21:16",
+        "upload_time_iso_8601": "2019-03-12T08:21:16.625591Z",
+        "url": "https://files.pythonhosted.org/packages/53/06/c5982055047e1e31877b1c984245030b69446c2039d3cc5befd8c9ac3ae1/cloudformation-seed-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56600d55aaaea6c28ca153556eafeed40d0e55f039311e7df67b48744ef13829",
+          "md5": "9790d75f3b7e2f56121972e4cb2faa9b",
+          "sha256": "2d52caeaf2d26e4a8f46f24db90b90c0e7d6c86e11769a847f38533052d0f1e6"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.9.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9790d75f3b7e2f56121972e4cb2faa9b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 19130,
+        "upload_time": "2019-03-18T05:50:29",
+        "upload_time_iso_8601": "2019-03-18T05:50:29.794346Z",
+        "url": "https://files.pythonhosted.org/packages/56/60/0d55aaaea6c28ca153556eafeed40d0e55f039311e7df67b48744ef13829/cloudformation_seed-0.9.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c7952fc2bbf5dfa13d0dac93c27577f8c4946ccadd3e330372f5ce7de78127a",
+          "md5": "64fb0959baa7967f48879d0fa503e207",
+          "sha256": "e8059c4b5b887e6458ff3114cde2fd3e09fb1440336e75d46577463e9bd48d10"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "64fb0959baa7967f48879d0fa503e207",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19879,
+        "upload_time": "2019-03-18T05:50:31",
+        "upload_time_iso_8601": "2019-03-18T05:50:31.880393Z",
+        "url": "https://files.pythonhosted.org/packages/7c/79/52fc2bbf5dfa13d0dac93c27577f8c4946ccadd3e330372f5ce7de78127a/cloudformation-seed-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c9afaeed124901bb86c4bab944f4cad74d351b8a1bf537f778f23f4379e89988",
+          "md5": "967aaa0d2bc9694437e79565c3227c8b",
+          "sha256": "3cc0146015c362ff7e7277c7c1cc6481fd5fb28d21634dc85b1365c2eed412df"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-0.9.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "967aaa0d2bc9694437e79565c3227c8b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 19140,
+        "upload_time": "2019-03-21T00:31:58",
+        "upload_time_iso_8601": "2019-03-21T00:31:58.062812Z",
+        "url": "https://files.pythonhosted.org/packages/c9/af/aeed124901bb86c4bab944f4cad74d351b8a1bf537f778f23f4379e89988/cloudformation_seed-0.9.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "797e39b32589c0ad8cf0457b42f078498aee4feb5671adf9a0db8063753c90a3",
+          "md5": "dc9a9d1dfa416a8c4cb57ab422ba86b9",
+          "sha256": "4859d735a1e157eb101ff15bedd88752df64ae7124f3969848ba61c6aa7d76e9"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-0.9.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dc9a9d1dfa416a8c4cb57ab422ba86b9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19892,
+        "upload_time": "2019-03-21T00:32:00",
+        "upload_time_iso_8601": "2019-03-21T00:32:00.136560Z",
+        "url": "https://files.pythonhosted.org/packages/79/7e/39b32589c0ad8cf0457b42f078498aee4feb5671adf9a0db8063753c90a3/cloudformation-seed-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "318aa340627d29f60b5fac7ae1f92ce088e29f4f95908f2aee281e81278cf5ee",
+          "md5": "5817f1728ab7411943bdabab6f9b5bb0",
+          "sha256": "375b9169453e063c1a900e3b9eb84b8cef8720d354cda2bab2a3873cb24a16d7"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5817f1728ab7411943bdabab6f9b5bb0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 24972,
+        "upload_time": "2021-09-15T08:27:37",
+        "upload_time_iso_8601": "2021-09-15T08:27:37.322781Z",
+        "url": "https://files.pythonhosted.org/packages/31/8a/a340627d29f60b5fac7ae1f92ce088e29f4f95908f2aee281e81278cf5ee/cloudformation_seed-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "890beb5bc91f4930b3e1abf2ececc0a07929714a8de25e6b2ef4648593e8969e",
+          "md5": "3a64f5279fec4d6345924bf9eb7ffd4e",
+          "sha256": "b844be7507c51c14010bcd4f7be16b7780401eb36ccc577eab61a5da2a0ac416"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3a64f5279fec4d6345924bf9eb7ffd4e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25007,
+        "upload_time": "2021-09-15T08:27:38",
+        "upload_time_iso_8601": "2021-09-15T08:27:38.435428Z",
+        "url": "https://files.pythonhosted.org/packages/89/0b/eb5bc91f4930b3e1abf2ececc0a07929714a8de25e6b2ef4648593e8969e/cloudformation-seed-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79b570876b102c8d0f5803169c588a8f967000e1762a2ae2713780d617d18631",
+          "md5": "eebbb5f66da6169922745163539fab05",
+          "sha256": "b9150fe37c0b2dee6a59098dccb211978331263de0c6ea91cb6916b7b3eca4f4"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eebbb5f66da6169922745163539fab05",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 25050,
+        "upload_time": "2022-02-07T10:25:46",
+        "upload_time_iso_8601": "2022-02-07T10:25:46.946131Z",
+        "url": "https://files.pythonhosted.org/packages/79/b5/70876b102c8d0f5803169c588a8f967000e1762a2ae2713780d617d18631/cloudformation_seed-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bdd1dbd293b374330ca63878daa3b3cf2cca39f1e8217d93fd13e0aa365dbdba",
+          "md5": "def85ee40f30fa79c9f84f7c14c71369",
+          "sha256": "312ea612070ecbd8dcc42a74900fd69772b5adf989e65bc7112b0b74d15b4eb0"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "def85ee40f30fa79c9f84f7c14c71369",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 25057,
+        "upload_time": "2022-02-07T10:25:48",
+        "upload_time_iso_8601": "2022-02-07T10:25:48.099305Z",
+        "url": "https://files.pythonhosted.org/packages/bd/d1/dbd293b374330ca63878daa3b3cf2cca39f1e8217d93fd13e0aa365dbdba/cloudformation-seed-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1cd06f5f8034822f08e858b58854c002278dbc9b87780a68b13a79e68aeb0c4e",
+          "md5": "e3dee13215cfc5de9f28553627654637",
+          "sha256": "368d6c031902e1356120a677828c4fc46d8fbf0941c234e80d6374e4041cbd63"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e3dee13215cfc5de9f28553627654637",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 26860,
+        "upload_time": "2022-02-08T08:25:04",
+        "upload_time_iso_8601": "2022-02-08T08:25:04.234125Z",
+        "url": "https://files.pythonhosted.org/packages/1c/d0/6f5f8034822f08e858b58854c002278dbc9b87780a68b13a79e68aeb0c4e/cloudformation_seed-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d98faed6da1fbbce790c5e3d8d7169b859df5e448c4668eacdd00242a6ecfe33",
+          "md5": "508e4a381876e989dc6f5b5a40fba5ba",
+          "sha256": "18c51c0fd7fd5bc2c4327905335339769af98c6438e71c374cfa712cca13dca1"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "508e4a381876e989dc6f5b5a40fba5ba",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 27720,
+        "upload_time": "2022-02-08T08:25:05",
+        "upload_time_iso_8601": "2022-02-08T08:25:05.991284Z",
+        "url": "https://files.pythonhosted.org/packages/d9/8f/aed6da1fbbce790c5e3d8d7169b859df5e448c4668eacdd00242a6ecfe33/cloudformation-seed-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "299025348835499bae903aa78b25f37bad577fb348b809a00d252bf4d35b84cd",
+          "md5": "6e4e5ab3d9be336f0280e7e1c2d05d8d",
+          "sha256": "4d5a88f364a134ce825901e60ecd65be77b6c947620bc47dc851fd2850c88d44"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6e4e5ab3d9be336f0280e7e1c2d05d8d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27170,
+        "upload_time": "2022-02-08T09:59:18",
+        "upload_time_iso_8601": "2022-02-08T09:59:18.343391Z",
+        "url": "https://files.pythonhosted.org/packages/29/90/25348835499bae903aa78b25f37bad577fb348b809a00d252bf4d35b84cd/cloudformation_seed-1.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5aa7cfe83aa370d13a2c7e984c437d3b46b827acc490902227fbe5a28a6c3140",
+          "md5": "9115397af235c4afbe1cc14375b5806a",
+          "sha256": "8d4d0853947d18cfc00cb3b3312e4b587cec3c92bec0105826a5b4ed8df2bc9b"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9115397af235c4afbe1cc14375b5806a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28315,
+        "upload_time": "2022-02-08T09:59:19",
+        "upload_time_iso_8601": "2022-02-08T09:59:19.683436Z",
+        "url": "https://files.pythonhosted.org/packages/5a/a7/cfe83aa370d13a2c7e984c437d3b46b827acc490902227fbe5a28a6c3140/cloudformation-seed-1.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b65c69af3d16ae2ef376719ff3efadb4ad048a8b3cddb1dc1f1fba17a466000",
+          "md5": "39cfccd435cbf799b6043c306a2b31d8",
+          "sha256": "b0542bb9416a82be53a05326e14e8a275b2c63141a7a29eeb8c288129724e530"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "39cfccd435cbf799b6043c306a2b31d8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27177,
+        "upload_time": "2022-02-09T04:23:34",
+        "upload_time_iso_8601": "2022-02-09T04:23:34.139051Z",
+        "url": "https://files.pythonhosted.org/packages/1b/65/c69af3d16ae2ef376719ff3efadb4ad048a8b3cddb1dc1f1fba17a466000/cloudformation_seed-1.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "698c39ce87d18f5e9cbae3800840a024bab154fb95375370344b700032e1d105",
+          "md5": "50961622b3894c8246ccbb3860340838",
+          "sha256": "f9f3a413575587daa60300cea7c5576d7aa1da50f1a31cda95beadcfae618a8a"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "50961622b3894c8246ccbb3860340838",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28329,
+        "upload_time": "2022-02-09T04:23:35",
+        "upload_time_iso_8601": "2022-02-09T04:23:35.393254Z",
+        "url": "https://files.pythonhosted.org/packages/69/8c/39ce87d18f5e9cbae3800840a024bab154fb95375370344b700032e1d105/cloudformation-seed-1.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f19a5de2185e3cf770b04caf4346b510b7b4e1ed05e8c8ab94a98268881d17d",
+          "md5": "ed053c5bc5c465ee5bcf3d5784171d19",
+          "sha256": "5f74dfdd4496094f78ed7d9917dc08d99c7c61c46c11d303b9431bd6392a1faf"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ed053c5bc5c465ee5bcf3d5784171d19",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27267,
+        "upload_time": "2022-02-09T23:00:13",
+        "upload_time_iso_8601": "2022-02-09T23:00:13.185765Z",
+        "url": "https://files.pythonhosted.org/packages/9f/19/a5de2185e3cf770b04caf4346b510b7b4e1ed05e8c8ab94a98268881d17d/cloudformation_seed-1.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "380e6a90b63fa8dc89e2dbad760c8be588f3a60721df7d0cef05fb9348d5a9b0",
+          "md5": "148a49e1941c6f9e18751fc510ed227f",
+          "sha256": "901c8f08a7f7f4d067f180d784660e578678a370074cf89bcfec6d86331e5ac3"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "148a49e1941c6f9e18751fc510ed227f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 28417,
+        "upload_time": "2022-02-09T23:00:14",
+        "upload_time_iso_8601": "2022-02-09T23:00:14.973636Z",
+        "url": "https://files.pythonhosted.org/packages/38/0e/6a90b63fa8dc89e2dbad760c8be588f3a60721df7d0cef05fb9348d5a9b0/cloudformation-seed-1.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "609184e786c784a4510f5c69aa9a677947046eb4ec8e3fa51fcf73bff990c249",
+          "md5": "caeca15435ca1a81e4014a2d29802cae",
+          "sha256": "e58da9f69a9632704f05f8d73afed87e5fb3a1fc26752ff95ded7e6535b0a91e"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "caeca15435ca1a81e4014a2d29802cae",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27807,
+        "upload_time": "2022-02-11T07:51:35",
+        "upload_time_iso_8601": "2022-02-11T07:51:35.774389Z",
+        "url": "https://files.pythonhosted.org/packages/60/91/84e786c784a4510f5c69aa9a677947046eb4ec8e3fa51fcf73bff990c249/cloudformation_seed-1.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6464f858e87e1d5598cadd27c8c4477147934b583f9d4762facd083f3c30c155",
+          "md5": "525b6a4e71309e6c5212b53c27863b9b",
+          "sha256": "72fcf04c9f79b5ef15129b8eb52019a616fcb85060131a48b883ee789d7ce2c6"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "525b6a4e71309e6c5212b53c27863b9b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29139,
+        "upload_time": "2022-02-11T07:51:37",
+        "upload_time_iso_8601": "2022-02-11T07:51:37.306196Z",
+        "url": "https://files.pythonhosted.org/packages/64/64/f858e87e1d5598cadd27c8c4477147934b583f9d4762facd083f3c30c155/cloudformation-seed-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c08077433eceffc8460747a8d9dfacac7924f3cb0471096e6ed4dcf6f6071f2",
+          "md5": "8096e48b9e2ad2bf8e15c57e39c7a176",
+          "sha256": "6a579646ed8e5651d4784b4687c8e9c2527f4dd5757f2547398a47cc246bbbba"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8096e48b9e2ad2bf8e15c57e39c7a176",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27914,
+        "upload_time": "2022-05-31T07:07:37",
+        "upload_time_iso_8601": "2022-05-31T07:07:37.789799Z",
+        "url": "https://files.pythonhosted.org/packages/7c/08/077433eceffc8460747a8d9dfacac7924f3cb0471096e6ed4dcf6f6071f2/cloudformation_seed-1.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ecb170ad520f66432c24908c259667aa4af8658d5de2f393d7424887e307d07",
+          "md5": "ce802b075187f842168522e6b0032bae",
+          "sha256": "08eee6f0119c13702db64a233c6f5eb602392b5bd5af757ff5d37537f8b9b39d"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ce802b075187f842168522e6b0032bae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29263,
+        "upload_time": "2022-05-31T07:07:39",
+        "upload_time_iso_8601": "2022-05-31T07:07:39.816864Z",
+        "url": "https://files.pythonhosted.org/packages/6e/cb/170ad520f66432c24908c259667aa4af8658d5de2f393d7424887e307d07/cloudformation-seed-1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "222b3b2d27e8ed3e6c79d1cbd4a2c0a44c05af1ac8ae6093f73163abb0e712f3",
+          "md5": "c96f06e395682599ee0cacc2de6da1c5",
+          "sha256": "b2d8be625c8870496ab11ce39842a5436917141dc96b472b3cd0a755e4254752"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c96f06e395682599ee0cacc2de6da1c5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 27920,
+        "upload_time": "2022-06-08T09:52:19",
+        "upload_time_iso_8601": "2022-06-08T09:52:19.039460Z",
+        "url": "https://files.pythonhosted.org/packages/22/2b/3b2d27e8ed3e6c79d1cbd4a2c0a44c05af1ac8ae6093f73163abb0e712f3/cloudformation_seed-1.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69b64f012d6da7630d97f014d8ed1f7c9bccbc96ea5d0c5c621579f9e1f44706",
+          "md5": "e9199a8ef4659daef16cf44c6d2012a2",
+          "sha256": "8fe8039a6d09a53e7e57bd59227866a764b2171897fcf83d565386be32aad0bf"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e9199a8ef4659daef16cf44c6d2012a2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29282,
+        "upload_time": "2022-06-08T09:52:20",
+        "upload_time_iso_8601": "2022-06-08T09:52:20.931049Z",
+        "url": "https://files.pythonhosted.org/packages/69/b6/4f012d6da7630d97f014d8ed1f7c9bccbc96ea5d0c5c621579f9e1f44706/cloudformation-seed-1.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09f951da1e33ff6fa5bd2ab403a104c7a14aa379860aaff667017f05bb3bb8d3",
+          "md5": "e2ba4414ea92d374a3e130d88278f1ef",
+          "sha256": "e18d932b6623c5f6d78e28b863a1a77560ea8b27cef5595de7544874838374cb"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e2ba4414ea92d374a3e130d88278f1ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 28315,
+        "upload_time": "2022-06-13T10:22:29",
+        "upload_time_iso_8601": "2022-06-13T10:22:29.444066Z",
+        "url": "https://files.pythonhosted.org/packages/09/f9/51da1e33ff6fa5bd2ab403a104c7a14aa379860aaff667017f05bb3bb8d3/cloudformation_seed-1.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "961897960f994f2906d5f712928dacebf7867f953d66cc181945cbb2495fd292",
+          "md5": "fd5a73139b3384939d5965be11db4c7c",
+          "sha256": "e036674154021cee4f2b93d33a01cb97e3b976c03a94bfbaf142be4993edd53d"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd5a73139b3384939d5965be11db4c7c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29627,
+        "upload_time": "2022-06-13T10:22:31",
+        "upload_time_iso_8601": "2022-06-13T10:22:31.524654Z",
+        "url": "https://files.pythonhosted.org/packages/96/18/97960f994f2906d5f712928dacebf7867f953d66cc181945cbb2495fd292/cloudformation-seed-1.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a67b7c4ab81f1da4c4c6481c465f568f9f1d110a5cb2e4df2c093ce71606e331",
+          "md5": "130d1c2f9a7c3bc26a0f57f6f41e24f7",
+          "sha256": "6e4ca3dd8bb5c5910073aaf3edfad029acf8cb7cdcdefac58e2f60c4f7215b0f"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "130d1c2f9a7c3bc26a0f57f6f41e24f7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 28299,
+        "upload_time": "2022-08-19T00:22:18",
+        "upload_time_iso_8601": "2022-08-19T00:22:18.053685Z",
+        "url": "https://files.pythonhosted.org/packages/a6/7b/7c4ab81f1da4c4c6481c465f568f9f1d110a5cb2e4df2c093ce71606e331/cloudformation_seed-1.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9151351ecfbedbfa599c1bb3f3a3dc6fcdf8ba716541a9879405283a44784a3",
+          "md5": "8829e4ba33041f2969c23f6b383aa9a9",
+          "sha256": "4115335d918ed7174c8471bbfb6e24289e0ac8a7cbf7eea064316920f5545ba2"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8829e4ba33041f2969c23f6b383aa9a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29589,
+        "upload_time": "2022-08-19T00:22:19",
+        "upload_time_iso_8601": "2022-08-19T00:22:19.611911Z",
+        "url": "https://files.pythonhosted.org/packages/b9/15/1351ecfbedbfa599c1bb3f3a3dc6fcdf8ba716541a9879405283a44784a3/cloudformation-seed-1.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "943df60a7a1d54d3a2f93aca0734890ffe1cc64e1d655a1bacdeb42f7daf18b5",
+          "md5": "515448adb5c5247d5a7b274b5a8d3bac",
+          "sha256": "9cd5258ffc7242e0e00a66a7c9c71ad055f17a4c59c543a82579988cfbcec6a4"
+        },
+        "downloads": -1,
+        "filename": "cloudformation_seed-1.3.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "515448adb5c5247d5a7b274b5a8d3bac",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 28552,
+        "upload_time": "2022-08-19T07:15:58",
+        "upload_time_iso_8601": "2022-08-19T07:15:58.683779Z",
+        "url": "https://files.pythonhosted.org/packages/94/3d/f60a7a1d54d3a2f93aca0734890ffe1cc64e1d655a1bacdeb42f7daf18b5/cloudformation_seed-1.3.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f40fd81ae8acfd473b60e737a16e2142117e268bf5d33cf4f27891b2042ddba3",
+          "md5": "5ffa31541e40cfee6687719eafc1baaf",
+          "sha256": "c70611cb094cbdfd9bae412463693e958647058e1e44d8aa2b52ee1715d343fb"
+        },
+        "downloads": -1,
+        "filename": "cloudformation-seed-1.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5ffa31541e40cfee6687719eafc1baaf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 29838,
+        "upload_time": "2022-08-19T07:15:59",
+        "upload_time_iso_8601": "2022-08-19T07:15:59.969483Z",
+        "url": "https://files.pythonhosted.org/packages/f4/0f/d81ae8acfd473b60e737a16e2142117e268bf5d33cf4f27891b2042ddba3/cloudformation-seed-1.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "943df60a7a1d54d3a2f93aca0734890ffe1cc64e1d655a1bacdeb42f7daf18b5",
+        "md5": "515448adb5c5247d5a7b274b5a8d3bac",
+        "sha256": "9cd5258ffc7242e0e00a66a7c9c71ad055f17a4c59c543a82579988cfbcec6a4"
+      },
+      "downloads": -1,
+      "filename": "cloudformation_seed-1.3.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "515448adb5c5247d5a7b274b5a8d3bac",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 28552,
+      "upload_time": "2022-08-19T07:15:58",
+      "upload_time_iso_8601": "2022-08-19T07:15:58.683779Z",
+      "url": "https://files.pythonhosted.org/packages/94/3d/f60a7a1d54d3a2f93aca0734890ffe1cc64e1d655a1bacdeb42f7daf18b5/cloudformation_seed-1.3.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f40fd81ae8acfd473b60e737a16e2142117e268bf5d33cf4f27891b2042ddba3",
+        "md5": "5ffa31541e40cfee6687719eafc1baaf",
+        "sha256": "c70611cb094cbdfd9bae412463693e958647058e1e44d8aa2b52ee1715d343fb"
+      },
+      "downloads": -1,
+      "filename": "cloudformation-seed-1.3.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "5ffa31541e40cfee6687719eafc1baaf",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 29838,
+      "upload_time": "2022-08-19T07:15:59",
+      "upload_time_iso_8601": "2022-08-19T07:15:59.969483Z",
+      "url": "https://files.pythonhosted.org/packages/f4/0f/d81ae8acfd473b60e737a16e2142117e268bf5d33cf4f27891b2042ddba3/cloudformation-seed-1.3.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

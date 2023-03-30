@@ -1,0 +1,490 @@
+{
+  "info": {
+    "author": "Conor Mancone",
+    "author_email": "cmancone@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Topic :: Software Development :: Build Tools"
+    ],
+    "description": "# clearskies-aws\n\nclearskies bindings for working in AWS, which means additional:\n\n - backends (DynamoDB, SQS)\n - Secret/environment integrations (parameter store/secret manager)\n - DB connectivity via IAM auth\n - Contexts (ALB, HTTP API Gateway, Rest API Gateway, direct Lambda invocation, lambda+SQS)\n\n# Installation, Documentation, and Usage\n\nTo install:\n\n```\npip3 install clear-skies-aws\n```\n\n# Usage\n\nAnytime you use a context from `clearskies-aws`, the default dependencies are adjust to:\n\n 1. Provide `dynamo_db_backend` as an allowed backend\n 2. Configure clearskies to use SSM Parameter Store as the default secrets \"manager\".\n\nIn both cases you must provide the AWS region for your resources, which you do by setting the `AWS_REGION` environment variable (either in an actual environment variable or in your `.env` file).\n\n## Paramter Store\n\nTo use the SSM parameter store you just inject the `secrets` variable into your callables:\n\n```\nimport clearskies_aws\n\ndef parameter_store_demo(secrets):\n    return secrets.get('/path/to/parameter')\n\nexecute_demo_in_elb = clearskies_aws.contexts.lambda_elb(parameter_store_demo)\n\ndef lambda_handler(event, context):\n    return execute_demo_in_elb(event, context)\n```\n\nAlso, per default behavior, clearskies can fetch things from your secret manager if specified in your environment/.env file.  For instance, if your database password is stored in parameter store, then you can reference it from your `.env` file with a standard cursor backend:\n\n```\ndb_host = \"path-to-aws.rds\"\ndb_username = \"sql_username\"\ndb_password = \"secret://path/to/password/in/parameter/store\"\ndb_database = \"sql_database_name\"\n```\n\n## Secret Manager\n\nIf desired, you can swap out the parameter store integration for secret manager.  Just remember that you can configure parameter store to fetch secrets from secret manager, so you might be best off doing that and sticking with the default parameter store integration.  Still, if you want to use secret manager, you just configure it in your application or context:\n\n```\nimport clearskies_aws\n\ndef secret_manager_demo(secrets):\n    return secrets.get('SecretARNFromSecretManager')\n\nexecute_demo_in_elb = clearskies_aws.contexts.lambda_elb(\n    parameter_store_demo,\n    bindings={'secrets': clearskies_aws.secrets.SecretManager},\n)\n\ndef lambda_handler(event, context):\n    return execute_demo_in_elb(event, context)\n```\n\n## Contexts\n\nclearskies_aws adds the following contexts:\n\n| name/import                                                 | Usage                             |\n|-------------------------------------------------------------|-----------------------------------|\n| `clearskies_aws.contexts.lambda_api_gateway`                | Lambdas behind a Rest API Gateway |\n| `clearskies_aws.contexts.lambda_elb`                        | Lambdas behind a simple ELB/ALB   |\n| `clearskies_aws.contexts.lambda_http_gateway`               | Lambdas behind an HTTP Gateway    |\n| `clearskies_aws.contexts.lambda_inocation`                  | Lambdas invoked directly          |\n| `clearskies_aws.contexts.lambda_sqs_standard_partial_batch` | Lambdas attached to an SQS queue  |\n\n### Lambdas+SQS\n\nHere's a simple example of using the Lambda+SQS context:\n\n```\nimport clearskies_aws\nimport clearskies\n\ndef process_record(request_data):\n    print(request_data)\n\nprocess_sqs = clearskies_aws.contexts.lambda_sqs_standard_partial_batch(process_record)\ndef lambda_handler(event, context):\n    process_sqs(event, context)\n```\n\nSee [the AWS docs](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html).\n\nNote that, unlike other contexts, the Lambda+SQS context really only works with a simple callable.  Routing and other handlers don't make much sense here.  Keep in mind that, before invoking the Lambda, AWS may batch up records together in arbitrary ways.  The context will take care of this and will invoke your callable once **for each record in the AWS event** - not once for the event.  `request_data` will be populated with the actual message for the event.  In addition, it assumes that a JSON message was sent to the queue, so `request_data` will be an object/list/etc, rather than a string.  This is intended to be used with [partial batching](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html#services-sqs-batchfailurereporting).  Therefore, if your function raises an error, the context will catch it, return a failure response for the cooresponding message, and then continue processing any other messages in the batch.\n\n## SQS Backend\n\nTo use the SQS backend just declare it for your model, set the table name to return the queue url, and execute a \"create\" operation to send data to the queue.  Note that the SQS backend is write-only: you can \"create\" records (resulting in a message being sent to the queue), but you can't read data back out.  The way the queue system in SQS works is just too different than a standard database for that to make sense in the context of a clearskies model.\n\n```\n#!/usr/bin/env python3\nimport clearskies_aws\nimport clearskies\nfrom collections import OrderedDict\n\nclass Product(clearskies.Model):\n    def __init__(self, sqs_backend, columns):\n        super().__init__(sqs_backend, columns)\n\n    @classmethod\n    def table_name(cls):\n        return 'https://sqs.us-east-1.amazonaws.com/123456789012/test-queue'\n\n    def columns_configuration(self):\n        return OrderedDict([\n            clearskies.column_types.string('name'),\n            clearskies.column_types.string('description'),\n        ])\n\ndef send_to_queue(products):\n    for i in range(10):\n        products.create({\n            'name': 'test',\n            'description': str(i),\n        })\n\ncli = clearskies_aws.contexts.cli(\n    send_to_queue,\n    binding_classes=[Product],\n)\nif __name__ == '__main__':\n    cli()\n```\n\n## IAM DB Auth\n\nFor non-serverless RDS databases, AWS supports login via IAM.  You have to provide a few additional details in your environment to make this work:\n\n| name                     | value                                                                                                                 |\n|--------------------------|-----------------------------------------------------------------------------------------------------------------------|\n| `AWS_REGION`             | The region your database is in (e.g. `us-east-1`)                                                                     |\n| `db_endpoint`            | The endpoint from your database (available in RDS)                                                                    |\n| `db_username`            | The username to use to connect                                                                                        |\n| `db_database`            | The name of the database                                                                                              |\n| `ssl_ca_bundle_filename` | Path to the appropriate SSL bundle (see https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) |\n\nand then you have to enable it in your application/context configuration:\n\n```\nimport clearskies_aws\n\ndef cursor_via_iamdb_auth(cursor):\n    print('I connected successfully!')\n\nexecute_demo_in_elb = clearskies_aws.contexts.lambda_elb(\n    cursor_via_iamdb_auth,\n    additional_configs=[clearskies_aws.di.IAMDBAuth]\n)\n\ndef lambda_handler(event, context):\n    return execute_demo_in_elb(event, context)\n```\n\nOf course normally you wouldn't want to interact with it directly.  Adding `IAMDBAuth` to your `additional_configs` and setting up the necessary environemnt variables will be sufficient that any models that use the `cursor_backend` will connect via IAM DB Auth, rather than using hard-coded passwords.\n\n## IAM DB Auth with SSM Bastion\n\nComing shortly\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/cmancone/clearskies-aws",
+    "keywords": "setuptools development",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "clear-skies-aws",
+    "package_url": "https://pypi.org/project/clear-skies-aws/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/clear-skies-aws/",
+    "project_urls": {
+      "Homepage": "https://github.com/cmancone/clearskies-aws"
+    },
+    "release_url": "https://pypi.org/project/clear-skies-aws/1.2.0/",
+    "requires_dist": [
+      "boto3",
+      "clear-skies",
+      "akeyless-cloud-id"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "clearskies bindings for working in AWS",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17450551,
+  "releases": {
+    "0.9.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4a09a67481a9fc76306ef709171fa77077ecbff6f5a45c62670cd803388d946",
+          "md5": "426b7d00d09339c095ca775f7aeca655",
+          "sha256": "a9a9caeb0fbde260132d19df394f0de8cab6a3de06cd0cc8e5217fff9978fa9d"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-0.9.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "426b7d00d09339c095ca775f7aeca655",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 20145,
+        "upload_time": "2022-01-16T23:09:49",
+        "upload_time_iso_8601": "2022-01-16T23:09:49.982565Z",
+        "url": "https://files.pythonhosted.org/packages/a4/a0/9a67481a9fc76306ef709171fa77077ecbff6f5a45c62670cd803388d946/clear_skies_aws-0.9.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "141bc0498cdf86ada839c3b315a76fb98ae76fbe56161f1fc9e57f09f0004820",
+          "md5": "0c198988f6e3b55f184c20d8b971556f",
+          "sha256": "b6dccd787c507fd1fa969c1b168ab56c875f8be5e16b8fc7937562cf5084d4aa"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-0.9.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0c198988f6e3b55f184c20d8b971556f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 15049,
+        "upload_time": "2022-01-16T23:09:52",
+        "upload_time_iso_8601": "2022-01-16T23:09:52.243673Z",
+        "url": "https://files.pythonhosted.org/packages/14/1b/c0498cdf86ada839c3b315a76fb98ae76fbe56161f1fc9e57f09f0004820/clear-skies-aws-0.9.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d75403c1441d0bd3b3fa36f0e352ae7004ea36d195fe93e14b0042f57af003e",
+          "md5": "06b4090b33247a347e27063761319c75",
+          "sha256": "64338f1bfc958762ffbed6986a75531fad44cf898f0e0e10a2b5d0d24a22df48"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06b4090b33247a347e27063761319c75",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22254,
+        "upload_time": "2022-04-09T20:29:52",
+        "upload_time_iso_8601": "2022-04-09T20:29:52.263303Z",
+        "url": "https://files.pythonhosted.org/packages/6d/75/403c1441d0bd3b3fa36f0e352ae7004ea36d195fe93e14b0042f57af003e/clear_skies_aws-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b190968d55d37d9608eccd75b5d45f0225fa7259cf1204fcae394854dcf8dfa9",
+          "md5": "292c3c44c3bbd45f04df96fb29c9b7d3",
+          "sha256": "f47e7faa1957fe6c0e593ff1b8491736fa5d185f1883562079aefbbd2a4235b0"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "292c3c44c3bbd45f04df96fb29c9b7d3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16288,
+        "upload_time": "2022-04-09T20:29:54",
+        "upload_time_iso_8601": "2022-04-09T20:29:54.312780Z",
+        "url": "https://files.pythonhosted.org/packages/b1/90/968d55d37d9608eccd75b5d45f0225fa7259cf1204fcae394854dcf8dfa9/clear-skies-aws-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "17a7b2293b6d51c5dc1c35ed4b61dd98bb935c1069b57bcaafa213f79f546a91",
+          "md5": "87bbd00f72b3ee8764a691aeb9184b1d",
+          "sha256": "48b558cd151e29366296c754029e262b59c07b5e1f4a96e09ef4539b35706ed1"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "87bbd00f72b3ee8764a691aeb9184b1d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24229,
+        "upload_time": "2022-04-13T02:57:38",
+        "upload_time_iso_8601": "2022-04-13T02:57:38.704989Z",
+        "url": "https://files.pythonhosted.org/packages/17/a7/b2293b6d51c5dc1c35ed4b61dd98bb935c1069b57bcaafa213f79f546a91/clear_skies_aws-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0fa89959b8ad167bba699e28bda32d90afff831aef6b2f6dc2c2e30170649079",
+          "md5": "40baa580467ff8597ae07af2d534f5c0",
+          "sha256": "602807a8d62acef8cfd885b51a57d350a7c3050155c4462c42c65aba9a875b4b"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "40baa580467ff8597ae07af2d534f5c0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17092,
+        "upload_time": "2022-04-13T02:57:39",
+        "upload_time_iso_8601": "2022-04-13T02:57:39.943263Z",
+        "url": "https://files.pythonhosted.org/packages/0f/a8/9959b8ad167bba699e28bda32d90afff831aef6b2f6dc2c2e30170649079/clear-skies-aws-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d79450f9d766a5fc4bb92ff988da00c6e9b16faaf84b0c054d9addfc5f844137",
+          "md5": "33444e51724fea998cdba097accdd6e9",
+          "sha256": "01e74649b1a7fb8e87138f1a15f3332a8f76a31df0aaae70ed2f6434fdceacff"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "33444e51724fea998cdba097accdd6e9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24423,
+        "upload_time": "2022-04-14T03:03:46",
+        "upload_time_iso_8601": "2022-04-14T03:03:46.768899Z",
+        "url": "https://files.pythonhosted.org/packages/d7/94/50f9d766a5fc4bb92ff988da00c6e9b16faaf84b0c054d9addfc5f844137/clear_skies_aws-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "72101234abf305c0ccf479e0f72552ba412e00d15ebd4439b1cea0bf8cf70988",
+          "md5": "14341f518eaeb42ec014143a1a44c6fc",
+          "sha256": "fc2c34695af41b6039e6ca62a7e07137c3489399438358ec880eb079cee485ad"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14341f518eaeb42ec014143a1a44c6fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17358,
+        "upload_time": "2022-04-14T03:03:48",
+        "upload_time_iso_8601": "2022-04-14T03:03:48.510881Z",
+        "url": "https://files.pythonhosted.org/packages/72/10/1234abf305c0ccf479e0f72552ba412e00d15ebd4439b1cea0bf8cf70988/clear-skies-aws-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3bc32106c1e6420357197976b1673552d7e408412ddc74c8c4d2f2ccc75808f2",
+          "md5": "ee1f927103705b6b1e1e6608057464d2",
+          "sha256": "f1a625385f225d27e888d1dc3ee9a45c52f0893ee92dbc646b89f2cd017cd182"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ee1f927103705b6b1e1e6608057464d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24588,
+        "upload_time": "2022-04-16T02:05:26",
+        "upload_time_iso_8601": "2022-04-16T02:05:26.895435Z",
+        "url": "https://files.pythonhosted.org/packages/3b/c3/2106c1e6420357197976b1673552d7e408412ddc74c8c4d2f2ccc75808f2/clear_skies_aws-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20525e32b6b1171e1ab1492e5c6588588a8e6562413b4b1a9a960555879c951e",
+          "md5": "f945f155c3e1a0e6da869a5a382cebbf",
+          "sha256": "0a166e590ae8ca885dd5958f52eb84e906b77b5910eed41764daaa7758c9be57"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f945f155c3e1a0e6da869a5a382cebbf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17493,
+        "upload_time": "2022-04-16T02:05:28",
+        "upload_time_iso_8601": "2022-04-16T02:05:28.088768Z",
+        "url": "https://files.pythonhosted.org/packages/20/52/5e32b6b1171e1ab1492e5c6588588a8e6562413b4b1a9a960555879c951e/clear-skies-aws-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "133185652477cfa31b9f2561ef1cd8f03cfad6e74f53b451c85ccf0c66534be8",
+          "md5": "e946d2fa7e996565d5109e6c933ff38c",
+          "sha256": "6f4cd80dacd7d44212f2ba1c823bfc6895c0df92c3b55dd3a18b9e128dd162b4"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e946d2fa7e996565d5109e6c933ff38c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24582,
+        "upload_time": "2022-10-22T17:26:36",
+        "upload_time_iso_8601": "2022-10-22T17:26:36.230484Z",
+        "url": "https://files.pythonhosted.org/packages/13/31/85652477cfa31b9f2561ef1cd8f03cfad6e74f53b451c85ccf0c66534be8/clear_skies_aws-1.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dce53de2a73b891fa2b1c1f57cdcacae08782b1e09f039648d221c23f0fa47fa",
+          "md5": "2585f588f45d3ec6c714a31a92f44316",
+          "sha256": "f541b86165476563ab9a655f659d2e2c5335ec3f211d84e6dc4801d357db8a3b"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2585f588f45d3ec6c714a31a92f44316",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17530,
+        "upload_time": "2022-10-22T17:26:37",
+        "upload_time_iso_8601": "2022-10-22T17:26:37.351944Z",
+        "url": "https://files.pythonhosted.org/packages/dc/e5/3de2a73b891fa2b1c1f57cdcacae08782b1e09f039648d221c23f0fa47fa/clear-skies-aws-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "537e7ae5f0f8e38319ebf3aea6905da53999bd44b62782c5d591ae28ba2e4528",
+          "md5": "2f3f9c1bbf404a02671fe15b23858247",
+          "sha256": "a5168e1ec6d98fd830b14e8d17353941f7ad81a54db14c27636b602957ac4255"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f3f9c1bbf404a02671fe15b23858247",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24598,
+        "upload_time": "2022-10-26T11:00:50",
+        "upload_time_iso_8601": "2022-10-26T11:00:50.949050Z",
+        "url": "https://files.pythonhosted.org/packages/53/7e/7ae5f0f8e38319ebf3aea6905da53999bd44b62782c5d591ae28ba2e4528/clear_skies_aws-1.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3a999edd8d2a757b85aebbb112b5fd9923ada026708c43628429e961e0bf3053",
+          "md5": "92c9d0c12f882315c59d62a16ce6c262",
+          "sha256": "c16fb1881ee44288c956779ede60f448876b390b417cda3e3b30727d46647f3d"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "92c9d0c12f882315c59d62a16ce6c262",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17516,
+        "upload_time": "2022-10-26T11:00:52",
+        "upload_time_iso_8601": "2022-10-26T11:00:52.879697Z",
+        "url": "https://files.pythonhosted.org/packages/3a/99/9edd8d2a757b85aebbb112b5fd9923ada026708c43628429e961e0bf3053/clear-skies-aws-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1d8496702440040522857d2621b38e820eebd9644307d18dfad3e60c82d7b9f",
+          "md5": "14e7cf28b4cfbbb054066ed7c8e91117",
+          "sha256": "cd9667d02831d4f14d7f51f2afb9914f6b718f50efa46817c08174285216aebf"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "14e7cf28b4cfbbb054066ed7c8e91117",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24810,
+        "upload_time": "2023-02-20T19:02:27",
+        "upload_time_iso_8601": "2023-02-20T19:02:27.465450Z",
+        "url": "https://files.pythonhosted.org/packages/e1/d8/496702440040522857d2621b38e820eebd9644307d18dfad3e60c82d7b9f/clear_skies_aws-1.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da5233f16f9efe6aa511541a1e49f6be0fc8eb4e7f757ab4f7d889f2ee637c19",
+          "md5": "9e4e041ae5a5ed0c1b7532653d99310e",
+          "sha256": "34b6c961b73ccfac92b092dbc9c677ea52fa697fad6b66c6a648b23bd5182c3a"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e4e041ae5a5ed0c1b7532653d99310e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17815,
+        "upload_time": "2023-02-20T19:02:29",
+        "upload_time_iso_8601": "2023-02-20T19:02:29.271505Z",
+        "url": "https://files.pythonhosted.org/packages/da/52/33f16f9efe6aa511541a1e49f6be0fc8eb4e7f757ab4f7d889f2ee637c19/clear-skies-aws-1.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9499303a0ae6f8a14789b5a859e58b91108de567f4ae08d0d8c75a4aac4640d",
+          "md5": "ae9c446f25af50c910278b1c98dfe3e8",
+          "sha256": "fcde17994346390bbe5b0835937082e5c88fca326286fab931d1b5780499c886"
+        },
+        "downloads": -1,
+        "filename": "clear_skies_aws-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ae9c446f25af50c910278b1c98dfe3e8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29052,
+        "upload_time": "2023-03-26T15:10:35",
+        "upload_time_iso_8601": "2023-03-26T15:10:35.668321Z",
+        "url": "https://files.pythonhosted.org/packages/e9/49/9303a0ae6f8a14789b5a859e58b91108de567f4ae08d0d8c75a4aac4640d/clear_skies_aws-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a95b967f8a29a77b8e316e9612b9a9ef4fbf633b682cb740552cf10d913127c8",
+          "md5": "8942fa021b0cec0173c5034373027207",
+          "sha256": "549aad40fe10b5a624f475fb4c1340c38de3e0d5560167c2f963f69891f88aec"
+        },
+        "downloads": -1,
+        "filename": "clear-skies-aws-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8942fa021b0cec0173c5034373027207",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 19955,
+        "upload_time": "2023-03-26T15:10:38",
+        "upload_time_iso_8601": "2023-03-26T15:10:38.543900Z",
+        "url": "https://files.pythonhosted.org/packages/a9/5b/967f8a29a77b8e316e9612b9a9ef4fbf633b682cb740552cf10d913127c8/clear-skies-aws-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e9499303a0ae6f8a14789b5a859e58b91108de567f4ae08d0d8c75a4aac4640d",
+        "md5": "ae9c446f25af50c910278b1c98dfe3e8",
+        "sha256": "fcde17994346390bbe5b0835937082e5c88fca326286fab931d1b5780499c886"
+      },
+      "downloads": -1,
+      "filename": "clear_skies_aws-1.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ae9c446f25af50c910278b1c98dfe3e8",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 29052,
+      "upload_time": "2023-03-26T15:10:35",
+      "upload_time_iso_8601": "2023-03-26T15:10:35.668321Z",
+      "url": "https://files.pythonhosted.org/packages/e9/49/9303a0ae6f8a14789b5a859e58b91108de567f4ae08d0d8c75a4aac4640d/clear_skies_aws-1.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a95b967f8a29a77b8e316e9612b9a9ef4fbf633b682cb740552cf10d913127c8",
+        "md5": "8942fa021b0cec0173c5034373027207",
+        "sha256": "549aad40fe10b5a624f475fb4c1340c38de3e0d5560167c2f963f69891f88aec"
+      },
+      "downloads": -1,
+      "filename": "clear-skies-aws-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "8942fa021b0cec0173c5034373027207",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 19955,
+      "upload_time": "2023-03-26T15:10:38",
+      "upload_time_iso_8601": "2023-03-26T15:10:38.543900Z",
+      "url": "https://files.pythonhosted.org/packages/a9/5b/967f8a29a77b8e316e9612b9a9ef4fbf633b682cb740552cf10d913127c8/clear-skies-aws-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

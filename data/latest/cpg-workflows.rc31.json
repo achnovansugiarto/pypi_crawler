@@ -1,0 +1,787 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Environment :: Console",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: MIT License",
+      "Natural Language :: English",
+      "Operating System :: MacOS :: MacOS X",
+      "Operating System :: POSIX",
+      "Operating System :: Unix",
+      "Programming Language :: Python",
+      "Topic :: Scientific/Engineering",
+      "Topic :: Scientific/Engineering :: Bio-Informatics"
+    ],
+    "description": "# Hail Batch Workflows\n\nThis repository provides implementations of genomics workflows using Hail Batch, specifically:\n\n* WES/WGS Seqr Loader: FASTQ -> CRAM -> GVCF -> pVCF -> Matrix Table -> Elasticsearch index, with an ability to use parts of this pipeline as e.g. a single-sample germline variant calling workflow (FASTQ -> GVCF), joint-calling pipeline (GVCF -> pVCF), AS-VQSR pipeline, etc.\n* WES/WGS Large Cohort Workflow: FASTQ -> CRAM -> GVCF -> VDS with Hail Table annotations.\n* (in progress) GATK-SV: CRAM -> VCF and more, orchestrates [GATK-SV WDL workflows](https://github.com/broadinstitute/gatk-sv) in Hail Batch.\n\n## Installation\n\nRequirements:\n\n* [Analysis runner](https://github.com/populationgenomics/analysis-runner)\n\nClone the repository recursively and change into the repository folder:\n\n```sh\ngit clone --recurse-submodules git@github.com:populationgenomics/production-pipelines.git\ncd production-pipelines\n```\n\n## Seqr Loader\n\n![uml](docs/seqr_loader.png)\n\nSeqr Loader is a combination of the following [WARP](https://github.com/broadinstitute/warp)-inspired workflows:\n\n* Single-sample whole genome and WES germline calling, FASTQ -> GVCF (BWA/DRAGMAP, GATK4 HaplotypeCaller)\n* Single-sample calling with re-alignment, CRAM -> GVCF (we use [BAZAM](https://github.com/ssadedin/bazam) to extract FASTQ from CRAM/BAM)\n* Whole genome and WES joint-calling, GVCFs -> pVCF\n* WES AS-VQSR and WGS VQSR workflows\n\nAs well as:\n\n* [The Broad's seqr loading pipelines](https://github.com/broadinstitute/seqr-loading-pipelines)\n* [Somalier](https://github.com/brentp/somalier) pedigree checks\n* [MultiQC](https://github.com/ewels/MultiQC) QC reporting.\n\nThe workflow uses Metamist as a source of FASTQ, CRAMs, and sample/participant metadata, and TOML configs for extended configuration (dataset and samples, Hail Batch parameters, Elasticsearch credentials, QC thresholds).\n\n### Example usage\n\nTo run the Seqr Loader workflow on the dataset called `validation`, create a config file `~/myconfig.toml` as follows:\n\n```toml\n[workflow]\ninput_datasets = ['validation']\nsequencing_type = 'genome'\ncreate_es_index_for_datasets = ['validation']\nskip_samples = [\n    'CPG243717',  # NA12878_KCCG low coverage (8x)\n]\n```\n\nSubmit `main.py seqr_loader` to the analysis runner, and pass along the config above, as well as the `cpg_workflows` Docker image:\n\n```bash\nanalysis-runner \\\n  --dataset seqr --description \"Seqr Loader\" --output-dir \"seqr-loader\" \\\n  --access-level full \\\n  --config ~/myconfig.toml \\\n  --image australia-southeast1-docker.pkg.dev/cpg-common/images/cpg_workflows:latest \\\n  main.py \\\n  seqr_loader\n```\n\nNote that you can pass multiple configs to the analysis runner, by repeating the `--config` option multiple times. All config will be merged by the  analysis runner. For more info about configs, see [team-docs](https://github.com/populationgenomics/team-docs/blob/main/cpg_utils_config.md).\n\nFor more options available for seqr-loader configuration, check the seqr-loader defaults in [configs/defaults/seqr_loader.toml](configs/defaults/seqr_loader.toml) as well as cpg-workflows defaults in [cpg_workflows/defaults.toml](cpg_workflows/defaults.toml).\n\n### Seqr production load invocation\n\n`configs/seqr-main.toml` provides relevant configuration defaults for a CPG production seqr-loader run. Specifically, in contains the list of datasets to query from Metamist and joint-call together, and a list of blacklisted samples in those datasets. Another handy configs, `configs/genome.toml` or `configs/exome.toml`, can be passed to subset samples to WGS or WES specifically. To use along with `configs/seqr-main.toml`, of these two must be provided, as the seqr-loader can work on only one type of data at a time. \n\nFor example, to load the genome data:\n\n```sh\nanalysis-runner \\\n  --dataset seqr --description \"Seqr Loader\" --output-dir \"seqr-loader\" \\\n  --access-level full \\\n  --config configs/seqr-main.toml \\\n  --config configs/genome.toml \\\n  --image australia-southeast1-docker.pkg.dev/cpg-common/images/cpg_workflows:latest \\\n  main.py \\\n  seqr_loader\n```\n\n### Stage selection example: only align Seqr samples\n\nSeqr Loader can be used partially, controlled by `workflows/first_stages`, `workflows/last_stages`, and `workflows/only_stages` parameters.\n\nIn order to align data, you only need to trigger the `Align` stage from the workflow (or `CramMultiQC`, if you also want a dataset-level MultiQC report), which can be done with `workflows/last_stages`. So you can create a configuration file like the following:\n\n```toml\n[workflow]\nlast_stages = ['CramMultiQC']\n```\n\nAnd assuming it's named `~/myconfig.toml`, run:\n\n```bash\nanalysis-runner \\\n  --dataset seqr --description \"CRAM MultiQC\" --output-dir \"seqr\" \\\n  --access-level full \\\n  --config configs/seqr-main.toml \\\n  --config configs/genome.toml \\\n  --config ~/myconfig.toml \\\n  --image australia-southeast1-docker.pkg.dev/cpg-common/images/cpg_workflows:latest \\\n  main.py \\\n  seqr_loader\n```\n\nFor exomes, replace `configs/genome.toml` with `configs/exome.toml`, or set `sequencing_type = 'exome'` in the `workflow` section.\n\nThe section `workflows/input_datasets` in `configs/seqr-main.toml` specified the list of all projects to be processed, excluding samples specified in the `workflows/skip_samples` section.\n\nQC reports for each dataset would be exposed on a web server, e.g. for `validation` genomes, the URL would be https://main-web.populationgenomics.org.au/validation/qc/cram/multiqc.html, and for exomes, it will  be https://main-web.populationgenomics.org.au/validation/exome/qc/cram/multiqc.html.\n\nIf samples had pedigree data, a Somalier report will be run to infer and validate participant relationships, with report produced as https://main-web.populationgenomics.org.au/validation/qc/cram/somalier.html\n\n### Stage selection example: create GVCFs and QC variant calls\n\nRun the same command as in the above section, but with the following section in `~/myconfig.toml`:\n\n```toml\n[workflow]\nlast_stages = ['GvcfMultiQC']\n```\n\nThe genome GVCF QC report will be exposed as https://main-web.populationgenomics.org.au/validation/qc/gvcf/multiqc.html, for `validation` samples it would include a [hap.py](https://github.com/Illumina/hap.py) section with validation stats.\n\n### Stage selection example: upload Elasticsearch indices\n\nIf you want the workflow to create Elasticsearch indices in the end, make sure you include the stage `MtToEs` into the workflow (if every prerequisite stage is already finished, you can specify it under `first_stages`), and set the `workflow/create_es_index_for_datasets` section with the list of datasets for which you want the indices to be created:\n\n```toml\n[workflow]\nfirst_stages = ['MtToEs']\ncreate_es_index_for_datasets = ['validation']\n```\n\nThe resulting index will be named using the current datestamp, or using `worfklow/output_version` option if it's specified. The Elasticsearch server is configured using the `elasticsearch` section in `configs/defailts/seqr_loader.toml`. The reason for not automatically creating indices for every project is that the Elasticsearch instance can easily run out of disk space, so additional safeguard is handy. \n\n## Large Cohort Workflow\n\nAnother workflow in this repository is [Hail Query](https://hail.is/) workflow for large germline genomic variant calling cohorts.\n\n![uml](docs/large_cohort.png)\n\nLarge-cohort workflow diverges from seqr-loader after the single-sample `Genotype` stage (which outputs GVCF files). Instead of using GATK for joint genotyping, it uses Hail VCF combiner:\n\n1. Combine GVCFs (generated by GATK4) into a [VDS](https://hail.is/docs/0.2/vds/hail.vds.VariantDataset.html#hail.vds.VariantDataset) format.\n2. Perform sample-level QC, including, pedigree, sex and ancestry inference.\n3. Perform variant-level QC, including [allele-specific VQSR](https://gatk.broadinstitute.org/hc/en-us/articles/360035890551-Allele-specific-annotation-and-filtering-of-germline-short-variants).\n\n### Usage\n\nGiven the config `~/myconfig.toml` is:\n\n```toml\n[workflow]\ninput_datasets = ['validation']\nsequencing_type = 'genome'\nscatter_count = 20\noutput_version = '0.1'\n```\n\nRun the analysis runner:\n\n```sh\nanalysis-runner \\\n  --dataset prophecy --description \"Larcoh validation\" --output-dir \"larcoh\" \\\n  --access-level main \\\n  --config ~/myconfig.toml \\\n  --image australia-southeast1-docker.pkg.dev/cpg-common/images/cpg_workflows:latest \\\n  main.py \\\n  large_cohort\n```\n\nThe workflow will find inputs using Metamist along with available sample metadata (e.g. known population labels, pedigree), align and call GVCFs, and follow with the VCF combiner and downstream annotation, writing the results into the `gs://cpg-validation-main` bucket.\n\nNote that you can pass multiple configs to the analysis runner, by repeating the `--config` option multiple times. All config will be merged by the analysis runner. For more info about configs, see [team-docs](https://github.com/populationgenomics/team-docs/blob/main/cpg_utils_config.md).\n\nFor more options available for the large-cohort workflow configuration, check the defaults in [configs/defaults/large_cohort.toml](configs/defaults/large_cohort.toml), as well as cpg-workflows defaults in [cpg_workflows/defaults.toml](cpg_workflows/defaults.toml).\n\n### Outputs\n\n#### VDS\n\nGVCFs are combined into a [VDS folder format](https://hail.is/docs/0.2/vds/hail.vds.VariantDataset.html#variantdataset) which is writen to `gs://cpg-prophecy-test/vds/v0-1.vds`.\n\n#### Sample QC\n\n* Sample-level metadata and QC is written to `gs://cpg-prophecy-test/large-cohort/v0-1/sample_qc.ht`, with the following row fields.\n\nMetamist metadata:\n\n```\n's': str\n'external_id': str\n'dataset': str\n'gvcf': str\n'sex': str\n'continental_pop': str\n'subcontinental_pop': str\n```\n\n[hl.sample_qc](https://hail.is/docs/0.2/methods/genetics.html#hail.methods.sample_qc) annotations:\n\n```\n'sample_qc': struct {\n    n_het: int64,\n    n_hom_var: int64,\n    n_non_ref: int64,\n    n_singleton: int64,\n    n_singleton_ti: int64,\n    n_singleton_tv: int64,\n    n_snp: int64,\n    n_insertion: int64,\n    n_deletion: int64,\n    n_transition: int64,\n    n_transversion: int64,\n    n_star: int64,\n    r_ti_tv: float64,\n    r_ti_tv_singleton: float64,\n    r_het_hom_var: float64,\n    r_insertion_deletion: float64,\n    bases_over_gq_threshold: tuple (\n        int64,\n        int64,\n        int64\n    ),\n    bases_over_dp_threshold: tuple (\n        int64,\n        int64,\n        int64,\n        int64,\n        int64\n    )\n}\n```\n\n[Sex imputation](https://hail.is/docs/0.2/methods/genetics.html#hail.methods.impute_sex):\n\n```\n'is_female': bool\n'var_data_chr20_mean_dp': float64\n'chrX_mean_dp': float64\n'chrX_ploidy': float64\n'chrY_mean_dp': float64\n'chrY_ploidy': float64\n'X_karyotype': str\n'Y_karyotype': str\n'sex_karyotype': str\n'impute_sex_stats': struct {\n    f_stat: float64,\n    n_called: int64,\n    expected_homs: float64,\n    observed_homs: int64\n}\n```\n\nSoft filters are assigned based on the sample QC (`low_coverage` and `bad_sample_qc_metrics`) and sex imputation results (`sex_aneuploidy` and `ambiguous_sex`):\n\n```\n'filters': set<str>\n```\n\nThresholds for sample QC filters are pulled from the config TOML (you can see the default values in [configs/defaults/large_cohort.toml](configs/defaults/large_cohort.toml).\n\n#### Relatedness\n\n[PC-Relate method](https://hail.is/docs/0.2/methods/relatedness.html#hail.methods.pc_relate) is used to identify pairs of the 1st and the 2nd degree relatives (kin coefficient threshold - below which samples are considered unrelated - is specified as `large_cohort.max_kin` in [TOML](configs/defaults/large_cohort.toml)). Pairwise sample relatedness matrix is written as a Hail table index by a tuple of sample IDs: `gs://cpg-prophecy-test/large-cohort/v0-1/relatedness.ht`\n\n```\nRow fields:\n    'i': str\n    'j': str\n    'kin': float64\n    'ibd0': float64\n    'ibd1': float64\n    'ibd2': float64\n----------------------------------------\nKey: ['i', 'j']\n```\n\n`gs://cpg-prophecy-test/large-cohort/v0-1/relateds_to_drop.ht` is a sample-level table which contains related samples to drop, with top ranking sample selected from each family. Sets of unrelated individuals are determined using Hail's [`maximal_independent_set`](https://hail.is/docs/0.2/methods/misc.html?highlight=maximal_independent_set#hail.methods.maximal_independent_set). \n\n```\nRow fields:\n    's': str\n    'rank': int64\n----------------------------------------\nKey: ['s']\n```\n\n### Ancestry\n\nPCA results are written into `gs://cpg-prophecy-test/large-cohort/v0-1/ancestry`:\n  * `gs://cpg-prophecy-test/large-cohort/v0-1/ancestry/eigenvalues.ht`\n  * `gs://cpg-prophecy-test/large-cohort/v0-1/ancestry/loadings.ht`\n  * `gs://cpg-prophecy-test/large-cohort/v0-1/ancestry/scores.ht`\n \nWhen there are samples with known continental population available (the metamist participant metadata field with that data can be specified in the [TOML](configs/defaults/large_cohort.toml) as `large_cohort.pop_meta_field`), a random forest method is used to infer population labels from the PCA results. The method is trained using 16 principal components as features on samples with known ancestry (the number of components can be adjusted in the TOML as well as `large_cohort.n_pcs`). Ancestry was assigned to all samples for which the probability of that ancestry was high enough (the threshold is configured as `large_cohort.min_pop_prob` in the TOML). Results are written as sample-level table `gs://cpg-prophecy-test/large-cohort/v0-1/ancestry/inferred_pop.ht`.\n\n```\nRow fields:\n    's': str\n    'scores': array<float64>\n    'pop': str\n    'is_training': bool\n    'pca_scores': array<float64>\n----------------------------------------\nKey: ['s']\n``` \n\nPlots for PCA and loadings are written to `gs://cpg-prophecy-test-web/large-cohort/v0-1/ancestry/*`, a bucket that is exposed as https://test-web.populationgenomics.org.au/prophecy/large-cohort/ancestry/*\n \n#### Dense subset\n\nFor PCA and PC-relate, a dense subset of the original dataset is used. The markers for the subset are read from the `references.gnomad.predetermined_qc_variants` Hail table specified in the TOML config. The table is suitable for both exomes and genomes, so that a mixture of different sequencing types can be processed together. The resulting subset is written to `gs://cpg-prophecy-test/large-cohort/v0-1/dense-subset.mt`.\n\n### Allele-specific variant quality score recalibration (AS-VQSR)\n\nVariants from good quality samples are filtered using the [AS-VQSR method](https://gatk.broadinstitute.org/hc/en-us/articles/360035531612-Variant-Quality-Score-Recalibration-VQSR-):\n\n1. Variants are exported into a sites-only VCF,\n\n1. Batch jobs are submitted to create SNP and indel recalibration models using the allele-specific version of GATK Variant Quality Score Recalibration [VQSR](https://gatkforums.broadinstitute.org/gatk/discussion/9622/allele-specific-annotation-and-filtering), with the standard GATK training resources (HapMap, Omni, 1000 Genomes, Mills indels), and the following features:\n   \n   * SNVs:   `AS_FS`, `AS_SOR`, `AS_ReadPosRankSum`, `AS_MQRankSum`, `AS_QD`, `AS_MQ`,\n   * Indels: `AS_FS`, `AS_SOR`, `AS_ReadPosRankSum`, `AS_MQRankSum`, `AS_QD`.\n   \n1. The models are applied to the VCFs and combine them back into one VCF.\n   \n1. VCF is converted back into a sites-only locus-level Hail table `gs://cpg-prophecy-test/large-cohort/v0-1/vqsr.ht`, with split multiallelics.\n\n```\nRow fields:\n    'locus': locus<GRCh38>\n    'alleles': array<str>\n    'filters': set<str>\n    'info': struct {\n        NEGATIVE_TRAIN_SITE: bool,\n        POSITIVE_TRAIN_SITE: bool,\n        culprit: str\n    }\n    'a_index': int32\n    'was_split': bool\n```\n\nNote that the `info.AS-*` annotations used for AS-VQSR are dropped, and only the resulting filter label is appended into the `filters` field, e.g. `VQSRTrancheINDEL99.50to99.90`, `VQSRTrancheSNP99.00to99.90+`, etc. The AS_VQSLOD thresholds for assigning filters are configurable in the [TOML](configs/defaults/large_cohort.toml) as `vqsr.snp_filter_level` and `vqsr.indel_filter_level`.\n\nThis pipeline is largely compiled from the following two WDL workflows:\n   \n1. `hail-ukbb-200k-callset/GenotypeAndFilter.AS.wdl`\n\n2. The [Broad VQSR workflow](https://github.com/broadinstitute/warp/blob/develop/pipelines/broad/dna_seq/germline/joint_genotyping/JointGenotyping.wdl) documented [here](https://gatk.broadinstitute.org/hc/en-us/articles/360035531112--How-to-Filter-variants-either-with-VQSR-or-by-hard-filtering), translated from WDL with a help of [Janis](https://github.com/PMCC-BioinformaticsCore/janis).\n\n#### Frequencies\n\nFrequencies are calculated using the Hail's [hl.variant_qc](https://hail.is/docs/0.2/methods/genetics.html#hail.methods.variant_qc) method from good quality samples, and written to `gs://cpg-prophecy-test/large-cohort/v0-1/frequencies.ht` locus-level table with split multiallelics:\n\n```\nRow fields:\n    'locus': locus<GRCh38>\n    'alleles': array<str>\n    'a_index': int32\n    'was_split': bool\n    'InbreedingCoeff': float64\n    'dp_stats': struct {\n        mean: float64,\n        stdev: float64,\n        min: float64,\n        max: float64\n    }\n    'gq_stats': struct {\n        mean: float64,\n        stdev: float64,\n        min: float64,\n        max: float64\n    }\n    'AC': array<int32>\n    'AF': array<float64>\n    'AN': int32\n    'homozygote_count': array<int32>\n    'call_rate': float64\n    'n_called': int64\n    'n_not_called': int64\n    'n_filtered': int64\n    'n_het': int64\n    'n_non_ref': int64\n    'het_freq_hwe': float64\n    'p_value_hwe': float64\n    'p_value_excess_het': float64\n----------------------------------------\nKey: ['locus', 'alleles']\n```\n\n### Applied outputs\n\nTables generated by the workflow can be applied to a VDS or a split+dense matrix table in the following way:\n\n```python\nimport hail as hl\n\nvds = hl.vds.read_vds('gs://cpg-prophecy-test/vds/v0-1.vds')\nsample_qc_ht = hl.read_table('gs://cpg-prophecy-test/large-cohort/v0-1/sample_qc.ht')\nrelateds_to_drop_ht = hl.read_table('gs://cpg-prophecy-test/large-cohort/v0-1/relateds_to_drop.ht')\npop_ht = hl.read_table('gs://cpg-prophecy-test/large-cohort/v0-1/ancestry/inferred_pop.ht')\nvqsr_ht = hl.read_table('gs://cpg-prophecy-test/large-cohort/v0-1/vqsr.ht')\nfreq_ht = hl.read_table('gs://cpg-prophecy-test/large-cohort/v0-1/frequencies.ht')\n\n# Row-level tables require a split+dense matrix table:\nvds = hl.vds.split_multi(vds, filter_changed_loci=True)\nmt = hl.vds.to_dense_mt(vds)\n\n# Hard-filtering samples and variants:\nmt = mt.filter_cols(hl.len(sample_qc_ht[mt.col_key].filters) > 0, keep=False)\nmt = mt.filter_cols(hl.is_defined(relateds_to_drop_ht[mt.col_key]), keep=False)\nmt = mt.filter_rows(hl.len(vqsr_ht[mt.row_key].filters) > 0, keep=False)\n\n# Annotating samples and variants:\nmt = mt.annotate_cols(**sample_qc_ht[mt.col_key])\nmt = mt.annotate_cols(**pop_ht[mt.col_key])\nmt = mt.annotate_rows(**vqsr_ht[mt.row_key])\nmt = mt.annotate_rows(**freq_ht[mt.row_key])\n```\n\n### References\n\nThe workflow is largely inspired by [the Hail pipeline used for the QC of gnomAD releases](https://github.com/broadinstitute/gnomad_qc). Good summaries of gnomAD QC can be found in gnomAD update blog posts:\n\n* [https://macarthurlab.org/2017/02/27/the-genome-aggregation-database-gnomad](https://macarthurlab.org/2017/02/27/the-genome-aggregation-database-gnomad)\n* [https://macarthurlab.org/2018/10/17/gnomad-v2-1](https://macarthurlab.org/2018/10/17/gnomad-v2-1)\n* [https://macarthurlab.org/2019/10/16/gnomad-v3-0](https://macarthurlab.org/2019/10/16/gnomad-v3-0)\n* [https://gnomad.broadinstitute.org/blog/2020-10-gnomad-v3-1-new-content-methods-annotations-and-data-availability/#sample-and-variant-quality-control](https://gnomad.broadinstitute.org/blog/2020-10-gnomad-v3-1-new-content-methods-annotations-and-data-availability/#sample-and-variant-quality-control)\n* [https://blog.hail.is/whole-exome-and-whole-genome-sequencing-recommendations/](https://blog.hail.is/whole-exome-and-whole-genome-sequencing-recommendations/)\n\n## GATK-SV\n\nBroad's [GATK-SV workflow](https://github.com/broadinstitute/gatk-sv) is WIP, but it can be already used to call SV evidence from individual samples. \n\nUnder the hood, the workflow invokes the GATK-SV WDL workflow using a managed Cromwell instance via the analysis runner helper functions. The WDL workflow repository is [forked](https://github.com/populationgenomics/gatk-sv), and the latest commit to use is specified in `gatk_sv/gatk_sv.py` as a `GATK_SV_COMMIT` constant.\n\n### Building reference and dockers\n\nRunning the workflow requires the Broad reference data copied to a `workflow/reference_prefix` bucket, and images copied to `workflow/image_registry_prefix`. In order to do that, use the following scripts:\n\n```bash\nbash sync_references.sh\npython sync_images.py\n```\n\nThe latter script will print a section for the `gatk-sv.toml` `[images]` section, that you'd need to insert there to make sure the workflow points to the latest tags. Also, when updating the GATK-SV fork, double check that the `[references.broad.sv.*]` sections in the config are up-to-date as well, and add new missing reference files if there are any.\n\n## Development\n\n### Dev installation\n\nAssuming `python3` points to `python3.10`, set up a virtual environment:\n\n```sh\npython3 -m pip install virtualenv\nvirtualenv venv\nsource venv/bin/activate\n```\n\nInstall the package, and the development environment:\n\n```bash\npip install -e .\npip install -r requirements-dev.txt\n```\n\n### Codebase\n\nThe entry point of the codebase is `main.py` script. It contains `WORKFLOWS` dictionary, which is listing all available workflows. A workflow is defined by the final stages it needs to trigger, with each stage pulling other required stages recursively following `required_stages` links. Those final stages are passed to the `run_workflow()` function, which would orchestrate stages and required inputs. \n\nIn this documentation section, we describe in more detail how exactly it's implemented.\n\n### `cpg_workflows` library\n\n[Hail Batch](https://hail.is/#hail-batch) is a powerful system for workflow programming and execution using cloud compute and storage. In CPG, we manage our own Hail Batch deployment, along with the [analysis-runner](https://github.com/populationgenomics/analysis-runner) tool that provides an approachable and secure way to submit analysis scripts to Hail Batch.\n\nIn Hail, the workflows can be described using Python, and be built to be parts of more complex applications. E.g. the analysis-runner uses Hail Batch to drive itself, and the genomic variation analysis tool called Hail Query can use Hail Batch as a backend. All that makes Hail Batch a natural choice to design genomics workflows.\n\nClassical genomics best-practices workflow implementations like [WARP](https://github.com/broadinstitute/warp) and [GATK-SV](https://github.com/broadinstitute/gatk-sv) use WDL to be run with [Cromwell](https://github.com/broadinstitute/cromwell) or Terra. In order to integrate WDL workflows into a Hail Batch infrastructure, there are a few possible approaches.\n\n1. Start a Cromwell instance as part of Hail Batch job script, and submit a sub-workflow inside that job,\n2. Maintain a managed Cromwell instance, and wrap only workflow submissions in a Hail Batch job,\n3. Fully re-engineer WDL workflows in Python and Hail Batch.\n\nFor the GATK-SV workflow, we went with the approach #2. The workflow is quite complex, it uses many layers of branching nested sub-workflows, and it implements even minor file processing commands as separate WDL tasks. We also do not intend to adjust this workflow much as of now. In order to run GATK-SV, we support a managed Cromwell instance along with a [Python helper](https://github.com/populationgenomics/analysis-runner/blob/main/analysis_runner/cromwell.py#L230) that wraps interaction with Cromwell using Hail Batch jobs, and we utilize Cromwell API along with [Swagger](https://cromwell.populationgenomics.org.au/swagger/index.html?url=/swagger/cromwell.yaml#/Workflows/metadata) to explore Cromwell logs.\n\nAs for the WGS/WES germline variant workflows, we re-engineered them fully in Hail Batch, largely inspired by WARP, but with significant divergence from WARP: we added dataset-specific pedigree checks and dataset-specific MultiQC reports, allele-specific VQSR for WGS, cohort annotation using Hail Query and exporting to the Elasticsearch using scripts from [seqr-loading-pipelines](https://github.com/broadinstitute/seqr-loading-pipelines). There are also several CPG-specific layers, like reading inputs and metadata from [Metamist](https://github.com/populationgenomics/sample-metadata); reporting analysis results back to Metamist; setting global configuration with TOML; and a necessity for a more fine-grained tuning of tool's parameters and compute resources.\n\nTo facilitate re-engineering WARP workflows and creating workflows scratch, we implemented some abstractions in this module, namely a workflow \"stage\" with expected inputs, outputs, and dependencies, and \"stage\" target (\"sample\", \"dataset\", \"cohort\"). Unlike WDL's concept of nested sub-workflows, Hail Batch is intrinsically lower-level, naturally providing one layer of jobs, with each job corresponding to on bash script that is run on one cloud VM. That doesn't always match a higher-level task in the application domain. For example, a workflow stage called \"genotype\" can include multiple jobs to generate calling intervals, partition inputs, run the genotyping tool in parallel instances, gather results, perform post-processing and filtering. That \"stage\" would sit between an \"alignment\" stage and a \"joint calling\" stage, and a user might need to start a workflow from a specific stage, reusing pre-existing outputs; or run the pipeline only up to a specific stage. So it's helpful to abstract a set of jobs related in a domain-specific way as a stage, with an ability to restart/skip/select stages. It also turns out that GATK-SV facilitates from these abstractions too, as it consists of multiple disconnected sub-workflows of different levels.\n\n### Stages\n\n![uml](docs/classes.png)\n\nThis library provides an abstraction interface on top of Hail Batch jobs, namely a `Stage` abstract class, parametrised by the `Target` abstract class, representing what target this stage works with. \n\nFor example, a stage that performs read alignment to produce a CRAM file, would be derived from `SampleStage`, and be parametrised by `Sample`, and a stage that performs joint-calling would be derived from `CohortStage`, parametrised by `Cohort`.\n\nEach `Stage` final implementation must declare paths to the outputs it would write in the `expected_outputs()` method. It must also define how jobs are added into Hail Batch using the `queue_jobs()` method.\n\nFor example, out \"Align\" stage that runs BWA might look like as following:\n\n```python\nfrom cpg_utils import Path\nfrom cpg_workflows.workflow import stage, SampleStage, Sample, StageInput, StageOutput\nfrom cpg_workflows.batch import get_batch\n\n@stage\nclass Align(SampleStage):\n    def expected_outputs(self, sample: Sample) -> Path:\n        return sample.make_cram_path().path\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        j = get_batch().new_job('BWA', self.get_job_attrs(sample))\n        j.command(f'bwa ... > {j.output}')\n        get_batch().write_output(j.output, str(self.expected_outputs(sample)))\n        # Construct StageOutput object, where we pass a path to the results, \n        return self.make_outputs(sample, self.expected_outputs(sample), [j])\n```\n\nThe `queue_jobs()` method is expected to return an output of type `StageOutput`: you can call `self.make_outputs()` to construct that object.\n\nStages can depend on each other (i.e. they form a directed acyclic graph), which is specified using a parameter `required_stages` to the `@stage` class decorator, and the `inputs` parameter in `queue_jobs()` to get the output of a previous stage. E.g. our sample genotyping stage might look like this:\n\n```python\nfrom cpg_utils import Path\nfrom cpg_workflows.workflow import stage, SampleStage, Sample, StageInput, StageOutput\n\nAlign = ...\n\n\n@stage(required_stages=Align)\nclass Genotype(SampleStage):\n    def expected_outputs(self, sample: Sample) -> Path:\n        return sample.make_gvcf_path().path\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        jobs = ...\n        return self.make_outputs(sample, self.expected_outputs(sample), jobs)\n```\n\nStage of different levels can depend on each other, and the library will resolve that correctly. E.g. joint calling stage that takes GVCF outputs to produce a cohort-level VCF would look like this:\n\n```python\nfrom cpg_utils import Path\nfrom cpg_workflows.workflow import stage, CohortStage, Cohort, StageInput, StageOutput\n\nGenotype = ...\n\n\n@stage(required_stages=Genotype)\nclass JointCalling(CohortStage):\n    def expected_outputs(self, cohort: Cohort) -> Path:\n        return cohort.analysis_dataset.prefix() / 'joint-called.vcf.gz'\n\n    def queue_jobs(self, cohort: Cohort, inputs: StageInput) -> StageOutput | None:\n        # Get outputs from previous stage. Because the Genotype stage\n        # acts on a sample, we use a method `as_path_by_target` that returns\n        # a dictionary index by sample ID:\n        gvcf_path_by_sample = inputs.as_path_by_target(Genotype)\n        assert len(gvcf_path_by_sample) == len(cohort.get_samples())\n        jobs = ...\n        return self.make_outputs(cohort, self.expected_outputs(cohort), jobs)\n```\n\nTo submit a set of defined stages to Hail Batch, just call the `run_workflow(stages)` method:\n\n```python\nfrom cpg_workflows.workflow import run_workflow\nJointCalling = ...\nrun_workflow().run(stages=[JointCalling])\n```\n\nIt takes a list of stage classes as a single parameter, and it would resolve all implicit dependencies automatically.\n\n### Configuration\n\nThe library implicitly reads configuration using the `cpg_utils.config.get_config()` from a TOML file specified in the `CPG_CONFIG_PATH` environment variables, which are passed via the analysis runner's `--config` flag. For example, you can prepare a TOML config file `config.toml` as follows:\n\n```toml\n[workflow]\nsequencing_type = 'genome'\nonly_datasets = ['hgdp', 'thousand-genomes']\nskip_samples = ['CPG202994', 'CPG203000']\nskip_stages = ['Align']\ncheck_inputs = true  # checks e.g. if fastq for align stage exist\ncheck_intermediates = false  # explitic calls to can_reuse(path) will return False \ncheck_expected_outputs = true  # if expected_outputs() exist, skip stage\n```\n\nAnd execute the workflow script `main.py` with the analysis-runner as follows:\n\n```bash\nanalysis-runner --dataset seqr --access-level test -o test-workflow \\\n--config configs/config.toml main.py\n```\n\nThe script would be able to access config parameters with \n\n```python\nfrom cpg_utils.config import get_config\nassert get_config()['workflow']['sequencing_type'] == 'genome'\n```\n\nNote that the workflow implicitly reads inputs from Metamist, and requires `workflow/only_datasets` and `workflow/sequencing_type` to be defined to pull proper inputs. \n\nTOML files in [configs/defaults](configs/defaults) and [cpg_workflows/defaults.toml](cpg_workflows/defaults.toml) list possible configuration parameters for workflows, please refer to those configs for documentation.\n\nAlso keep in mind that analysis-runner would implicitly set a set of config parameters suitable specifically for the CPG infrastructure, e.g. the generated config after analysis-runner post-processing would look like this:\n\n```toml\n[workflow]\naccess_level = \"test\"\ndataset_gcp_project = \"validation\"\ndataset = \"validation\"\n\n[hail]\nbilling_project = \"validation\"\npool_label = \"large-cohort\"\n\n[images]\ncpg_workflows = \"australia-southeast1-docker.pkg.dev/cpg-common/images/cpg_workflows:1.4.1\"\nbcftools = \"australia-southeast1-docker.pkg.dev/cpg-common/images/bcftools:1.16\"\n...\n\n[references]\ngenome_build = \"GRCh38\"\nvep_mount = \"gs://cpg-common-main/references/vep/105.0/mount\"\n...\n\n[references.broad]\ndragmap_prefix = \"gs://cpg-common-main/references/hg38/v0/dragen_reference\"\n...\n\n[storage.default]\ndefault = \"gs://cpg-validation-main\"\nweb = \"gs://cpg-validation-main-web\"\nanalysis = \"gs://cpg-validation-main-analysis\"\ntmp = \"gs://cpg-validation-main-tmp\"\nweb_url = \"https://main-web.populationgenomics.org.au/validation\"\n...\n```\n\nIf you are not using the analysis runner, you'd have to set those generated values explicitly. \n\n### Batch helpers\n\nThe `cpg_workflows.batch` module provides a helper function `get_batch` to set up Hail Batch in the CPG context, assuming `hail/billing_project` and `hail/backend` are set in config.\n\n```python\nfrom cpg_workflows.batch import get_batch\nb = get_batch(name='My batch')\nj = b.new_job('My job', ...)\n...\n```\n\nThe Batch instance derives from a class extended from standard Hail `Batch` class, and it records stats of added jobs and prints statistics before submission, highlighting labelled jobs, e.g.:\n\n```sh\nWill submit 186 jobs:\nBWA: 3 for 3 samples\nSomalier extract (CRAMs): 3 for 3 samples\nHaplotypeCaller: 3 for 3 samples\nReblockGVCF: 3 for 3 samples\nSomalier extract (GVCFs): 3 for 3 samples\nOther jobs: 171\n```\n\nThe Batch instance also constructs the job name if the names of a sample and a dataset are provided as attributes, e.g.:\n\n```bash\n>>> j = b.new_job('My job', dict(sample='CPG196535', dataset='fewgenomes'))\n>>> print(j.name)\nfewgenomes/CPG196535: My job\n```\n\n`cpg_utils.hail_batch` provides a helper `command` to set up a command that can be used to add monitoring of disk space, or authenticate with GCP:\n\n```python\nfrom cpg_utils.hail_batch import command\nj = ...\nj.command(command('sleep 600', monitor_space=True, setup_gcp=True))\n```\n\nThis will wrap the command as follows:\n\n```bash\nset -o pipefail\nset -ex\nexport GOOGLE_APPLICATION_CREDENTIALS=/gsa-key/key.json\ngcloud -q auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS\n\n(while true; do df -h; du -sh $BATCH_TMPDIR; sleep 600; done) &\n\nsleep 600\n\ndf -h; du -sh $BATCH_TMPDIR\n```\n\n### Reusing existing results\n\n`workflow/check_expected_outputs = true` controls whether the paths returned by `expected_outputs()` of each job correspond to existing objects, and would skip stages with already existing outputs.\n\nYou can also call the method `cpg_workflows.utils.can_reuse(path)` explicitly within the code called from `queue_jobs()`. \n`workflow/check_intermediates = true` controls whether `can_reuse()` checks the object(s), or always returns `False`.\n\n`workflow/check_inputs = true` controls whether inputs to the first stage in the pipeline should be checked for existence, e.g. alignment inputs for an `Align` stage. `skip_samples_with_missing_input` controls the behaviour if those inputs are missing: where skip such samples, or stop the workflow.\n\nYou can also start the pipeline from a specific stage with `workflow/first_stages` (it would skip all previous stages, but still check immediately required inputs for the first stage). `workflow/last_stages` would stop the workflow after the stages specified. `workflow/only_stages` would execute only stages specified, ignoring dependencies.\n\nYou can also force the pipeline to skip certain samples with `workflow/skip_samples`, pick only certain samples with `workfpow/only_samples`, force re-processing of certain samples with `workflow/force_samples`. `workflow/skip_datasets` and `workflow/only_datasets` are available, and more fine-grained combination of `skip_samples` and `skip_stages`: \n\n```toml\n[workflow.skip_samples_stages]\nCramQC = ['CPG13409']\n```\n\n### Available stages\n\nTo see available workflow stages, explore the `cpg_workflows/stages` folder. A stage wrappers for Hail Batch jobs that allow to glue them together into genomics workflows. `cpg_workflows` also provides helper functions that create Hail Batch jobs for different domain-specific applications, e.g. alignment, deduplication, QC, variant calling, creating calling intervals, running VQSR, creating ES index, etc. Those jobs can be called from the `queue_jobs` method of a stage, or in isolation, as they don't need to know about the stage they are called from, but only need a `Batch` object.\n\n\n### Slack QC notifications\n\nConfig's `[slack]` section activates QC reports to a Slack channel. For example:\n\n```toml\n[slack]\nchannel = 'workflows-qc'\ntoken_secret_id = 'slack-seqr-loader-token'\ntoken_project_id = 'seqr-308602'\n```\n\nWould send messages on QC completion to the `workflows-qc` channel, flagging failed samples.\n\nTwo scripts send Slack messages: `check_multiqc.py` and `check_pedigree.py`. Note that the MultiQC checks only work when the `qc_thresholds` section is also specified, for example:\n\n```toml\n[qc_thresholds.genome.min]\n\"MEDIAN_COVERAGE\" = 10\n\"PCT_PF_READS_ALIGNED\" = 0.80\n[qc_thresholds.genome.max]\n\"FREEMIX\" = 0.04\n\"PERCENT_DUPLICATION\" = 25\n```\n\nThresholds can be adjusted as needed, per workflow or dataset. Note that the metrics names here should match the ones in the MultiQC JSON.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/populationgenomics/production-pipelines",
+    "keywords": "bioinformatics",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cpg-workflows",
+    "package_url": "https://pypi.org/project/cpg-workflows/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/cpg-workflows/",
+    "project_urls": {
+      "Homepage": "https://github.com/populationgenomics/production-pipelines"
+    },
+    "release_url": "https://pypi.org/project/cpg-workflows/1.12.4/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "CPG workflows for Hail Batch",
+    "version": "1.12.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16737283,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44c1f156d452cf779adb259f162b9ff9bf1fc7998f8ec4b54f9fd3b2428cc626",
+          "md5": "1a0b8b044d422570c6f7352618f2816d",
+          "sha256": "32aeb4c40082553f29328781ffbbc971227b6723a85b1120786cddf3057eadd5"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a0b8b044d422570c6f7352618f2816d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 134506,
+        "upload_time": "2022-10-26T06:00:43",
+        "upload_time_iso_8601": "2022-10-26T06:00:43.928121Z",
+        "url": "https://files.pythonhosted.org/packages/44/c1/f156d452cf779adb259f162b9ff9bf1fc7998f8ec4b54f9fd3b2428cc626/cpg-workflows-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "617a7bff43d13f1c75fe396daaf8efa4ece3e37fade73cee6289903dc3e7cf63",
+          "md5": "2d9ddc45d045db51ee962b992e0a4afe",
+          "sha256": "8690a79f3b69810daa863d8ec36dc6a1e3433e63746cec2bbc81d9330c51dad6"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2d9ddc45d045db51ee962b992e0a4afe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 151465,
+        "upload_time": "2022-11-28T04:54:05",
+        "upload_time_iso_8601": "2022-11-28T04:54:05.782006Z",
+        "url": "https://files.pythonhosted.org/packages/61/7a/7bff43d13f1c75fe396daaf8efa4ece3e37fade73cee6289903dc3e7cf63/cpg-workflows-1.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8ae9bb636564bb11e850284d4e83759df8cbfaa479b104dc7da6b5ab24bc9fd8",
+          "md5": "020221af432c1df7949b75c6aa36cdf8",
+          "sha256": "c25f0cd9f6ad102c7f0658e35edee5311aaddf3ae4932ba4b5c3bf92a83790df"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "020221af432c1df7949b75c6aa36cdf8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 151585,
+        "upload_time": "2022-11-29T01:49:56",
+        "upload_time_iso_8601": "2022-11-29T01:49:56.063272Z",
+        "url": "https://files.pythonhosted.org/packages/8a/e9/bb636564bb11e850284d4e83759df8cbfaa479b104dc7da6b5ab24bc9fd8/cpg-workflows-1.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2b169b1c61e268b4d738178c83259d8fc44bcc814c6616f5f38c79259034493",
+          "md5": "61144acdc9a802168aaff34ca89b83df",
+          "sha256": "f28f2f175106f64730ff10e86d1a4718beb405c4fb3728501c7ee3bd5072c290"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "61144acdc9a802168aaff34ca89b83df",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 139286,
+        "upload_time": "2022-11-01T22:48:10",
+        "upload_time_iso_8601": "2022-11-01T22:48:10.730553Z",
+        "url": "https://files.pythonhosted.org/packages/e2/b1/69b1c61e268b4d738178c83259d8fc44bcc814c6616f5f38c79259034493/cpg-workflows-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "131f498f4aac195aea523a7651f4241bdfe30eba1eb1520eeddd1ddea256e8fd",
+          "md5": "9745b7c6d9a58ddc37e23b1615959bb2",
+          "sha256": "1376aeae7c141a7b2df607b989e667f875f992ba686fff49a2790bbeaf752f6e"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9745b7c6d9a58ddc37e23b1615959bb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 187522,
+        "upload_time": "2022-11-07T05:39:27",
+        "upload_time_iso_8601": "2022-11-07T05:39:27.525415Z",
+        "url": "https://files.pythonhosted.org/packages/13/1f/498f4aac195aea523a7651f4241bdfe30eba1eb1520eeddd1ddea256e8fd/cpg-workflows-1.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "def6b28ba271b6d8d70f639c13e7066e35108014a39324b57ee7d66fb9a0adaf",
+          "md5": "09ce717896f1cafad5303e57e31210ed",
+          "sha256": "da377162f1faefb021a4488050ef17fd10383150747a45069bc52d0bf65df783"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09ce717896f1cafad5303e57e31210ed",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 144251,
+        "upload_time": "2022-11-08T03:45:26",
+        "upload_time_iso_8601": "2022-11-08T03:45:26.524526Z",
+        "url": "https://files.pythonhosted.org/packages/de/f6/b28ba271b6d8d70f639c13e7066e35108014a39324b57ee7d66fb9a0adaf/cpg-workflows-1.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03303da8a6c3c4131e55b18940c790e1adffdffb37900b48aedc43729c816ce8",
+          "md5": "cdadf42e8ad4917b53431bb878610f52",
+          "sha256": "f25f136bbdaa8ab0539ca32720ffd63f78882eae1f1a205b50c9c7a5c2cd88e5"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cdadf42e8ad4917b53431bb878610f52",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 144013,
+        "upload_time": "2022-11-09T22:54:31",
+        "upload_time_iso_8601": "2022-11-09T22:54:31.852741Z",
+        "url": "https://files.pythonhosted.org/packages/03/30/3da8a6c3c4131e55b18940c790e1adffdffb37900b48aedc43729c816ce8/cpg-workflows-1.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f8cbfb48f7c79ffd816599f06beda2297bcfb3f48d27410f7b1b16ba24bf4f27",
+          "md5": "0455a23758e32c0168cb32c7acd46f5e",
+          "sha256": "57b1990d024d8089aacde350c28cf75809c0e0fdb4da31bee49b43e3bea831d0"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0455a23758e32c0168cb32c7acd46f5e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 147946,
+        "upload_time": "2022-11-11T00:46:30",
+        "upload_time_iso_8601": "2022-11-11T00:46:30.651353Z",
+        "url": "https://files.pythonhosted.org/packages/f8/cb/fb48f7c79ffd816599f06beda2297bcfb3f48d27410f7b1b16ba24bf4f27/cpg-workflows-1.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c55bce63bb759dc7ccbd739d7d75f2b29c6e68298d26b0a1306da8cb56eb993c",
+          "md5": "456060b05801a31e3ea0a42451e726ff",
+          "sha256": "a70593b8ff461a575f38d7add56e0199f0ae9d934f2aea01d8df04ef51d5b3d3"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "456060b05801a31e3ea0a42451e726ff",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 147946,
+        "upload_time": "2022-11-11T06:09:49",
+        "upload_time_iso_8601": "2022-11-11T06:09:49.143761Z",
+        "url": "https://files.pythonhosted.org/packages/c5/5b/ce63bb759dc7ccbd739d7d75f2b29c6e68298d26b0a1306da8cb56eb993c/cpg-workflows-1.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3e05e9c4bcc492de3cc4827f6bdb0097375129502a7ff8607f7779d8c65c973",
+          "md5": "b4d15e8b4000499cce3d47e48add6199",
+          "sha256": "88e13a6de62127f1bc24f8106c023a0a484220727222ce497fdf22195c943757"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b4d15e8b4000499cce3d47e48add6199",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 148000,
+        "upload_time": "2022-11-11T06:12:03",
+        "upload_time_iso_8601": "2022-11-11T06:12:03.230155Z",
+        "url": "https://files.pythonhosted.org/packages/c3/e0/5e9c4bcc492de3cc4827f6bdb0097375129502a7ff8607f7779d8c65c973/cpg-workflows-1.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac309e0e5ae13e61e50d5f617d30a20be20dd1a7ba656824c12e69d307932a40",
+          "md5": "a1a2626c798f499320febc58fd87bb48",
+          "sha256": "e69973a8ddcef13acb203903328284d724b003b09a81f13f4a8b82654103f080"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a1a2626c798f499320febc58fd87bb48",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152205,
+        "upload_time": "2022-11-23T04:11:25",
+        "upload_time_iso_8601": "2022-11-23T04:11:25.353465Z",
+        "url": "https://files.pythonhosted.org/packages/ac/30/9e0e5ae13e61e50d5f617d30a20be20dd1a7ba656824c12e69d307932a40/cpg-workflows-1.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03395291885ca5cc520cb6bd707edb4a0896c509ab4c5788f38306f968ca3782",
+          "md5": "7ce46385c8eeeb20f6e434f1dddf7562",
+          "sha256": "991607b53c902ddd06fbc99da46565b86a2cd9b76705f3b14832529789129d27"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.10.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7ce46385c8eeeb20f6e434f1dddf7562",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152714,
+        "upload_time": "2022-12-23T03:39:36",
+        "upload_time_iso_8601": "2022-12-23T03:39:36.348796Z",
+        "url": "https://files.pythonhosted.org/packages/03/39/5291885ca5cc520cb6bd707edb4a0896c509ab4c5788f38306f968ca3782/cpg-workflows-1.10.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6501f747879f595438797b1551f3aba03abc8ea9810723d74dc62a0051c586a",
+          "md5": "1d45fb5c18fd71c95919fe357c1acd20",
+          "sha256": "e62f5a1f89976ce231ec5b237c1d8f7e462f43974ae5eb56d447ed2d5a8c4a65"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.11.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1d45fb5c18fd71c95919fe357c1acd20",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 153784,
+        "upload_time": "2023-01-06T05:35:21",
+        "upload_time_iso_8601": "2023-01-06T05:35:21.945003Z",
+        "url": "https://files.pythonhosted.org/packages/a6/50/1f747879f595438797b1551f3aba03abc8ea9810723d74dc62a0051c586a/cpg-workflows-1.11.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.11.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d13c00480993874af60a68ace81b8e7f90e867a32867b0dc4026c0a2d9fa8e69",
+          "md5": "68c0d8707c99b181b6e94376957dd8ac",
+          "sha256": "f47c78bf1e4b0e449a4298ffeba1f09e19709d175eab30d247b43de693b2505e"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.11.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "68c0d8707c99b181b6e94376957dd8ac",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 154943,
+        "upload_time": "2023-01-10T23:50:57",
+        "upload_time_iso_8601": "2023-01-10T23:50:57.937619Z",
+        "url": "https://files.pythonhosted.org/packages/d1/3c/00480993874af60a68ace81b8e7f90e867a32867b0dc4026c0a2d9fa8e69/cpg-workflows-1.11.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a7662d96f87e91d29a20e903ec3cb2e7559c5219918884d1b37c8455e5209ca",
+          "md5": "420b1584cfac204bc67a927428cbf2f2",
+          "sha256": "9c64254962c5416a414115353c2666037d857c19918bb2345ccf07a5411a379d"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.12.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "420b1584cfac204bc67a927428cbf2f2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 155120,
+        "upload_time": "2023-01-11T04:06:03",
+        "upload_time_iso_8601": "2023-01-11T04:06:03.851311Z",
+        "url": "https://files.pythonhosted.org/packages/4a/76/62d96f87e91d29a20e903ec3cb2e7559c5219918884d1b37c8455e5209ca/cpg-workflows-1.12.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c98df972485939b33500dd473a152664c5d4d7e4627fc453ee99e89f9d3e521e",
+          "md5": "31a650b1aea41287042d017cc7de97d9",
+          "sha256": "d5bc207394753dd8db729c0ac210686dc922035e316be061858c9959f004b91d"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.12.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "31a650b1aea41287042d017cc7de97d9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 156677,
+        "upload_time": "2023-01-25T01:35:02",
+        "upload_time_iso_8601": "2023-01-25T01:35:02.951698Z",
+        "url": "https://files.pythonhosted.org/packages/c9/8d/f972485939b33500dd473a152664c5d4d7e4627fc453ee99e89f9d3e521e/cpg-workflows-1.12.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5864d343286b3dd317afc7201b4935eb2933a83ec1d1a09a1df2dcc81df0810a",
+          "md5": "7e1e1e184b6df1910ebb26b599eb240d",
+          "sha256": "f5d9a406aa8ad776f775a393101b0731861cca8ecfbc90540d5e5f5c36271da2"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.12.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7e1e1e184b6df1910ebb26b599eb240d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 156711,
+        "upload_time": "2023-02-06T05:53:50",
+        "upload_time_iso_8601": "2023-02-06T05:53:50.044483Z",
+        "url": "https://files.pythonhosted.org/packages/58/64/d343286b3dd317afc7201b4935eb2933a83ec1d1a09a1df2dcc81df0810a/cpg-workflows-1.12.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "204569b40ccf73ef182f7db8b22558d734402a35d89a07ab101ef1df85d8d87e",
+          "md5": "9281a401c70d2e906b4a9720ee0c35b7",
+          "sha256": "afe326c626afb08f4c74ddf35725364df61630b103a0c4e2f309546a3e61a0cb"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.12.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9281a401c70d2e906b4a9720ee0c35b7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 156681,
+        "upload_time": "2023-02-07T02:49:08",
+        "upload_time_iso_8601": "2023-02-07T02:49:08.305542Z",
+        "url": "https://files.pythonhosted.org/packages/20/45/69b40ccf73ef182f7db8b22558d734402a35d89a07ab101ef1df85d8d87e/cpg-workflows-1.12.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.12.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4568edbdc60063cd5b82f970c6a6cbf5b5c88fa64190f53ede9b86c1ad7c2a68",
+          "md5": "166c86055fb185b72dfaa45d9bd96535",
+          "sha256": "0c0e841cc27f4df74d213ef1d92e5dace23c79ac6b3d0b4e1ea946cac7ece252"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.12.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "166c86055fb185b72dfaa45d9bd96535",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 156695,
+        "upload_time": "2023-02-07T23:07:14",
+        "upload_time_iso_8601": "2023-02-07T23:07:14.337173Z",
+        "url": "https://files.pythonhosted.org/packages/45/68/edbdc60063cd5b82f970c6a6cbf5b5c88fa64190f53ede9b86c1ad7c2a68/cpg-workflows-1.12.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "babff3ee0b3e9d001e9295bce76e1c3f14354c3daa8fe28c163d4307a7e80005",
+          "md5": "ed4fef2a7c2c45f98d1560ead5732c96",
+          "sha256": "0f94d0e411dec0b3cc4d67f8610736ec623c90fbad1308e2fa59fc0fdbcdacb3"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed4fef2a7c2c45f98d1560ead5732c96",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 150569,
+        "upload_time": "2022-12-01T22:21:33",
+        "upload_time_iso_8601": "2022-12-01T22:21:33.959999Z",
+        "url": "https://files.pythonhosted.org/packages/ba/bf/f3ee0b3e9d001e9295bce76e1c3f14354c3daa8fe28c163d4307a7e80005/cpg-workflows-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b33ed1582ce2bcfb32d911892b4b1844ea66c6bc835748d425728b7452b70b11",
+          "md5": "873707335f5b6bc36be9a5abd1e6d006",
+          "sha256": "84e6526243b2c2c5659db4d844e63589f60b14e6c0761094c8fbb90b63fcf9f6"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "873707335f5b6bc36be9a5abd1e6d006",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 150702,
+        "upload_time": "2022-12-07T02:22:09",
+        "upload_time_iso_8601": "2022-12-07T02:22:09.370158Z",
+        "url": "https://files.pythonhosted.org/packages/b3/3e/d1582ce2bcfb32d911892b4b1844ea66c6bc835748d425728b7452b70b11/cpg-workflows-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22e2b41f3315718a5ebf5a854f53039137307cf95dc322146a31eac77c58e506",
+          "md5": "bcf828fe254474c94b16fd3b70261a62",
+          "sha256": "70b6f0a8b56b018c9a9ab113da67577abaefa682aa4c2ba7fe79cff10f0e13f6"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bcf828fe254474c94b16fd3b70261a62",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 151851,
+        "upload_time": "2022-12-13T01:58:47",
+        "upload_time_iso_8601": "2022-12-13T01:58:47.998441Z",
+        "url": "https://files.pythonhosted.org/packages/22/e2/b41f3315718a5ebf5a854f53039137307cf95dc322146a31eac77c58e506/cpg-workflows-1.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5ab9ad3412ce639cda95a0b52c68e8dba0be6e260056918cd957e602b72005be",
+          "md5": "fc3c6df640bf3265aac96c19f1f331ad",
+          "sha256": "33e9c64a0328c3c160b94ed2ae05dd0939095ac338a2b1847f885cccf6216935"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fc3c6df640bf3265aac96c19f1f331ad",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 151872,
+        "upload_time": "2022-12-14T07:13:14",
+        "upload_time_iso_8601": "2022-12-14T07:13:14.861870Z",
+        "url": "https://files.pythonhosted.org/packages/5a/b9/ad3412ce639cda95a0b52c68e8dba0be6e260056918cd957e602b72005be/cpg-workflows-1.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a7bc2d37a67256be9d469be8a019af5b2be752e3efdc1509f78b4e735a659db",
+          "md5": "704f6168a875e971a0e3125731472e3d",
+          "sha256": "e075b8c01b1ae8780a5f4c9afb23817abbfc45c63324a07d1e02330fa44d6812"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "704f6168a875e971a0e3125731472e3d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152109,
+        "upload_time": "2022-12-16T04:59:20",
+        "upload_time_iso_8601": "2022-12-16T04:59:20.810244Z",
+        "url": "https://files.pythonhosted.org/packages/6a/7b/c2d37a67256be9d469be8a019af5b2be752e3efdc1509f78b4e735a659db/cpg-workflows-1.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c9b70ead93f2e7c2d98b249d6ba5ee4d1cbc69d22260da57cd5644279be9a5e7",
+          "md5": "d6c6c4d8ce4cdb5b18d12b07df38b522",
+          "sha256": "69c410dd0d50739744b34ae592bf2e46dd41727f4add10c05816021451b07f4c"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d6c6c4d8ce4cdb5b18d12b07df38b522",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152110,
+        "upload_time": "2022-12-16T07:12:12",
+        "upload_time_iso_8601": "2022-12-16T07:12:12.490946Z",
+        "url": "https://files.pythonhosted.org/packages/c9/b7/0ead93f2e7c2d98b249d6ba5ee4d1cbc69d22260da57cd5644279be9a5e7/cpg-workflows-1.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a7ca40f6aa101b730f6bd4237b1691dcb8f2dba636bb8cbec90d08f9ffb569c",
+          "md5": "4292ad0505ae3e4d73e40cf894d2dabb",
+          "sha256": "d5c3030b6574b8834dc26ce35b750e5b041bb4b7c66035f245df2ab056f55ac8"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4292ad0505ae3e4d73e40cf894d2dabb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152110,
+        "upload_time": "2022-12-16T07:57:41",
+        "upload_time_iso_8601": "2022-12-16T07:57:41.917073Z",
+        "url": "https://files.pythonhosted.org/packages/2a/7c/a40f6aa101b730f6bd4237b1691dcb8f2dba636bb8cbec90d08f9ffb569c/cpg-workflows-1.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4fb552697d497763ecfaa3d8469e06b6abbfd764f7ec8ca3f0a31e3896663b73",
+          "md5": "60306759987bd547d4d618541b1324e2",
+          "sha256": "e372f4a905b3f01a0598d51c6eeca2fa42b32b7a0ae25fe62af6c8de04fa0697"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "60306759987bd547d4d618541b1324e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152084,
+        "upload_time": "2022-12-19T03:47:55",
+        "upload_time_iso_8601": "2022-12-19T03:47:55.046349Z",
+        "url": "https://files.pythonhosted.org/packages/4f/b5/52697d497763ecfaa3d8469e06b6abbfd764f7ec8ca3f0a31e3896663b73/cpg-workflows-1.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.7.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f8bab8864560cca12776a397784662f4fc336d3f475de2920a4b619d987224a",
+          "md5": "9bc79de08c02632954eb067303481b63",
+          "sha256": "a748a88a0e44a15850d913896aa0ea303ed15a73eccc38c556fbedc17252e60b"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.7.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9bc79de08c02632954eb067303481b63",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152119,
+        "upload_time": "2022-12-20T02:37:33",
+        "upload_time_iso_8601": "2022-12-20T02:37:33.033583Z",
+        "url": "https://files.pythonhosted.org/packages/6f/8b/ab8864560cca12776a397784662f4fc336d3f475de2920a4b619d987224a/cpg-workflows-1.7.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "55d554d37cb8d11b845baef7c396918221993ba6fead9192363ebae35e462c08",
+          "md5": "8222fab9a6a0223c4441eacdb7fdee92",
+          "sha256": "14ab9fd5aeb95bbca89396da5f62f2783dce0cb24ca4147a967aef0d8a62f7f7"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8222fab9a6a0223c4441eacdb7fdee92",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152281,
+        "upload_time": "2022-12-21T03:30:00",
+        "upload_time_iso_8601": "2022-12-21T03:30:00.929594Z",
+        "url": "https://files.pythonhosted.org/packages/55/d5/54d37cb8d11b845baef7c396918221993ba6fead9192363ebae35e462c08/cpg-workflows-1.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9785ebcf50223506f96abcfa077315ab244e192faa632ed400789582dcf565e0",
+          "md5": "f5e3c0f1eee8cd8b2289e18057029504",
+          "sha256": "f4cc0731f494c777278ee0faf7b6d687156100ff1aa11a6f7672b860e87bdda2"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f5e3c0f1eee8cd8b2289e18057029504",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152203,
+        "upload_time": "2022-12-21T03:33:31",
+        "upload_time_iso_8601": "2022-12-21T03:33:31.440417Z",
+        "url": "https://files.pythonhosted.org/packages/97/85/ebcf50223506f96abcfa077315ab244e192faa632ed400789582dcf565e0/cpg-workflows-1.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d82bd0cb905c3b340f5cd9b1eb95911c5444e8ba0f6369afc3c60336fed7e14",
+          "md5": "9c8b70583e51d74804a4b842c38a8c24",
+          "sha256": "6a36c8d7e2a535f5db3c35a5b6104dff41eb030ea0e5fb4c6d5787de2cb6be7b"
+        },
+        "downloads": -1,
+        "filename": "cpg-workflows-1.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9c8b70583e51d74804a4b842c38a8c24",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 152313,
+        "upload_time": "2022-12-21T07:04:58",
+        "upload_time_iso_8601": "2022-12-21T07:04:58.760985Z",
+        "url": "https://files.pythonhosted.org/packages/0d/82/bd0cb905c3b340f5cd9b1eb95911c5444e8ba0f6369afc3c60336fed7e14/cpg-workflows-1.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4568edbdc60063cd5b82f970c6a6cbf5b5c88fa64190f53ede9b86c1ad7c2a68",
+        "md5": "166c86055fb185b72dfaa45d9bd96535",
+        "sha256": "0c0e841cc27f4df74d213ef1d92e5dace23c79ac6b3d0b4e1ea946cac7ece252"
+      },
+      "downloads": -1,
+      "filename": "cpg-workflows-1.12.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "166c86055fb185b72dfaa45d9bd96535",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 156695,
+      "upload_time": "2023-02-07T23:07:14",
+      "upload_time_iso_8601": "2023-02-07T23:07:14.337173Z",
+      "url": "https://files.pythonhosted.org/packages/45/68/edbdc60063cd5b82f970c6a6cbf5b5c88fa64190f53ede9b86c1ad7c2a68/cpg-workflows-1.12.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

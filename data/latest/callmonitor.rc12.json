@@ -1,0 +1,639 @@
+{
+  "info": {
+    "author": "Johannes Blaschke",
+    "author_email": "johannes@blaschke.science",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# `callmonitor` -- A Simple Tool to Monitor and Log Function Calls\n\n\n## Installation\n\n```bash\npip install callmonitor\n```\nor clone this repo and:\n```bash\npython setup.py install\n```\n\n\n## Usage\n\nIt's simple to use, just decorate any function with the `@intercept` decorator.\nEg:\n```python\nfrom callmonitor import intercept\n\n@intercept\ndef test_fn_2(x, y=2, z=3):\n    pass\n```\nThis will save the inputs (`args`, `kwargs` and `argspec`) along with a call\ndatabase (`callmonitor.DB`) to: `call-monitor/test_fn_2/<invocation count>`.\n\n\n### `callmonitor` Doesn't Overwrite Output\n\nIf the `call-monitor` folder already exists (eg. a previous run), then a new\nfolder `call-monitor-1`, or `call-monitor-2`, and so on, is created. See the\nsections on `Data Structure` for more details on _how_ this data is saved.\n\n\n### Multi-Threading/Process Safe\n\nTo avoid different processes from writing to the same location, `callmonitor`\nappends `-tid=<N>` to the root (`call-monitor`) folder. Currently `callmonitor`\nsupports `mpi4py` out of the box: if `mpi4py.MPI.COMM_WORLD.Get_rank() > 1`,\n`callmonitor` automatically assumes that it's running im multi-threaded mode\nand appends `-tid=<Get_rank()>` to the output. If your programm is\nmulti-threaded with another framwork (eg. `concurrent.Futures`) then you need\nto tell `callmonitor` your thread ID using `callmonitor.Settings`:\n```python\nfrom callmonitor import Settings\n\nsettings = Settings()\nsettings.enable_multi_threading(THREAD_ID)\n```\n__before__ the first invocation of `intercept` (the database is created on disk\nwhen it is first needed, it is at that point when `callmonitor.Settings` is\nread. Any changes made to `callmonitor.Settings` afterwards will only take\neffect if the database is recreated -- using `callmonitor.CONTEXT.new`).\n\n\n### Registering your own Argument `Handler`s\n\nSometimes `pickle` just won't cut it in terms of saving function inputs -- eg.\nwhen we need to save our own fancy data types. `callmonitor` provides a way of\nbuilding your down argument handlers and registering to the global\n`callmonitor.REGISTRY`. The registry is queried every time function inputs are\nprocessed, so if you build your own `ArgHandler` and add them usingg\n`callmonitor.REGISTRY.add`, it will process any arguments of the associated\ndatatype from that point forward. Eg, `numpy` provides its own `save`/`load`\nfunctions. We have already build (and registered) a numpy arggument handler\nlike so:\n```python\nimport numpy as np\n\nfrom os.path     import join\nfrom callmonitor import Handler, REGISTRY\n\nclass NPHandler(Handler):\n\n    def load(self, path):\n        self.data = np.load(join(path, f\"arg_{self.target}.npy\"))\n\n\n    def save(self, path):\n        np.save(join(path, f\"arg_{self.target}.npy\"), self.data)\n\n\n    @classmethod\n    def accumulator_done(cls):\n        pass\n\nREGISTRY.add(np.ndarray, NPHandler)\n```\n(remember that `callmonitor.REGISTRY.add` needs to be called __before__ the\nfirst invocation of `@intercept` that needs this particular `Handler`). A\ncustom handler needs to inherit the `callmonitor.Handler` class and define\n`save`, `load`, and `accumulator_done` (the last one being a `@classmethod`).\n\n\n### Loading Data\n\n`callmonitor.load(<path>)` will load a database at `<path>` (see section on\n`Data Structure`). Eg:\n```python\nfrom callmonitor import load\n\ndb = load(\"call-monitor\")\n```\n\nWe can now get individual function calls data from the database using `DB.get`:\n```python\nargs, kwargs = db.get(\"function_name\", invocation_count)\n```\n(which will also automatically load `.npy` files and any custom handlers --\nremember to register these in `callmonitor.REGISTRY` before executing `db.get`)\n\n__Remember:__ `invocation_count` starts at 1. Therefore to access the _first_ call to `test_np_1`, run:\n```python\nIn [4]: db.get(\"test_np_1\", 1)\nOut[4]: ([10, array([0., 0., 0., 0., 0., 0., 0., 0., 0., 0.])], {})\n```\n\n\n## Interacting with `callmonitor`\n\nWe try to enable top-level summaries of the following user-facing classes:\n1. `REGISTRY`\n2. `DB`\n3. `DB.get_args`, and `Args`\nvia the `__str__` and `__repr__` functions. Eg, `callmonitor.REGISTRY` shows\nwhich datatype/handler pairs are configured:\n```python\nIn [2]: callmonitor.REGISTRY\nOut[2]:\n{\n    <class 'numpy.ndarray'>: <class 'callmonitor.handler.NPHandler'>\n}\n```\nLikewise the `DB` object displays a summary of functions called and how often.\n```python\nIn [3]: db = callmonitor.load(\"call-monitor\")\nIn [4]: db\nOut[4]:\n{\n    Locked: True\n    test_np_1: {\n        calls: 2\n        args: ['x', 'n']\n        defaults: None\n    }\n}\n```\n\n\n### `Args` Container\n\nPicking apart `args`, `kwargs`, and `argspec.defaults` can be very tedious --\nespecially if you're trying to find out the value of a specific argument. Hence\n`callmonitor.DB` provides an additionl getter -- `get_args` which returns an\n`Args` object. `callmonitor.Args` are container classes that store each input\nargument by name as an attributed. Eg:\n```python\nIn [3]: args = db.get_args(\"test_fn_1\", 1)\nIn [4]: args\nOut[4]: dict_keys(['x', 'y', 'z'])\nIn [5]: args.x\nOut[5]: 1\n```\n\nNote: the `callmonitor.Args` constructor will fill in any arguments not in\n`args` and `kwargs` from the `FullArgSpec` defaults. If you just want to\nrecreate the original function call the `args` and `kwargs` returned by\n`callmonitor.DB.get` should be enough.\n\n\n## Data Structure\n\nWhile not technically a _database_, let's call the directories generated by\n`callmonitor` a database for the lack of a better term. Each database consists\nof a `db.pkl` file (containing metadata), as well as folders for each function\n(each function call is enumerated). Eg:\n```\ncall-monitor\n├── db.pkl\n├── test_fn_1\n│   ├── 1\n│   │   └── input_descriptor.pkl\n│   └── 2\n│       └── input_descriptor.pkl\n└── test_fn_2\n    └── 1\n        └── input_descriptor.pkl\n```\nSpecial attention is given to `numpy` inputs -- these are called\n`arg_<label>.npy`, where `<label>` is either the index of the input argument,\nor the `kw` for kwargs. Eg:\n```\ncall-monitor\n├── db.pkl\n└── test_np_1\n    ├── 1\n    │   ├── arg_1.npy\n    │   └── input_descriptor.pkl\n    └── 2\n        ├── arg_n.npy\n        └── input_descriptor.pkl\n```\n\nFull consideration was given to saving _all_ call data in a single data\nstructure -- maybe even a _real_ database ;) -- but to do this efficiently at\nscale is not easy, and might make this package cumbersome. Future versions will\ninclude the ability to fuse multiple small function calls into a single\naccumulator object to avoid large numbers of small files.\n\n\n## Backward Compatibility\n\nVersion 0.3.0 brigns many enhancements to `callmonitor`. We therefore could no\nlonger enable native backward compatibility. A tool that can convert an version\n0.2.0 database to a version 0.3.0 (or later) is currently being developed.\nVersions pre-dating 0.2.0 are no longer supported.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/JBlaschke/call-monitor",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "callmonitor",
+    "package_url": "https://pypi.org/project/callmonitor/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/callmonitor/",
+    "project_urls": {
+      "Homepage": "https://github.com/JBlaschke/call-monitor"
+    },
+    "release_url": "https://pypi.org/project/callmonitor/0.3.7/",
+    "requires_dist": [
+      "numpy"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A light-weight package that allows you to monitor function calls with ease.",
+    "version": "0.3.7",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10555103,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd798b01c7ec7c78d7f49e698035fb44c56bdc348a686e7977d428649af239da",
+          "md5": "dc93b42e1a6b04b78ae9aa1da4bce4b8",
+          "sha256": "32adb0c428d493cc02892fdb610a2f0f1af616e6500d153fd666ff0d3f23a581"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dc93b42e1a6b04b78ae9aa1da4bce4b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 4892,
+        "upload_time": "2020-08-19T00:47:57",
+        "upload_time_iso_8601": "2020-08-19T00:47:57.107692Z",
+        "url": "https://files.pythonhosted.org/packages/bd/79/8b01c7ec7c78d7f49e698035fb44c56bdc348a686e7977d428649af239da/callmonitor-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b11485b1342bf3307e71964b0bdefcb4428ca7dc7ef367934eac0deb51a0ee78",
+          "md5": "a9b7abb6d073a8d1ca7f3ba3e6056f1e",
+          "sha256": "77b1676a07b5df8f251502669b815ccc0dfe8f91ef2b0c22908b2f894d4df3b4"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a9b7abb6d073a8d1ca7f3ba3e6056f1e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 2759,
+        "upload_time": "2020-08-19T00:47:59",
+        "upload_time_iso_8601": "2020-08-19T00:47:59.328803Z",
+        "url": "https://files.pythonhosted.org/packages/b1/14/85b1342bf3307e71964b0bdefcb4428ca7dc7ef367934eac0deb51a0ee78/callmonitor-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9bd594f48482ead80fc2db4942472e80571024404b3c8051d90db731d7a9328",
+          "md5": "08bed04718ef6917e5606f641b4c50fc",
+          "sha256": "26193856d0108e649aedb0d12fd886b02b508adc2504810fc70891c1253b8ad3"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "08bed04718ef6917e5606f641b4c50fc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 5170,
+        "upload_time": "2020-08-19T01:36:11",
+        "upload_time_iso_8601": "2020-08-19T01:36:11.793244Z",
+        "url": "https://files.pythonhosted.org/packages/b9/bd/594f48482ead80fc2db4942472e80571024404b3c8051d90db731d7a9328/callmonitor-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9257031df8f0fd9ac103b03838481698a947962d65dafd6b87d96f2d088f8953",
+          "md5": "d90441c3a0df7a91d8eabd8645f4bf06",
+          "sha256": "487fe05a93d6a82a7219995f0c6dc6c125dcf165340425e59b9c6ec0179a2639"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d90441c3a0df7a91d8eabd8645f4bf06",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 3075,
+        "upload_time": "2020-08-19T01:36:13",
+        "upload_time_iso_8601": "2020-08-19T01:36:13.221030Z",
+        "url": "https://files.pythonhosted.org/packages/92/57/031df8f0fd9ac103b03838481698a947962d65dafd6b87d96f2d088f8953/callmonitor-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f2cb6c0fa416f3f2b887c5b09acf0133f9206b9eff1f78cad5d289f785c98732",
+          "md5": "e7a103378e6118d54bc708751fbc73ab",
+          "sha256": "06a69c0ec081cfa878e49c731966766ff544084f0f2222f71c11bee05d15e1a2"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e7a103378e6118d54bc708751fbc73ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 5176,
+        "upload_time": "2020-09-15T21:59:45",
+        "upload_time_iso_8601": "2020-09-15T21:59:45.441186Z",
+        "url": "https://files.pythonhosted.org/packages/f2/cb/6c0fa416f3f2b887c5b09acf0133f9206b9eff1f78cad5d289f785c98732/callmonitor-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9bbb8e2756eb740bc878790f1d72a18dd732465defd6e867bd724c07f7513f07",
+          "md5": "48f3eb94412584d2cf97f75ee949466d",
+          "sha256": "c5d4f459483bad9b716f24ff4649b716ccc8a077b64d14be0d98e2ba27ab4641"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "48f3eb94412584d2cf97f75ee949466d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 3095,
+        "upload_time": "2020-09-15T21:59:46",
+        "upload_time_iso_8601": "2020-09-15T21:59:46.669014Z",
+        "url": "https://files.pythonhosted.org/packages/9b/bb/8e2756eb740bc878790f1d72a18dd732465defd6e867bd724c07f7513f07/callmonitor-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21c5870b67dbc87850a1f1ab2dbe1fec69a1d7a17269fdb4b185f843c5952b2d",
+          "md5": "4823e82091a5b801085d050c7cc10906",
+          "sha256": "c8b4b7e92b6cd8d72db23c8a8a37d5c464048fb2d6676ce44e4b351a116bc44d"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4823e82091a5b801085d050c7cc10906",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 5316,
+        "upload_time": "2020-09-16T00:28:28",
+        "upload_time_iso_8601": "2020-09-16T00:28:28.522787Z",
+        "url": "https://files.pythonhosted.org/packages/21/c5/870b67dbc87850a1f1ab2dbe1fec69a1d7a17269fdb4b185f843c5952b2d/callmonitor-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da6c2460383411401c8965906ad364d61c4327368583844bdc19c6657f08f3e3",
+          "md5": "9590411aa6c669171b89655f8e2ca1c2",
+          "sha256": "cdd3d1742eccfbac246428d3e598b6eddce08b40e1c0e2710ca534c842a41a53"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9590411aa6c669171b89655f8e2ca1c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 3239,
+        "upload_time": "2020-09-16T00:28:30",
+        "upload_time_iso_8601": "2020-09-16T00:28:30.155573Z",
+        "url": "https://files.pythonhosted.org/packages/da/6c/2460383411401c8965906ad364d61c4327368583844bdc19c6657f08f3e3/callmonitor-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c73a2713147350bd08f90d7fb3c7a215d9ffd2cecc705f8b0e0b2ab8f226a122",
+          "md5": "37d9ec55c72a3e4ac6b449d64fc95c67",
+          "sha256": "802488a9139a8a1917eb3b52213e98575c0ca2d202402c59a7d1aeccaa84048c"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "37d9ec55c72a3e4ac6b449d64fc95c67",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11465,
+        "upload_time": "2020-12-29T22:23:14",
+        "upload_time_iso_8601": "2020-12-29T22:23:14.733827Z",
+        "url": "https://files.pythonhosted.org/packages/c7/3a/2713147350bd08f90d7fb3c7a215d9ffd2cecc705f8b0e0b2ab8f226a122/callmonitor-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "80783835747bbb3ab0023b903fb83e5654a6eec43eed16fb9fc34944139a1663",
+          "md5": "20e6124bff460d077229b6f7b495653a",
+          "sha256": "f89a9c7c8f8ef5f0187972acbef943a0576c8ee6f7d35c65bf35564df7ae274c"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20e6124bff460d077229b6f7b495653a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 10648,
+        "upload_time": "2020-12-29T22:23:15",
+        "upload_time_iso_8601": "2020-12-29T22:23:15.975233Z",
+        "url": "https://files.pythonhosted.org/packages/80/78/3835747bbb3ab0023b903fb83e5654a6eec43eed16fb9fc34944139a1663/callmonitor-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "562d0e0e3c2bdb0ab63841c74e6b1747e1808d423d6fdb9d1213f3dae1e22c3f",
+          "md5": "d593178c18ea5c9ef7dd392ecd565cd3",
+          "sha256": "d9f0f97c0c1386b83194d241c95916283793bdf9abc4d60666b06ed3611c1331"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d593178c18ea5c9ef7dd392ecd565cd3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11391,
+        "upload_time": "2020-12-30T05:26:59",
+        "upload_time_iso_8601": "2020-12-30T05:26:59.892609Z",
+        "url": "https://files.pythonhosted.org/packages/56/2d/0e0e3c2bdb0ab63841c74e6b1747e1808d423d6fdb9d1213f3dae1e22c3f/callmonitor-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3dd73c6b1d7d24e2080c7094d5eff7d9f73f10b4e22c84633f62005454bf3e95",
+          "md5": "0da70ae415c6f6d038eb5d4b9bb7def0",
+          "sha256": "2f4237d64e44eb532b868dff9021f238b5e110c06392d6a14398bdc4a14e5e9e"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0da70ae415c6f6d038eb5d4b9bb7def0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11388,
+        "upload_time": "2020-12-30T05:27:01",
+        "upload_time_iso_8601": "2020-12-30T05:27:01.309722Z",
+        "url": "https://files.pythonhosted.org/packages/3d/d7/3c6b1d7d24e2080c7094d5eff7d9f73f10b4e22c84633f62005454bf3e95/callmonitor-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9a3baf6b581f165f003069615e6ab6499b9f5661163eb58261d85c8ceda6f7e",
+          "md5": "98710ea4907802211384ce11721436cd",
+          "sha256": "fea97371b63cf6420f1337dd18aa913c60c50903770eb13c37ea51a1692df5aa"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "98710ea4907802211384ce11721436cd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11471,
+        "upload_time": "2021-01-02T01:14:10",
+        "upload_time_iso_8601": "2021-01-02T01:14:10.179395Z",
+        "url": "https://files.pythonhosted.org/packages/b9/a3/baf6b581f165f003069615e6ab6499b9f5661163eb58261d85c8ceda6f7e/callmonitor-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ddff957f2c03b0832bb9b9791eea0b56c72f4c7aa5b7ac0e7d6069c2e843c2f3",
+          "md5": "350d96707825483a7929b238229c0c6f",
+          "sha256": "f0239588ce438ac60e06a0b9e75419ded5bd168f7f418c20fbde8d1594ff4d30"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "350d96707825483a7929b238229c0c6f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11456,
+        "upload_time": "2021-01-02T01:14:11",
+        "upload_time_iso_8601": "2021-01-02T01:14:11.610411Z",
+        "url": "https://files.pythonhosted.org/packages/dd/ff/957f2c03b0832bb9b9791eea0b56c72f4c7aa5b7ac0e7d6069c2e843c2f3/callmonitor-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "85c6a8f1b87824ebc288d18e5d202949c9ef08f7d0eb198a9400c0106ba7e0cf",
+          "md5": "0edcbd6a6335f544999f87cc19991b21",
+          "sha256": "f7175b861c916e4092cd64d15ec0c5fc0c019ab64344addeec75e5b0f702c4ec"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0edcbd6a6335f544999f87cc19991b21",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11476,
+        "upload_time": "2021-01-03T01:44:29",
+        "upload_time_iso_8601": "2021-01-03T01:44:29.466143Z",
+        "url": "https://files.pythonhosted.org/packages/85/c6/a8f1b87824ebc288d18e5d202949c9ef08f7d0eb198a9400c0106ba7e0cf/callmonitor-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e45a09b429d542281d8004919a0af162c1351cae69ed78134cf60b147789be0",
+          "md5": "20ed1232136797967be267406bfaa3a8",
+          "sha256": "2e0175b66d25adc50f43a0c2d04587e48401cca65e1cea1fe4a98840dbb70344"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20ed1232136797967be267406bfaa3a8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11462,
+        "upload_time": "2021-01-03T01:44:30",
+        "upload_time_iso_8601": "2021-01-03T01:44:30.700656Z",
+        "url": "https://files.pythonhosted.org/packages/5e/45/a09b429d542281d8004919a0af162c1351cae69ed78134cf60b147789be0/callmonitor-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c353ee69f83dbc7c42a96e00d1f69b3113893c343771d4687b5a4383b87d947",
+          "md5": "9d30aabfcdff8080763378f61ffd1d9e",
+          "sha256": "bd7c790e01929b7993f5e3b5c27b836166feb4e13789e2b010a57c045edc2f80"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.4-py3.8.egg",
+        "has_sig": false,
+        "md5_digest": "9d30aabfcdff8080763378f61ffd1d9e",
+        "packagetype": "bdist_egg",
+        "python_version": "3.8",
+        "requires_python": ">=3.6",
+        "size": 21096,
+        "upload_time": "2021-01-10T21:56:59",
+        "upload_time_iso_8601": "2021-01-10T21:56:59.467438Z",
+        "url": "https://files.pythonhosted.org/packages/1c/35/3ee69f83dbc7c42a96e00d1f69b3113893c343771d4687b5a4383b87d947/callmonitor-0.3.4-py3.8.egg",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04bee490ae7628bdf74bca6f5ce122e1fa74cc4af9f9885dd66497002e4834c7",
+          "md5": "06cd8d0b182f98ce58fe9642374c81e2",
+          "sha256": "97c62c170b55ff42165f3052c27b020c217f5dce7280f85220ed28e36e98acad"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06cd8d0b182f98ce58fe9642374c81e2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11512,
+        "upload_time": "2021-01-10T21:56:57",
+        "upload_time_iso_8601": "2021-01-10T21:56:57.612413Z",
+        "url": "https://files.pythonhosted.org/packages/04/be/e490ae7628bdf74bca6f5ce122e1fa74cc4af9f9885dd66497002e4834c7/callmonitor-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0b230f351cd9d9b29116a8f7c49e500d1f59df0b8c1b01208360c0dc57a2374",
+          "md5": "e7e5a75b0a0974ae155710d8079d9b35",
+          "sha256": "846417e24016ddc4233132e5ad4015937e41d10848d17022d5911ec125761dab"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e7e5a75b0a0974ae155710d8079d9b35",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11433,
+        "upload_time": "2021-01-10T21:57:01",
+        "upload_time_iso_8601": "2021-01-10T21:57:01.084274Z",
+        "url": "https://files.pythonhosted.org/packages/f0/b2/30f351cd9d9b29116a8f7c49e500d1f59df0b8c1b01208360c0dc57a2374/callmonitor-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "111187058f7f416709e22d2aa4dbde27cfc608627df0b2df89324cd4dfae4075",
+          "md5": "c389b5556e5915f97866e3cc3cac6a32",
+          "sha256": "45e35e7d82b8d52aca3eff8be3b530345a926a530a7d734b1299301ff4364c1c"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c389b5556e5915f97866e3cc3cac6a32",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11532,
+        "upload_time": "2021-01-24T23:43:49",
+        "upload_time_iso_8601": "2021-01-24T23:43:49.381029Z",
+        "url": "https://files.pythonhosted.org/packages/11/11/87058f7f416709e22d2aa4dbde27cfc608627df0b2df89324cd4dfae4075/callmonitor-0.3.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f539b7a03f3147d6b41327c1e443d57274fb086a420d3dc3a9497cd7ab6c1bdd",
+          "md5": "22f539324ffef07aadfe9707967e12d4",
+          "sha256": "35b0888b09c0dafa0baf990c08fa6fd2657c48f7cbdb9e17b6c9add25e5f9801"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22f539324ffef07aadfe9707967e12d4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11482,
+        "upload_time": "2021-01-24T23:43:50",
+        "upload_time_iso_8601": "2021-01-24T23:43:50.565139Z",
+        "url": "https://files.pythonhosted.org/packages/f5/39/b7a03f3147d6b41327c1e443d57274fb086a420d3dc3a9497cd7ab6c1bdd/callmonitor-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4d25994266d48de5a426e0afd7611f66dee754d86ccfcd24f974e101d016508",
+          "md5": "ab65a3ec8ed761c7e3bcf94cf90f891c",
+          "sha256": "8a9ce9cc0974c1f93d61503ee0ba6efd658c0537a65200aa170a29d7b3ee39d4"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ab65a3ec8ed761c7e3bcf94cf90f891c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11557,
+        "upload_time": "2021-01-24T23:52:07",
+        "upload_time_iso_8601": "2021-01-24T23:52:07.230302Z",
+        "url": "https://files.pythonhosted.org/packages/c4/d2/5994266d48de5a426e0afd7611f66dee754d86ccfcd24f974e101d016508/callmonitor-0.3.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce0972aecdf94d5aec2dcf339d1ff10a187616f5a9f848c89470e363340dc88b",
+          "md5": "0eeb1e7690f191129af273cba7873a78",
+          "sha256": "02d6c448e8cb748feccf8d86bf89d86b7efb3d867c485e3537b436c69d7ca062"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0eeb1e7690f191129af273cba7873a78",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11504,
+        "upload_time": "2021-01-24T23:52:08",
+        "upload_time_iso_8601": "2021-01-24T23:52:08.743278Z",
+        "url": "https://files.pythonhosted.org/packages/ce/09/72aecdf94d5aec2dcf339d1ff10a187616f5a9f848c89470e363340dc88b/callmonitor-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f318035151093faa5b2fe6d3bea7136643fe718689334825396f371f947a095",
+          "md5": "6686ee91d92eefad53e1ab4e1735d6e2",
+          "sha256": "352c0f3bd8268b38a8f5e7e4dd80d4bdbafac7e6520860234b1f91de95888277"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6686ee91d92eefad53e1ab4e1735d6e2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 11651,
+        "upload_time": "2021-06-04T05:21:13",
+        "upload_time_iso_8601": "2021-06-04T05:21:13.281936Z",
+        "url": "https://files.pythonhosted.org/packages/9f/31/8035151093faa5b2fe6d3bea7136643fe718689334825396f371f947a095/callmonitor-0.3.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a1fd7fa51fae2c2bae532d448bc992adf3028cdc996b3263d8153312cb90318",
+          "md5": "dd8e5427e4fa2ba0c97265358192e8af",
+          "sha256": "11bacfe5940c3f6aff223e8e761b033d540542b4d738f7fef38cd923b3be0cbc"
+        },
+        "downloads": -1,
+        "filename": "callmonitor-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dd8e5427e4fa2ba0c97265358192e8af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11647,
+        "upload_time": "2021-06-04T05:21:14",
+        "upload_time_iso_8601": "2021-06-04T05:21:14.835230Z",
+        "url": "https://files.pythonhosted.org/packages/4a/1f/d7fa51fae2c2bae532d448bc992adf3028cdc996b3263d8153312cb90318/callmonitor-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9f318035151093faa5b2fe6d3bea7136643fe718689334825396f371f947a095",
+        "md5": "6686ee91d92eefad53e1ab4e1735d6e2",
+        "sha256": "352c0f3bd8268b38a8f5e7e4dd80d4bdbafac7e6520860234b1f91de95888277"
+      },
+      "downloads": -1,
+      "filename": "callmonitor-0.3.7-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "6686ee91d92eefad53e1ab4e1735d6e2",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 11651,
+      "upload_time": "2021-06-04T05:21:13",
+      "upload_time_iso_8601": "2021-06-04T05:21:13.281936Z",
+      "url": "https://files.pythonhosted.org/packages/9f/31/8035151093faa5b2fe6d3bea7136643fe718689334825396f371f947a095/callmonitor-0.3.7-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4a1fd7fa51fae2c2bae532d448bc992adf3028cdc996b3263d8153312cb90318",
+        "md5": "dd8e5427e4fa2ba0c97265358192e8af",
+        "sha256": "11bacfe5940c3f6aff223e8e761b033d540542b4d738f7fef38cd923b3be0cbc"
+      },
+      "downloads": -1,
+      "filename": "callmonitor-0.3.7.tar.gz",
+      "has_sig": false,
+      "md5_digest": "dd8e5427e4fa2ba0c97265358192e8af",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 11647,
+      "upload_time": "2021-06-04T05:21:14",
+      "upload_time_iso_8601": "2021-06-04T05:21:14.835230Z",
+      "url": "https://files.pythonhosted.org/packages/4a/1f/d7fa51fae2c2bae532d448bc992adf3028cdc996b3263d8153312cb90318/callmonitor-0.3.7.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

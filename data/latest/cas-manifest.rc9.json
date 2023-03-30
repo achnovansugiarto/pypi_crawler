@@ -1,0 +1,491 @@
+{
+  "info": {
+    "author": "Dan Frank",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "cas-manifest provides a means to store data that is always immutable, stable when you want it to be, and flexible when you need it to be.\n\ncas-manifest stores data artifacts via content addressible storage. It facilitates the use of CAS with standard, serializable wrappers that coexist with and support data.\n\n## Why CAS?\n\nIn short, CAS enforces immutability. When using CAS, a key's contents can never be changed. The following comes naturally:\n* No more `data_final__2_new` files - all objects are uniquely specified\n* No cache invalidation - cache objects freely, knowing that their contents will never change upstream\n* No more provenance questions - models can be robustly linked to the datasets used to train them\n\nIn a CAS store, instead of _put_-ing a Value at a Key, you _put_ a Value and get back the Key uniquely determined by that value.\n\n## Why manifests?\n\nIt's all well and good to stuff some data into a binary artifact and keep a key that references it. The hard part is, when you're given a key, how do you know what's stored there? If you do settle on a standard serialization method, how do you let it evolve while maintaining backward compatibility?\n\ncas-manifest encourages the use of manifest classes to address these challenges. These manifest classes include code to serialize and deserialize artifacts. They provide a place to store metadata about the artifacts - this may be used for deserialization, used to indicate how the loaded data should be used, or may simply be informational. Finally, fields in the manifest class may reference other objects in CAS, allowing objects to be composed and reused. In combination with CAS, you can ensure that your metadata and underlying data never go out of sync, since your metadata will refer to an immutable reference to underlying data.\n\n## Example\n\n### Implementing Serialization\n\nLet's say that we wish to store datasets that we represent in memory as pandas Dataframes. We'll create a subclass of `cas_manifest.Serializable` to represent what we wish to store:\n```python\nclass CSVSerializable(Serializable[pd.DataFrame]):\n\ncolumn_names: List[str]\npath: Ref\n\n@classmethod\ndef pack(cls, inst: pd.DataFrame, fs: HashFS) -> CSVSerializable:\n    with tempfile.TemporaryDirectory() as tmpdir:\n        tmp_path = Path(tmpdir) / 'tmp.csv'\n        with open(tmp_path, mode='w') as f:\n            inst.to_csv(f, header=False, index=False)\n        csv_addr = fs.put(tmp_path)\n        return CSVSerializable(path=Ref(csv_addr.id), column_names=inst.columns.to_list())\n\ndef unpack(self, fs: HashFS) -> pd.DataFrame:\n    addr = fs.get(self.path.hash_str)\n    df = pd.read_csv(addr.abspath, names=self.column_names)\n    return df\n```\nLet's break down the items one by one:\n```python\nclass CSVSerializable(Serializable[pd.DataFrame]):\n```\nThe type parameter of `Serializable` is the type that we use in memory. Whatever it is you use in application code, that's what you put here.\n```python\ncolumn_names: List[str]\npath: Ref\n```\ncas-manifest uses pydantic to define its manifest classes. This allows you to specify class fields at the top level. In order to ensure that they can be serialized, these fields need to be simple types, or other pydantic classes. `Ref` is a special wrapper class used to refer to other objects in cas.\n```python\n@classmethod\ndef pack(cls, inst: pd.DataFrame, fs: HashFS) -> CSVSerializable:\n    with tempfile.TemporaryDirectory() as tmpdir:\n        tmp_path = Path(tmpdir) / 'tmp.csv'\n        with open(tmp_path, mode='w') as f:\n            inst.to_csv(f, header=False, index=False)\n        csv_addr = fs.put(tmp_path)\n        return CSVSerializable(path=Ref(csv_addr.id), column_names=inst.columns.to_list())\n```\n`pack` is a required method; this specifies how your data should be serialized. Take note of the types of the arguments.\n\nIn the body of this method, we save our dataframe as a csv, without a header row. We then `put` that into the `HashFS` instance that `pack` takes as an argument. `HashFS` provides the implementation of `CAS` that we use. That `put` operation returns the address (or key) for our csv. We can then construct an instance of our wrapper class, which contains a `Ref` to the csv file, and the column names as fields in the manifest class.\n```python\ndef unpack(self, fs: HashFS) -> pd.DataFrame:\n    addr = fs.get(self.path.hash_str)\n    df = pd.read_csv(addr.abspath, names=self.column_names)\n    return df\n```\n`unpack` is another required method; this indicates how your serialized data should be deserialized. Again, note the types of the arguments and the return types. In this case, we get the location on the filesystem for the csv file that we saved. We then call `pandas.read_csv` to read it, supplying the column names stored in the manifest class.\n\nNote that, when this pattern is followed in the real world, it can often be confusing to keep track of whether column names are stored as a header row or kept elsewhere, whether there should be an index column, etc. This sounds silly, but it's a real problem - especially if you ever want to change your mind! cas-manifest standardizes these decisions by embedding the logic in the manifest class.\n\n### Storing and retrieving data\n\nNow that we've implemented all that, how do we use it?\n\nFirst, we need to put something into cas. Let's say that we have a DataFrame named `df`. We'll also need an instance of `HashFS` from the `hashfs` package. AWS users may wish to make use of `S3HashFS` in this package, which provides an implementation of `HashFS` backed by S3. We can then do the following\n```python\nimport pandas as pd\nfrom hashfs import HashFS, HashAddress\ndf: pd.DataFrame = ...\nfs_instance: HashFS = ...\naddr: HashAddress = CSVSerializable.dump(df, fs_instance)\n```\nGiven an instance of `HashFS`,  we can call `dump` on `CSVSerializable` to serialize our DataFrame and store it in `fs_instance`. The returned object is a `HashAddress`, which includes the immutable hash of the serialized object, as well as helper information like a path to its location on disk. If we wanted access to the serialized representation, we could also have called `CSVSerializable.pack(df, fs_instance)` to get an instance of `CSVSerializable`.\n\nNow, how do we retrieve our serialized object from storage? Again with our instance of `HashFS`, we'll do the following\n```python\nhash_str = addr.id\n# We create a Registry that knows what classes to expect\nregistry: SerializableRegistry[pd.DataFrame] = \\\n    SerializableRegistry(fs=fs_instance, classes=[CSVSerializable])\n# We can `open` a hash address to get access to the dataframe\nwith registry.open(hash_str) as df:\n    pass # df is the DataFrame that we saved before\n# Or we can get the serialized form directly\nserialized: CSVSerializable = registry.load(addr.id)\n```\n\nWhy is `open` a context manager? Some implementations of `Serializable` may create temporary resources that need to be cleaned up, so we treat `open` like opening and closing a file.\n\n\n### Evolving the serialization schema\n\nNow, let's imagine that we decide we want to change our seralization format. Perhaps we'd like to make use of numpy's serialization methods to store the data in our dataframe. We can create another subclass of `Serializable`, implementing `pack` and `unpack` as before:\n```python\nclass NPYSerializable(Serializable[pd.DataFrame]):\n    ...\n```\nWe'll skip the implementation for brevity here, but one is available in `tests/dataset.py`.\n\nWe can serialize a dataframe in this new format just as we did with `CSVSerializable`. When we want to load data, that's where things get interesting:\n```python\nregistry_2: SerializableRegistry[pd.DataFrame] = \\\n    SerializableRegistry(fs=fs_instance, classes=[CSVSerializable, NPYSerializable])\n```\n`registry_2` now knows how to deserialize data stored in either format. You can pass it a hash string corresponding to either format, and it will correctly deserialize it into a DataFrame.\n\nThis means that you won't have to implement code to sniff out how data is stored on disk and sprinkle it around your codebase. You can consolidate your serde logic in a class, and let cas-manifest sort out how to handle it from there.\n\n## Gotchas\n* Regarding portability and schema evolution: keep in mind that your code is _not_ serialized. So, in order to load an object of type `X`, you must still have `X` available in your codebase. Instantiating your registry should make this part fairly clear\n* Related to the above, if you make changes to a class, you must ensure that they are backward-compatible (e.g. adding optional fields) in order to be able to load older data.\n* Typing: I've done my best to supply correct type annotations, but mypy struggles to infer return types of some generic functions. Explicit type annotations can be helpful.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/danielhfrank/cas-manifest",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cas-manifest",
+    "package_url": "https://pypi.org/project/cas-manifest/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/cas-manifest/",
+    "project_urls": {
+      "Homepage": "https://github.com/danielhfrank/cas-manifest",
+      "Repository": "https://github.com/danielhfrank/cas-manifest"
+    },
+    "release_url": "https://pypi.org/project/cas-manifest/0.4.1/",
+    "requires_dist": [
+      "pydantic (>=1.6.1,<2.0.0)",
+      "hashfs (>=0.7.2,<0.8.0)",
+      "boto3 (>=1.9.201,<2.0.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "cas-manifest allows developers to store artifacts in a content-addressable store using a self-describing manifest",
+    "version": "0.4.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9261034,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8592d48b74722afd6f6a08f7843d9d3fcf45139c029e3a77f470ec9679eb96b3",
+          "md5": "e632d5daa20bdfdcb3e6f4a1225e2793",
+          "sha256": "142ff0b755bde0efb8c7bcb78e4eb9405bbfcaf80eb6a2616edbf1245b78124a"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e632d5daa20bdfdcb3e6f4a1225e2793",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 3208,
+        "upload_time": "2020-10-07T00:09:02",
+        "upload_time_iso_8601": "2020-10-07T00:09:02.888627Z",
+        "url": "https://files.pythonhosted.org/packages/85/92/d48b74722afd6f6a08f7843d9d3fcf45139c029e3a77f470ec9679eb96b3/cas_manifest-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a622119acc0ee90d9a5c8a62ea6858928628723c22f00a4d1798f9d21325f36",
+          "md5": "d6418f681317a8d460ae6b15a84b1524",
+          "sha256": "761acbf8a2cdb30dd5d4a4d24274af391a442fb430b66809dc75ef2d10769579"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d6418f681317a8d460ae6b15a84b1524",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 2397,
+        "upload_time": "2020-10-07T00:09:00",
+        "upload_time_iso_8601": "2020-10-07T00:09:00.763140Z",
+        "url": "https://files.pythonhosted.org/packages/2a/62/2119acc0ee90d9a5c8a62ea6858928628723c22f00a4d1798f9d21325f36/cas-manifest-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f26bd9e0febb3916f80dd973a0f96fe12a8b2b4491e6b817cf058c08aca39e57",
+          "md5": "154c79f16760fc2005b0ff905def5d7a",
+          "sha256": "6a082318ad1bd8b36d151be822c465d30af25a2067a3b04b62afa3a3db73946c"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "154c79f16760fc2005b0ff905def5d7a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 3900,
+        "upload_time": "2020-10-07T00:40:14",
+        "upload_time_iso_8601": "2020-10-07T00:40:14.757938Z",
+        "url": "https://files.pythonhosted.org/packages/f2/6b/d9e0febb3916f80dd973a0f96fe12a8b2b4491e6b817cf058c08aca39e57/cas_manifest-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d05ec27ae0b74930e127df5495dc28fc5583fc5d91a2e23335d2918785b02dba",
+          "md5": "cf05be189194192f2f05bfffd2b1a827",
+          "sha256": "f667dc3dc9cccb5357768d8d03698074dd238847bfd65cdf2cfe2eccdf8063b9"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf05be189194192f2f05bfffd2b1a827",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 3286,
+        "upload_time": "2020-10-07T00:40:13",
+        "upload_time_iso_8601": "2020-10-07T00:40:13.621628Z",
+        "url": "https://files.pythonhosted.org/packages/d0/5e/c27ae0b74930e127df5495dc28fc5583fc5d91a2e23335d2918785b02dba/cas-manifest-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2116676a54ffbb115113a41f70fb3a9408d73155d9bbf6ca0b3a02497960250b",
+          "md5": "be231096b4e258465c4f635d88534bb5",
+          "sha256": "736b04261ea9c004d1c69d1e69f5c4e0f6d5642f8e9e3a522bc1cef1ada38c1a"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "be231096b4e258465c4f635d88534bb5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 4715,
+        "upload_time": "2020-11-03T00:24:44",
+        "upload_time_iso_8601": "2020-11-03T00:24:44.554071Z",
+        "url": "https://files.pythonhosted.org/packages/21/16/676a54ffbb115113a41f70fb3a9408d73155d9bbf6ca0b3a02497960250b/cas_manifest-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c80af92ca38057c98216bc38ed49c2e3656a91b4bdb4a9cc3851b2afc3d6de69",
+          "md5": "b8f0414ccde1d45281fd393cb622e3df",
+          "sha256": "5d18349314f2bd027dd5248f4ee855da6f5fc7d2a9d42616bcc972bfd7d93775"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8f0414ccde1d45281fd393cb622e3df",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 4106,
+        "upload_time": "2020-11-03T00:24:43",
+        "upload_time_iso_8601": "2020-11-03T00:24:43.562299Z",
+        "url": "https://files.pythonhosted.org/packages/c8/0a/f92ca38057c98216bc38ed49c2e3656a91b4bdb4a9cc3851b2afc3d6de69/cas-manifest-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8ccfb1e096444961667ac5455810c57dec97655e65d8787169cf186ebe315de",
+          "md5": "11afdc77b3ca27c63cca77a0cbc15a63",
+          "sha256": "dd50b8e1ca5cbfb4466fdcbfd130f473c3f5f6658982b85971d7576c98b0252f"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "11afdc77b3ca27c63cca77a0cbc15a63",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5734,
+        "upload_time": "2020-11-03T00:56:12",
+        "upload_time_iso_8601": "2020-11-03T00:56:12.430347Z",
+        "url": "https://files.pythonhosted.org/packages/b8/cc/fb1e096444961667ac5455810c57dec97655e65d8787169cf186ebe315de/cas_manifest-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7aa754181df20a1dd9afdccd390dc9a7873e26010f8e789d9bddc9f8052f2621",
+          "md5": "678cdfd53a8a2a102fed365243d26f8a",
+          "sha256": "9ab2c2ca431cee6f884808d59e094e576e3171aad034ec0281e8e4c3396945e4"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "678cdfd53a8a2a102fed365243d26f8a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 4936,
+        "upload_time": "2020-11-03T00:56:11",
+        "upload_time_iso_8601": "2020-11-03T00:56:11.339210Z",
+        "url": "https://files.pythonhosted.org/packages/7a/a7/54181df20a1dd9afdccd390dc9a7873e26010f8e789d9bddc9f8052f2621/cas-manifest-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1a48934c29aaef824804a4916d19feca4dc8c0dd39fd9a3b4d2af0e67936cf74",
+          "md5": "b7c297810cf4b40e8b116344ff8a70c0",
+          "sha256": "9ad6f76f5da60fd144b95f2df5f01ee4651f709aaf78d5af9382f55de38c64b4"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b7c297810cf4b40e8b116344ff8a70c0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6097,
+        "upload_time": "2020-11-06T20:50:24",
+        "upload_time_iso_8601": "2020-11-06T20:50:24.562948Z",
+        "url": "https://files.pythonhosted.org/packages/1a/48/934c29aaef824804a4916d19feca4dc8c0dd39fd9a3b4d2af0e67936cf74/cas_manifest-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d07f72531c218383045354c05db5c573fea2abe7eec7322d1d91e82a2629b4c",
+          "md5": "afc2b14c59e6187c721f350b7587969e",
+          "sha256": "3a1d7bb5ea25539da640c3d8f9c37fbdc161ea85ded7c07a4ce1ab67b93b7de5"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "afc2b14c59e6187c721f350b7587969e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5312,
+        "upload_time": "2020-11-06T20:50:23",
+        "upload_time_iso_8601": "2020-11-06T20:50:23.445164Z",
+        "url": "https://files.pythonhosted.org/packages/1d/07/f72531c218383045354c05db5c573fea2abe7eec7322d1d91e82a2629b4c/cas-manifest-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8b3da386246a8dc2c6ef98329ad0e11b2b5fe1504d250b64b78b9fd54126ed9",
+          "md5": "5ddb5a75c617fbb87a80da353b6da6b6",
+          "sha256": "f41c93def1d54d5dcf6af244ab66d6bfd1d3c7ba79b4c6c5889df939a3583aa7"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5ddb5a75c617fbb87a80da353b6da6b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6101,
+        "upload_time": "2020-11-25T19:45:28",
+        "upload_time_iso_8601": "2020-11-25T19:45:28.828267Z",
+        "url": "https://files.pythonhosted.org/packages/a8/b3/da386246a8dc2c6ef98329ad0e11b2b5fe1504d250b64b78b9fd54126ed9/cas_manifest-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb8177938513441411293fbe32def7f2c03bac6e4a2ca309c54e5291866d2c5b",
+          "md5": "17ccfec96effcc0786272e7b65af09ee",
+          "sha256": "1bad3d16dd7b895c16030f8fa7ec7480f19e0dda9872486638d0356af92ec289"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "17ccfec96effcc0786272e7b65af09ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5320,
+        "upload_time": "2020-11-25T19:45:27",
+        "upload_time_iso_8601": "2020-11-25T19:45:27.609234Z",
+        "url": "https://files.pythonhosted.org/packages/eb/81/77938513441411293fbe32def7f2c03bac6e4a2ca309c54e5291866d2c5b/cas-manifest-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11a12689106e8863ac5461acdac3be06c0048ecb9dc0307efdf02d08781e08ff",
+          "md5": "55553c0ca0401690100e04305bee05c9",
+          "sha256": "258964d361efeabc6e82e3e0c8fabb8ab76232fd66f6a12e33ef6ad12bb1b7b7"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "55553c0ca0401690100e04305bee05c9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6150,
+        "upload_time": "2020-11-30T22:38:52",
+        "upload_time_iso_8601": "2020-11-30T22:38:52.251176Z",
+        "url": "https://files.pythonhosted.org/packages/11/a1/2689106e8863ac5461acdac3be06c0048ecb9dc0307efdf02d08781e08ff/cas_manifest-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "92c75b83badca8dbba07410fae021dcc17e0e252f7e30884bd8337fe5cd9ca8c",
+          "md5": "fdeb8e02cf571e65814968f633aa7db0",
+          "sha256": "471d4ab5f932f70dd4597959d0cf089ef0077066c21cb7e8901f2e4eb4cb055c"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fdeb8e02cf571e65814968f633aa7db0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5354,
+        "upload_time": "2020-11-30T22:38:51",
+        "upload_time_iso_8601": "2020-11-30T22:38:51.099719Z",
+        "url": "https://files.pythonhosted.org/packages/92/c7/5b83badca8dbba07410fae021dcc17e0e252f7e30884bd8337fe5cd9ca8c/cas-manifest-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f924b0c36ee1de890e44f77082f5586e169e636685f0a297d5c43353a05b1161",
+          "md5": "07d76e5af9ee431b3dc84886a1b86cb9",
+          "sha256": "05dcff13bf2d6607b9c284403bafcaa215f2ba34973759dfbc1552fc3ebf5aeb"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "07d76e5af9ee431b3dc84886a1b86cb9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 6391,
+        "upload_time": "2021-01-16T00:30:03",
+        "upload_time_iso_8601": "2021-01-16T00:30:03.979338Z",
+        "url": "https://files.pythonhosted.org/packages/f9/24/b0c36ee1de890e44f77082f5586e169e636685f0a297d5c43353a05b1161/cas_manifest-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ae9da7a91e298a7c756dab301b46aaddd798d9ca13ed5b21c4d1c338b9257c4d",
+          "md5": "976a14af564c3ff70ed87c56e58fa835",
+          "sha256": "d182253406f1f611d23f051830fb16d8560752e4b125c63b84e4cb37340331f3"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "976a14af564c3ff70ed87c56e58fa835",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5568,
+        "upload_time": "2021-01-16T00:30:02",
+        "upload_time_iso_8601": "2021-01-16T00:30:02.756313Z",
+        "url": "https://files.pythonhosted.org/packages/ae/9d/a7a91e298a7c756dab301b46aaddd798d9ca13ed5b21c4d1c338b9257c4d/cas-manifest-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "47a1abadfc9dbcd7c461d5fedd4b1dcb79295848d478042fcb5eedb428aa6dfc",
+          "md5": "72bb890c6bfd76c955d91fbc32670acd",
+          "sha256": "4fb6c720f2be2b57207c5cf7d0ebc8be7eb309fd63d29d51d6702e7b79c591f3"
+        },
+        "downloads": -1,
+        "filename": "cas_manifest-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "72bb890c6bfd76c955d91fbc32670acd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8862,
+        "upload_time": "2021-01-29T01:24:43",
+        "upload_time_iso_8601": "2021-01-29T01:24:43.168285Z",
+        "url": "https://files.pythonhosted.org/packages/47/a1/abadfc9dbcd7c461d5fedd4b1dcb79295848d478042fcb5eedb428aa6dfc/cas_manifest-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6192f7078bc77c5d2c0e2aad0adeec1db81dbd817bfb8a758425483fa0ac0ef1",
+          "md5": "a67657ef06d5fd2ac19f114eb6d2104e",
+          "sha256": "6847fb2511c7768f92cd6fbbf842e0fc8ca0e794952364db1fcc518c2cafdb4b"
+        },
+        "downloads": -1,
+        "filename": "cas-manifest-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a67657ef06d5fd2ac19f114eb6d2104e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8639,
+        "upload_time": "2021-01-29T01:24:41",
+        "upload_time_iso_8601": "2021-01-29T01:24:41.939339Z",
+        "url": "https://files.pythonhosted.org/packages/61/92/f7078bc77c5d2c0e2aad0adeec1db81dbd817bfb8a758425483fa0ac0ef1/cas-manifest-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "47a1abadfc9dbcd7c461d5fedd4b1dcb79295848d478042fcb5eedb428aa6dfc",
+        "md5": "72bb890c6bfd76c955d91fbc32670acd",
+        "sha256": "4fb6c720f2be2b57207c5cf7d0ebc8be7eb309fd63d29d51d6702e7b79c591f3"
+      },
+      "downloads": -1,
+      "filename": "cas_manifest-0.4.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "72bb890c6bfd76c955d91fbc32670acd",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 8862,
+      "upload_time": "2021-01-29T01:24:43",
+      "upload_time_iso_8601": "2021-01-29T01:24:43.168285Z",
+      "url": "https://files.pythonhosted.org/packages/47/a1/abadfc9dbcd7c461d5fedd4b1dcb79295848d478042fcb5eedb428aa6dfc/cas_manifest-0.4.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6192f7078bc77c5d2c0e2aad0adeec1db81dbd817bfb8a758425483fa0ac0ef1",
+        "md5": "a67657ef06d5fd2ac19f114eb6d2104e",
+        "sha256": "6847fb2511c7768f92cd6fbbf842e0fc8ca0e794952364db1fcc518c2cafdb4b"
+      },
+      "downloads": -1,
+      "filename": "cas-manifest-0.4.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a67657ef06d5fd2ac19f114eb6d2104e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 8639,
+      "upload_time": "2021-01-29T01:24:41",
+      "upload_time_iso_8601": "2021-01-29T01:24:41.939339Z",
+      "url": "https://files.pythonhosted.org/packages/61/92/f7078bc77c5d2c0e2aad0adeec1db81dbd817bfb8a758425483fa0ac0ef1/cas-manifest-0.4.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

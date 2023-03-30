@@ -1,0 +1,1159 @@
+{
+  "info": {
+    "author": "Caleb S. Cullen",
+    "author_email": "ccullen@easydns.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Environment :: No Input/Output (Daemon)",
+      "Framework :: AsyncIO",
+      "Framework :: FastAPI",
+      "Framework :: Pytest",
+      "Framework :: Sphinx",
+      "Intended Audience :: System Administrators",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: POSIX :: Linux",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Communications :: Email :: Filters"
+    ],
+    "description": "# the Caching, Highly-Available Postfix Policy Service\n\n| **requires Python 3.8.10+**\n| **makes use of Redis (or Sentinel) and a relational database (MariaDB)**\n\n## Introduction\n\nThere is a need for a highly-available, high-performance, concurrent,\nclusterable solution for handling various aspects of email policy.\nPostfix farms out the job of policy decisions to a delegate over a\nsocket, so we can provide a framework for receiving that data, making\na decision about it, and then sending a response back to Postfix.\nThere are some projects which have provided smaller-scale solutions to\nthis issue.  We handle rather a large volume of email, so we need\nsomething more performant than a script which makes a database access\non every email.  In order to simplify the language, the term \"customer\"\nis used herein to mean a person who logs into an SMTP server in order\nto send email.\n\nMy decision was to use Redis, since with Redis Sentinel it should be\npossible to achieve a degree of high-availability using Redis as a\ncommon datastore between the various email servers in the farm(s)\nwhich will run local instances of the policy server, which will itself\nuse Redis to cache data and keep track of email quotas, etc.\n\nIn the first iteration, we propose to provide functionality for:\n - outbound quota tracking on a continuous, rolling, per-interval basis;\n - outbound sender domain authorization\n - inbound email greylisting;\n - inbound SPF checking\n\nThe framework is meant to be extensible, so that any conceivable email\npolicy might be implemented in the future.\n\n## Configuration\n\nThe library will create a config file for itself if it does not find one\nat its default config path, `/etc/chapps/chapps.ini`, or the value of\nthe environment variable `CHAPPS_CONFIG` if it is set.  Note that\ndefault settings for all available submodules will be produced.  At\nthe time of writing, each script runs its own type of policy handler,\nso only the settings for the policies of that handler will be needed,\nplus the general CHAPPS settings and the Redis settings.\n\nPolicies may each specify separate listening addresses and ports, so\nthat they may run simultaneously on the same server.  For multi-policy\nhandlers, the first handler specified will be the one whose network\nsettings are used.  It is recommended to configure those elements only\non that policy, or to keep them in sync on all policies which are\nhandled together.\n\nExample Postfix configs are included in the `postfix` directory,\nclassified by which service they are for.  Most access control policy\nservices will be implemented in a very similar way in `main.cf`,\nprobably in combination with other policies.  The examples provided\nare the same configs used for testing, and are necessarily stripped\ndown to focus just on that particular service.\n\nAn example **rsyslog** config is also included; modification is\nencouraged.  If you wish to keep the debug logs in their special\ndestination, ensure that you create a log-rotation profile for it.\n\n## Installation Overview\n\nThe recommended Debian packages are:\n  - `mysqlclient`\n  - `redis`\n  - `python3-pip`\n  - `python3-venv`\n\nIt is highly recommended to install CHAPPS into a venv.  You may need\nto install the system package `python3-venv` in order for this to\nwork:\n```\npython3 -m venv chapps-venv\n. chapps-venv/bin/activate\n```\n\nThe package may be installed via PyPI, using the following command:\n\n```\npython3 -m pip install chapps\n```\n\n### DB Initialization\n\nAs of this writing, it should be possible to run `apply-migrations` or\n`chapps-cli admin db-setup` once the venv is activated, and that should\napply all of the necessary Alembic migrations to bring the database up\nto date from zero, based on the database access configuration in the\nCHAPPS config file.\n\nIf the config file has not yet been populated with database\ncredentials, do that first, and ensure that the named database exists\n(has been created) on the database server before attempting to install\nthe schema into it.\n\n**Please Note:**\n\n\tDatabases created with earlier versions of CHAPPS (v<=0.4.12) need to\n\thave their data dumped to SQL, and the database dropped and the schema\n\tre-created via the `apply-migrations` mechanism in order for it to exactly\n\tmatch Alembic's notion of how it is built.  Once Alembic has built the\n\tschema, the data may be read back into the database.  We will be using\n\tAlembic going forward so this should be a one-time annoyance.\n\n\tFor convenience, here is the `mysqldump` commandline recommended for\n\tdumping the data:\n\n\t.. code:\n\n\t    mysqldump --skip-add-drop-table -tc chapps > chapps-data-only.sql\n\n\tThese options tell `mysqldump` not to drop the tables, not to try to create\n\tthe tables, and to use \"complete\" INSERT statements, which ensures that the\n\ttarget columns are listed in the INSERT statement, in case the native column\n\torder changes between dump and restore.\n\n#### Database Adapters\n\nIn order to obtain control data from the database, CHAPPS policy\nobjects use a database adapter object tailored for their specific\nneeds.  This allows all database logic to be factored completely out\nof the policy layer.\n\nAs of CHAPPS v0.5.5, the database adapter layer is now based on\nSQLAlchemy throughout.  However, it is still possible to switch to\nusing the MariaDB adapter instead, for the actual services.  The API\nis built on SQLAlchemy and requires it.\n\n**To set CHAPPS to use MySQL/MariaDB** directly, instead of\nSQLAlchemy, set the environment variable `CHAPPS_DB_MODULE` to\n`mysql`.  Doing so will cause the policy layer to use the adapter\nmodule based on `mysqlclient`, which also works just fine with\nMariaDB.  If it is not set or is set to something else, SQLAlchemy\nwill be used.  This will need to be specified in the service\ndescription file to take effect, unless some other method is being\nused to launch CHAPPS.\n\nThe ability to switch database adapter modules may be eliminated in a\nfuture release.  However, since the application has not been tested in\nproduction using SQLAlchemy, it seems prudent to provide a mechanism\nfor switching between them.\n\n### Starting and Auto-launching Services\n\nWith a venv, the SystemD service files are installed to a folder\ncalled `chapps/install` inside the venv directory, and Postfix\nexample/testing configs are located in the `chapps/postfix` folder.  Scripts\nand package go to `bin` and `lib/.../chapps` as expected.  Use of a\nvenv is recommended, as the SystemD service description files provided\nare formatted during the install process to launch the services correctly\nwithin their venv.\n\nWithout a venv, they go to various system locations,\nwith the ancillary `chapps` directory usually showing up at\n`/usr/local/chapps`.  YMMV.  A venv will keep things organized.\n\nA Python script called `chapps_database_init.py` is included\nto create the database schema required by the library.  It\ndoes not create the database itself.  Before running this script,\nensure that the CHAPPS configuration file contains the correct\ncredentials and other control data to be able to connect to the\ndatabase server, and also ensure that the database named in that\nconfig has been created on the server.  The script will connect to the\ndatabase and create the tables.  It uses `IF EXISTS` and does not\ncontain any kind of data deletion, so it should be safe to use at any\ntime.\n\nFor more information about installing, see the\n[INSTALLATION](INSTALLATION.md) file.\n\n### Redis configuration\n\nRedis is used to store the real-time state of every active user's\noutbound quota, sender-domain authorization status cache, and also to\nkeep track of greylisting status for greylisted emails.  An active\nuser is one who has sent email in the last _interval_, that interval\ndefaulting to a day, since most quotas are expressed as\nmessages-per-day.\n\nIf your Redis deployment is on a different server and/or if CHAPPS is\nsharing a Redis instance with some other services it may be necessary\nto adjust the Redis-related settings in the config file, to adjust the\naddress and/or port to connect to, or what database to use.  By\ndefault, CHAPPS tries to connect to Redis on localhost, using the\nstandard port assignment and db 0.\n\nIf Sentinel is in use, populate the Sentinel-oriented configuration\nelements `sentinel_servers` and `sentinel_dataset`.  The servers list\nshould be a space-separated list of each Sentinel server half-socket;\nfor example, \"10.1.9.10:26379 10.1.9.12:26379\".  The dataset name is\nthe one you specified to Sentinel when setting up the Sentinel\ncluster.  Sentinel's default dataset name is `mymaster`.  We, of\ncourse, recommend `chapps`, or perhaps `chapps-outbound` at a site\nwith a large volume of email.  Since SPF doesn't make much use of\nRedis, the inbound load may be lighter than the outbound load,\ndepending on which things happen more at a particular site.\n\n### Logging\n\nAt this time, CHAPPS uses **syslog**, and transmits logs on the\n`local0` facility.  CHAPPS sends a fair amount of debug information at\nthe DEBUG level.  Right now, the application's facility and level may\nnot be adjusted via the config file; later this may be implemented.\nFor the time being, it seems sufficient to control logging via the\n**rsyslog** configuration used to control log entries on `local0`.\n\nThe example provided (in the `install` directory) sends all logs to a\nspecial log (the path needs to exist and belong to the syslog user,\nwhether that be `syslog` (as on Ubuntu) or `root` under Debian).  As\nlong as the path exists and is writable by **rsyslog**, it will create\nthe log.  The example also sends logs at INFO level or above to\n`/var/log/mail.log`, which generally is the destination that\n**rsyslog** uses for mail-related logs.\n\nOf course, site operators are encouraged to alter this example config\nto their needs.  For those who wish to monkeypatch facility and level,\nit is set in one place, at the top of `chapps.logging`.\n\n## REST API Service\n\nStarting with version 0.4.0, a REST API service is included, based on\nFastAPI, and using SQLAlchemy with the MySQLclient backend.  A service\ntemplate for the API is provided, as well as a socket unit and an\n**nginx** example config, for using a UDS to proxy between the web and\nthe application.  By default, Gunicorn is used to launch Uvicorn\nworkers which serve the API directly on port 8080.  The precise\ndetails may be adjusted in the `chapps-api-gunicorn.service` unit\nfile.\n\nIt is also possible that other approaches are preferred at other sites.\nThe extra files, provided in the `install` directory, are provided in\nthe hope that they may be useful.\n\nThe API is self-documenting.  Once it is running, visit it at\n`<server>:8080/redoc/` or `<server>:8080/docs/` to browse the\ndocumentation.\n\nThe API service needs to have the same configuration as the other\nCHAPPS services it is meant to manage.  Since it instantiates policy\nobjects, it is best to simply provide the same copy of the config to\nall related nodes.  Please note that the API service is completely\nseparate from the policy service(s), and need not run on the same\nserver -- and in fact probably _should_ not run on the same server --\nwith the policy service.\n\n## Outbound Services\n\nPolicy services can be divided into those which work on outbound mail,\nand those which work on inbound mail.  Some, possibly, might be\napplied to either flow, but none such are part of this project yet.\nOutbound items share some characteristics.\n\nOutbound mail, for our purposes, is assumed to originate with an\nauthenticated user.  That user may authenticate with Postfix using a\nusername/password or a client-side SSL cert, in which case the\nusername or subject name (of the cert) will be passed along by Postfix\nto the policy service.\n\nIn order to allow sites to specify exactly what field of the Postfix\npolicy data they would like to use to identify users, the\nconfiguration allows the user to specify the first field to check.\n\n### Setting the user key\n\nPostfix submits a fairly large packet of data on each policy\ndelegation request.  One prominent element of this data is the MAIL\nFROM address, which is labelled as `sender`.  This is perhaps the\nobvious element to use to count quotas, but some other fields are more\ninteresting.\n\nCurrent versions of the software allow the config file to specify what\nelement of that delegation request payload to use, defaulting to\n`sasl_username`.  This is because when customers use a password auth\nprocess, the `sasl_username` corresponds to the customer whose\nemail quota is being checked.  In certain circumstances (when\nauthentication fails), the `sasl_username` field is blank.  Since\nv0.3.11, when we find it blank we attribute that to authentication\nfailure, and we provide some extra config elements to control this\nbehavior.\n\nIf the config key `require_user_key` is set to **True**, then only the\nkey specified in `user_key` will be checked for contents to identify\nthe customer, and if it is empty, an `AuthenticationFailedException`\nwill be raised, which will cause the `no_user_key_response` to be sent\nback via Postfix.  If `require_user_key` is **False**, then a series\nof fields will be searched as outlined below.\n\nAt present, there is little sanitation on the `user_key` field.  It is\nnever evaluated as code, but it is used directly as the attribute name\nfor the value dereference.  If that yields no value, or if it is not\nspecified, CHAPPS looks for `sasl_username` first, then\n`ccert_subject`, and if there is none, it falls back to `sender`,\nwhich can also be blank. In that extreme case, CHAPPS uses\n`client_address`.  This will not work very well long-term if a lot of\nreal customers share a mail gateway, so it is recommended to make sure\nthat the field specified is being populated.\n\nIncidentally, this may be a reason for permitting customers which\ndon't appear in the user-list, since system-generated messages which\ndon't have a `sender` listed will end up quota'd on their client\naddress, and probably most of them will be denied by quota,\npotentially generating a large number of confusing secondary error\nmessages.  CHAPPS currently expects any permitted sender to appear in\nthe `users` table.  Note that the name which appears in this table\nneeds to match what will be discovered in the specified key field.\nFor sites which use the customer's email address as their login name\nfor email access, this is easy.  For cert issuers, it may simplify\nthings to use the email address as the subject of the cert, but any\nunique string will work.\n\n## Outbound Quota Policy Service\n\nThe service is designed to run locally side-by-side with the Postfix\nserver, and connect to a Redis instance, optionally via Sentinel.  As\nsuch it listens on 127.0.0.1, and on port 10225 by default, though\nboth may be adjusted in the config file.  It obtains quota policy data\non a per-customer basis, from a relational database, and caches that\ndata in Redis for operational use.  Once a user's quota data has been\nstored, it will be cached for a day, so that database accesses may be\navoided.\n\nCurrent quota usage is **not** kept in a relational database.\n\nThere is CLI access to data about current quota usage, providing\nfacilities for updating quota policy information immediately: clearing\nquotas, upgrading them, adding new users, adding new quotas, etc.,\nalong with a number of other useful functions.  The CLI, `chapps-cli`,\nis self-documenting.\n\nThere is also a REST API service which can perform any of these tasks,\nusing cURL or similar.\n\nIn order to set up Postfix for policy delegation, consult [Postfix\ndocumentation](http://www.postfix.org/SMTPD_POLICY_README.html) to\ngain a complete understanding of how policy delegation works.  In\nshort, the `smtpd_recipient_restrictions` block should contain the\nsetting `check_policy_service inet:127.0.0.1:10225`.  In addition, it\nis necessary to ensure that the service itself, the script\n`chapps_outbound_quota.py` or `chapps_outbound_multi.py` is running.\nThis should be accomplished\nusing SystemD or similar; scripts/unit file assets to assist with that\nare to be found in the `install` directory.  (For now, according to\ncurrent wisdom, Postfix's own `spawn` functionality from `master.cf`\nshould be avoided.)\n\n### Outbound Quota Policy Configuration: Database Setup\n\nAt present, the service expects to obtain quota policy enforcement\nparameters from a relational database (MySQL or MariaDB).  The\nframework has been designed to make it easy to write adapters to any\nparticular backend datasource regarding quota information.\n\nAs of CHAPPS v0.4.13, Alembic is used to maintain the database schema\nas it mutates across versions.  [See above](#db-initialization) for\nadvice related to software upgrades and database migrations.\n\nThe database schema used has been kept as simple as possible: (please\nnote that this schema may differ slightly in terms of index and key\nnames from the one installed by Alembic)\n\n```\nCREATE TABLE `users` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `name` varchar(128) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\nCREATE TABLE `quotas` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `name` varchar(32) NOT NULL,\n  `quota` bigint(20) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `name` (`name`),\n  UNIQUE KEY `quota` (`quota`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\nCREATE TABLE `quota_user` (\n  `quota_id` bigint(20) NOT NULL,\n  `user_id` bigint(20) NOT NULL,\n  PRIMARY KEY (`user_id`)\n  KEY `fk_quota` (`quota_id`),\n  CONSTRAINT `fk_quota_user` FOREIGN KEY (`quota_id`) REFERENCES `quotas` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,\n  CONSTRAINT `fk_user_quota` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n```\n\nThe `users` table contains a record for each authorized customer who\nis allowed to send email.  Customers without entries will not be able\nto send email, despite authenticating with Postfix.\n\nThe `quotas` table contains quota definitions, the `name` is meant to\nhold a user-readable tag for the quota and max outbound email count\n(`quota`) of that quota.\n\nThe `quota_user` table joins the `users` table with the `quotas`\ntable.  The `quota_user.user_id` column joins with `users.id` to map\nusernames onto IDs.  Usernames may be email addresses, but they also\nmay not.  How they are obtained is configurable as `user_key` -- the\nspecified field will be extracted from the policy request payload\npresented by Postfix.\n\nOnce the `quotas` table has been populated with the desired quota\npolicies, the `quota_user` table may then be populated to reflect each\nuser's quota.\n\nThe application sets cached quota limit data to expire after 24 hours,\nso it will occasionally refresh quota policy settings, in case they\nget changed.  In order to flush the quota information, all that is\nrequired is to delete that user's policy tracking data from Redis.\nRoutes for doing so are provided by the REST API.\n\n**Please note:** Customers with no `users` entry will not be able to send\noutbound email.\n\n### Quota policy settings (non-database)\n\n#### Counting all outbound messages against the quota\n\nSome quota systems count any email as a single email regardless of the\nnumber of recipients included in the envelope recipients list\n(RCPT&nbsp;TO).  This software can operate that way, but it can also\ncount an email for each recipient in the list.  Whether it does so is\ngoverned by the boolean setting `counting_recipients`: setting this to\nTrue will cause CHAPPS OutboundQuotaPolicy to count a sent email for\neach recipient.\n\n#### Outbound quota grace margins\n\nThere is a `margin` setting which will allow for some fuzziness over\nthe established quota for multi-recipient emails, allowing a customer\nto go over their quota on a single (multi-recipient) email as long as\nthe total number of mails sent fits within the margin.  This obviously\nhas no meaning if recipients aren't being counted, since no email will\never represent more than a single outbound message.\n\nMargins specified in **integers** are absolute message counts.\n\nThose specified as **floats** represent a proportion of the total\nmargin.  If a float value is less than 1 it is assumed to be the\nratio.  If it is larger than 1 and less than 100, it is assumed to be\na percentage, and it divided by 100.0 is used as the ratio.\n\n## Sender Domain Authorization (Outbound multi-policy service)\n\nAs of CHAPPS v0.4.12 , sender-domain authorization (SDA) is only\navailable as part of the outbound multi-policy service, consisting of\nSDA followed by outbound quota.  There is a plan (TODO:) to produce a\nstandalone SDA service script.\n\nThe SDA policy allows an email service provider to specify on a\nper-customer basis exactly which domains may appear after the @ in the\nMAIL FROM address, the `sender` field in the Postfix policy delegation\ndata packet.  Customer identification for outbound emails is covered\nin a previous section of this document (see: ['Setting the user\nkey'](#setting-the-user-key)).\n\nIt is generally possible to configure vanilla Postfix to limit\noutbound domains for users, but we encountered some difficulty getting\nit to work reliably, and this method opens the door to a great deal of\nadditional nuance which would not otherwise be available to us.\n\nCHAPPS stores SDA policy control data in its database, in a fairly\nsimple, normalized scheme.  This feature uses a table each to store\nsource domains and email addresses, and a new join table for each to\nlink customers with domains and whole-email addresses they are allowed to\nuse for outbound mail.\n\nThe domain matching is intentionally inflexible -- the\nentire string after the @ sign must match a domain in the table.  That\nis to say: in order to allow users to send from subdomains, those\nsubdomains must have entries in the domains table, and those entries\nmust be linked to the logged-in (email-sending) customer via the\n`domain_user` join table.\n\nHere is the schema, for reference: (please note that this schema may\ndiffer slightly in terms of index and key names from the one installed\nby Alembic)\n\n```\nCREATE TABLE `domains` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `name` varchar(64) NOT NULL,\n  `greylist` tinyint(1) NOT NULL,\n  `check_spf` tinyint(1) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `ix_domains_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\nCREATE TABLE `domain_user` (\n  `domain_id` bigint(20) NOT NULL,\n  `user_id` bigint(20) NOT NULL,\n  PRIMARY KEY (`domain_id`,`user_id`),\n  KEY `fk_user_domain` (`user_id`),\n  CONSTRAINT `fk_domain_user`\n    FOREIGN KEY (`domain_id`) REFERENCES `domains` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,\n  CONSTRAINT `fk_user_domain`\n    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\nCREATE TABLE `emails` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `name` varchar(128) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\nCREATE TABLE `email_user` (\n  `email_id` bigint(20) NOT NULL,\n  `user_id` bigint(20) NOT NULL,\n  PRIMARY KEY (`email_id`,`user_id`),\n  KEY `fk_user_email` (`user_id`),\n  CONSTRAINT `fk_email` FOREIGN KEY (`email_id`) REFERENCES `emails` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,\n  CONSTRAINT `fk_user_email` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n```\n\nAs with the quota policy, the logic used is inherently conservative.\nIf a customer has no entry in the `users` table, that customer will\nnot be able to send mail (even though they have authenticated).  If a\ncustomer is trying to send an email from an address (the `sender`\naddress) which has a domain string (everything after the @ sign) which\ndoes not appear in the `domains` table, or for which that user lacks a\njoin record in `domain_user`, the email will be denied.\n\nIn practice, this will mean that when a new customer signs up,\nthe domain(s) included in that service agreement should be added to\nthe `domains` table.  Any users which are authorized to send email\nappearing to originate from that domain should be added to the `users`\ntable, with join records linking their IDs to the IDs of the domain(s)\nthey can send for, in `domain_user`.\n\n### Whole-Email Matching\n\nAs a fallback to domain authorization, the SDA module also compares\nthe entire `sender` field with the whole-email entries associated to\nthe user.  This allows an email provider to specify specific email\naddresses which may be used for outbound masquerading.  This helps to\nprevent customers from pretending to be other customers, and helps to\ncreate a specification for possible scanning tools which might\notherwise react negatively to the logs of such activity.\n\nTODO: Currently, CHAPPS causes cached policy data to have an expiry\ntimer of a day.  For outbound quota, this makes a great deal of sense\nbecause the quotas are expressed in emails per day.  However, a day's\nworth of authorized email senders' Redis cache keys may actually cause\nquite a bit of memory usage for no particular reason.  Users don't\nsend an evenly-spaced stream of email throughout the day; they send\nsome emails, often in clusters, separated by long pauses.  As such,\nthe expiry time of SDA Redis caches should probably be a tunable\nparameter, in order to allow operators to tune how much RAM on their\nRedis servers ends up devoted to SDA caching.  6 or 8 hours seems like\na reasonable trade-off between Redis-RAM bloat and RDBMS latency, but\ndifferent sites are different.\n\n## Inbound Services\n\nFor inbound services, it is possible to enable either policy on a\nper-domain basis.  This may be accomplished via the CLI or API.\n\n### HELO Whitelisting\n\nSometimes CHAPPS may not be the first line of defense for all email;\nit is possible that most email needs policy enforcement, but that some\nparticular relay(s) already do the same job as CHAPPS, and so whatever\nthey relay should be whitelisted.  In such a case, the relay will\nprobably always fail SPF anyway, and result in a header to that\neffect.\n\nIn order to whitelist by **HELO**, specify the `helo_whitelist` option in\nthe `[CHAPPS]` section of the config file, with data about the server\nto whitelist.  Due to some limitations of ConfigParser, the data\nneeds to be packed into a list on a single line.  The format is as\nfollows:\n```\nhelo_whitelist=mx.example.com[:1.2.3.4][;mx2.example.com[:5.6.7.8][;...]]\n```\nTo break this down in English, provide at a minimum the HELO name used\nby the server to whitelist.  In such a case, the IP will be obtained\nfrom DNS and used as if it had also been supplied.  In order to supply\nthe IP address of the server, use a colon (`:`) after the name.  In\norder to list more than one name (optionally with IP address), use\nsemi-colons (`;`) to separate entries.\n\nAt configuration time, the A record will be evaluated to see if it\nmatches the IP provided.  The PTR of the IP, whether provided or\nobtained by a lookup, will be obtained as well, and checked to make\nsure the provided name matches.  If all the elements do not match,\nCHAPPS will log an error and will not perform any whitelisting.\n\nCurrently, if the address provided is the loopback address\n\"127.0.0.1\", then no DNS lookups will be performed, and both name and\naddress values will be used without any checking or cross-checking.\nIn future versions this logic could be expanded to include all\n\"private\" IPv4 address ranges, v6 ranges, etc.\n\n## Greylisting Policy Service\n\nGreylisting is an [approach to spam\nprevention](https://en.wikipedia.org/wiki/Greylisting_(email)) based\non the tendency of spammers to emit emails without using gateways.\nSpam is typically sent _to_ one or more gateways by malware programs\nwhich amount to viral MUAs, able to connect to SMTP servers to send\nmail, but not capable of noting response codes and retrying deferred\ndeliveries.  Because a large proportion of spam is (or was) sent this\nway, the simple act of deferring emails from unknown (untrusted)\nsources eliminates a large amount of spam.\n\nCHAPPS can, on a per-domain, opt-in basis, perform [RCPT or DATA\ngreylisting](https://datatracker.ietf.org/doc/html/rfc6647#section-2.4)\nat present, since it wants to use the sender's email address and IP\naddress as well as the recipient list.  CHAPPS is written to expect to\nbe invoked during the RCPT phase, but should work in the DATA phase.\nThat has not been tested.\n\nEmails addressed to enforcing domains will be greylisted--that is,\ndeferred--when they are associated with source tuples which are not\nrecognized.  Tracking data regarding recognized tuples and domain\noption setting is stored in Redis.  Config data regarding option\nstatus is obtained from the database and cached in Redis.  Domains\nwhich do not set the `greylist` bit on their records will receive all\nmail addressed to them immediately, without any greylisting.\n\nThe Greylisting module performs whitelisting at its own level, based\non a tally of successfully delivered deferred emails.  That is to say,\nemails which have been deferred and then redelivered on the required\nschedule are counted in a tally per-client (by source IP address).\nWhen that tally reaches 10, further emails with matching source IPs\nare whitelisted.  This threshhold may be adjusted in the\n`GreylistingPolicy` config, as `whitelist_threshold`.\n\nPlease note that in the context of comprehensive inbound email\nfiltering, SPF and greylisting have an interesting relationship which\nis not entirely straightforward, and so a special combined, inbound\nmulti-policy service has been provided which combines the features of\ngreylisting and SPF checking in a sane fashion, and provides a\nframework for adding further policies.\n\n## SPF Policy Enforcement\n\nThe [Sender Policy\nFramework](https://en.wikipedia.org/wiki/Sender_Policy_Framework) is a\ncomplicated and intricate beast, and so I will not try to describe it\nin great detail, but instead link to relevant documentation about what\nSPF is.  Important to note is the fact that SPF is a framework for\nusing the DNS as the policy configuration source.\n\nThere is no provision in the RFC for the caching of SPF results in\norder to apply them to other circumstances, such as another email with\nthe same inputs.  It is possible that the policy itself, i.e. the TXT\nrecord containing the SPF policy string, could change between emails.\nAs such, this module does not use Redis to cache operational data.\nRedis is used to cache the per-domain SPF-enablement option.\n\nThere is a very widely-used and well-supported implementation of the\nSPF check itself in the Python community called\n[pyspf](https://pypi.org/project/pyspf/), by Stuart Gathman and\nTerence Way.  CHAPPS uses this library to get SPF check results.\n\nThe SPF policy enforcement framework included in CHAPPS makes it\npossible for an operator to specify clearly and flexibly what they\nwould like to have happen in response to any of the different SPF\ncheck results.  The [SPF specification in RFC\n7208](https://datatracker.ietf.org/doc/html/rfc7208) does not address\nexactly what response to take in each case, saying that it is a site's\nprerogative to decide the fates of those emails.\n\nDomains must opt-in to SPF checking, just as with Greylisting.\nDomains which opt out of both will simply receive all email addressed\nto them without any SPF checking or Greylisting.\n\nThere is no standalone SPF service; it is part of the multipolicy\ninbound service.  It would be trivial to create a standalone SPF\nservice.  Since we intend to provide both options to our customers,\ncreating a standalone service is a low priority.  **Please note** that\nas with Greylisting, the domain-level option will be honored even by\nstandalone handlers, meaning that in order for a domain's incoming\nemail to have SPF enforced, that option will still need to be set on\nits record.\n\n## Inbound Multi-policy Service (SPF + Greylisting)\n\n**Please note that blanket use of Greylisting is not recommended.**\n\nWhat does it mean to use both greylisting and SPF?  The trivial answer\nis to pass one filter, and then pass the next filter.  But which comes\nfirst?\n\nIf one greylists first, a legitimate email may be deferred for ten\nminutes, then pass SPF checking; should emails which pass SPF be\nsubject to greylisting?  Conversely, a greylisted email may also come\nfrom a server which is not allowed by its SPF record, and then be\ndeferred only to be denied for an unrelated reason after ten minutes\nof taking up disk space and using up cycles needlessly.\n\nOn the other hand, if one uses an SPF filter first, in a trivial\nfashion, then emails must pass muster on the SPF check first, which\nseems right and proper to me, certainly.  And if greylisting is to be\nused also, then it makes sense for emails which get `pass` from SPF to\nbe deferred.  When they are sent again they will of course incur\nanother SPF check, and then they will pass greylisting, provided that\nthe SPF record they depend on has not changed in the meantime.\n\nIn the realm of SPF, there are a couple of grey areas, no pun\nintended.  SPF can return `softfail` if it isn't sure enough about the\ncheck failing to indicate a hard fail.  It can also return `none` or\n`neutral` which are required to be treated the same way.  In such\ncases, the SPF checker is saying that the SPF record either doesn't\nexist or might as well not exist for all the good it does in this\ncase.\n\nGenerally, sites are left to determine whether to accept these emails,\nor possibly tag them and/or quarantine them.  So far, this software\ndoes not address any of those possible outcomes.  But we can provide\nthe interesting option of using greylisting for grey areas.\n\nBy default, CHAPPS SPF policy enforcement service uses greylisting for\nemails which receive `softfail` and `none`/`neutral` responses on\ntheir SPF checks.\n\nIf a domain is set to enforce SPF **and** Greylisting, that will cause\nCHAPPS to greylist even emails which receive `pass` from SPF, meaning\nthat any \"deliverable\" email will be deferred unless it is already\ncoming from a recognized source (tuple), when both are enabled.\n(Non-deliverable categories are: `fail`, `temperror`, `permerror`.)\n\nThe messages which accompany the various rejections and deferrals\nindicate what the reason was.  In some cases, those messages indicate\nthat a message has been greylisted due to the SPF enforcement policy.\n\n## Upcoming features\n\nA mini-roadmap of upcoming changes:\n\nminor:\n\n  - SDA (and other) Redis keys will have tunable expiry times\n  - Look into specifying log facility and level in the config file\n\nmajor:\n\n  - Possibly support multiple enforcement intervals\n  - It seems inevitable that other features will also be added.  There\n    is some skeletal code in the repo for building email content\n    filters, which are not the same as policy delegates.\n  - Using Redis makes it possible to send pub/sub messages when\n    certain sorts of conditions occur, such as a user making a large\n    number of attempts to send mail in a short time while overquota,\n    or when a user (repeatedly?) attempts to send email as being from\n    a domain that user lacks authorization for.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://github.com/easydns/chapps/tree/main/dist/chapps-0.5.15.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/easydns/chapps",
+    "keywords": "Postfix,Policy,Daemon",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "chapps",
+    "package_url": "https://pypi.org/project/chapps/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/chapps/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/easydns/chapps/issues",
+      "Documentation": "https://chapps.readthedocs.io",
+      "Download": "https://github.com/easydns/chapps/tree/main/dist/chapps-0.5.15.tar.gz",
+      "Homepage": "https://github.com/easydns/chapps",
+      "Release Notes": "https://github.com/easydns/chapps/blob/main/CHANGELOG.md",
+      "Source Code": "https://github.com/easydns/chapps/"
+    },
+    "release_url": "https://pypi.org/project/chapps/0.5.15/",
+    "requires_dist": null,
+    "requires_python": ">=3.8",
+    "summary": "Caching, Highly-Available Postfix Policy Service",
+    "version": "0.5.15",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17432005,
+  "releases": {
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06a9f84c5db6b4f3563dd63a376976559ee49230474442f7bdced590ab41cc13",
+          "md5": "e73aab815d778360f271b7921bfbf1a0",
+          "sha256": "6ad8ebc6bcc564bcfad0e8ae5f3536749fe246058450aa643f2e94dc72eb9af1"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e73aab815d778360f271b7921bfbf1a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 59605,
+        "upload_time": "2022-02-25T21:02:51",
+        "upload_time_iso_8601": "2022-02-25T21:02:51.117428Z",
+        "url": "https://files.pythonhosted.org/packages/06/a9/f84c5db6b4f3563dd63a376976559ee49230474442f7bdced590ab41cc13/chapps-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "78c54023baeb9725ed7f125da86497b0a931e20c8720d8cc644791745e2e57c1",
+          "md5": "ffa64d1386e67504896fefe84f5890e5",
+          "sha256": "242035a8183c9deec9ae8c2cd85ea3e4832e6826b6170f382ea0b1523e0629b6"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ffa64d1386e67504896fefe84f5890e5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 46696,
+        "upload_time": "2022-02-25T21:02:52",
+        "upload_time_iso_8601": "2022-02-25T21:02:52.488073Z",
+        "url": "https://files.pythonhosted.org/packages/78/c5/4023baeb9725ed7f125da86497b0a931e20c8720d8cc644791745e2e57c1/chapps-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f69bdba2c3ac5715ccebf0aeb91721cf192eb40ba7790bfb505f96ef05890785",
+          "md5": "94b0aaa9d76c934ffa9d60ce5417dd96",
+          "sha256": "64cabf81609c97ffcdb854571d7ba154bd0f3792cdad3a82ccdcea1fa9443524"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "94b0aaa9d76c934ffa9d60ce5417dd96",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 49036,
+        "upload_time": "2022-03-14T22:01:57",
+        "upload_time_iso_8601": "2022-03-14T22:01:57.904910Z",
+        "url": "https://files.pythonhosted.org/packages/f6/9b/dba2c3ac5715ccebf0aeb91721cf192eb40ba7790bfb505f96ef05890785/chapps-0.3.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d2e9c4bf35e844fead2288a3927b163653767937b72bcbb6abf08939ff68b25",
+          "md5": "c81e52997d80586e6ac87e00694b951a",
+          "sha256": "e085dbe4bb7a7b3ddd321f49f245944b9afba357d5455d1fa86c3dc7d370e648"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c81e52997d80586e6ac87e00694b951a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 49958,
+        "upload_time": "2022-03-18T14:30:53",
+        "upload_time_iso_8601": "2022-03-18T14:30:53.091743Z",
+        "url": "https://files.pythonhosted.org/packages/2d/2e/9c4bf35e844fead2288a3927b163653767937b72bcbb6abf08939ff68b25/chapps-0.3.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd497c4aec5cbfb13f5bc7ea87fe4b3d5d3d06f35ad0e883e19929f514e184b6",
+          "md5": "aa4e4eda063549ed49b5cd052b942b84",
+          "sha256": "be6d497f77275e6ac0eceae6f5faa2ad338f250fe9f744b0aff4c208bee2147b"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aa4e4eda063549ed49b5cd052b942b84",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 49531,
+        "upload_time": "2022-03-23T21:38:11",
+        "upload_time_iso_8601": "2022-03-23T21:38:11.483816Z",
+        "url": "https://files.pythonhosted.org/packages/bd/49/7c4aec5cbfb13f5bc7ea87fe4b3d5d3d06f35ad0e883e19929f514e184b6/chapps-0.3.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8785b500885d9b645948eb65ffc11128c5b7284e03e31871760352e68f4b1f35",
+          "md5": "0d683f8aa427b876780007c4efc36a8e",
+          "sha256": "b40616568c6811ef6f32d3b664e461ab7b046520cf661287d6f57a4e0a5b3c88"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0d683f8aa427b876780007c4efc36a8e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 51847,
+        "upload_time": "2022-03-25T18:39:16",
+        "upload_time_iso_8601": "2022-03-25T18:39:16.236913Z",
+        "url": "https://files.pythonhosted.org/packages/87/85/b500885d9b645948eb65ffc11128c5b7284e03e31871760352e68f4b1f35/chapps-0.3.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a76c89bb607e000ff5379d5b4aa288be7fc8fc26b65534fd2fc1d9a7fc49ee57",
+          "md5": "8c9517caca3d1c762d931b1d98f76a0a",
+          "sha256": "679c97122aea83782b9694c50025ee8f5d4a163b0254e7cef9764a1ffffbe860"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8c9517caca3d1c762d931b1d98f76a0a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 59763,
+        "upload_time": "2022-02-25T21:13:41",
+        "upload_time_iso_8601": "2022-02-25T21:13:41.498669Z",
+        "url": "https://files.pythonhosted.org/packages/a7/6c/89bb607e000ff5379d5b4aa288be7fc8fc26b65534fd2fc1d9a7fc49ee57/chapps-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7560d0f5157d120c12b253e404406c873a45e035d1ca370a5d65e6b86af91d7b",
+          "md5": "46acaaf7d083e3388d7489dadbc6282a",
+          "sha256": "8b02d45c15b0c0c27d15d0247a71cee3070b6b1423ba540f49d7aa37bb8a7623"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "46acaaf7d083e3388d7489dadbc6282a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 46681,
+        "upload_time": "2022-02-25T21:13:43",
+        "upload_time_iso_8601": "2022-02-25T21:13:43.592890Z",
+        "url": "https://files.pythonhosted.org/packages/75/60/d0f5157d120c12b253e404406c873a45e035d1ca370a5d65e6b86af91d7b/chapps-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5180d3b011280a9ac81233555e37b07bd1dcb62cdd6fd4115dbaeae15932e8e6",
+          "md5": "f52ad10d1365bb693b397e47c4f043c3",
+          "sha256": "cb10da80c3aa28fe3a60941eb6e79033a5b97868fc79d0a95f74e8c7b1a99272"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f52ad10d1365bb693b397e47c4f043c3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 48028,
+        "upload_time": "2022-03-01T21:09:45",
+        "upload_time_iso_8601": "2022-03-01T21:09:45.491548Z",
+        "url": "https://files.pythonhosted.org/packages/51/80/d3b011280a9ac81233555e37b07bd1dcb62cdd6fd4115dbaeae15932e8e6/chapps-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42986c6d53d34d14c96164502e5da5134bef7ad435a0d4f71934e821d0566741",
+          "md5": "cc3c8ec3865ae03be5f5d888efee77bf",
+          "sha256": "c0770f7fca247f4f34c1baa0266cba1d19d7c8ea372fa6e07a777f9410cbb05c"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc3c8ec3865ae03be5f5d888efee77bf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 48739,
+        "upload_time": "2022-03-02T19:09:00",
+        "upload_time_iso_8601": "2022-03-02T19:09:00.091242Z",
+        "url": "https://files.pythonhosted.org/packages/42/98/6c6d53d34d14c96164502e5da5134bef7ad435a0d4f71934e821d0566741/chapps-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38d0f9582dbff305bbbfe6c9cd2313ac6377f7d2d22e64710674145a2b10206e",
+          "md5": "7554764241b88f703bcca741ae97232d",
+          "sha256": "d0bc349630182ac07e70da565dd491f9bd5404701686c1de2e17f6bc680af307"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7554764241b88f703bcca741ae97232d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 48806,
+        "upload_time": "2022-03-03T22:30:45",
+        "upload_time_iso_8601": "2022-03-03T22:30:45.399065Z",
+        "url": "https://files.pythonhosted.org/packages/38/d0/f9582dbff305bbbfe6c9cd2313ac6377f7d2d22e64710674145a2b10206e/chapps-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e65705ba6a452681039ccd2f8585861e6bb490e2f242d720e94809f1568f4bb5",
+          "md5": "c48c161355e3925c50a8c0e697c0308a",
+          "sha256": "4c83fd8fdc10800aa0beeddae28519c8ec52661bb32968beb4ad2d29cba89889"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c48c161355e3925c50a8c0e697c0308a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 48950,
+        "upload_time": "2022-03-04T16:06:35",
+        "upload_time_iso_8601": "2022-03-04T16:06:35.819517Z",
+        "url": "https://files.pythonhosted.org/packages/e6/57/05ba6a452681039ccd2f8585861e6bb490e2f242d720e94809f1568f4bb5/chapps-0.3.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab6e994fffcb92c6c220d181afbcecb43a3b371fac61094dfe82bc47ec02cf32",
+          "md5": "dc118f6f6abf7fa171ef26cdd700a8e6",
+          "sha256": "f9873e741cef818516452873c033338c316263a81183ca7a93fec885f404d4db"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.3.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dc118f6f6abf7fa171ef26cdd700a8e6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 48329,
+        "upload_time": "2022-03-09T20:02:16",
+        "upload_time_iso_8601": "2022-03-09T20:02:16.346083Z",
+        "url": "https://files.pythonhosted.org/packages/ab/6e/994fffcb92c6c220d181afbcecb43a3b371fac61094dfe82bc47ec02cf32/chapps-0.3.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7312bd39b7fdeba73ef2ce5cc71a07d5b499bca37f576d4c85312e4009473f5e",
+          "md5": "69312cd924b110f4049451cba3482134",
+          "sha256": "b5e010791c8458158bb961f044d34f88d4e2e53e18911520d7769f4fb6cd3bb4"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "69312cd924b110f4049451cba3482134",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 66448,
+        "upload_time": "2022-04-07T21:05:13",
+        "upload_time_iso_8601": "2022-04-07T21:05:13.051451Z",
+        "url": "https://files.pythonhosted.org/packages/73/12/bd39b7fdeba73ef2ce5cc71a07d5b499bca37f576d4c85312e4009473f5e/chapps-0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "087295d73a222c0b0651250e19c5b95dd1bd0423ae6cfa49a5fd21717be5ed77",
+          "md5": "06ce2e7f7e765e867402b2ad9e6534ae",
+          "sha256": "cd1f1acb697c1933b16425b4fff1a7429267cfc51cff871eb1772d4b8ac5265e"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06ce2e7f7e765e867402b2ad9e6534ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 67643,
+        "upload_time": "2022-04-08T21:01:54",
+        "upload_time_iso_8601": "2022-04-08T21:01:54.496244Z",
+        "url": "https://files.pythonhosted.org/packages/08/72/95d73a222c0b0651250e19c5b95dd1bd0423ae6cfa49a5fd21717be5ed77/chapps-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0bb7a3b888b34429f9a2607249a220473c7447aaa836eade4c23ae82f9703ea",
+          "md5": "3d4dd57fc16fc71193a4ffed12575790",
+          "sha256": "36ca7d01ba07394270a65c6648807ad2d197dbc1e28aca24172aa3c8ef6793cc"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3d4dd57fc16fc71193a4ffed12575790",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 116789,
+        "upload_time": "2022-06-07T14:33:08",
+        "upload_time_iso_8601": "2022-06-07T14:33:08.086230Z",
+        "url": "https://files.pythonhosted.org/packages/f0/bb/7a3b888b34429f9a2607249a220473c7447aaa836eade4c23ae82f9703ea/chapps-0.4.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d788959b3f3166dd3e9165b9d04855c94ab7e43b5ad22aab73dcf165d166d68",
+          "md5": "a4ff47505c8a40f930091a3242e4d4db",
+          "sha256": "1f3743047e2b7a1515cae1bfdc084c18ba648b381a0380961583c687d8630584"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a4ff47505c8a40f930091a3242e4d4db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 121248,
+        "upload_time": "2022-06-07T18:21:03",
+        "upload_time_iso_8601": "2022-06-07T18:21:03.890430Z",
+        "url": "https://files.pythonhosted.org/packages/1d/78/8959b3f3166dd3e9165b9d04855c94ab7e43b5ad22aab73dcf165d166d68/chapps-0.4.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "05a8c75a98877c43b97a9281cbe9557b69e4450b88d452af8479646f1c53588b",
+          "md5": "7c6fa0973059b3f5232eb0ffe6c2d847",
+          "sha256": "e2c40257baa4a4a4f59c0c25e71acc71c91876b0b58b44ef9d74534681be58e9"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7c6fa0973059b3f5232eb0ffe6c2d847",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 121357,
+        "upload_time": "2022-06-09T14:54:06",
+        "upload_time_iso_8601": "2022-06-09T14:54:06.938722Z",
+        "url": "https://files.pythonhosted.org/packages/05/a8/c75a98877c43b97a9281cbe9557b69e4450b88d452af8479646f1c53588b/chapps-0.4.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "325f03ee9dfccc7c913b59fa38b2d69d6d450785bc37d01f21ab1ab719f382e1",
+          "md5": "3fee5bf18628af8cb7c3b8159aef7b29",
+          "sha256": "0ba9aaa994bc2a21f21fe8bced9c80d51db28e80d1f38ab9eee144f124a29d2e"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3fee5bf18628af8cb7c3b8159aef7b29",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 132152,
+        "upload_time": "2022-07-12T21:07:52",
+        "upload_time_iso_8601": "2022-07-12T21:07:52.984212Z",
+        "url": "https://files.pythonhosted.org/packages/32/5f/03ee9dfccc7c913b59fa38b2d69d6d450785bc37d01f21ab1ab719f382e1/chapps-0.4.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "debefbe3853ec36dc95cbbf2a176af8f3d0d0560f2087093b975f3f69c70176a",
+          "md5": "6f3c0ecc36371b4fa932049b6fdedd18",
+          "sha256": "cdd6d786987785e68a2f54d52f3aeed5b753c8ad3d02ec5beae498afe514d476"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6f3c0ecc36371b4fa932049b6fdedd18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 133635,
+        "upload_time": "2022-07-13T17:55:42",
+        "upload_time_iso_8601": "2022-07-13T17:55:42.261656Z",
+        "url": "https://files.pythonhosted.org/packages/de/be/fbe3853ec36dc95cbbf2a176af8f3d0d0560f2087093b975f3f69c70176a/chapps-0.4.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98006599a7e9beeebfa5beb79ca0296c92cb973fa68c04dcbd9f7781e869c243",
+          "md5": "bb15008b21c2823cadd8c7b2991a115c",
+          "sha256": "f45f7aa66b1e5b036df5906ac1ce45cd8fe6ae9ea01900400b80411f51a2622c"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bb15008b21c2823cadd8c7b2991a115c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 134959,
+        "upload_time": "2022-07-13T18:25:38",
+        "upload_time_iso_8601": "2022-07-13T18:25:38.539416Z",
+        "url": "https://files.pythonhosted.org/packages/98/00/6599a7e9beeebfa5beb79ca0296c92cb973fa68c04dcbd9f7781e869c243/chapps-0.4.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d236e66a841aace528619ba7d71f0209c9381c9ae650ca1ca0536d6e9547a1d",
+          "md5": "dda426b324c3bf6c5c3fc87c439da41b",
+          "sha256": "8c7515ae2c26eca42ec041383c69e58e5f9fcf5489fb1dfe77e852eadcd498d2"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dda426b324c3bf6c5c3fc87c439da41b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 140310,
+        "upload_time": "2022-07-20T19:17:33",
+        "upload_time_iso_8601": "2022-07-20T19:17:33.982454Z",
+        "url": "https://files.pythonhosted.org/packages/2d/23/6e66a841aace528619ba7d71f0209c9381c9ae650ca1ca0536d6e9547a1d/chapps-0.4.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a28c68c97e8bbefdf3fcdc1e12a087880a7b34f96ca7cce57e3f1db750764742",
+          "md5": "151dad76bc7b4d2eeb23041df7cd0f13",
+          "sha256": "453f46bdf79935a41c0f9430d3b7e94a8a909a3d35412672bb0744e2383136d4"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "151dad76bc7b4d2eeb23041df7cd0f13",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 140814,
+        "upload_time": "2022-08-17T22:45:40",
+        "upload_time_iso_8601": "2022-08-17T22:45:40.381625Z",
+        "url": "https://files.pythonhosted.org/packages/a2/8c/68c97e8bbefdf3fcdc1e12a087880a7b34f96ca7cce57e3f1db750764742/chapps-0.4.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "088f7c640cb9d8437e2b2b7a67d7df2195197bff081c57cf01c1b7bd845e77b6",
+          "md5": "443f4e49319714bf8e68f71e48f9cf8a",
+          "sha256": "78a4dc943af48c6fe53adee6798255aef635498f52cbf3321185b912be0c561c"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "443f4e49319714bf8e68f71e48f9cf8a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 80432,
+        "upload_time": "2022-04-12T17:34:16",
+        "upload_time_iso_8601": "2022-04-12T17:34:16.566720Z",
+        "url": "https://files.pythonhosted.org/packages/08/8f/7c640cb9d8437e2b2b7a67d7df2195197bff081c57cf01c1b7bd845e77b6/chapps-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e27969ef7518a1ef6d8fe85ef1d051150dcdbd68d503d6435aeb631b8791793",
+          "md5": "7fc7170b50489e0560335f3bcce07b65",
+          "sha256": "66949b1fbd017aaa62d6bede027ba3bee20597f7b0b3cd25e8f36a85c26869b3"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7fc7170b50489e0560335f3bcce07b65",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 80919,
+        "upload_time": "2022-04-12T18:37:36",
+        "upload_time_iso_8601": "2022-04-12T18:37:36.282108Z",
+        "url": "https://files.pythonhosted.org/packages/1e/27/969ef7518a1ef6d8fe85ef1d051150dcdbd68d503d6435aeb631b8791793/chapps-0.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d8de04892f8d5025d88ba2946cbbb15987c7a34dd6916c4f9b01990db22a9db8",
+          "md5": "c06406774b45108272c3b89d65c905d9",
+          "sha256": "cba88a1d044f31306aea1e54ae708e5725071bffb8571774c74bd8677950ec89"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c06406774b45108272c3b89d65c905d9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 83288,
+        "upload_time": "2022-04-26T14:15:35",
+        "upload_time_iso_8601": "2022-04-26T14:15:35.447207Z",
+        "url": "https://files.pythonhosted.org/packages/d8/de/04892f8d5025d88ba2946cbbb15987c7a34dd6916c4f9b01990db22a9db8/chapps-0.4.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a30cbf3abe0e4b9b408e8d64b63382bc26b05fc29dcd113dc9bd7d3679ce5e4",
+          "md5": "1a09e48e59fcb512951893bd900ae54f",
+          "sha256": "d6e3426ad78593cc0bcf6620c99d83fd434b7dd8e1fb01b106981754cca52e12"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a09e48e59fcb512951893bd900ae54f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 83937,
+        "upload_time": "2022-04-28T15:27:01",
+        "upload_time_iso_8601": "2022-04-28T15:27:01.087846Z",
+        "url": "https://files.pythonhosted.org/packages/6a/30/cbf3abe0e4b9b408e8d64b63382bc26b05fc29dcd113dc9bd7d3679ce5e4/chapps-0.4.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be5d2f94002ce08348ed47438547135646a3892f5b4d9256af66f48b9b5f6263",
+          "md5": "311abad047fce2e669fe33963547ce35",
+          "sha256": "b4c6c31a7329ed794ca513ccad75d2cd1f3ad3f545983c37e2a0a45706054ab6"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "311abad047fce2e669fe33963547ce35",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 111740,
+        "upload_time": "2022-05-18T21:43:42",
+        "upload_time_iso_8601": "2022-05-18T21:43:42.684779Z",
+        "url": "https://files.pythonhosted.org/packages/be/5d/2f94002ce08348ed47438547135646a3892f5b4d9256af66f48b9b5f6263/chapps-0.4.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "059364d9d61b38226ce79a16b08560547286169e155affb050dd51ad51c0d995",
+          "md5": "3ae7cc89bfbcb8228a9f89ecc9b25879",
+          "sha256": "9fdb5affc235c684aa45e841586cce4bd9835b7a1ecd6a16c91ff8c867c02ce1"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3ae7cc89bfbcb8228a9f89ecc9b25879",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 114392,
+        "upload_time": "2022-05-27T16:33:54",
+        "upload_time_iso_8601": "2022-05-27T16:33:54.078397Z",
+        "url": "https://files.pythonhosted.org/packages/05/93/64d9d61b38226ce79a16b08560547286169e155affb050dd51ad51c0d995/chapps-0.4.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6f7857b4e57ddebcadb9af02836c451b31e4b53db6aa7a0e81fefc9e8d5ec414",
+          "md5": "4bb8d65e3f060bfc142c780a723bf9e7",
+          "sha256": "417c7c014613e3b73f347b9f160c0583f2f8e741037f5d47588561bfb2c7d985"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bb8d65e3f060bfc142c780a723bf9e7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 114589,
+        "upload_time": "2022-05-31T14:03:09",
+        "upload_time_iso_8601": "2022-05-31T14:03:09.743331Z",
+        "url": "https://files.pythonhosted.org/packages/6f/78/57b4e57ddebcadb9af02836c451b31e4b53db6aa7a0e81fefc9e8d5ec414/chapps-0.4.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e650f138373f10e9ac738213d58f4548cc1c2247c9508108643202ecf338d068",
+          "md5": "d180db160fa5608cfd81ddf567d96f3e",
+          "sha256": "88ea05181e695e849916f91548a2c1a29f4d19124c98917a2602762f799a04f9"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.4.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d180db160fa5608cfd81ddf567d96f3e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 116188,
+        "upload_time": "2022-06-06T20:38:55",
+        "upload_time_iso_8601": "2022-06-06T20:38:55.575436Z",
+        "url": "https://files.pythonhosted.org/packages/e6/50/f138373f10e9ac738213d58f4548cc1c2247c9508108643202ecf338d068/chapps-0.4.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69213e9bb2d07173468c5041455a3bde2a676aa284e76ee96ef110d33b82241a",
+          "md5": "856bdbbb6e853bca22d3b86a05026ebe",
+          "sha256": "9032c48b2c436d518c2c2568006b6e99a3d003cd54b6793edcea8fb1d5cf5a7a"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "856bdbbb6e853bca22d3b86a05026ebe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 142574,
+        "upload_time": "2022-09-06T21:17:52",
+        "upload_time_iso_8601": "2022-09-06T21:17:52.160386Z",
+        "url": "https://files.pythonhosted.org/packages/69/21/3e9bb2d07173468c5041455a3bde2a676aa284e76ee96ef110d33b82241a/chapps-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c25bdf039c814fa3eca16395fbb4092fbb1c206ef91a1ef8e46e5467676d64b4",
+          "md5": "804d666617849fd539c76ba0ae31497c",
+          "sha256": "84e26cac041ed19b5f92b6e5b7e9f5ba8bb2951c8ca81a8d9aaebae9a7c79251"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "804d666617849fd539c76ba0ae31497c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 142676,
+        "upload_time": "2022-09-12T17:49:10",
+        "upload_time_iso_8601": "2022-09-12T17:49:10.266194Z",
+        "url": "https://files.pythonhosted.org/packages/c2/5b/df039c814fa3eca16395fbb4092fbb1c206ef91a1ef8e46e5467676d64b4/chapps-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e8d6b8c4a729f4a6c62d311542568bd59c0ad00641324eb8488c16f69c755bf",
+          "md5": "b7827a015a96bb7cfda8fe322555386d",
+          "sha256": "25029177a2a19343068f9e08443352f2d7ac1c0d8c393cc1995943919101dec2"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b7827a015a96bb7cfda8fe322555386d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 147454,
+        "upload_time": "2022-11-11T19:19:11",
+        "upload_time_iso_8601": "2022-11-11T19:19:11.453580Z",
+        "url": "https://files.pythonhosted.org/packages/4e/8d/6b8c4a729f4a6c62d311542568bd59c0ad00641324eb8488c16f69c755bf/chapps-0.5.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b12ad341fab0a3f984a4285a082c967b8876917d265c039cc4737270b01333d4",
+          "md5": "0dfe6484c9afdf05eefcbe2d38748631",
+          "sha256": "70f99b04fba300d65a57584b1f22ac8f84a0a641f739c87d62dcfd7cf047d274"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0dfe6484c9afdf05eefcbe2d38748631",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 147517,
+        "upload_time": "2022-11-25T18:20:45",
+        "upload_time_iso_8601": "2022-11-25T18:20:45.371294Z",
+        "url": "https://files.pythonhosted.org/packages/b1/2a/d341fab0a3f984a4285a082c967b8876917d265c039cc4737270b01333d4/chapps-0.5.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ca964f20ed0d29b3167d42e0735d8030e0ad98d90912248990ca0d06d01ffe5",
+          "md5": "178d1bd387ce669b861c3c19afe9e43c",
+          "sha256": "f6a287a383e373f5edbf2d02971fe4a128d3f71187cb56009c4e640f90c43b5e"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "178d1bd387ce669b861c3c19afe9e43c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 147942,
+        "upload_time": "2023-02-08T16:24:16",
+        "upload_time_iso_8601": "2023-02-08T16:24:16.896457Z",
+        "url": "https://files.pythonhosted.org/packages/2c/a9/64f20ed0d29b3167d42e0735d8030e0ad98d90912248990ca0d06d01ffe5/chapps-0.5.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a932eed0fd0d24b12bf2dcdae6c671489f9b1268fcf31835f1bdaa18bc35795a",
+          "md5": "3ba23f8250ccb0bfd873bb4175ef9232",
+          "sha256": "79ce52b78cc9ebb5d71a62c7fdc0e79cb551a864de55f0f5395842aee207eb50"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3ba23f8250ccb0bfd873bb4175ef9232",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 148891,
+        "upload_time": "2023-03-17T18:29:01",
+        "upload_time_iso_8601": "2023-03-17T18:29:01.002268Z",
+        "url": "https://files.pythonhosted.org/packages/a9/32/eed0fd0d24b12bf2dcdae6c671489f9b1268fcf31835f1bdaa18bc35795a/chapps-0.5.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8329a139d0af22aba1b17360ccb682edf860f373031cc7b40f4a6039a7d4fa08",
+          "md5": "c6379ea6eb4f7c95eff0429d7643491c",
+          "sha256": "4f53689f983603e9baf554b8096b9b0fa41ad9176c426ca36a04f458ab4839cc"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c6379ea6eb4f7c95eff0429d7643491c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 149244,
+        "upload_time": "2023-03-22T19:28:17",
+        "upload_time_iso_8601": "2023-03-22T19:28:17.270642Z",
+        "url": "https://files.pythonhosted.org/packages/83/29/a139d0af22aba1b17360ccb682edf860f373031cc7b40f4a6039a7d4fa08/chapps-0.5.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc1326aba0f526d9764c353a15bd1316a258ec6f53438c1ce7a2639cee6cf828",
+          "md5": "603070bfaf3cf51a52d4c9c810dbb22e",
+          "sha256": "753baf0d0394030f9e01b4fdbb131cfb07ff665b2da3862c60d2abc977b6f681"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "603070bfaf3cf51a52d4c9c810dbb22e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 149316,
+        "upload_time": "2023-03-24T14:36:23",
+        "upload_time_iso_8601": "2023-03-24T14:36:23.897026Z",
+        "url": "https://files.pythonhosted.org/packages/fc/13/26aba0f526d9764c353a15bd1316a258ec6f53438c1ce7a2639cee6cf828/chapps-0.5.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6bfae43d01bb8182eb50d3b362ec817f490f7da63d4e58ee1a97340baa615d00",
+          "md5": "b49d3b682027ff2ee9ca762edb25e7f5",
+          "sha256": "7f63a7bbc9e6c5183b1cf692ed1777a6a4da9bdb0df657b8095f9fc80f10eab9"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b49d3b682027ff2ee9ca762edb25e7f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 143114,
+        "upload_time": "2022-09-21T16:25:51",
+        "upload_time_iso_8601": "2022-09-21T16:25:51.144582Z",
+        "url": "https://files.pythonhosted.org/packages/6b/fa/e43d01bb8182eb50d3b362ec817f490f7da63d4e58ee1a97340baa615d00/chapps-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a4b3a785b379a1bdc966d3a392984d8de4120329bef8709e8b5fa0eeb58fc0f3",
+          "md5": "6160b4ac2471a2fafb397a205824837e",
+          "sha256": "8848f8f5d85545fe01eb703e04881d07802a66635b42af1dac8d77761cd5e150"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6160b4ac2471a2fafb397a205824837e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 144821,
+        "upload_time": "2022-10-04T19:01:15",
+        "upload_time_iso_8601": "2022-10-04T19:01:15.385900Z",
+        "url": "https://files.pythonhosted.org/packages/a4/b3/a785b379a1bdc966d3a392984d8de4120329bef8709e8b5fa0eeb58fc0f3/chapps-0.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "419a3f67e96c50e43d427324eab63f75e4920303473a1d6b3c75e1182cc43293",
+          "md5": "a3b3a45180a33a407cbad64ea6e89a5e",
+          "sha256": "902857ae142fbbb9e87b702106352724fdce1ec1747427439e019d20a2dbbb00"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a3b3a45180a33a407cbad64ea6e89a5e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 144973,
+        "upload_time": "2022-10-05T16:23:18",
+        "upload_time_iso_8601": "2022-10-05T16:23:18.289216Z",
+        "url": "https://files.pythonhosted.org/packages/41/9a/3f67e96c50e43d427324eab63f75e4920303473a1d6b3c75e1182cc43293/chapps-0.5.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "784ddf839097e6543c4ce31767b77f80840f0e08c5c5c08a8dd0e455c217e6b4",
+          "md5": "14c71a9cbf655ca61fed3a55b8361e98",
+          "sha256": "ea2930c9a3dd915720de5e2acb3f989053a2c092d7eed0632189bd00335aba80"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14c71a9cbf655ca61fed3a55b8361e98",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 146298,
+        "upload_time": "2022-10-06T19:54:19",
+        "upload_time_iso_8601": "2022-10-06T19:54:19.799950Z",
+        "url": "https://files.pythonhosted.org/packages/78/4d/df839097e6543c4ce31767b77f80840f0e08c5c5c08a8dd0e455c217e6b4/chapps-0.5.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf861bb38f4a573dd919111be164f5efb4d81ef0c6aa6cf607d1b70390030428",
+          "md5": "91906d55e90fdf0f4c397fb2e3a6c103",
+          "sha256": "7becf999bc567f00312f72072f967628141c83674aaf5e3e51eae6409514e302"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "91906d55e90fdf0f4c397fb2e3a6c103",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 146779,
+        "upload_time": "2022-10-17T19:11:37",
+        "upload_time_iso_8601": "2022-10-17T19:11:37.610540Z",
+        "url": "https://files.pythonhosted.org/packages/bf/86/1bb38f4a573dd919111be164f5efb4d81ef0c6aa6cf607d1b70390030428/chapps-0.5.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "558dd1c4a8dcc6ef974b09ce95fb1280d4298d007dbddbbc375111e8ad90fdca",
+          "md5": "9e0f9c22f001c6bfa9a91c8d0d44267a",
+          "sha256": "548544bfc2ae03caee6d65d7d964d23f352904ee196f6b7a4122d5426c3b2180"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e0f9c22f001c6bfa9a91c8d0d44267a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 143528,
+        "upload_time": "2022-10-17T20:46:25",
+        "upload_time_iso_8601": "2022-10-17T20:46:25.946713Z",
+        "url": "https://files.pythonhosted.org/packages/55/8d/d1c4a8dcc6ef974b09ce95fb1280d4298d007dbddbbc375111e8ad90fdca/chapps-0.5.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8bd5df296714fc041bace5eebcd3fac4e9bf39aad4f50f2ef9de28c41d76e739",
+          "md5": "f9cfd192d611eec52db1d528078c4614",
+          "sha256": "2ba6688b6d32f2d6fe1e88a914fc0b24a75c50a95e9f7a3884390c444a80cf08"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f9cfd192d611eec52db1d528078c4614",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 143692,
+        "upload_time": "2022-10-17T21:44:43",
+        "upload_time_iso_8601": "2022-10-17T21:44:43.985672Z",
+        "url": "https://files.pythonhosted.org/packages/8b/d5/df296714fc041bace5eebcd3fac4e9bf39aad4f50f2ef9de28c41d76e739/chapps-0.5.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1368799ffd52fb5d3e27c59e86c866a2bddd87f357cbe1e6b2f5a4aa350040f0",
+          "md5": "171f1878ff7868c766c4abb7df83618a",
+          "sha256": "04a00b712f2bd23891f52d2628178c62a0563442da5f6ea0d512b3489ba9be6c"
+        },
+        "downloads": -1,
+        "filename": "chapps-0.5.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "171f1878ff7868c766c4abb7df83618a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 143788,
+        "upload_time": "2022-10-18T13:24:36",
+        "upload_time_iso_8601": "2022-10-18T13:24:36.442331Z",
+        "url": "https://files.pythonhosted.org/packages/13/68/799ffd52fb5d3e27c59e86c866a2bddd87f357cbe1e6b2f5a4aa350040f0/chapps-0.5.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fc1326aba0f526d9764c353a15bd1316a258ec6f53438c1ce7a2639cee6cf828",
+        "md5": "603070bfaf3cf51a52d4c9c810dbb22e",
+        "sha256": "753baf0d0394030f9e01b4fdbb131cfb07ff665b2da3862c60d2abc977b6f681"
+      },
+      "downloads": -1,
+      "filename": "chapps-0.5.15.tar.gz",
+      "has_sig": false,
+      "md5_digest": "603070bfaf3cf51a52d4c9c810dbb22e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 149316,
+      "upload_time": "2023-03-24T14:36:23",
+      "upload_time_iso_8601": "2023-03-24T14:36:23.897026Z",
+      "url": "https://files.pythonhosted.org/packages/fc/13/26aba0f526d9764c353a15bd1316a258ec6f53438c1ce7a2639cee6cf828/chapps-0.5.15.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

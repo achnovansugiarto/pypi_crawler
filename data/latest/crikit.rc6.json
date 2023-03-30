@@ -1,0 +1,394 @@
+{
+  "info": {
+    "author": "CRIKit Team",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "# CRIKit: The Constitutive Relation Inference Toolkit\n\n[**Quick Start** ](#quick-start)|[ **Documentation** ](https://crikit.science)|[ **Installation Guide** ](#installation)\n\n## Overview\n\nCRIKit integrates [FEniCS] and [Pyadjoint] with machine learning libraries\nlike [JAX] and [TensorFlow], and provides tools to infer physically-compatible constitutive relations from sparse, noisy observations of a system modeled by partial differential equations. CRIKit bridges the FEniCS world with those of\nJAX and TensorFlow by storing [covering maps] between abstract `Space` classes that\nrepresent spaces like a FEniCS `FunctionSpace` or a space of JAX arrays of a\nparticular shape, or a [direct sum] of multiple `Space`s.\n\n![](https://gitlab.com/crikit/crikit/-/raw/main/images/diagram.png)\n\nCRIKit also provides tools to help perform post-processing, such as observation operators, as well as a collection of loss functions.\n\n## Quick Start\n\n### Constructing And Optimizing a CR\n\nThis guide will show you the basics of constructing and optimizing a simple CR\nthat represents linear elasticity, assuming that you're already familiar with\nthe basics of [FEniCS]. You can compare the mechanics of CRIKit to that of FEniCS\ndirectly by comparing this example to [the 2D linear elasticity example] from\n[Numerical tours of Computational Mechanics using FEniCS]. The primary difference\nbetween the model shown here and the linked example in the previous sentence is that\nhere we use a geometrically nonlinear model, as described in the documentation for\nthe [libCEED hyperelasticity example].\n\n```python\nfrom crikit import *\nimport jax\nfrom jax import numpy as jnp\nimport numpy as np\nfrom functools import partial\n\n# set up mesh, FunctionSpace, etc\nfe_order = 2\ndims = 2\nNx, Ny = 50, 5\nL = 20.\nH = 1.\nmesh = RectangleMesh(Point(0., 0.), Point(L, H), Nx, Ny)\nV = VectorFunctionSpace(mesh, \"CG\", fe_order)\nquad_params = {'quadrature_degree' : fe_order + 1}\nset_default_covering_params(domain=mesh.ufl_domain(),\n                            quad_params=quad_params)\nu = Function(V)\n\ndef left_boundary(x, on_boundary):\n    return near(x[0], 0.)\n\nbcs = [DirichletBC(V, Constant((0., 0.)), left_boundary)]\n\n# these will tell CRIKit what the inputs and ouputs to the CR\n# are so that we can automatically generate the scalar and form-invariants\n# Let's suppose you want the Cauchy stress tensor as a function of the\n# strain sym(grad(u))\ninput_types = (TensorType.make_symmetric(2, dims, 'strain'),)\noutput_type = TensorType.make_symmetric(2, dims, 'stress')\n\n# initial guess of parameters\nYoungs = 1.0e5\nPoisson = 0.3\n\nlmbda = (Youngs * Poisson) / ((1 + Poisson) * (1 - 2 * Poisson))\nmu = Youngs / (2 * (1 + Poisson))\n# since this is 2-d, we need to use a modified version of lambda\n# to make our initial guesses physical\nlmbda = 2 * lmbda * mu / (lmbda + 2 * mu)\n\ntheta = array([lmbda, mu])\n\ndef cr_func(invariants, theta):\n    lmbda, mu = theta\n    return jnp.array([lmbda * jnp.log1p(invariants[0]), 2 * mu])\n\ncr = CR(output_type, input_types, cr_func, params=[theta])\n\n\n# If you're in a Jupyter notebook, run this at the bottom of a cell instead of\n# calling `print()` on it to get neatly-rendered HTML output.\n# This function shows you a description of the scalar and form invariants of `cr`\n# in the order they are placed in the arrays\nprint(cr.invariant_descriptions())\n\n# set the default covering params for crikit.covering so we can automatically\n# generate covering maps between spaces of FEniCS Functions and JAX arrays\n# Let's just pretend that degree 3 is sufficient quadrature for whatever problem\n# we're solving\nquad_params = {'quadrature_degree' : 3}\nset_default_covering_params(domain=mesh.ufl_domain(), quad_params=quad_params)\n\n# create_ufl_standins() returns a tuple of objects that can act as standins\n# for the output of a CR. You can't directly call the CR on the inputs because\n# the CR expects JAX arrays as an input, not a FEniCS Function. You'll instead have\n# to assembly the variational form F using assemble_with_cr(), which will generate\n# a covering map from the space of FEniCS Functions to the space of JAX arrays\n# using crikit.covering (and likewise from the output JAX array space to a space of\n# `crikit.fe.Function`s), use it to get appropriate arguments, call the CR, and project the result\n# back into a Function\ntarget_shape = tuple(i for i in cr.target.shape() if i != -1)\n\nstandin_sigma, = create_ufl_standins((target_shape,))\n\n# create your form as if standin_sigma were (cr(sym(grad(u)))\nv = TestFunction(V)\n# external force\nf = Constant((0,-1e-3), name='force')\nF = inner(standin_sigma, sym(grad(v))) * dx - inner(f, v) * dx\n\n# define a new sub-tape that records the actions of this equation\nwith push_tape():\n     # a function that we can assemble the variational form into\n     # using the `tensor` kwarg of `crikit.assemble()`, which\n     # is directly passed on to `crikit.fe.backend.assemble()` \n     # (e.g. `fenics.assemble()`)\n     residual = Function(V)\n\n     # input to the CR is sym(grad(u))\n     assemble_with_cr(F, cr, sym(grad(u)), standin_sigma, tensor=residual,\n     \t\t      quad_params=quad_params)\n     ucontrol = Control(u)\n     # a ReducedFunction to represent the residual as a function of `u`\n     res_rf = ReducedFunction(residual, ucontrol)\n\n# an object to represent the equation defined above\nred_eq = ReducedEquation(res_rf, bcs, homogenize_bcs(bcs))\n\n# and an object to solve it. Make sure your .petscrc is set appropriately!\n# if you want to pass an assembled Jacobian, use 'jmat_type' : 'assembled',\n# but if you want the solver to instead use the matrix-free Jacobian action,\n# pass 'jmat_type' : 'action'\nsolver = SNESSolver(red_eq, {'jmat_type' : 'assembled'})\npred_u = solver.solve(ucontrol)\n\n# define a loss function and an observer\n\nnum_slices = 100\nseed = 0\n# sliced quadratic Wasserstein distance\nloss = SlicedWassersteinDistance(V, num_slices, jax.random.PRNGKey(seed), p=2)\n\nclass ObservedSubDomain(SubDomain):\n      def inside(self, x, on_boundary):\n      \t  ... # return appropriate True/False if x is in the observed subdomain or not\n\n# observe only on a given SubDomain\nobserver = SubdomainObserver(mesh, ObservedSubDomain())\n\n# get your observations from somewhere as a Function in V\nobs = ...\n\nerr = loss(observer(obs), observer(pred_u))\n\n\nJhat = ReducedFunctional(err, Control(theta))\n\n#check the derivative\nh = np.random.randn(*theta.shape)\nv = array(1.0) # test the adjoint\nassert taylor_test(Jhat, theta, h, v=v) >= 1.9\n\n# choose an optimization method\nopt_method = 'L-BFGS-B'\noptimal_params = minimize(Jhat, method=opt_method)\n```\n\n## Installation\n\nFirst, install [FEniCS]. Then you can install the latest development\nversion of this package by running\n\n    pip install .\n\nor, to install in editable mode (useful for devs),\n\n    pip install -e .\n\nThere are four optional sets of dependencies that can be installed by listing\nany of them (with no spaces) in square brackets. Or if you want to install all\nof them, you can use the key `all`, so the two lines below are equivalent.\n\n    pip install -e .[test,visualization,tensorflow,doc]\n    pip install -e .[all]\n\n\nIf you would rather install the latest release version of CRIKit, you can\ninstead run\n\n    pip install crikit\n\nMake sure you have install CRIKit into an environment with a working FEniCS\ninstallation, or the build might fail. In particular, if you encounter\nerrors building `petsc4py`, ensure that the FEniCS installation in your\nenvironment works.\n\n### Setting Up a Conda Environment\n\nFEniCS provides a conda package, so installation into a conda environment is simple.\n\n```shell\nconda create --name fenics2019 python=3.7 --no-default-packages -y -q\nconda activate fenics2019\n\nconda install -c conda-forge fenics=2019.1.0 -y -q\npip install -e .[all]\n```\n\nWhenever you want to enter this environment, run `conda activate fenics2019`.\n\n## Documentation\n\nDocumentation is done with [Sphinx].\n\nDocumentation can be built by running `make` in the `docs` folder. By default,\nthat will create HTML documentation in `docs/build/html`, and you can view it by\nopening up `docs/build/html/index.html` in your favorite browser.\n\nRun `make todo=true` to include Todo blocks in the output. Otherwise, they won't show up.\n\nYou can also run `make help` to see a list of other formats that can be built. For instance,\n\n- `make coverage` creates a file showing what classes/functions are missing documentation.\n- `make doctest` tests the example code in the documentation.\n\n\n## Examples\n\nExample programs are in the `examples` folder. Run with the `--help` argument to\nsee command-line parameters. For example,\n\n    cd examples/p-stokes\n    python p-stokes.py --help\n\n## Tests\n\nYou can run the main tests with the command below.\n\n    python3 -m pytest tests\n\nYou can run a specific test by running `python3 -m pytest tests -k test_name`,\nwhere `test_name` is all or part of the test name. For example,\n\n    python3 -m pytest tests/crikit/test_assemble_with_cr.py -k test_assemble_with_cr_scalar\n\nor\n\n    python3 -m pytest tests/crikit/test_assemble_with_cr.py -k scalar\n\nSome implementation files and documentation files have doctests. Those can be run like so:\n\n    python -m pytest --doctest-modules --rootdir tests crikit\n    cd docs && make doctest\n\n## Developer style guidelines\n\nCRIKit uses the auto-formatter [black] to ensure the code has a consistent style. To automatically\nrun it before each git commit, use the following commands.\n\n    pip install -e .[dev]\n    pre-commit install\n\n\n## Support\n\nThis material is based upon work supported by the National Science Foundation under Grant No. 1835825 and 1835792.\nAny opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation.\n\n\n[FEniCS]: https://fenicsproject.org/download/\n[Sphinx]: https://www.sphinx-doc.org/\n[black]: https://github.com/psf/black\n[JAX]: https://github.com/google/jax\n[Pyadjoint]: https://github.com/dolfin-adjoint/pyadjoint\n[TensorFlow]: https://tensorflow.org\n[covering maps]: https://en.wikipedia.org/wiki/Covering_space\n[direct sum]: https://en.wikipedia.org/wiki/Direct_sum\n[the 2D linear elasticity example]: https://comet-fenics.readthedocs.io/en/latest/demo/elasticity/2D_elasticity.py.html\n[Numerical tours of Computational Mechanics using FEniCS]: https://comet-fenics.readthedocs.io/en/latest/index.html\n[libCEED hyperelasticity example]: https://libceed.readthedocs.io/en/latest/examples/solids/#hyperelasticity-at-small-strain\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.com/crikit/crikit",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "crikit",
+    "package_url": "https://pypi.org/project/crikit/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/crikit/",
+    "project_urls": {
+      "Bug Tracker": "https://gitlab.com/crikit/crikit/issues",
+      "Documentation": "https://crikit.science/documentation",
+      "Homepage": "https://gitlab.com/crikit/crikit"
+    },
+    "release_url": "https://pypi.org/project/crikit/0.1.5/",
+    "requires_dist": [
+      "dolfin-adjoint (>=2019.1.1)",
+      "numpy",
+      "autograd",
+      "petsc4py (>=3.11.0)",
+      "jax",
+      "jaxlib",
+      "pytest (>=3.10) ; extra == 'all'",
+      "pytest-rerunfailures ; extra == 'all'",
+      "flake8 ; extra == 'all'",
+      "coverage ; extra == 'all'",
+      "matplotlib ; extra == 'all'",
+      "flax ; extra == 'all'",
+      "tensorflow (>=2.0) ; extra == 'all'",
+      "sphinx ; extra == 'all'",
+      "myst-nb ; extra == 'all'",
+      "sphinxcontrib-bibtex ; extra == 'all'",
+      "sphinxcontrib-katex ; extra == 'all'",
+      "pydata-sphinx-theme ; extra == 'all'",
+      "linkify-it-py ; extra == 'all'",
+      "black ; extra == 'all'",
+      "pre-commit ; extra == 'all'",
+      "build ; extra == 'all'",
+      "black ; extra == 'dev'",
+      "pre-commit ; extra == 'dev'",
+      "build ; extra == 'dev'",
+      "sphinx ; extra == 'doc'",
+      "myst-nb ; extra == 'doc'",
+      "sphinxcontrib-bibtex ; extra == 'doc'",
+      "sphinxcontrib-katex ; extra == 'doc'",
+      "pydata-sphinx-theme ; extra == 'doc'",
+      "linkify-it-py ; extra == 'doc'",
+      "flax ; extra == 'flax'",
+      "tensorflow (>=2.0) ; extra == 'tensorflow'",
+      "pytest (>=3.10) ; extra == 'test'",
+      "pytest-rerunfailures ; extra == 'test'",
+      "flake8 ; extra == 'test'",
+      "coverage ; extra == 'test'",
+      "matplotlib ; extra == 'visualization'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Constitutive Relation Inference Toolkit",
+    "version": "0.1.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12141440,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "196efefe33e6eeb932d44d1cff4eb6e07134f9be15bc89bac6a72bd2f3c49c5c",
+          "md5": "3ca79d83ba6089e41588cd2b4fc6f310",
+          "sha256": "16d2a0eeba402e0b2b42419fd1af40242a59e5e62bae7a5c91d310534f13d501"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3ca79d83ba6089e41588cd2b4fc6f310",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 136937,
+        "upload_time": "2021-04-14T03:30:19",
+        "upload_time_iso_8601": "2021-04-14T03:30:19.994283Z",
+        "url": "https://files.pythonhosted.org/packages/19/6e/fefe33e6eeb932d44d1cff4eb6e07134f9be15bc89bac6a72bd2f3c49c5c/crikit-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e15aa14898b3a10d1984302ecd5ed0dfed43f26ceeae6902f157f12392aae9e8",
+          "md5": "41ca8515f1109c293a4232842c3ac2a6",
+          "sha256": "1d540cde0f02afb2087fcca7c6644835a7bd94d4a9cc7e7007f8810cf1b9d72c"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "41ca8515f1109c293a4232842c3ac2a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 189875,
+        "upload_time": "2021-04-14T03:30:22",
+        "upload_time_iso_8601": "2021-04-14T03:30:22.060916Z",
+        "url": "https://files.pythonhosted.org/packages/e1/5a/a14898b3a10d1984302ecd5ed0dfed43f26ceeae6902f157f12392aae9e8/crikit-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0446a7518a6700a2c564b9a3a6c58b4c8da515faa3467a08bad6f8c398b00bbd",
+          "md5": "0e4a5dd423ef9c4c068a4a1446a7e18e",
+          "sha256": "7114194c00ce4ff2ca0ee0dd47a8fdf1e952e20fd464f2b3f40ece858c95711c"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0e4a5dd423ef9c4c068a4a1446a7e18e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 137601,
+        "upload_time": "2021-06-03T23:45:38",
+        "upload_time_iso_8601": "2021-06-03T23:45:38.907605Z",
+        "url": "https://files.pythonhosted.org/packages/04/46/a7518a6700a2c564b9a3a6c58b4c8da515faa3467a08bad6f8c398b00bbd/crikit-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "158831c790de3f8e3890da1f79d44fefdc6cbf92772205ff168333ea37f048b3",
+          "md5": "388f1fd8cd87525c8521bdf6c879f9f1",
+          "sha256": "31c4597c84520d101e08ea26d6843dc21d7d61c3e9c28dad7b4be5d5716605c1"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "388f1fd8cd87525c8521bdf6c879f9f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 190399,
+        "upload_time": "2021-06-03T23:45:40",
+        "upload_time_iso_8601": "2021-06-03T23:45:40.581423Z",
+        "url": "https://files.pythonhosted.org/packages/15/88/31c790de3f8e3890da1f79d44fefdc6cbf92772205ff168333ea37f048b3/crikit-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de0bc1f8b9254ddd5fd9b5cf004ee4e6beade3e437aaf587e4c9806d0c7f4037",
+          "md5": "d7c7e098bfe360e4cc581d92d7dd3c2f",
+          "sha256": "3e1733763f7486aba5b33ef11d02f8b5bc16acbbb0587b1b7977d5512491a78a"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d7c7e098bfe360e4cc581d92d7dd3c2f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 138169,
+        "upload_time": "2021-08-11T23:09:50",
+        "upload_time_iso_8601": "2021-08-11T23:09:50.041141Z",
+        "url": "https://files.pythonhosted.org/packages/de/0b/c1f8b9254ddd5fd9b5cf004ee4e6beade3e437aaf587e4c9806d0c7f4037/crikit-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3a83f31e649b517e4d520068366e5f20649a05d7487b607b3f432f5a9879577f",
+          "md5": "ea1f2ab43e6bab7fae2a26a376fa3644",
+          "sha256": "531f0ea0c9becc9d05f9fda9491576d9be2cdaa26764ab388aa705e6f153b2f3"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ea1f2ab43e6bab7fae2a26a376fa3644",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 191418,
+        "upload_time": "2021-08-11T23:09:52",
+        "upload_time_iso_8601": "2021-08-11T23:09:52.203315Z",
+        "url": "https://files.pythonhosted.org/packages/3a/83/f31e649b517e4d520068366e5f20649a05d7487b607b3f432f5a9879577f/crikit-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e57bb433267c2233e44ad62bc9b103433b281290d2bfefccd75faf07b25560f0",
+          "md5": "d400fd95842a2521c5ca0971a5a5e776",
+          "sha256": "03a988bc9c4b328ef9ec08dd2bc96fc9f0f69c29fc170fa7a8d4c0b0c11831d0"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d400fd95842a2521c5ca0971a5a5e776",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 139275,
+        "upload_time": "2021-09-17T17:29:22",
+        "upload_time_iso_8601": "2021-09-17T17:29:22.858783Z",
+        "url": "https://files.pythonhosted.org/packages/e5/7b/b433267c2233e44ad62bc9b103433b281290d2bfefccd75faf07b25560f0/crikit-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5be40ec11d2cd614f84f5f548a6ce4f84e380d540704f834bccccc487536fdc9",
+          "md5": "ae50bdde5cb78195a7a7b87c854cc9aa",
+          "sha256": "7a2ec9b419ab28d37b3a020976b101ac09f1368ebb0571bc325ad6caacc21747"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ae50bdde5cb78195a7a7b87c854cc9aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 192314,
+        "upload_time": "2021-09-17T17:29:25",
+        "upload_time_iso_8601": "2021-09-17T17:29:25.554775Z",
+        "url": "https://files.pythonhosted.org/packages/5b/e4/0ec11d2cd614f84f5f548a6ce4f84e380d540704f834bccccc487536fdc9/crikit-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "207ed5d10fdb3c91a32413cb96c96f603dfcaea4c3ff3916bc3cfc982f362e00",
+          "md5": "a9e62ba47882ea2e82c46e5c9c19bb21",
+          "sha256": "7ec60c48b0a6b9374d7c096fde567cc6dc8b4d055a4b9c5274bf8cb208bf4c6e"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a9e62ba47882ea2e82c46e5c9c19bb21",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 139299,
+        "upload_time": "2021-10-14T03:36:40",
+        "upload_time_iso_8601": "2021-10-14T03:36:40.664883Z",
+        "url": "https://files.pythonhosted.org/packages/20/7e/d5d10fdb3c91a32413cb96c96f603dfcaea4c3ff3916bc3cfc982f362e00/crikit-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07efa5ed1d2c06750f9e44cfa7106ba87955f858c07324d4edebbfc657d44786",
+          "md5": "8b15087003cc51dcf214282b60291ac6",
+          "sha256": "5c2a04bb9ea408f5a62eaf5c995e0db45a48b104d6aaed2dd3d73f096f7c9eeb"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8b15087003cc51dcf214282b60291ac6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 194711,
+        "upload_time": "2021-10-14T03:36:43",
+        "upload_time_iso_8601": "2021-10-14T03:36:43.682106Z",
+        "url": "https://files.pythonhosted.org/packages/07/ef/a5ed1d2c06750f9e44cfa7106ba87955f858c07324d4edebbfc657d44786/crikit-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f0ca1d5e9ed8042e43c18aaff05280ba024f1c79e2d9b71722136792dc32d24",
+          "md5": "dfe67aa92024c5308bd50339f88c7761",
+          "sha256": "419229b64504ec6e0471252600cff3701921d5eabea63866551655fe51886195"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dfe67aa92024c5308bd50339f88c7761",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 144619,
+        "upload_time": "2021-11-27T19:44:52",
+        "upload_time_iso_8601": "2021-11-27T19:44:52.066179Z",
+        "url": "https://files.pythonhosted.org/packages/4f/0c/a1d5e9ed8042e43c18aaff05280ba024f1c79e2d9b71722136792dc32d24/crikit-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac607f305d70fa9b6f59fcaf19e5bf9ab9b838c706fb195ea26852ecf57f56af",
+          "md5": "f582a5489355144f7d1bbe39f718a78b",
+          "sha256": "02434dd7b9c810daa02bbbc824cc3a4c078f7d50ad76a643dd550d862d5df33d"
+        },
+        "downloads": -1,
+        "filename": "crikit-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f582a5489355144f7d1bbe39f718a78b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 198800,
+        "upload_time": "2021-11-27T19:44:54",
+        "upload_time_iso_8601": "2021-11-27T19:44:54.322212Z",
+        "url": "https://files.pythonhosted.org/packages/ac/60/7f305d70fa9b6f59fcaf19e5bf9ab9b838c706fb195ea26852ecf57f56af/crikit-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4f0ca1d5e9ed8042e43c18aaff05280ba024f1c79e2d9b71722136792dc32d24",
+        "md5": "dfe67aa92024c5308bd50339f88c7761",
+        "sha256": "419229b64504ec6e0471252600cff3701921d5eabea63866551655fe51886195"
+      },
+      "downloads": -1,
+      "filename": "crikit-0.1.5-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "dfe67aa92024c5308bd50339f88c7761",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 144619,
+      "upload_time": "2021-11-27T19:44:52",
+      "upload_time_iso_8601": "2021-11-27T19:44:52.066179Z",
+      "url": "https://files.pythonhosted.org/packages/4f/0c/a1d5e9ed8042e43c18aaff05280ba024f1c79e2d9b71722136792dc32d24/crikit-0.1.5-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ac607f305d70fa9b6f59fcaf19e5bf9ab9b838c706fb195ea26852ecf57f56af",
+        "md5": "f582a5489355144f7d1bbe39f718a78b",
+        "sha256": "02434dd7b9c810daa02bbbc824cc3a4c078f7d50ad76a643dd550d862d5df33d"
+      },
+      "downloads": -1,
+      "filename": "crikit-0.1.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f582a5489355144f7d1bbe39f718a78b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 198800,
+      "upload_time": "2021-11-27T19:44:54",
+      "upload_time_iso_8601": "2021-11-27T19:44:54.322212Z",
+      "url": "https://files.pythonhosted.org/packages/ac/60/7f305d70fa9b6f59fcaf19e5bf9ab9b838c706fb195ea26852ecf57f56af/crikit-0.1.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

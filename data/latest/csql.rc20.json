@@ -1,0 +1,985 @@
+{
+  "info": {
+    "author": "Jarrad Whitaker",
+    "author_email": "akdor1154@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Database"
+    ],
+    "description": "\n# csql - Composeable SQL\n\n<!-- (intro)= -->\n\n**csql** is a Python library to help you write more manageable SQL queries. You can write your queries as small, self-contained chunks, preview the results without pulling a whole result-set down from your database, then refer to them in future queries.\n\nThere are also useful features for handling database parameters properly.\n\nThe intended use-case is for data analysis and exploration.\n\n[![PyPI version](https://badge.fury.io/py/csql.svg)](https://pypi.org/project/csql/)\n\n**Full documentation** is available at https://csql.readthedocs.io/en/latest/api.html .\n\n## Example\n\n```py\nfrom csql import Q, Parameters\nimport pandas as pd\nfrom datetime import date\n\ncon = your_database_connection()\n```\n\nStart with a straightforward query:\n```py\np = Parameters(\n\tcreated_on = date(2020,1,1)\n)\nq1 = Q(f\"\"\"\nselect\n\tcustomers.id,\n\tfirst(customers.name) as name,\n\tfirst(created_on) as created_on,\n\tsum(sales.value) as sales\nfrom\n\tcustomers\n\tjoin sales on customers.id = sales.customer_id\nwhere created_on > {p['created_on']}}\ngroup by customers.id\n\"\"\")\n\nprint(q1.preview_pd(con))\n```\n\n|  | id | name | created_on | sales |\n|--|----|------|------------|-------|\n|1 |111 |John Smith | 2020-02-05 | 32.0 |\n|2 |112 |Amy Zhang | 2020-05-01 | 101.5 |\n|3 |115 |Tran Thanh | 2020-03-02 | 100000.0 |\n\n\nThe preview will pull down 10 rows to a) sanity-check the result of what you've just written, and b) validate your sql.\n\n-----\n\nNow, try building some new queries *that build on your previous queries*:\n```py\nq2 = Q(f\"\"\"\nselect\n\tntile(100) over (order by sales)\n\t\tas ntile_100,\n\tname,\n\tsales\nfrom {q1}\n\"\"\")\n\nprint(q2.preview_pd(con))\n```\n\n|  | ntile_100 | name | sales |\n|--|-----------|------|-------|\n| 1|29| John Smith| 32.0 |\n| 2|50|Amy Zhang | 101.5 |\n| 3|99|Tran Thanh | 100000.0 |\n\n-----\n\n```py\nq3 = Q(f\"\"\"\nselect\n\tntile_100,\n\tmin(sales),\n\tmax(sales)\nfrom {q2}\ngroup by ntile_100\norder by ntile_100\n\"\"\")\n\n# this time, we'll pull the whole result instead of just previewing:\nresult = pd.read_sql(**q3.pd(), con=con)\nprint(result)\n```\n|  | ntile_100 | min(sales) | max(sales) |\n|--|-----------|----------|--------------|\n| 28| 29 | 25 | 33.3 |\n| 49| 50 | 98 | 120 |\n| 98| 99 | 5004 | 100000.0 |\n\n-----\n\n## Cool! But, how does it work?\n\nThe basic idea is to turn your queries into a CTE by keeping track of what builds on top of what. For example, for the last query shown, `q3`, what actually gets sent to the database is:\n\n```sql\nwith _subQuery0 as (\n\tselect\n\t\tcustomers.id,\n\t\tfirst(customers.name) as name,\n\t\tfirst(created_on) as created_on,\n\t\tsum(sales.value) as sales\n\tfrom\n\t\tcustomers\n\t\tjoin sales on customers.id = sales.customer_id\n\twhere created_on > :1\n\tgroup by customers.id\n),\n_subQuery1 as (\n\tselect\n\t\tntile(100) over (order by sales)\n\t\t\tas ntile_100,\n\t\tname,\n\t\tsales\n\tfrom _subQuery0\n)\nselect\n\tntile_100,\n\tmin(sales),\n\tmax(sales)\nfrom _subQuery1\ngroup by ntile_100\norder by ntile_100\n```\n\nwhich is exactly the sort of unmaintainable and undebuggable monstrosity that this library is designed to help you avoid.\n\n\n<!-- (end-intro)= -->\n\n## Design Notes\n\nI am perhaps overly optimistic about this, but currently I think this should work with most SQL dialects. It doesn't attempt to parse your SQL, uses CTEs which are widely supported, and passes numeric style parameters.\nIt's also not actually tied to `pandas` at all - `.pd()` is just a convenience method to build a dict you can splat into pd.read_sql.\n\n## Easy Parameters\n\n<!-- (params)= -->\n\nUsing proper SQL prepared statements is great to do, but can be annoying to maintain. Additionally, it can be incredibly\nannoying when you are trying to use a list from Python:\n\n```py\ncon = my_connection()\nids_i_want = [1, 2, 3]\nwith con.cursor() as c:\n\t# uh oh, you can't do this\n\tc.execute('select * from customers where id in :1', (ids_i_want,))\n\n\t# you need to do something like this instead\n\tc.execute('select * from customers where id in (:1, :2, :3), (ids_i_want[0], ids_i_want[1], ids_i_want[2],))\n```\n\n`csql` makes this much easier - you can embed your parameters naturally with string interpolation, and they will still be\nsent as proper parameterized statements.\n\n```py\np = Parameters(\n\tids_i_want = [1, 2, 3],\n\tname = 'Jarrad'\n)\n\nget_customers = Q(f'''\n\tselect * from customers\n\twhere\n\t\tids in {p['ids_i_want']}\n\t\tor name = {p['name']}\n''')\n\nwith con.cursor() as c:\n\tc.execute(*get_customers.db)\n```\n\nThat final statement is actually equivalent to:\n\n```py\nwith con.cursor() as c:\n\tc.execute('''\n\t\tselect * from customers\n\t\twhere\n\t\t\tids in (:1, :2, :3)\n\t\t\tor name = :4\n\t''', [1, 2, 3, 'Jarrad'])\n```\n\n\n\n<!-- (end-params)= -->\n\n\n## Changing Parameter Values\n\n<!-- (reparam)= -->\n\nParameters aren't super useful if they are set in stone, but `csql` wants you\nto give values at the query definition time! How can you pass different values later?\n\nThis is achieved by passing `newParams` to {meth}`csql.Query.build`:\n\n```py\np = Parameters(\n  start=datetime.now() - timedelta(days=3),\n  end=datetime.now()\n)\nq = Q(f'select count(*) from events where start <= date and date < end')\npd.read_sql(**q.pd, con=con)\n# 42 # 3 days ago to now, as per `p`.\nnewParams = {'start': date(2010,1,1)}\npd.read_sql(**q.build(newParams=newParams).pd, con=con)\n# 42000 # 2010 to now, with new value for `start` provided.\n```\n\n<!-- (end-reparam)= -->\n\n## SQL Dialects\n\n<!-- (sql-dialects)= -->\n\nDifferent dialects can be specified at render time, or as the default dialect of your Queries. Currently the only things dialects control are parameter rendering and limits, but I expect to see some scope creep around here...\nDialects are instances of {class}`csql.dialect.SQLDialect` and can be found in {mod}`csql.dialect`. The default dialect is {class}`csql.dialect.DefaultDialect`, which uses a numeric parameter renderer. You can specify your own prefered dialect per-query:\n\n```py\nq = csql.Q(\n\tf\"select 1 from thinger\",\n\tdialect=csql.dialect.DuckDB\n)\n```\n\nIf you want to set a default, use `functools.partial` like so:\n\n```py\nimport functools\nQ = functools.partial(csql.Q, dialect=csql.dialect.DuckDB)\nq = Q(f\"select 1 from thinger\")\n```\n\n### Inferred Dialects\n\nIf a query `q2` references a previous query `q1`, and `q1` has a dialect specified, then `q2` will use `q1`'s dialect by default.\n\n```py\nq1 = csql.Q('select 1 from thinger', dialect=csql.dialect.Snowflake)\nq2 = csql.Q('select count(*) from {q1})\nassert q2.default_dialect == csql.dialect.Snowflake\n```\n\nIf you reference multiple queries with conflicting dialects, you'll get an error. Normally this is because you've actually\nforgotten to specify something somewhere. If you're doing this on purpose, override by setting `dialect=` to `Q` manually.\n\n### DIY Dialects \n\nYou can construct your own dialects:\n\n```py\nimport csql.dialect\nMyDialect = csql.dialect.SQLDialect(\n  paramstyle=csql.dialect.ParamStyle.qmark\n)\n```\n\nThere are presets for some common databases (see below), and I'm very happy to accept PRs for any\nothers.\n\n\n<!-- (end-sql-dialects)= -->\n\n\nHow to use Caching\n==================\n\n<!-- (persist)= -->\n\nOnce you have a few queries chained together, you may\nstart to get annoyed by how long one or two big things at the start\ntake, and wonder if there's a way to stop them being executed each time.\n\nFor example,\n\n```py\nq1 = Q(f'select id, date, rank() over (partition by name order by date) as rank from customers')\nq2 = Q(f'select date, count(*) from {q1}')\nprint(q2.preview_pd(con))\n# takes 2 mins becuase q1 is so slow\nprint(q2.preview_pd(con))\n# same thing again, also takes 2 mins\nq3 = Q(f'select max(date) from {q2}')\nprint(q3.preview_pd(con))\n# also takes 2 mins because q1 is so slow\n```\n\nThe solution is to use {meth}`csql.Query.persist` on the slow query you want to re-use.\nAbove, we could either do this on `q1` or `q2`, depending on what works best with\nour database. I'll demonstrate `q2`:\n\n```py\nq1 = Q(f'select id, date, rank() over (partition by name order by date) as rank from customers')\ncache = TempTableCacher(con)\nq2 = Q(f'select date, count(*) from {q1}').persist(cache) # <--- !!\nprint(q2.preview_pd(con))\n# still takes 2 mins\nprint(q2.preview_pd(con))\n# now this is fast!\nq3 = Q(f'select max(date) from {q2}')\nprint(q3.preview_pd(con))\n# now this is fast as well!\n```\n\nThe only general builtin caching method is {class}`csql.contrib.persist.TempTableCacher`, however it's straightforward\nto write your own. You may want to also see {mod}`csql.contrib.persist` as there is a Snowflake-specific example in there as well.\n\n<!-- (end-persist)= -->\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/akdor1154/python-csql",
+    "keywords": "sql,analytics",
+    "license": "LGPL-3.0-or-later",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "csql",
+    "package_url": "https://pypi.org/project/csql/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/csql/",
+    "project_urls": {
+      "Homepage": "https://github.com/akdor1154/python-csql",
+      "Repository": "https://github.com/akdor1154/python-csql"
+    },
+    "release_url": "https://pypi.org/project/csql/0.11.0/",
+    "requires_dist": [
+      "pandas (>=1.3.4,<2.0.0); extra == \"pandas\" or extra == \"docs\"",
+      "openpyxl (>=3.0.9,<4.0.0); extra == \"notebooks\"",
+      "duckdb (>=0.3.1,<0.4.0); extra == \"notebooks\"",
+      "ipykernel (>=6.6.0,<7.0.0); extra == \"notebooks\"",
+      "Sphinx (>=4.3.1,<5.0.0); extra == \"docs\"",
+      "sphinx-autobuild (>=2021.3.14,<2022.0.0); extra == \"docs\"",
+      "sphinx-rtd-theme (>=1.0.0,<2.0.0); extra == \"docs\"",
+      "sphinx-external-toc (>=0.2.3,<0.3.0); extra == \"docs\"",
+      "myst-parser[linkify] (>=0.16.1,<0.17.0); extra == \"docs\"",
+      "snowflake-connector-python (>=2.7.2,<3.0.0); extra == \"docs\""
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "Simple library for writing composeable SQL queries",
+    "version": "0.11.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12706459,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ced5b0f03853d5c4b0aeab09572d9adbe4288e37954d8c96f924ee85dee010a2",
+          "md5": "b0980d614a7fb642377a51b4b2247f83",
+          "sha256": "87329789224f7b031cadd45232e50d67cdf851484739a5f29d5ea5cb59316002"
+        },
+        "downloads": -1,
+        "filename": "csql-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0980d614a7fb642377a51b4b2247f83",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 7406,
+        "upload_time": "2020-10-23T04:28:58",
+        "upload_time_iso_8601": "2020-10-23T04:28:58.708944Z",
+        "url": "https://files.pythonhosted.org/packages/ce/d5/b0f03853d5c4b0aeab09572d9adbe4288e37954d8c96f924ee85dee010a2/csql-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "343a1b5ca24e47f593af793b3cb5199313e1287e51645850416b4db49173e0f9",
+          "md5": "6568569399cf039f1e8c1efaf7b25066",
+          "sha256": "8e4a45b5667faaad6ad52b7a5f0c59b9310f7e98941dc28c1228796d48ed38c8"
+        },
+        "downloads": -1,
+        "filename": "csql-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6568569399cf039f1e8c1efaf7b25066",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 5527,
+        "upload_time": "2020-10-23T04:29:01",
+        "upload_time_iso_8601": "2020-10-23T04:29:01.441340Z",
+        "url": "https://files.pythonhosted.org/packages/34/3a/1b5ca24e47f593af793b3cb5199313e1287e51645850416b4db49173e0f9/csql-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e9053f9ff2df2a63646c90b99fa25242332c9d22f1b97670a4c5e754be8f0e7",
+          "md5": "5453eae0f3a409f7dc85bca784e1c178",
+          "sha256": "9f5f7f1f10a48a67188895eb26c688c97225435315989d6d8d8d043b4e20f381"
+        },
+        "downloads": -1,
+        "filename": "csql-0.10.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5453eae0f3a409f7dc85bca784e1c178",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 28327,
+        "upload_time": "2022-01-10T08:11:01",
+        "upload_time_iso_8601": "2022-01-10T08:11:01.466226Z",
+        "url": "https://files.pythonhosted.org/packages/1e/90/53f9ff2df2a63646c90b99fa25242332c9d22f1b97670a4c5e754be8f0e7/csql-0.10.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5b9780fc9587b2624c8e12f0527293304ffc0e57bf108c16a30994fe8316946",
+          "md5": "21d84e6ec137eff8502569f40f24d9e8",
+          "sha256": "9117dff80e1c158feaa538949e895acffad2955de26f2aeba9858640ccbd21b0"
+        },
+        "downloads": -1,
+        "filename": "csql-0.10.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "21d84e6ec137eff8502569f40f24d9e8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25465,
+        "upload_time": "2022-01-10T08:11:02",
+        "upload_time_iso_8601": "2022-01-10T08:11:02.630973Z",
+        "url": "https://files.pythonhosted.org/packages/b5/b9/780fc9587b2624c8e12f0527293304ffc0e57bf108c16a30994fe8316946/csql-0.10.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fff72bd1db80fa743de21e4c842e54410f3fa665c265cb326d4abc05cd812cbe",
+          "md5": "a8c64889b9f6816f3d049a5260e44b7f",
+          "sha256": "f8c038729532aced96c170aa5a5d4d549f50032b2078c7b0fc306565fef99f7a"
+        },
+        "downloads": -1,
+        "filename": "csql-0.11.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a8c64889b9f6816f3d049a5260e44b7f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29933,
+        "upload_time": "2022-01-27T04:59:33",
+        "upload_time_iso_8601": "2022-01-27T04:59:33.570608Z",
+        "url": "https://files.pythonhosted.org/packages/ff/f7/2bd1db80fa743de21e4c842e54410f3fa665c265cb326d4abc05cd812cbe/csql-0.11.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db3b3e395b3f7134269a61a349caa1959dc9ed0f75ea53120e1582fefa676b44",
+          "md5": "28d3b275447999d165c1f51469889a41",
+          "sha256": "b60e20d0a59b9fb895cd5068eccdb671d5758ed10e6214a98b63538044337498"
+        },
+        "downloads": -1,
+        "filename": "csql-0.11.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28d3b275447999d165c1f51469889a41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26962,
+        "upload_time": "2022-01-27T04:59:35",
+        "upload_time_iso_8601": "2022-01-27T04:59:35.173345Z",
+        "url": "https://files.pythonhosted.org/packages/db/3b/3e395b3f7134269a61a349caa1959dc9ed0f75ea53120e1582fefa676b44/csql-0.11.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c4bf73d8de99483b94d6d283cae8ae6db4ba3bcf3d7e069e8e2aed472f1e6dc",
+          "md5": "a59d49d6a3469eaac280fa31f10a7efb",
+          "sha256": "91c95ef5f0de37cb1e3db4dcc9600ac84de29de901763542256e142483571727"
+        },
+        "downloads": -1,
+        "filename": "csql-0.11.0a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a59d49d6a3469eaac280fa31f10a7efb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29948,
+        "upload_time": "2022-01-14T04:44:11",
+        "upload_time_iso_8601": "2022-01-14T04:44:11.207034Z",
+        "url": "https://files.pythonhosted.org/packages/6c/4b/f73d8de99483b94d6d283cae8ae6db4ba3bcf3d7e069e8e2aed472f1e6dc/csql-0.11.0a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03446aeac5a559e20e75c471cc3e8a41667f278091ecff41a6803d0970392d48",
+          "md5": "9001b83454ac35d80d2cdb16331d1d86",
+          "sha256": "6586ffb3d3059ce7c6244f5bbbab013afacfee248ed09bc3d508da5783141982"
+        },
+        "downloads": -1,
+        "filename": "csql-0.11.0a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9001b83454ac35d80d2cdb16331d1d86",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26999,
+        "upload_time": "2022-01-14T04:44:12",
+        "upload_time_iso_8601": "2022-01-14T04:44:12.539079Z",
+        "url": "https://files.pythonhosted.org/packages/03/44/6aeac5a559e20e75c471cc3e8a41667f278091ecff41a6803d0970392d48/csql-0.11.0a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a2dd5a04de85c476d73c88fed957161c655a1bf678aa623f819e169f25f03916",
+          "md5": "68cedf8b93228d1dcd217da48b098679",
+          "sha256": "0958051fd3b707dd0c7ef3f3245c31b702ad47c0c8e2e07d5fa65d9ea51e1a7f"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "68cedf8b93228d1dcd217da48b098679",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 7406,
+        "upload_time": "2020-10-23T05:13:52",
+        "upload_time_iso_8601": "2020-10-23T05:13:52.588280Z",
+        "url": "https://files.pythonhosted.org/packages/a2/dd/5a04de85c476d73c88fed957161c655a1bf678aa623f819e169f25f03916/csql-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41630666d4fabb3b19d6236c8ec7dc48809ada2d7b54e9f9070a44fadcde0a5d",
+          "md5": "05896f070e1df7aeaa1cc5a23a133dc2",
+          "sha256": "f59746b44972eb8c69aa09c3538d709d27668f663af96030009b5cd9e24916cb"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05896f070e1df7aeaa1cc5a23a133dc2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 5408,
+        "upload_time": "2020-10-23T05:13:53",
+        "upload_time_iso_8601": "2020-10-23T05:13:53.594891Z",
+        "url": "https://files.pythonhosted.org/packages/41/63/0666d4fabb3b19d6236c8ec7dc48809ada2d7b54e9f9070a44fadcde0a5d/csql-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1593faf1cdbe6299a45e5114ba36309087a7238a341aa28874a69127f174a3e8",
+          "md5": "2ee9d62205726aa7d99594c4438cf85e",
+          "sha256": "8b05bd61f2e4192e83999357b38c44cff7a834bd63c51e0d0bd485c6ba72e993"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2ee9d62205726aa7d99594c4438cf85e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 12920,
+        "upload_time": "2020-10-23T05:25:37",
+        "upload_time_iso_8601": "2020-10-23T05:25:37.430778Z",
+        "url": "https://files.pythonhosted.org/packages/15/93/faf1cdbe6299a45e5114ba36309087a7238a341aa28874a69127f174a3e8/csql-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3d0f5b10204547a8881eadef7858c3a972fe98cd1c84f9ceef311c51413bc1a0",
+          "md5": "cd9697e3c2d95b88a8f609d14386697a",
+          "sha256": "4984c1b9d493520e37811f5d5cbbf70556f6f4909e0cd9d21750cf3fbe65b5ea"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cd9697e3c2d95b88a8f609d14386697a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 13682,
+        "upload_time": "2020-10-23T05:25:39",
+        "upload_time_iso_8601": "2020-10-23T05:25:39.658784Z",
+        "url": "https://files.pythonhosted.org/packages/3d/0f/5b10204547a8881eadef7858c3a972fe98cd1c84f9ceef311c51413bc1a0/csql-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d8f9f45b7ad84902cb35d619711be233f625920345abfe6a0f59523c7665466",
+          "md5": "a762389a8cf6e986e52265dceb1a8ad2",
+          "sha256": "02b4b991654a3d17be3737a70f534f9d2983e1ad6bbe15bf367e3924cbc09f0b"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a762389a8cf6e986e52265dceb1a8ad2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 13008,
+        "upload_time": "2020-10-23T05:40:51",
+        "upload_time_iso_8601": "2020-10-23T05:40:51.304159Z",
+        "url": "https://files.pythonhosted.org/packages/0d/8f/9f45b7ad84902cb35d619711be233f625920345abfe6a0f59523c7665466/csql-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59e94a8241d80007cc42e62c09c038316ee0c2b3f3a4670db2b09f4eeb2dd5ef",
+          "md5": "bc3e3af023d1a18543ed8173fae70706",
+          "sha256": "2ff92afb41e6a4f40a9f203d82dd70c9303b7b90e4778448c49e0e4f6c7972fd"
+        },
+        "downloads": -1,
+        "filename": "csql-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bc3e3af023d1a18543ed8173fae70706",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 13825,
+        "upload_time": "2020-10-23T05:40:53",
+        "upload_time_iso_8601": "2020-10-23T05:40:53.015856Z",
+        "url": "https://files.pythonhosted.org/packages/59/e9/4a8241d80007cc42e62c09c038316ee0c2b3f3a4670db2b09f4eeb2dd5ef/csql-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "090c2fcdcb94ae6873cbfd08a17638f5af28a761388aaa4b6eafc071b742650b",
+          "md5": "78f2877f8bb3ed5bd0ecc600c9980a56",
+          "sha256": "e665f8c614bc5d65f25fdcb23f44d377cced1eaba739dfb1747a5da3bea35f54"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "78f2877f8bb3ed5bd0ecc600c9980a56",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11665,
+        "upload_time": "2020-11-13T04:58:18",
+        "upload_time_iso_8601": "2020-11-13T04:58:18.242207Z",
+        "url": "https://files.pythonhosted.org/packages/09/0c/2fcdcb94ae6873cbfd08a17638f5af28a761388aaa4b6eafc071b742650b/csql-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd93b5d7bb7664454663779da7f7dd2bab0f5eebc19a40fec0bc4de922ef9160",
+          "md5": "a25f2401f341eb162619c8010e029e65",
+          "sha256": "7f00ae2b2fa97e5469d4b2cc2ceb78b77e0a93736c2e42f55bd15506a01151ed"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a25f2401f341eb162619c8010e029e65",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11620,
+        "upload_time": "2020-11-13T04:58:19",
+        "upload_time_iso_8601": "2020-11-13T04:58:19.358581Z",
+        "url": "https://files.pythonhosted.org/packages/dd/93/b5d7bb7664454663779da7f7dd2bab0f5eebc19a40fec0bc4de922ef9160/csql-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "54bb4639dd5569ff2791076f2a26cffb69b0746af10a97e321df2635879f4061",
+          "md5": "e7a9bfd137f51b25ac77ae69394d48b8",
+          "sha256": "be221d7a966df2a7d5730dff0732c5f712768a6ee0b58fddbff9b13b73a90f5b"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e7a9bfd137f51b25ac77ae69394d48b8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11685,
+        "upload_time": "2020-12-16T03:42:23",
+        "upload_time_iso_8601": "2020-12-16T03:42:23.009163Z",
+        "url": "https://files.pythonhosted.org/packages/54/bb/4639dd5569ff2791076f2a26cffb69b0746af10a97e321df2635879f4061/csql-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fcfccd8c351e31e2afc78993b8fb11318a7ffaa191ae77da87b42a50ff86a5a9",
+          "md5": "db6c151a999ab8ca12d30e36a44f8f18",
+          "sha256": "642913ecc7f3fb3b7556fa684a19aad538fc394e3717d68bb316416f135ccfbd"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db6c151a999ab8ca12d30e36a44f8f18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11647,
+        "upload_time": "2020-12-16T03:42:24",
+        "upload_time_iso_8601": "2020-12-16T03:42:24.150458Z",
+        "url": "https://files.pythonhosted.org/packages/fc/fc/cd8c351e31e2afc78993b8fb11318a7ffaa191ae77da87b42a50ff86a5a9/csql-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1420a9b9e4eae3712b7db19bd0e68139494a59c708ad1f7c597f335818e64a43",
+          "md5": "b87fa7209b5d5273df2f29c59dce3dce",
+          "sha256": "5184eb708eda8a20f9c190ecd2b81a7c21da9ef1e2f0f83b4ae4a9212e64aebe"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b87fa7209b5d5273df2f29c59dce3dce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11678,
+        "upload_time": "2020-12-16T03:48:52",
+        "upload_time_iso_8601": "2020-12-16T03:48:52.772903Z",
+        "url": "https://files.pythonhosted.org/packages/14/20/a9b9e4eae3712b7db19bd0e68139494a59c708ad1f7c597f335818e64a43/csql-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "135453f895761180d2af3bdee8f62cacc18419ce8c34bbf6d7c20aee33ab4e47",
+          "md5": "0c03b0c3f57543cb9cacc0b8fcfb9f0c",
+          "sha256": "75582f45717bf67e4a120eeaec906552ffe654f981302a3bbc2856dcf7bfe444"
+        },
+        "downloads": -1,
+        "filename": "csql-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0c03b0c3f57543cb9cacc0b8fcfb9f0c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11634,
+        "upload_time": "2020-12-16T03:48:53",
+        "upload_time_iso_8601": "2020-12-16T03:48:53.872254Z",
+        "url": "https://files.pythonhosted.org/packages/13/54/53f895761180d2af3bdee8f62cacc18419ce8c34bbf6d7c20aee33ab4e47/csql-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e8cfc56fe557f48202451ae352ce7343407bb0e227a9260580a774baaeab1ce7",
+          "md5": "bdc7f25626c83c95ddc14053a6a059ce",
+          "sha256": "d78c1ddaca553337caf4f378c9d32a1d801f2b9809ec2e2695596f2a605e59e4"
+        },
+        "downloads": -1,
+        "filename": "csql-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bdc7f25626c83c95ddc14053a6a059ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11707,
+        "upload_time": "2021-03-30T05:55:21",
+        "upload_time_iso_8601": "2021-03-30T05:55:21.991218Z",
+        "url": "https://files.pythonhosted.org/packages/e8/cf/c56fe557f48202451ae352ce7343407bb0e227a9260580a774baaeab1ce7/csql-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e4888c3e348eaf9b846bd157174d924bc441e53b74fbc995267fdf2fa8b3e78e",
+          "md5": "cec2f9f7a1df264697be659d8cb7411e",
+          "sha256": "c2bc78c3ef2c80602ac2a814d16d178b68c3b622e0aafcef1766a8b962f72d3e"
+        },
+        "downloads": -1,
+        "filename": "csql-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cec2f9f7a1df264697be659d8cb7411e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 11666,
+        "upload_time": "2021-03-30T05:55:23",
+        "upload_time_iso_8601": "2021-03-30T05:55:23.164835Z",
+        "url": "https://files.pythonhosted.org/packages/e4/88/8c3e348eaf9b846bd157174d924bc441e53b74fbc995267fdf2fa8b3e78e/csql-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e21b6cec818d54d3467a4376cd8022a8490d41f94a9f493e9e62a34362044da",
+          "md5": "feb9e42319bd04679fd421a5853bd545",
+          "sha256": "b28248c4020dc8f377cf8a59e29464a445e1835f4ab8e317d1a3f306758c05b2"
+        },
+        "downloads": -1,
+        "filename": "csql-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "feb9e42319bd04679fd421a5853bd545",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 12948,
+        "upload_time": "2021-04-20T12:11:50",
+        "upload_time_iso_8601": "2021-04-20T12:11:50.265558Z",
+        "url": "https://files.pythonhosted.org/packages/3e/21/b6cec818d54d3467a4376cd8022a8490d41f94a9f493e9e62a34362044da/csql-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "569ec9d37c16273b1a1127659f586ddc16b06722a5aee46554e105244a119b1c",
+          "md5": "790c5269254826ce6bf63dfbb0f8e6fa",
+          "sha256": "1d0298a16b5267b5f97983b961a77fe57d59d28d8c05a7e17d2d7442cee9160b"
+        },
+        "downloads": -1,
+        "filename": "csql-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "790c5269254826ce6bf63dfbb0f8e6fa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 13037,
+        "upload_time": "2021-04-20T12:11:51",
+        "upload_time_iso_8601": "2021-04-20T12:11:51.310378Z",
+        "url": "https://files.pythonhosted.org/packages/56/9e/c9d37c16273b1a1127659f586ddc16b06722a5aee46554e105244a119b1c/csql-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4ec46c2d4c2a000fed49c0b5e39c43a3248dab2998481eba8f7f3633dc05e4dc",
+          "md5": "8e88ccc39d0807b2a56fcc8f092fd9ad",
+          "sha256": "f0947de5f4276ad6df643b54a72a0af5dd3b362d3f510018bedab89d6c50a95a"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8e88ccc39d0807b2a56fcc8f092fd9ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 16063,
+        "upload_time": "2021-04-21T10:25:49",
+        "upload_time_iso_8601": "2021-04-21T10:25:49.810555Z",
+        "url": "https://files.pythonhosted.org/packages/4e/c4/6c2d4c2a000fed49c0b5e39c43a3248dab2998481eba8f7f3633dc05e4dc/csql-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ac4fcad91ff49c1ae35ea3babaa1fbd0d55fc8f2e5fd500b7bd3d02db06eb30",
+          "md5": "66703ed228752261ecfd5fe58f010b24",
+          "sha256": "0bc3378f7a37f660d2a27ba84ad9b4ab13339bb8af74d0c71df160dfc82fac42"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "66703ed228752261ecfd5fe58f010b24",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 14824,
+        "upload_time": "2021-04-21T10:25:50",
+        "upload_time_iso_8601": "2021-04-21T10:25:50.914594Z",
+        "url": "https://files.pythonhosted.org/packages/2a/c4/fcad91ff49c1ae35ea3babaa1fbd0d55fc8f2e5fd500b7bd3d02db06eb30/csql-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04e613d370688ece9ee228227a1965e49adccf6b98d3d08e060427c385fe8ca5",
+          "md5": "e47860af62e6608e7ac676d78f1456d7",
+          "sha256": "9ae8568e503fbc3853ef57eec3f46cf0ea92062cb3c6775949e322578911aec8"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e47860af62e6608e7ac676d78f1456d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 16065,
+        "upload_time": "2021-04-21T10:40:21",
+        "upload_time_iso_8601": "2021-04-21T10:40:21.074363Z",
+        "url": "https://files.pythonhosted.org/packages/04/e6/13d370688ece9ee228227a1965e49adccf6b98d3d08e060427c385fe8ca5/csql-0.7.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e9c4f6bb7f6d70b87c1f0d50b34a1bdc2b0859b47a525b35219d4a96317167a4",
+          "md5": "64eb1d37856086850a39f0f1bdb811c0",
+          "sha256": "7758f689c4b4f611ce356b02a1b1ccbf2ee1bac57277f34e8598b1ea6378547a"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "64eb1d37856086850a39f0f1bdb811c0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 14814,
+        "upload_time": "2021-04-21T10:40:22",
+        "upload_time_iso_8601": "2021-04-21T10:40:22.212598Z",
+        "url": "https://files.pythonhosted.org/packages/e9/c4/f6bb7f6d70b87c1f0d50b34a1bdc2b0859b47a525b35219d4a96317167a4/csql-0.7.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab28bb78779f6731c80bff171557aed7f61be9fab976f5f0558dd7b5c70e9a13",
+          "md5": "21a1ee65c82e496a9ea40479d3e1d493",
+          "sha256": "2f5c824008ae99d39b77bab7482f27551172eed06a8090cffa88580761271cd6"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "21a1ee65c82e496a9ea40479d3e1d493",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 16066,
+        "upload_time": "2021-04-22T07:10:02",
+        "upload_time_iso_8601": "2021-04-22T07:10:02.731508Z",
+        "url": "https://files.pythonhosted.org/packages/ab/28/bb78779f6731c80bff171557aed7f61be9fab976f5f0558dd7b5c70e9a13/csql-0.7.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5e0fa312d2ff6aac0d4f5b1b602adb249b8757fc99c0385d6fd86d708dba014b",
+          "md5": "f2c8a3e2dafcd463e0934709751ba435",
+          "sha256": "4da3ca0273a59ed1a748aa911abfc7fb6aec947978df6397b449d8f29c6f75d5"
+        },
+        "downloads": -1,
+        "filename": "csql-0.7.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f2c8a3e2dafcd463e0934709751ba435",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 14840,
+        "upload_time": "2021-04-22T07:10:04",
+        "upload_time_iso_8601": "2021-04-22T07:10:04.923801Z",
+        "url": "https://files.pythonhosted.org/packages/5e/0f/a312d2ff6aac0d4f5b1b602adb249b8757fc99c0385d6fd86d708dba014b/csql-0.7.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8a34d634421fb3e1239cc1f3d1aacc3b10ea8cead8a9255c4b4b8eacd6eb1b40",
+          "md5": "dfabbf8fbe936d6f4d3a785d109b8782",
+          "sha256": "d6a6a090fa733247b85e047adbdd71baab9d725efb1e7f6482df9ce7ea81e60d"
+        },
+        "downloads": -1,
+        "filename": "csql-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dfabbf8fbe936d6f4d3a785d109b8782",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 16492,
+        "upload_time": "2021-05-26T02:44:09",
+        "upload_time_iso_8601": "2021-05-26T02:44:09.175959Z",
+        "url": "https://files.pythonhosted.org/packages/8a/34/d634421fb3e1239cc1f3d1aacc3b10ea8cead8a9255c4b4b8eacd6eb1b40/csql-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "374525ab763cc404f7204233d3c0a23057288f9de4adf68b13f78f3263a5cd60",
+          "md5": "3dc5cd3920bdbd699ebce52cb08a7a5f",
+          "sha256": "33d38b5d5df9987d677585e404fff56488f3bdcd64e119439d4c990c61bf0c2b"
+        },
+        "downloads": -1,
+        "filename": "csql-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3dc5cd3920bdbd699ebce52cb08a7a5f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.2,<4.0.0",
+        "size": 15217,
+        "upload_time": "2021-05-26T02:44:10",
+        "upload_time_iso_8601": "2021-05-26T02:44:10.371417Z",
+        "url": "https://files.pythonhosted.org/packages/37/45/25ab763cc404f7204233d3c0a23057288f9de4adf68b13f78f3263a5cd60/csql-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6700b1bc49bab4dbddfcaf9954ccedd716bea7fdbd0d5f25848ed6a9ddef0cb",
+          "md5": "490e4de79f2bdfe15446f4bc4765218b",
+          "sha256": "7dd8a9675f613eb146da19e4eb7ccda98b5c8fafe8e8e08179864e07bebd6111"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "490e4de79f2bdfe15446f4bc4765218b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 28816,
+        "upload_time": "2022-01-10T04:43:48",
+        "upload_time_iso_8601": "2022-01-10T04:43:48.370529Z",
+        "url": "https://files.pythonhosted.org/packages/b6/70/0b1bc49bab4dbddfcaf9954ccedd716bea7fdbd0d5f25848ed6a9ddef0cb/csql-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f15769c986830af998f6a1c4af1a70ce6033041e9b398e49b7117db48438bef",
+          "md5": "65176bfaf00df29b110163082910e35f",
+          "sha256": "44f641e4d5ce5bd01c70f21ed105d5258da8bb7fc4933e5216d7dc319c5faf58"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "65176bfaf00df29b110163082910e35f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25867,
+        "upload_time": "2022-01-10T04:43:49",
+        "upload_time_iso_8601": "2022-01-10T04:43:49.882612Z",
+        "url": "https://files.pythonhosted.org/packages/4f/15/769c986830af998f6a1c4af1a70ce6033041e9b398e49b7117db48438bef/csql-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0a12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da30a5ddd959e17c06969671778cdd41b0cebaaa58b953f9c17192907de2e070",
+          "md5": "61cfe2362fb2a493d0742dd18b160439",
+          "sha256": "64fdb656c12fe266455cbb20d81392bcdb0ecc293e40a9291c61ca9145ae4174"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "61cfe2362fb2a493d0742dd18b160439",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19336,
+        "upload_time": "2022-01-06T05:32:55",
+        "upload_time_iso_8601": "2022-01-06T05:32:55.082935Z",
+        "url": "https://files.pythonhosted.org/packages/da/30/a5ddd959e17c06969671778cdd41b0cebaaa58b953f9c17192907de2e070/csql-0.9.0a12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee3b797771b8e13d28be363a991304288e3b01daacef627342cd5e10c0ad6d1e",
+          "md5": "02bca24b3fa61893e9dbcaf6f8519d50",
+          "sha256": "d618a7dfe29d6eb963f705486854d7755f6994d14e01e33ed98a49e6cd402d83"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02bca24b3fa61893e9dbcaf6f8519d50",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17819,
+        "upload_time": "2022-01-06T05:32:56",
+        "upload_time_iso_8601": "2022-01-06T05:32:56.198786Z",
+        "url": "https://files.pythonhosted.org/packages/ee/3b/797771b8e13d28be363a991304288e3b01daacef627342cd5e10c0ad6d1e/csql-0.9.0a12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9dd53011ce178cbb281e8fd93fbb9e1117be43a32dfa584d42d0e09168a3d7bd",
+          "md5": "2186fee33160d4760bb50bd29fd670b9",
+          "sha256": "fe9a704fae8506fd80b5f2904c5ee97a497718f7664feb63b0c6ae154d155d5a"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2186fee33160d4760bb50bd29fd670b9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19158,
+        "upload_time": "2022-01-06T02:19:11",
+        "upload_time_iso_8601": "2022-01-06T02:19:11.886808Z",
+        "url": "https://files.pythonhosted.org/packages/9d/d5/3011ce178cbb281e8fd93fbb9e1117be43a32dfa584d42d0e09168a3d7bd/csql-0.9.0a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e12d75b2f07dd9f418f7dcea8fbba84683d8ce95f03d84959116a095ffdec2ec",
+          "md5": "4bba785d715489d626408b8f136a01c4",
+          "sha256": "9a5d2001de70fba330b3645dd1e50337306541e947bba6ac6888c93b57e7f957"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bba785d715489d626408b8f136a01c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17654,
+        "upload_time": "2022-01-06T02:19:13",
+        "upload_time_iso_8601": "2022-01-06T02:19:13.277902Z",
+        "url": "https://files.pythonhosted.org/packages/e1/2d/75b2f07dd9f418f7dcea8fbba84683d8ce95f03d84959116a095ffdec2ec/csql-0.9.0a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0a6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "23c80cf167e54f54f3eeae076df053ba4b3289b7c21e27c3f43a0b38f5fae94c",
+          "md5": "53bec91d9d0db4df2716c4f08601134b",
+          "sha256": "55d4fb30c7f21f36fd5aeb7f525b02f597a48716a8a835ebc5032b7a4f6de2f4"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "53bec91d9d0db4df2716c4f08601134b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19282,
+        "upload_time": "2022-01-06T04:38:47",
+        "upload_time_iso_8601": "2022-01-06T04:38:47.154578Z",
+        "url": "https://files.pythonhosted.org/packages/23/c8/0cf167e54f54f3eeae076df053ba4b3289b7c21e27c3f43a0b38f5fae94c/csql-0.9.0a6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b7fae88911bc248d04cd690e6390ce8b0748b4d46b9d7a86b275a8572b4e364e",
+          "md5": "e3954f8a05f77c2109a831d8e46b883c",
+          "sha256": "84f7793501eb9b478568b85b861a845fac24a4601d2607085ff214ceef75774b"
+        },
+        "downloads": -1,
+        "filename": "csql-0.9.0a6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e3954f8a05f77c2109a831d8e46b883c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17784,
+        "upload_time": "2022-01-06T04:38:48",
+        "upload_time_iso_8601": "2022-01-06T04:38:48.457012Z",
+        "url": "https://files.pythonhosted.org/packages/b7/fa/e88911bc248d04cd690e6390ce8b0748b4d46b9d7a86b275a8572b4e364e/csql-0.9.0a6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "fff72bd1db80fa743de21e4c842e54410f3fa665c265cb326d4abc05cd812cbe",
+        "md5": "a8c64889b9f6816f3d049a5260e44b7f",
+        "sha256": "f8c038729532aced96c170aa5a5d4d549f50032b2078c7b0fc306565fef99f7a"
+      },
+      "downloads": -1,
+      "filename": "csql-0.11.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a8c64889b9f6816f3d049a5260e44b7f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 29933,
+      "upload_time": "2022-01-27T04:59:33",
+      "upload_time_iso_8601": "2022-01-27T04:59:33.570608Z",
+      "url": "https://files.pythonhosted.org/packages/ff/f7/2bd1db80fa743de21e4c842e54410f3fa665c265cb326d4abc05cd812cbe/csql-0.11.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "db3b3e395b3f7134269a61a349caa1959dc9ed0f75ea53120e1582fefa676b44",
+        "md5": "28d3b275447999d165c1f51469889a41",
+        "sha256": "b60e20d0a59b9fb895cd5068eccdb671d5758ed10e6214a98b63538044337498"
+      },
+      "downloads": -1,
+      "filename": "csql-0.11.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "28d3b275447999d165c1f51469889a41",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 26962,
+      "upload_time": "2022-01-27T04:59:35",
+      "upload_time_iso_8601": "2022-01-27T04:59:35.173345Z",
+      "url": "https://files.pythonhosted.org/packages/db/3b/3e395b3f7134269a61a349caa1959dc9ed0f75ea53120e1582fefa676b44/csql-0.11.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

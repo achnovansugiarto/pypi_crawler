@@ -1,0 +1,430 @@
+{
+  "info": {
+    "author": "Yiling-J",
+    "author_email": "njjyl723@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Cacheme\n\nAsyncio cache framework with multiple cache storages.\n\n- **Organize cache better:** Cache configuration with node, you can apply different strategies on different nodes.\n- **Multiple cache storages:** in-memory/redis/mongodb/postgres..., also support chain storages.\n- **Multiple serializers:** Pickle/Json/Msgpack serializers.\n- **Thundering herd protection:** Simultaneously requests to same key are blocked by asyncio Event and only load from source once.\n- **Cache stats API:** Stats of each node and colected automatically.\n- **Performance:** See Benchemarks section.\n\nRelated projects:\n- High performance in-memory cache: https://github.com/Yiling-J/theine\n\n## Table of Contents\n\n- [Installation](#installation)\n- [Add Node](#add-node)\n- [Register Storage](#register-storage)\n- [Cacheme API](#cacheme-api)\n- [Cache Node](#cache-node)\n    + [Key](#key)\n    + [Meta Class](#meta-class)\n    + [Serializers](#serializers)\n    + [DoorKeeper](#doorkeeper)\n- [Cache Storage](#cache-storage)\n    + [Local Storage](#local-storage)\n    + [Redis Storage](#redis-storage)\n    + [MongoDB Storage](#mongodb-storage)\n    + [Sqlite Storage](#sqlite-storage)\n    + [PostgreSQL Storage](#postgresql-storage)\n    + [MySQL Storage](#mysql-storage)\n- [How Thundering Herd Protection Works](#how-thundering-herd-protection-works)\n- [Benchmarks](#benchmarks)\n    + [continuous benchmark](#continuous-benchemark)\n    + [200k concurrent requests](#200k-concurrent-requests)\n    + [20k concurrent batch requests](#20k-concurrent-batch-requests)\n\n## Requirements\nPython 3.7+\n\n## Installation\n\n```\npip install cacheme\n```\n\nMultiple storages are supported by drivers. You can install the required drivers with:\n```\npip install cacheme[redis]\npip install cacheme[aiomysql]\npip install cacheme[motor]\npip install cacheme[asyncpg]\n```\n\n## Add Node\nNode is the core part of cache. Each node has its own key function, load function and storage options. Stats of each node are collected independently. You can place all node definations into one package/module, so everyone knows exactly what is cached and how they are cached. All cacheme API are based on node.\n\nEach node contains:\n- Key attritubes and `key` method,  which are used to generate cache key. Here the `UserInfoNode` is a dataclass, so `__init__` method is generated automatically.\n- Async `load` method, which will be called to load data from data source on cache missing. This method can be omitted if you use `Memoize` decorator only.\n- `Meta` class, node cache configurations. See [Cache Node](#cache-node)\n\n```python\nimport cacheme\nfrom dataclasses import dataclass\nfrom cacheme.serializer import MsgPackSerializer\n\n@dataclass\nclass UserInfoNode(cacheme.Node):\n    user_id: int\n\n    def key(self) -> str:\n        return f\"user:{self.user_id}:info\"\n\n    async def load(self) -> Dict:\n        user = get_user_from_db(self.user_id)\n        return serialize(user)\n\n    class Meta(cacheme.Node.Meta):\n        version = \"v1\"\n        caches = [cacheme.Cache(storage=\"my-redis\", ttl=None)]\n        serializer = MsgPackSerializer()\n```\nThis simple example use a cache storage called \"my-redis\", which will be registered next step. Also we use `MsgPackSerializer` here to dump and load data from redis. See [Cache Node] for more details.\n\n## Register Storage\n\nRegister a redis storage called \"my-redis\", which you can use in node meta data. The `register_storage` is asynchronous and will try to establish connection to cache store.\nSee [Cache Storage] for more details.\n\n```python\nimport cacheme\n\nawait cacheme.register_storage(\"my-redis\", cacheme.Storage(url=\"redis://localhost:6379\"))\n```\n\n## Cacheme API\n\n`get`: get data from single node.\n```python\nuser = await cacheme.get(UserInfoNode(user_id=1))\n```\n\n`get_all`: get data from multiple nodes, same node type.\n```python\nusers = await cacheme.get_all([UserInfoNode(user_id=1), UserInfoNode(user_id=2)])\n```\n\n`invalidate`: invalidate a node, remove data from cache.\n```python\nawait cacheme.invalidate(UserInfoNode(user_id=1))\n```\n\n`refresh`: reload node data using `load` method.\n```python\nawait cacheme.refresh(UserInfoNode(user_id=1))\n```\n\n`Memoize`: memoize function with this decorator.\n\nDecorate your function with `cacheme.Memoize` decorator and cache node. Cacheme will load data using the decorated function and ignore `load` method.\nBecause your function may contain variable number of args/kwargs, we need one more step to map between args/kwargs to node. The decorated map function should have same input signature as memoized function, and return a cache node.\n\n```python\n@cacheme.Memoize(UserInfoNode)\nasync def get_user_info(user_id: int) -> Dict:\n    return {}\n\n# function name is not important, so just use _ here\n@get_user_info.to_node\ndef _(user_id: int) -> UserInfoNode:\n    return UserInfoNode(user_id=user_id)\n```\n\n`nodes`: list all nodes.\n```python\nnodes = cacheme.nodes()\n```\n\n`stats`: get node stats.\n```\nmetrics = cacheme.stats(UserInfoNode)\n\nmetrics.request_count() # total request count\nmetrics.hit_count() # total hit count\nmetrics.hit_rate() # hit_count/request_count\nmetrics.miss_count() # (request_count - hit_count)/request_count\nmetrics.miss_rate() # miss_count/request_count\nmetric.load_success_count() # total load success count\nmetrics.load_failure_count() # total load fail count\nmetrics.load_failure_rate() # load_failure_count/load_count\nmetrics.load_count() # total load count\nmetrics.total_load_time() # total load time in nanoseconds\nmetrics.average_load_time() # total_load_time/load_count\n```\n\n`set_prefix`: set prefix for all keys. Default prefix is `cacheme`. Change prefix will invalid all keys, because prefix is part of the key.\n```python\ncacheme.set_prefix(\"mycache\")\n```\n\n\n## Cache Node\n\n#### Key\nGenerated cache key will be: `{prefix}:{key()}:{Meta.version}`. So change `version` will invalid all keys automatically.\n\n#### Meta Class\n- `version[str]`: Version of node, will be used as suffix of cache key.\n- `caches[List[Cache]]`: Caches for node. Each `Cache` has 2 attributes, `storage[str]` and `ttl[Optional[timedelta]]`. `storage` is the name you registered with `register_storage` and `ttl` is how long this cache will live. Cacheme will try to get data from each cache from left to right. In most cases, use single cache or [local, remote] combination.\n- `serializer[Optional[Serializer]]`: Serializer used to dump/load data. If storage type is `local`, serializer is ignored. See [Serializers](#serializers).\n- `doorkeeper[Optional[DoorKeeper]]`: See [DoorKeeper](#doorkeeper).\n\nMultiple caches example. Local cache is not synchronized, so set a much shorter ttl compared to redis one. Then we don't need to worry too much about stale data.\n\n```python\nimport cacheme\nfrom dataclasses import dataclass\nfrom datetime import timedelta\nfrom cacheme.serializer import MsgPackSerializer\n\n@dataclass\nclass UserInfoNode(cacheme.Node):\n    user_id: int\n\n    def key(self) -> str:\n        return f\"user:{self.user_id}:info\"\n\n    async def load(self) -> Dict:\n        user = get_user_from_db(self.user_id)\n        return serialize(user)\n\n    class Meta(cacheme.Node.Meta):\n        version = \"v1\"\n        caches = [\n            cacheme.Cache(storage=\"local\", ttl=timedelta(seconds=30)),\n            cacheme.Cache(storage=\"my-redis\", ttl=timedelta(days=10))\n        ]\n        serializer = MsgPackSerializer()\n```\n\nCacheme also support creating Node dynamically, you can use this together with `Memoize` decorator:\n\n```python\n@Memoize(cacheme.build_node(\"TestNodeDynamic\", \"v1\", [Cache(storage=\"local\", ttl=None)]))\nasync def fn(a: int) -> int:\n    return 1\n\n\n@fn.to_node\ndef _(a: int) -> cacheme.DynamicNode:\n    return DynamicNode(key=f\"bar:{a}\")\n```\nHere we use `DynamicNode`, which only support one param: `key`\n\n#### Serializers\nCacheme provides serveral builtin serializers, you can also write your own serializer.\n\n- `PickleSerializer`: All python objects.\n- `JSONSerializer`: Use `pydantic_encoder` and `json`, support python primitive types, dataclass, pydantic model. See [pydantic types](https://docs.pydantic.dev/usage/types/).\n- `MsgPackSerializer`: Use `pydantic_encoder` and `msgpack`, support python primitive types, dataclass, pydantic model. See [pydantic types](https://docs.pydantic.dev/usage/types/).\n\nserializer with compression, use zlib level-3\n\n- `CompressedPickleSerializer`\n- `CompressedJSONSerializer`\n- `CompressedMsgPackSerializer`\n\n#### DoorKeeper\nIdea from [TinyLfu paper](https://arxiv.org/pdf/1512.00727.pdf).\n\n*The Doorkeeper is a regular Bloom filter placed in front of the cahce. Upon\nitem arrival, we first check if the item is contained in the Doorkeeper. If it is not contained in the\nDoorkeeper (as is expected with first timers and tail items), the item is inserted to the Doorkeeper and\notherwise, it is inserted to the cache.*\n\n```python\nfrom cacheme import BloomFilter\n\n@dataclass\nclass UserInfoNode(cacheme.Node):\n\n    class Meta(cacheme.Node.Meta):\n        # size 100000, false positive probability 0.01\n        doorkeeper = BloomFilter(100000, 0.01)\n```\nBloomFilter is cleared automatically when requests count == size.\n\n\n## Cache Storage\n\n#### Local Storage\nLocal storage use the state-of-the-art library **Theine** to store data. If your use case in simple, also consider using [Theine](https://github.com/Yiling-J/theine) directly, which will have the best performance.\n\n```python\n# lru policy\nStorage(url=\"local://lru\", size=10000)\n\n# w-tinylfu policy\nStorage(url=\"local://tlfu\", size=10000)\n\n```\nParameters:\n\n- `url`: `local://{policy}`. 2 policies are currently supported:\n  - `lru`\n  - `tlfu`: W-TinyLfu policy\n\n- `size`: size of the storage. Policy will be used to evict key when cache is full.\n\n#### Redis Storage\n```python\nStorage(url=\"redis://localhost:6379\")\n\n# cluster\nStorage(url=\"redis://localhost:6379\", cluster=True)\n```\nParameters:\n\n- `url`: redis connection url.\n- `cluster`: bool, cluster or not, default False.\n- `pool_size`: connection pool size, default 100.\n\n#### MongoDB Storage\nTo use mongodb storage, create index first. See [mongo.js](cacheme/storages/scripts/mongo.js)\n```python\nStorage(url=\"mongodb://test:password@localhost:27017\",database=\"test\",collection=\"cache\")\n```\nParameters:\n\n- `url`: mongodb connection url.\n- `database`: mongodb database name.\n- `collection`: mongodb collection name.\n- `pool_size`: connection pool size, default 50.\n\n#### Sqlite Storage\nTo use sqlite storage, create table and index first. See [sqlite.sql](cacheme/storages/scripts/sqlite.sql)\n```python\nStorage(url=\"sqlite:///test\", table=\"cache\")\n```\nParameters:\n\n- `url`: sqlite connection url.\n- `table`: cache table name.\n- `pool_size`: connection pool size, default 50.\n\n#### PostgreSQL Storage\nTo use postgres storage, create table and index first. See [postgresql.sql](cacheme/storages/scripts/postgresql.sql)\n```python\nStorage(url=\"postgresql://username:password@127.0.0.1:5432/test\", table=\"cache\")\n```\nParameters:\n\n- `url`: postgres connection url.\n- `table`: cache table name.\n- `pool_size`: connection pool size, default 50.\n\n#### MySQL Storage\nTo use mysql storage, create table and index first. See [mysql.sql](cacheme/storages/scripts/mysql.sql)\n```python\nStorage(\"mysql://username:password@localhost:3306/test\", table=\"cache\")\n```\nParameters:\n\n- `url`: mysql connection url.\n- `table`: cache table name.\n- `pool_size`: connection pool size, default 50.\n\n## How Thundering Herd Protection Works\n\nIf you are familar with Go [singleflight](https://pkg.go.dev/golang.org/x/sync/singleflight), you may have an idea how Cacheme works. Cacheme group concurrent requests to same resource(node) into a singleflight with asyncio Event, which will **load from remote cache OR data source only once**. That's why in next Benchmarks section, you will find Cacheme even reduce total redis GET command count under high concurrency.\n\n\n## Benchmarks\n\n### continuous benchmark\nhttps://github.com/Yiling-J/cacheme-benchmark\n\n### 200k concurrent requests\n\naiocache: https://github.com/aio-libs/aiocache\n\ncashews: https://github.com/Krukov/cashews\n\nsource code: https://github.com/Yiling-J/cacheme/blob/master/benchmarks/trace.py\n\nHow this benchmark run:\n\n1. Initialize Cacheme/Aiocache/Cashews with Redis backend, use Redis blocking pool and set pool size to 100.\n2. Decorate Aiocache/Cashews/Cacheme with a function which accept a number and sleep 0.1s. This function also record how many times it is called.\n3. Register Redis response callback, so we can know how many times GET command are called.\n4. Create 200k coroutines use a zipf generator and put them in async queue(around 50k-60k unique numbers).\n5. Run coroutines in queue with N concurrent workers.\n6. Collect results.\n\nIdentifier:\n- Cacheme: Cacheme redis storage\n- Aiocahce: Aiocahce cached decorator\n- Cashews: Cashews cache decorate\n- Cacheme-2: Cacheme use cache chain [local, redis]\n- Aiocache-2: Aiocache cached_stampede decorator\n- Cashews-2: Cashews decorator with lock=True\n\nResult:\n- Time: How long it takes to finish bench.\n- Redis GET: How many times Redis GET command are called, use this to evaluate pressure to remote cache server.\n- Load Hits: How many times the load function(which sleep 0.1s) are called, use this to evaluate pressure to load source(database or something else).\n\n#### 1k concurrency\n\n|            | Time  | Redis GET  | Load Hits |\n|------------|-------|------------|-----------|\n| Cacheme    | 30 s  | 166454     | 55579     |\n| Cacheme-2  | 18 s  | 90681      | 55632     |\n| Aiocache   | 46 s  | 200000     | 56367     |\n| Aiocache-2 | 63 s  | 256492     | 55417     |\n| Cashews    | 51 s  | 200000     | 56920     |\n| Cashews-2  | 134 s | 200000     | 55450     |\n\n\n#### 10k concurrency\n\n|            | Time  | Redis GET | Load Hits |\n|------------|-------|-----------|-----------|\n| Cacheme    | 32 s  | 123704    | 56736     |\n| Cacheme-2  | 20 s  | 83750     | 56635     |\n| Aiocache   | 67 s  | 200000    | 62568     |\n| Aiocache-2 | 113 s | 263195    | 55507     |\n| Cashews    | 68 s  | 200000    | 66036     |\n| Cashews-2  | 175 s | 200000    | 55709     |\n\n\n#### 100k concurrency\n\n|            | Time  | Redis GET | Load Hits |\n|------------|-------|-----------|-----------|\n| Cacheme    | 30 s  | 60990     | 56782     |\n| Cacheme-2  | 27 s  | 55762     | 55588     |\n| Aiocache   | 80 s  | 200000    | 125085    |\n| Aiocache-2 | 178 s | 326417    | 65598     |\n| Cashews    | 88 s  | 200000    | 87894     |\n| Cashews-2  | 236 s | 200000    | 55647     |\n\n### 20k concurrent batch requests\n\nsource code: https://github.com/Yiling-J/cacheme/blob/master/benchmarks/trace.py\n\nHow this benchmark run:\n\n1. Initialize Cacheme with Redis backend, use Redis blocking pool and set pool size to 100.\n2. Decorate Cacheme with a function which accept a number and sleep 0.1s. This function also record how many times it is called.\n3. Register Redis response callback, so we can know how many times MGET command are called.\n4. Create 20k `get_all` coroutines use a zipf generator and put them in async queue(around 50k-60k unique numbers). Each `get_all` request will get 20 unique numbers in batch. So totally 400k numbers.\n5. Run coroutines in queue with N concurrent workers.\n6. Collect results.\n\nResult:\n- Time: How long it takes to finish bench.\n- Redis MGET: How many times Redis MGET command are called, use this to evaluate pressure to remote cache server.\n- Load Hits: How many times the load function(which sleep 0.1s) are called, use this to evaluate pressure to load source(database or something else).\n\n#### 1k concurrency\n\n|            | Time | Redis MGET | Load Hits |\n|------------|------|------------|-----------|\n| Cacheme    | 12 s | 9996       | 55902     |\n\n\n#### 10k concurrency\n\n|            | Time  | Redis MGET | Load Hits |\n|------------|-------|------------|-----------|\n| Cacheme    | 11 s  | 9908       | 42894     |\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cacheme",
+    "package_url": "https://pypi.org/project/cacheme/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/cacheme/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/cacheme/0.3.0/",
+    "requires_dist": [
+      "msgpack (>=1.0.4,<2.0.0)",
+      "pydantic (>=1.10.4,<2.0.0)",
+      "typing-extensions (>=4.4.0,<5.0.0)",
+      "redis (>=4.4.2,<5.0.0) ; extra == \"redis\"",
+      "motor (>=3.1.1,<4.0.0) ; extra == \"motor\"",
+      "aiomysql (>=0.1.1,<0.2.0) ; extra == \"aiomysql\"",
+      "asyncpg (>=0.27.0,<0.28.0) ; extra == \"asyncpg\"",
+      "theine (>=0.3.0,<0.4.0)",
+      "cashews (>=5.3.1,<6.0.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "async caching framework",
+    "version": "0.3.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17174723,
+  "releases": {
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9bdfb1c7cf3da1ab012df709600db1464a272e4caab11eeb3453b8990b512380",
+          "md5": "79dfd7a2a8c2f4d2197fbef9ba706231",
+          "sha256": "87abbbbad5e995a8f2f1cdcf1ab1968d3b996eb66bc99c83e18b52392f88cd0d"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "79dfd7a2a8c2f4d2197fbef9ba706231",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 6014,
+        "upload_time": "2019-12-12T14:46:17",
+        "upload_time_iso_8601": "2019-12-12T14:46:17.300825Z",
+        "url": "https://files.pythonhosted.org/packages/9b/df/b1c7cf3da1ab012df709600db1464a272e4caab11eeb3453b8990b512380/cacheme-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b6c2fb33a1ffa7a994741cb745f525967b8a3f652e98d048536859adacf37f70",
+          "md5": "d23a43e7ffb6ad50ef0363a6ad54e8dc",
+          "sha256": "70316e9577c3e57f09a40471c89b67a1cfe21f882acb4287de09746e701eb3f5"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d23a43e7ffb6ad50ef0363a6ad54e8dc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 5733,
+        "upload_time": "2020-03-09T01:49:07",
+        "upload_time_iso_8601": "2020-03-09T01:49:07.573130Z",
+        "url": "https://files.pythonhosted.org/packages/b6/c2/fb33a1ffa7a994741cb745f525967b8a3f652e98d048536859adacf37f70/cacheme-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d2427a18429cb7b6c8151f87594dc9494653587f8eaada8cbd76f00cf8d881a",
+          "md5": "c223ac50866ca7986e173d92fea7fce9",
+          "sha256": "2a59a2713ca04a1c62502e66dc7b99a71470cd186ba94b0eb104ecc2a009c32e"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c223ac50866ca7986e173d92fea7fce9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 7790,
+        "upload_time": "2020-03-09T01:49:09",
+        "upload_time_iso_8601": "2020-03-09T01:49:09.822087Z",
+        "url": "https://files.pythonhosted.org/packages/1d/24/27a18429cb7b6c8151f87594dc9494653587f8eaada8cbd76f00cf8d881a/cacheme-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f699cda33e28d88dad7ba1bc9fc140b788fe01ef429d8a5416f52fbcc82ba925",
+          "md5": "5cddcdc9e84b8a3095a9f03182acbcd7",
+          "sha256": "6c2d500433157f44bc3e306d96518fd4f9baaae7aa7e45c9152772338d396afa"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5cddcdc9e84b8a3095a9f03182acbcd7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.5",
+        "size": 6753,
+        "upload_time": "2020-04-15T15:03:33",
+        "upload_time_iso_8601": "2020-04-15T15:03:33.133387Z",
+        "url": "https://files.pythonhosted.org/packages/f6/99/cda33e28d88dad7ba1bc9fc140b788fe01ef429d8a5416f52fbcc82ba925/cacheme-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d3b569419e3187e380e00a30accf2bc8d62f690f493f1b804b04fc2a43846da",
+          "md5": "9443fa6fa4e74b347c920309851614b0",
+          "sha256": "276358c4c825a5146a9f6a439def2879afd34f49b40d63c27525800d6e8aee85"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9443fa6fa4e74b347c920309851614b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.5",
+        "size": 9068,
+        "upload_time": "2020-04-15T15:03:34",
+        "upload_time_iso_8601": "2020-04-15T15:03:34.913043Z",
+        "url": "https://files.pythonhosted.org/packages/7d/3b/569419e3187e380e00a30accf2bc8d62f690f493f1b804b04fc2a43846da/cacheme-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e991d1ea11cf0b8843501d0659255cf78b4fd28c5f3ab781dee4fdfb0f7ccc8f",
+          "md5": "f6c2cddc5b244655a9bc31bc856ca0d8",
+          "sha256": "c009837104cd72699e2329b7faaa3cc04df5d9436581235e6327982534bf1b7f"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f6c2cddc5b244655a9bc31bc856ca0d8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 21940,
+        "upload_time": "2023-01-27T03:11:59",
+        "upload_time_iso_8601": "2023-01-27T03:11:59.578653Z",
+        "url": "https://files.pythonhosted.org/packages/e9/91/d1ea11cf0b8843501d0659255cf78b4fd28c5f3ab781dee4fdfb0f7ccc8f/cacheme-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1370b703137a08648cff4bdc05b967614d0bacd6af04350b17f857b8816a24d1",
+          "md5": "0142a57464fd28160883cfae8d567c88",
+          "sha256": "eb0716200885a5d7037e90b826d991e1238363867397298d9ba5ea7139777158"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0142a57464fd28160883cfae8d567c88",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 19115,
+        "upload_time": "2023-01-27T03:12:00",
+        "upload_time_iso_8601": "2023-01-27T03:12:00.944514Z",
+        "url": "https://files.pythonhosted.org/packages/13/70/b703137a08648cff4bdc05b967614d0bacd6af04350b17f857b8816a24d1/cacheme-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "159cc042712b61caa9a45afb641c67c60e16e5b1c6fcc1ca14d3652aeb777afc",
+          "md5": "72e99a452acf2246a7ef016695d50de9",
+          "sha256": "72b776f1c65e825b78e5aa25211dc63e27f15d9c4dc4f85b2566edfcd6884710"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "72e99a452acf2246a7ef016695d50de9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 23053,
+        "upload_time": "2023-01-31T10:32:39",
+        "upload_time_iso_8601": "2023-01-31T10:32:39.737188Z",
+        "url": "https://files.pythonhosted.org/packages/15/9c/c042712b61caa9a45afb641c67c60e16e5b1c6fcc1ca14d3652aeb777afc/cacheme-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da672138514d6800a51acb2ad65f875dd0bab7a8d74504c803e66fbc5211b420",
+          "md5": "b047fd873371b5c85a381a692fc60ed6",
+          "sha256": "4c671a821e5437f7056276e8fdffcad5f37364e61b7450e8d442a614147e30ed"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b047fd873371b5c85a381a692fc60ed6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20327,
+        "upload_time": "2023-01-31T10:32:41",
+        "upload_time_iso_8601": "2023-01-31T10:32:41.539841Z",
+        "url": "https://files.pythonhosted.org/packages/da/67/2138514d6800a51acb2ad65f875dd0bab7a8d74504c803e66fbc5211b420/cacheme-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56204e554e94f2c1495f93e3d63766d59ce5656b8c658d483fb4ebbe4517495b",
+          "md5": "a32f4b93072891c112365f002e7b48ca",
+          "sha256": "4479bf5e8cdf8b1c028f306a89f21b519e7e8b00689f859491455bdc83bcfe5e"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a32f4b93072891c112365f002e7b48ca",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 23074,
+        "upload_time": "2023-02-03T18:06:47",
+        "upload_time_iso_8601": "2023-02-03T18:06:47.537458Z",
+        "url": "https://files.pythonhosted.org/packages/56/20/4e554e94f2c1495f93e3d63766d59ce5656b8c658d483fb4ebbe4517495b/cacheme-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62c29e4bdbe1fc40befa2ad7db5e22ae975b4a522fea5e29985050e0e6aa67d0",
+          "md5": "31475296d3388c1be9e6a16c3c77df60",
+          "sha256": "0721f857f1c1c34c9faaee383f574cfddc6511ae4f502aab5e7675aadbbde586"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "31475296d3388c1be9e6a16c3c77df60",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20370,
+        "upload_time": "2023-02-03T18:06:48",
+        "upload_time_iso_8601": "2023-02-03T18:06:48.831938Z",
+        "url": "https://files.pythonhosted.org/packages/62/c2/9e4bdbe1fc40befa2ad7db5e22ae975b4a522fea5e29985050e0e6aa67d0/cacheme-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "339563e5800bffe2e86b470ea28931e6102b53b74421559989b0ce217fcbfeef",
+          "md5": "c2ab2ca667c29ca964491fa2708a6349",
+          "sha256": "838e3cfecfddc09c78025498462c84c79a1ede3e496379967435c649234d579b"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c2ab2ca667c29ca964491fa2708a6349",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 22377,
+        "upload_time": "2023-02-08T14:26:07",
+        "upload_time_iso_8601": "2023-02-08T14:26:07.269926Z",
+        "url": "https://files.pythonhosted.org/packages/33/95/63e5800bffe2e86b470ea28931e6102b53b74421559989b0ce217fcbfeef/cacheme-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "094ed99782c9f2c4f1ddc0809d7c3ca4ec78f3365345b721e4ee135a1e00e2fc",
+          "md5": "035ab99928e2d208fd08fa2c31df4e7f",
+          "sha256": "1b919bb532be9bf1c8afb2992fc88d65fabe77f77d6734457d6cbda62745f211"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "035ab99928e2d208fd08fa2c31df4e7f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 19755,
+        "upload_time": "2023-02-08T14:26:09",
+        "upload_time_iso_8601": "2023-02-08T14:26:09.282643Z",
+        "url": "https://files.pythonhosted.org/packages/09/4e/d99782c9f2c4f1ddc0809d7c3ca4ec78f3365345b721e4ee135a1e00e2fc/cacheme-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d71799f50fe9b2ff835d6901ae75c2a61b8e65ac36483a644ef5acb290a72705",
+          "md5": "4d8e59ec00e8fb2054de0b6b51a0a679",
+          "sha256": "e39da37c615c13828cd6be172078870b651c219cb3ca05ed7f738f2cf79d2736"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4d8e59ec00e8fb2054de0b6b51a0a679",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 24777,
+        "upload_time": "2023-03-06T13:05:25",
+        "upload_time_iso_8601": "2023-03-06T13:05:25.363378Z",
+        "url": "https://files.pythonhosted.org/packages/d7/17/99f50fe9b2ff835d6901ae75c2a61b8e65ac36483a644ef5acb290a72705/cacheme-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a0fff70c0b6f218b6ceae1bbaacc369245d4bc3d1b3060b20b6f19386368c42a",
+          "md5": "2bc47e56e0908c59075cf871e1ab5fb2",
+          "sha256": "9f01ef34d2dc207b5f4392c12d5e964b018c7607f5341b0c3212cde266cef87a"
+        },
+        "downloads": -1,
+        "filename": "cacheme-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2bc47e56e0908c59075cf871e1ab5fb2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 21807,
+        "upload_time": "2023-03-06T13:05:26",
+        "upload_time_iso_8601": "2023-03-06T13:05:26.915332Z",
+        "url": "https://files.pythonhosted.org/packages/a0/ff/f70c0b6f218b6ceae1bbaacc369245d4bc3d1b3060b20b6f19386368c42a/cacheme-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d71799f50fe9b2ff835d6901ae75c2a61b8e65ac36483a644ef5acb290a72705",
+        "md5": "4d8e59ec00e8fb2054de0b6b51a0a679",
+        "sha256": "e39da37c615c13828cd6be172078870b651c219cb3ca05ed7f738f2cf79d2736"
+      },
+      "downloads": -1,
+      "filename": "cacheme-0.3.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4d8e59ec00e8fb2054de0b6b51a0a679",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 24777,
+      "upload_time": "2023-03-06T13:05:25",
+      "upload_time_iso_8601": "2023-03-06T13:05:25.363378Z",
+      "url": "https://files.pythonhosted.org/packages/d7/17/99f50fe9b2ff835d6901ae75c2a61b8e65ac36483a644ef5acb290a72705/cacheme-0.3.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a0fff70c0b6f218b6ceae1bbaacc369245d4bc3d1b3060b20b6f19386368c42a",
+        "md5": "2bc47e56e0908c59075cf871e1ab5fb2",
+        "sha256": "9f01ef34d2dc207b5f4392c12d5e964b018c7607f5341b0c3212cde266cef87a"
+      },
+      "downloads": -1,
+      "filename": "cacheme-0.3.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "2bc47e56e0908c59075cf871e1ab5fb2",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 21807,
+      "upload_time": "2023-03-06T13:05:26",
+      "upload_time_iso_8601": "2023-03-06T13:05:26.915332Z",
+      "url": "https://files.pythonhosted.org/packages/a0/ff/f70c0b6f218b6ceae1bbaacc369245d4bc3d1b3060b20b6f19386368c42a/cacheme-0.3.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

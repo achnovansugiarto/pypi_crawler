@@ -1,0 +1,485 @@
+{
+  "info": {
+    "author": "Sean Ma",
+    "author_email": "maye-msft@outlook.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Config-Driven Data Pipeline\n\n[![pypi](https://img.shields.io/pypi/v/cddp.svg)](https://pypi.org/project/cddp)\n\n## Why this solution\n\nThis repository is to illustrate the basic concept and implementation of the solution of config-driven data pipeline. The configuration is a JSON file that contains the information about the data sources, the data transformations and the data curation. The configuration file is the only file that needs to be modified to change the data pipeline. **In this way, even business users or operation team can modify the data pipeline without the need of a developer.**\n\nThis repository shows a simplified version of this solution based on [Azure Databricks](https://learn.microsoft.com/en-us/azure/databricks/introduction/), [Apache Spark](https://spark.apache.org/docs/latest/index.html) and [Delta Lake](https://www.delta.io). The configuration file is converted into Azure Databricks Job as the runtime of the data pipeline. It targets to provide a lo/no code data app solution for business or operation team.\n\n## Background\n\n![medallion architecture](images/arc1.png)\n\nThis is the medallion architecture introduced by Databricks. And it shows a data pipeline which includes three stages: Bronze, Silver, and Gold. In most data platform projects, the stages can be named as Staging, Standard and Serving.\n\n- Bronze/Staging: The data from external systems is ingested and stored in the staging stage. The data structures in this stage correspond to the source system table structures \"as-is,\" along with any additional metadata columns that capture the load date/time, process ID, etc.\n- Silver/Standardization: The data from the staging stage is cleansed and transformed and then stored in the standard stage. It provides enriched datasets for further business analysis. The master data could be versioned with slowly changed dimension (SCD) pattern and the transaction data is deduplicated and contextualized with master data.\n- Gold/Serving: The data from the standard stage is aggregated and then stored in the serving stage. The data is organized in consumption-ready \"project-specific\" databases, such as Azure SQL.\n\n![Azure](images/arc2.png)\n\nThe above shows a typical way to implement a data pipeline and data platform based on Azure Databricks.\n\n- Azure Data Factory can be used to load external data and store to Azure Data Lake Storage.\n- Azure Data Lake Storage (ADLS) can be applied as the storage layer of the staging, standard, and serving stage.\n- Azure Databricks is the calculation engine for data transformation, and most of the transformation logic can be implemented with pySpark or SparkSQL.\n- Azure Synapse Analytics or Azure Data Explorer is the solution of serving stage.\nThe medallion architecture and Azure big data services consist of the infrastructure of an enterprise data platform. Then data engineers can build transformation and aggregation logic with programming languages such as Scala, Python, SQL etc. Meanwhile, DevOps is mandatory in the modern data warehouse.\n\n## Architecture\n\n![Architecture](images/arc3.png)\n\nInspired by Data Mesh, we try to create a solution to accelerate the data pipeline implementation and reduce the respond time to changing business needs, where we’d like to help business team can have the ownership of data application instead of data engineers, who could focus on the infrastructure and frameworks to support business logic more efficiently.\n\nThe configurable data pipeline includes two parts\n\n- Framework: The framework is to load the configuration files and convert them into Spark Jobs which could be run with Databricks. It encapsulates the complex Spark cluster and job runtime and provides a simplified interface to users, who can focus on business logic. The framework is based on pySpark and Delta Lake and managed by developers.\n- Configuration: It is the metadata of the pipeline, which defines the pipeline stages, data source information, transformation and aggregation logic which can be implemented in SparkSQL. And the configuration can be managed by a set of APIs. The technical operation team can manage the pipeline configuration via a Web UI based on the API layer.\nProof of Concept:\nWe need to build a data pipeline to calculate the total revenue of fruits.\n\n![PoC](images/poc.png)\n\nThere are 2 data sources:\n\n- fruit price – the prices could be changed frequently and saved as CSV files which upload into the landing zone.\n- fruit sales – it is streaming data when a transition occurs, an event will be omitted. And the data is saved as CSV file into a folder of landing zone as well.\nIn the standardized zone, the price and sales view can be joined. Then in the serving zone, the fruit sales data can be aggregated.\nThe JSON file below describes the pipeline.\n\n### Configuration file\n\n```json\n{\n  \"name\": \"fruit_data_app\",\n  \"staging\": [\n    {\n      \"name\": \"sales\",\n      \"format\": \"csv\",\n      \"target\": \"raw_sales\",\n      \"location\": \"sales/\",\n      \"type\": \"batch\",\n      \"output\": [\"file\", \"view\"],\n      \"schema\": {...}\n    },\n    {\n      \"name\":\"price\",\n      \"format\": \"csv\",\n      \"target\": \"raw_price\",\n      \"location\": \"price/\",\n      \"type\": \"batch\",\n      \"output\": [\"file\", \"view\"],\n      \"schema\": {...}\n    }\n  ],\n  \"standard\": [\n    {\n      \"name\":\"fruit_sales\",\n      \"sql\": \"select price.fruit, price.id, sales.amount, price.price, sales.ts from raw_sales sales left outer join raw_price price on sales.id = price.id and sales.ts >= price.start_ts and sales.ts < price.end_ts\",\n      \"target\": \"fruit_sales\",\n      \"type\": \"batch\",\n      \"output\": [\"file\", \"view\"]\n    }\n  ],\n  \"serving\": [\n    {\n      \"name\": \"fruit_sales_total\",\n      \"sql\": \"select id, fruit, sum(amount*price) as total from fruit_sales group by id, fruit order by total desc\",\n      \"target\": \"fruit_sales_total\",\n      \"type\": \"batch\",\n      \"output\": [\"table\", \"file\"]\n    }\n  ]\n}\n\n```\n\nIn the pipeline, it includes the 3 blocks:\n\n- **staging**\n- **standardization**\n- **serving**\n\nThe staging block defines the data sources. The standardization block defines the transformation logic. The serving block defines the aggregation logic.\nSpark SQL are used in the standardization block and the serving block, one is merge price and sales data and the other is for aggregation of the sales data.\n\nHere is a simplified version of the framework. It is built with a Databricks notebook in python.\n\nHere is the full [JSON file](pipeline_fruit.json) of this example pipeline. And [another more complex example pipeline](pipeline_nyc_taxi.json) in this repo which is a data pipeline to analyze NYC taxi pickup data.\n\n### Framework\n\nThere are 3 functions defined in the notebook.\n\n- start_staging_job: \n  - It is to load the data from the data sources and save them to the staging zone.\n  - It supports to load data in streaming or batch mode.\n\n```python\ndef start_staging_job(spark, config, task, timeout=None):\n    \"\"\"Creates the staging job\"\"\"\n    schema = StructType.fromJson(task[\"schema\"])\n    location = task[\"location\"]\n    target = task[\"target\"]\n    type = task[\"type\"]\n    output = task[\"output\"]\n    format = task[\"format\"]\n    landing_path = config[\"landing_path\"]\n    staging_path = config[\"staging_path\"]\n    if type == \"streaming\":\n        df = spark \\\n            .readStream \\\n            .format(format) \\\n            .option(\"multiline\", \"true\") \\\n            .option(\"header\", \"true\") \\\n            .schema(schema) \\\n            .load(landing_path+\"/\"+location)    \n\n        if \"table\" in output:\n            query = df.writeStream\\\n                .format(storage_format) \\\n                .outputMode(\"append\")\\\n                .option(\"checkpointLocation\", staging_path+\"/\"+target+\"_chkpt\")\\\n                .toTable(target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"file\" in output:\n            query = df.writeStream \\\n                .format(storage_format) \\\n                .outputMode(\"append\") \\\n                .option(\"checkpointLocation\", staging_path+\"/\"+target+\"_chkpt\") \\\n                .start(staging_path+\"/\"+target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n    elif type == \"batch\":\n        df = spark \\\n            .read \\\n            .format(format) \\\n            .option(\"multiline\", \"true\") \\\n            .option(\"header\", \"true\") \\\n            .schema(schema) \\\n            .load(landing_path+\"/\"+location)  \n\n        if \"table\" in output:\n            df.write.format(storage_format).mode(\"append\").option(\"overwriteSchema\", \"true\").saveAsTable(target)\n        if \"file\" in output:\n            df.write.format(storage_format).mode(\"append\").option(\"overwriteSchema\", \"true\").save(staging_path+\"/\"+target)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n    else :\n        raise Exception(\"Invalid type\")\n```\n\n- start_stardard_job:\n  - It is to load the data from the staging zone and transform them to the standard zone.\n  - This function supports to run in batch mode or streaming mode, the streaming mode is available when there are view from streaming data source.\n\n```python\ndef start_standard_job(spark, config, task, timeout=None):\n    \"\"\"Creates the standard job\"\"\"\n    standard_path = config[\"standard_path\"]\n    sql = task[\"sql\"]\n    output = task[\"output\"]\n    if(isinstance(sql, list)):\n        sql = \" \\n\".join(sql)\n    target = task[\"target\"]\n    load_staging_views(spark, config)\n    df = spark.sql(sql)\n    type = \"batch\"\n    if \"type\" in task:\n        type = task[\"type\"]\n    if type == \"streaming\":\n        if \"table\" in output:\n            query = df.writeStream\\\n                .format(storage_format) \\\n                .outputMode(\"append\")\\\n                .option(\"checkpointLocation\", standard_path+\"/\"+target+\"_chkpt\")\\\n                .toTable(target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"file\" in output:\n            query = df.writeStream \\\n                .format(storage_format) \\\n                .outputMode(\"append\") \\\n                .option(\"checkpointLocation\", standard_path+\"/\"+target+\"_chkpt\") \\\n                .start(standard_path+\"/\"+target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n    elif type == \"batch\":\n        if \"table\" in output:\n            df.write.format(storage_format).mode(\"append\").option(\"overwriteSchema\", \"true\").saveAsTable(target)\n        if \"file\" in output:\n            df.write.format(storage_format).mode(\"append\").option(\"overwriteSchema\", \"true\").save(standard_path+\"/\"+target)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n    else :\n        raise Exception(\"Invalid type\")\n```\n\n- start_serving_job:\n  - It is to load the data from the standard zone and aggregate them to the serving zone.\n  - This function supports to run in batch mode or streaming mode, the streaming mode is available when there are view from streaming data source.\n\n```python\ndef start_serving_job(spark, config, task, timeout=None):\n    \"\"\"Creates the serving job\"\"\"\n    serving_path = config[\"serving_path\"]\n    sql = task[\"sql\"]\n    output = task[\"output\"]\n    if(isinstance(sql, list)):\n        sql = \" \\n\".join(sql)\n    target = task[\"target\"]\n    type = \"batch\"\n    if \"type\" in task:\n        type = task[\"type\"]\n    load_staging_views(spark, config)\n    load_standard_views(spark, config)\n    df = spark.sql(sql)\n    if type == \"streaming\":\n        if \"table\" in output:\n            query = df.writeStream\\\n                .format(storage_format) \\\n                .outputMode(\"complete\")\\\n                .option(\"checkpointLocation\", serving_path+\"/\"+target+\"_chkpt\")\\\n                .toTable(target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"file\" in output:\n            query = df.writeStream \\\n                .format(storage_format) \\\n                .outputMode(\"complete\") \\\n                .option(\"checkpointLocation\", serving_path+\"/\"+target+\"_chkpt\") \\\n                .start(serving_path+\"/\"+target)\n            if timeout is not None:\n                query.awaitTermination(timeout)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n\n    elif type == \"batch\":\n        if \"table\" in output:\n            df.write.format(storage_format).mode(\"overwrite\").option(\"overwriteSchema\", \"true\").saveAsTable(target)\n        if \"file\" in output:\n            df.write.format(storage_format).mode(\"overwrite\").option(\"overwriteSchema\", \"true\").save(serving_path+\"/\"+target)\n        if \"view\" in output:\n            df.createOrReplaceTempView(target)\n    else :\n        raise Exception(\"Invalid type\")\n```\n\nThe pipeline configuration file is loaded by the notebook, where the file path is an input of the notebook.\n\n```python\ndef load_config(path) :\n    with open(path, 'r') as f:\n        config = json.load(f)\n    return config\n```\n\nFinally, the notebook starts all the tasks in each stage.\n\n```python\nif 'staging' in config:\n    for name in config[\"staging\"]:\n        start_staging_job(spark, config, name)\nif 'standard' in config:\n    for name in config[\"standard\"]:\n        start_standard_job(spark, config, name)\nif 'serving' in config:\n    for name in config[\"serving\"]:\n        start_serving_job(spark, config, name)\n```\n\nWe create one Databricks job to run this notebook. Here is the screenshot to create the Databricks job and task.\n\n![job config](images/job1.png)\n\nAfter running the job, the data output to the serving path will be as below.\n\n  id|      fruit|total\n----|-----------|------\n   4|Green Apple| 90.0\n   7|Green Grape| 72.0\n   5| Fiji Apple|112.0\n   1|  Red Grape| 48.0\n   3|     Orange| 56.0\n   6|     Banana| 34.0\n   2|      Peach| 78.0\n\n### Job Parallelism\n\nDatabricks supports to execute tasks in parallel, the tasks in a job can be organized as a graph based on the dependency of tasks.\n\n![job config](images/job2.png)\n\nAnd the four tasks in the pipeline can be organized as below\n\n![job config](images/job3.png)\n  \n## Conclusion\n\nIt introduces a method to build a data pipeline with configuration file and demonstrates it through a Databricks notebook and JSON based configuration file. And we can create an API layer on the top of the Databricks REST API and then the data pipeline development work could be shifted from data engineering team.\n\n## Next Step\n\nWhile the following topics still need to be considered before go-to-production.\n\n- Data persistence: In staging and standardization zone, the data can be converted into parquet format and stored into Azure Data Lake Storage to have better performance. While in standardization zone, temporary view could be applied for intermediate result when no persistence is required.\n- Slow Changed Dimension (SCD): Slowly Changing Dimensions are dimensions which change over time, and it is a pattern to keep the accuracy of the report in the data pipeline which can track the changes of the attributes. Here is an SCD implementation which could be used in the framework. [https://pypi.org/project/dbxscd/](https://pypi.org/project/dbxscd/)\n- CI/CD: We can leverage DevOps pipeline to automatically complete the notebook testing and deployment, here is one template of Azure DevOps pipeline for Databricks notebook. [link](https://github.com/Azure-Samples/modern-data-warehouse-dataops/tree/main/single_tech_samples/databricks/sample4_ci_cd)\n- Error Handling: Databricks provide mature solution to handle bad record while we need to design and implementation retry solution. [Handling bad records and files - Azure Databricks | Microsoft Docs](https://docs.microsoft.com/en-us/azure/databricks/spark/latest/spark-sql/handling-bad-records)\n- Monitoring: Azure Monitor and Azure Log Analytics are the tools which can integrated with Azure Databricks, here is a tutorial to build the Databricks monitoring. [Monitor Azure Databricks - Azure Architecture Center | Microsoft Docs](https://docs.microsoft.com/en-us/azure/architecture/databricks-monitoring/)\n\n## Reference\n\n- [Medallion Architecture – Databricks](https://www.databricks.com/glossary/medallion-architecture)\n\n- [How to Use Databricks to Scale Modern Industrial IoT Analytics - Part 1 - The Databricks Blog](https://www.databricks.com/blog/2020/08/03/modern-industrial-iot-analytics-on-azure-part-1.html)\n\n- [How to Implement CI/CD on Databricks Using Databricks Notebooks and Azure DevOps - The Databricks Blog](https://www.databricks.com/blog/2021/09/20/part-1-implementing-ci-cd-on-databricks-using-databricks-notebooks-and-azure-devops.html)\n\n- [Break Through the Centralized Platform Bottlenecks with Data Mesh | Thoughtworks](https://www.thoughtworks.com/en-sg/insights/articles/break-though-the-centralized-platform-bottlenecks-with-data-mesh)\n\n## Appendix\n\n### Run the demonstration locally\n\n- Clone the repository\n\n```bash\ngit clone https://github.com/Azure/config-driven-data-pipeline\ncd config-driven-data-pipeline\n```\n\n- Install the dependencies\n\n```bash\npython -m venv .venv\ncd .venv\ncd Scripts\nactivate\ncd ../..\npip install -r requirements.txt\n```\n\n- Run fruit app\n\n```bash\npython src/main.py --config-path ./example/pipeline_fruit.json --working-dir ./tmp --show-result True --build-landing-zone True --cleanup-database True\n```\n\n- Run fruit app in parallel\n\n```bash\npython src/main.py --config-path ./example/pipeline_fruit_parallel.json --working-dir ./tmp --await-termination 60 --show-result True  --build-landing-zone True --cleanup-database True\n```\n\n- Run NYC taxi app with python\n\n```bash\npython src/main.py --config-path ./example/pipeline_nyc_taxi.json --landing-path ./data/landing/nyc_taxi/ --working-dir ./tmp --show-result True \n```\n\n- Start the WebUI\n\n```bash\ncd src\npython -m flask run\n```\n\nThen visit http://127.0.0.1:5000/static/index.html to open the WebUI as shown below.\n\n![job config](images/webUI.png)\n\n## Contributing\n\nThis project welcomes contributions and suggestions.  Most contributions require you to agree to a\nContributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us\nthe rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.\n\nWhen you submit a pull request, a CLA bot will automatically determine whether you need to provide\na CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions\nprovided by the bot. You will only need to do this once across all repos using our CLA.\n\nThis project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).\nFor more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or\ncontact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.\n\n## Legal Notices\n\nMicrosoft and any contributors grant you a license to the Microsoft documentation and other content\nin this repository under the [Creative Commons Attribution 4.0 International Public License](https://creativecommons.org/licenses/by/4.0/legalcode),\nsee the [LICENSE](LICENSE) file, and grant you a license to any code in the repository under the [MIT License](https://opensource.org/licenses/MIT), see the\n[LICENSE-CODE](LICENSE-CODE) file.\n\nMicrosoft, Windows, Microsoft Azure and/or other Microsoft products and services referenced in the documentation\nmay be either trademarks or registered trademarks of Microsoft in the United States and/or other countries.\nThe licenses for this project do not grant you rights to use any Microsoft names, logos, or trademarks.\nMicrosoft's general trademark guidelines can be found at http://go.microsoft.com/fwlink/?LinkID=254653.\n\nPrivacy information can be found at <https://privacy.microsoft.com/en-us/>\n\nMicrosoft and any contributors reserve all other rights, whether under their respective copyrights, patents,\nor trademarks, whether by implication, estoppel or otherwise.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/azure/config-driven-data-pipeline",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cddp",
+    "package_url": "https://pypi.org/project/cddp/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/cddp/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/azure/config-driven-data-pipeline/issues",
+      "Homepage": "https://github.com/azure/config-driven-data-pipeline"
+    },
+    "release_url": "https://pypi.org/project/cddp/0.0.9/",
+    "requires_dist": null,
+    "requires_python": ">=3.8",
+    "summary": "Config Driven Data Pipeline",
+    "version": "0.0.9",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15494469,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60acb4db534549b0ead4a57def428d978f8413098307af15efce5f5796f64ccc",
+          "md5": "f46ffdfc568b9651cd490b03cfac671d",
+          "sha256": "a8bd700344fea1f2f1e0e46b31a4ef86d634c6f14ec3a1decfb60e20a8f89d2a"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f46ffdfc568b9651cd490b03cfac671d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 10840,
+        "upload_time": "2022-09-27T01:53:34",
+        "upload_time_iso_8601": "2022-09-27T01:53:34.795847Z",
+        "url": "https://files.pythonhosted.org/packages/60/ac/b4db534549b0ead4a57def428d978f8413098307af15efce5f5796f64ccc/cddp-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e63bdfc942432e5e919a982650995d043291822b65c96f3edbf912d874d28cf",
+          "md5": "d84e901120a685ecf6ee6141ca56bf87",
+          "sha256": "968b64fd280a31ba52298fa53d73391fdeb6abbdd62bc9bcc2482597edfdf020"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d84e901120a685ecf6ee6141ca56bf87",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15013,
+        "upload_time": "2022-09-27T01:53:37",
+        "upload_time_iso_8601": "2022-09-27T01:53:37.187776Z",
+        "url": "https://files.pythonhosted.org/packages/9e/63/bdfc942432e5e919a982650995d043291822b65c96f3edbf912d874d28cf/cddp-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d601cd10eeed9d74c0ad07514204a90239390b1c8bda79a59158281387a08f3c",
+          "md5": "ead16496eabfe9da200f4edf19b25746",
+          "sha256": "2053021395b2f2f1569a4cefd5901c85fb2afc122eed98f40b94946a8394ee1d"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ead16496eabfe9da200f4edf19b25746",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 9947,
+        "upload_time": "2022-09-27T03:16:48",
+        "upload_time_iso_8601": "2022-09-27T03:16:48.890740Z",
+        "url": "https://files.pythonhosted.org/packages/d6/01/cd10eeed9d74c0ad07514204a90239390b1c8bda79a59158281387a08f3c/cddp-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "233539f37c8d5b441b2525e390e3abaa1738c10023ac1bc15c28f79d134748c6",
+          "md5": "5b585f44d7c0417ee69e16eb7c120977",
+          "sha256": "72a4d0ffd2593de364071206e653b88699fcaa87c93e5c7951f5abe88035a37d"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5b585f44d7c0417ee69e16eb7c120977",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 14317,
+        "upload_time": "2022-09-27T03:16:50",
+        "upload_time_iso_8601": "2022-09-27T03:16:50.692744Z",
+        "url": "https://files.pythonhosted.org/packages/23/35/39f37c8d5b441b2525e390e3abaa1738c10023ac1bc15c28f79d134748c6/cddp-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91581fc8b651b37b58860a323f5699b30c1c7a0ddd8b3a440818a852138f1dcd",
+          "md5": "eec8878628ab7f4e702724901aa6f76d",
+          "sha256": "27d548c4b9c57e1b5f64235965facb72487ae0ab8fe0ecd65a2ad32b9ba8009a"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "eec8878628ab7f4e702724901aa6f76d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 9971,
+        "upload_time": "2022-09-27T03:51:02",
+        "upload_time_iso_8601": "2022-09-27T03:51:02.710007Z",
+        "url": "https://files.pythonhosted.org/packages/91/58/1fc8b651b37b58860a323f5699b30c1c7a0ddd8b3a440818a852138f1dcd/cddp-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b83979cd0dac8bbca79adcce9be149faa24bf1b4686d428c1979e631f0b4d9b3",
+          "md5": "03880004633cd76eb006a6abd4b8ea06",
+          "sha256": "9444dcfd4afee0708d19d78798312250de5bf3aa1eb59e0bc264bc5ea4d03956"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03880004633cd76eb006a6abd4b8ea06",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 14352,
+        "upload_time": "2022-09-27T03:51:05",
+        "upload_time_iso_8601": "2022-09-27T03:51:05.086099Z",
+        "url": "https://files.pythonhosted.org/packages/b8/39/79cd0dac8bbca79adcce9be149faa24bf1b4686d428c1979e631f0b4d9b3/cddp-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ace55af34a239a6a7b62391de888f828a171944010cebf630a9fc7ea4091aeee",
+          "md5": "4f3f462c39403e1808ed60b483ee3b38",
+          "sha256": "f654fdb60dbf4ff912a44044ea11c398187ba607b722ee16c59f4cdff4ffb86a"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4f3f462c39403e1808ed60b483ee3b38",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 9973,
+        "upload_time": "2022-09-27T04:30:21",
+        "upload_time_iso_8601": "2022-09-27T04:30:21.793504Z",
+        "url": "https://files.pythonhosted.org/packages/ac/e5/5af34a239a6a7b62391de888f828a171944010cebf630a9fc7ea4091aeee/cddp-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0da44136391d72ee70e4a6e328feda6cf4c14a1c446ecc2be6a5e017079303db",
+          "md5": "74886ce76ea6880887e218aadfc4b3b7",
+          "sha256": "d99bb8aa20748d382d2608bccdc5c9c4fd611f06dc6af4e7fcb4a8de9b95f6e7"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "74886ce76ea6880887e218aadfc4b3b7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 14324,
+        "upload_time": "2022-09-27T04:30:23",
+        "upload_time_iso_8601": "2022-09-27T04:30:23.567233Z",
+        "url": "https://files.pythonhosted.org/packages/0d/a4/4136391d72ee70e4a6e328feda6cf4c14a1c446ecc2be6a5e017079303db/cddp-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c15e2a7c440b6b1d37b012d68af425841a9b4062c3885d3e0d77d89e8e930360",
+          "md5": "935aed1804b031a56f3d522db1485453",
+          "sha256": "2075a942a62ab033b96ae2aa2fb8d21db15e6e0ccd1b549655570747ee748629"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "935aed1804b031a56f3d522db1485453",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 10005,
+        "upload_time": "2022-09-27T05:24:16",
+        "upload_time_iso_8601": "2022-09-27T05:24:16.534829Z",
+        "url": "https://files.pythonhosted.org/packages/c1/5e/2a7c440b6b1d37b012d68af425841a9b4062c3885d3e0d77d89e8e930360/cddp-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb70c929fd72af0130956d8f46679c4c59afc9a006451fe2fc887fe500e5a509",
+          "md5": "e5c0bf993d5adf6992a0166db5db1535",
+          "sha256": "c35a49d7cbb6e8dc9f686e589bfdbaeb5b6f5d2a880519813c3f037816a79e17"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e5c0bf993d5adf6992a0166db5db1535",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 14385,
+        "upload_time": "2022-09-27T05:24:19",
+        "upload_time_iso_8601": "2022-09-27T05:24:19.958266Z",
+        "url": "https://files.pythonhosted.org/packages/eb/70/c929fd72af0130956d8f46679c4c59afc9a006451fe2fc887fe500e5a509/cddp-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9d413468cf6b673cd01855618f1588d51a28febe29a7216c94e76ce802345dec",
+          "md5": "c17e91d1b666a4a48fdabaf76114ecb0",
+          "sha256": "f07867aca7f61596c09f750c9cef2c6d4aff7bb9350baee38cd478e5bb36c23d"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c17e91d1b666a4a48fdabaf76114ecb0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 11668,
+        "upload_time": "2022-10-09T07:39:04",
+        "upload_time_iso_8601": "2022-10-09T07:39:04.711849Z",
+        "url": "https://files.pythonhosted.org/packages/9d/41/3468cf6b673cd01855618f1588d51a28febe29a7216c94e76ce802345dec/cddp-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc59371253fdd263ffb6c043cfba4c30d6d97c3d601b45f20fca81e4e50e78e8",
+          "md5": "4d857b6dbbd589487c9566fa93014e55",
+          "sha256": "e31fce8ebf32a8aef6ec48c1d8930e0c54a730d46fd285108384d44bbea8e7c2"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4d857b6dbbd589487c9566fa93014e55",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 16235,
+        "upload_time": "2022-10-09T07:39:06",
+        "upload_time_iso_8601": "2022-10-09T07:39:06.831759Z",
+        "url": "https://files.pythonhosted.org/packages/bc/59/371253fdd263ffb6c043cfba4c30d6d97c3d601b45f20fca81e4e50e78e8/cddp-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef5edba938b0c7db052674ee35de7dd0996513c56b2565348fddccb9c937ea6a",
+          "md5": "66c960d769a45762cff07f56f7c97e1a",
+          "sha256": "304cb1bd17b6a092030c160774108fd5309c7fe5a96c66c002b13d7e7d9d0945"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "66c960d769a45762cff07f56f7c97e1a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 24771,
+        "upload_time": "2022-10-21T03:36:12",
+        "upload_time_iso_8601": "2022-10-21T03:36:12.094601Z",
+        "url": "https://files.pythonhosted.org/packages/ef/5e/dba938b0c7db052674ee35de7dd0996513c56b2565348fddccb9c937ea6a/cddp-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb9179dd8a7f0d60a2875af5ad6fee3fa156a6bc88c5328f7f32edd2aaa0cce0",
+          "md5": "1a27a7f5ddfc01bfb72132833db69f0c",
+          "sha256": "494e706cad0889f6457353485c5410175c4c86772586403995009a739f5a5fd9"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a27a7f5ddfc01bfb72132833db69f0c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 27230,
+        "upload_time": "2022-10-21T03:36:14",
+        "upload_time_iso_8601": "2022-10-21T03:36:14.071252Z",
+        "url": "https://files.pythonhosted.org/packages/eb/91/79dd8a7f0d60a2875af5ad6fee3fa156a6bc88c5328f7f32edd2aaa0cce0/cddp-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7406267864d7a86b67cf2b1926194637f62dc8977963244e8cff8730d4c3c273",
+          "md5": "3f6559788f7e79cf77658c25b134a84a",
+          "sha256": "15d0ae531bdd24407e7dcad572b2993323f35ad8c9e7428c69bda314daf33f37"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3f6559788f7e79cf77658c25b134a84a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 25093,
+        "upload_time": "2022-10-21T13:30:11",
+        "upload_time_iso_8601": "2022-10-21T13:30:11.835193Z",
+        "url": "https://files.pythonhosted.org/packages/74/06/267864d7a86b67cf2b1926194637f62dc8977963244e8cff8730d4c3c273/cddp-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e040ca93aa289cee80a11ecc23ea2ac47beb63878f86c87c44bb32416a55e64e",
+          "md5": "f458a1bd4c3f02efdcd288703d4d7908",
+          "sha256": "ff7d62acc277388c895f3bd508ee6b6ddc0eae7c847c499345a9fa5a4bbf05fd"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f458a1bd4c3f02efdcd288703d4d7908",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 27457,
+        "upload_time": "2022-10-21T13:30:14",
+        "upload_time_iso_8601": "2022-10-21T13:30:14.783447Z",
+        "url": "https://files.pythonhosted.org/packages/e0/40/ca93aa289cee80a11ecc23ea2ac47beb63878f86c87c44bb32416a55e64e/cddp-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e05c714089beb131bf518bafda861e09de2626d653ba00f394c75a5ecfb2331",
+          "md5": "209886213c194168b59ee65cc7ba111a",
+          "sha256": "86cfc55dc47cdf5d56ea54e543dc4e347de133a64d7846974536ef446c99a71f"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "209886213c194168b59ee65cc7ba111a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 24787,
+        "upload_time": "2022-10-22T09:24:33",
+        "upload_time_iso_8601": "2022-10-22T09:24:33.546646Z",
+        "url": "https://files.pythonhosted.org/packages/6e/05/c714089beb131bf518bafda861e09de2626d653ba00f394c75a5ecfb2331/cddp-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5887c2442248e77ec1fe68cf10211f2d3e0082fa8a0e6933932496dce0ef07d",
+          "md5": "9beb8ea33865c4c13680688ff4a00cf6",
+          "sha256": "bd0205fa5b4a3edbb285ce3cfa0940901a6179e2f2372e9fd59075cde5f6058f"
+        },
+        "downloads": -1,
+        "filename": "cddp-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9beb8ea33865c4c13680688ff4a00cf6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 27210,
+        "upload_time": "2022-10-22T09:24:37",
+        "upload_time_iso_8601": "2022-10-22T09:24:37.899131Z",
+        "url": "https://files.pythonhosted.org/packages/b5/88/7c2442248e77ec1fe68cf10211f2d3e0082fa8a0e6933932496dce0ef07d/cddp-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6e05c714089beb131bf518bafda861e09de2626d653ba00f394c75a5ecfb2331",
+        "md5": "209886213c194168b59ee65cc7ba111a",
+        "sha256": "86cfc55dc47cdf5d56ea54e543dc4e347de133a64d7846974536ef446c99a71f"
+      },
+      "downloads": -1,
+      "filename": "cddp-0.0.9-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "209886213c194168b59ee65cc7ba111a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 24787,
+      "upload_time": "2022-10-22T09:24:33",
+      "upload_time_iso_8601": "2022-10-22T09:24:33.546646Z",
+      "url": "https://files.pythonhosted.org/packages/6e/05/c714089beb131bf518bafda861e09de2626d653ba00f394c75a5ecfb2331/cddp-0.0.9-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b5887c2442248e77ec1fe68cf10211f2d3e0082fa8a0e6933932496dce0ef07d",
+        "md5": "9beb8ea33865c4c13680688ff4a00cf6",
+        "sha256": "bd0205fa5b4a3edbb285ce3cfa0940901a6179e2f2372e9fd59075cde5f6058f"
+      },
+      "downloads": -1,
+      "filename": "cddp-0.0.9.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9beb8ea33865c4c13680688ff4a00cf6",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 27210,
+      "upload_time": "2022-10-22T09:24:37",
+      "upload_time_iso_8601": "2022-10-22T09:24:37.899131Z",
+      "url": "https://files.pythonhosted.org/packages/b5/88/7c2442248e77ec1fe68cf10211f2d3e0082fa8a0e6933932496dce0ef07d/cddp-0.0.9.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

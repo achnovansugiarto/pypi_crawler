@@ -1,0 +1,142 @@
+{
+  "info": {
+    "author": "OVH SAS",
+    "author_email": "opensource@ovh.net",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 2",
+      "Programming Language :: Python :: 2.7",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Software Development"
+    ],
+    "description": "# Celery Dyrygent\n\n[![Python 3.6](https://img.shields.io/badge/python-3.6-blue.svg)](https://www.python.org/downloads/release/python-360/)\n[![Unit Tests](https://github.com/ovh/celery-dyrygent/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/ovh/celery-dyrygent/actions/workflows/unit-tests.yml)\n[![Integration Tests](https://github.com/ovh/celery-dyrygent/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/ovh/celery-dyrygent/actions/workflows/integration-tests.yml)\n\n\nThis project aims to support full DAG workflow processing.\nIt's designed as celery extension and uses celery as an execution backend.\nCelery-dyrygent is released under modified BSD license. See [license](LICENSE)\n\n## What is it?\nThe reasons behind this project so as the implementation details were described in the following blogpost\nhttps://www.ovh.com/blog/doing-big-automation-with-celery/\n\n### What is a DAG workflow?\nDAG is a shortcut for Directed Acyclic Graph.\nWhile DAG workflow would be any combination of celery primitives:\n- groups\n- chains\n- chords\n\nCelery Dyrygent is able to process any kind of DAG workflows.\n\n### Why not to use native celery stuff?\nCelery struggles a bit with complex workflows built from combining primitives.\nThe execution might be unreliable, there are a lot of corner cases where workflow might not work as desired.\nSerialization of complex workflows causes memory issues.\nSome of the encountered problems which aren't solved (celery 4.2.1):\n- https://github.com/celery/celery/issues/5000\n- https://github.com/celery/celery/issues/5286\n- https://github.com/celery/celery/issues/5327\n\n## How does it work?\nThe whole workflow machinery works simialar to ```chord_unlock``` repeating celery task which waits till some tasks are done (header) and then executes further tasks (body).\nCelery Dyrygent introduces a workflow processor task which orchestrates an execution of a whole workflow.\nOnce the workflow is started the workflow processor task is repeated till the workflow execution is done or till some TTL timestamp is reached (not to repeat indefinitely).\nThe workflow processor schedules the execution of tasks according to their relations, retries itself, then checks if the tasks are done so the new ones can be scheduled, repeat.\nThat's it, the idea is quite simple.\n\n### Advantages\n- execution part is done by Celery, so all celery machinery with its features is available (retries, countdowns, etc.)\n- each workflow is executed in the same way\n- Celery operates on simple tasks only - no nested structures which causes troubles\n- link error for whole workflow can be implemented\n- finalizing task for whole workflow can be implemented (e.g. do something always when workflow finishes)\n- workflow execution is SOLID and RELIABLE\n- it's possible to track progress through signals (might need to implement a new signal for each tick)\n\n### Drawbacks\n- At the moment workflow processor doesn't pass task results from precedign tasks to following tasks (can be implemented, not implemented at the moment).\n- Workflow processor task is doing repeating ticks (like celery chord unlock) and new tasks are scheduled only within the ticks. This may result in noticeably longer execution time of task chains (e.g. if ticks are done each 2s, next task in chain will only be each 2s)\n- Reliable result backend has to be enabled\n\n# How to use it?\n## Which celery versions are supported?\n- celery 3.1.25\n- celery 4.2.1\n- probably any celery 4.x\n\n## Integration\n### Initialize workflows\nYou need to register workflow processor task in your celery app\n```python\nfrom celery_dyrygent.tasks import register_workflow_processor\n\napp = Celery() #  your celery application instance\n\nworkflow_processor = register_workflow_processor(app)\n```\n\n### Use workflow on you celery canvas\nWorkflows can consume celery canvas to properly build internal relations\n```python\nfrom celery_dyrygent.workflows import Workflow\n\ncanvas = celery.chain() | celery.chord() #  define your canvas using native celery mechanisms\n\nwf = Workflow()\nwf.add_celery_canvas(canvas)\nwf.apply_async()\n```\n\nWorkflow processor task will be scheduled holding all signatures from canvas and their relations. It will execute signatures according to their relations.\n\n### Signals support\nCelery Dyrygent provides additional signals which can be used e.g. for tracking workflow progress. Following signals are available:\n- ```after_active_tick```\n- ```on_finish```\n- ```on_state_change```\n\n#### How to use signals?\nWhen a signal is emitted all registered signal handlers are executed. In order to register signal handler you need to use ```Workflow.connect``` function. See examples below. The handler is called with two parameters: workflow instance and payload (optional).\n\n#### Using ```on_state_change``` signal\nSignal is emitted when workflow state changes. Supported states are:\n- INITIAL\n- RUNNING\n- SUCCESS\n- FAILURE\n- ERROR\n\nHandler is called with two params:\n- workflow instance\n- payload - current state of a workflow\n\n``` python\nfrom celery_dyrygent.workflows import Workflow\n\n@Workflow.connect('on_state_change')\ndef handle_state_change(workflow, payload):\n    print(\n        \"Workflow {} has new state {}\"\n        .format(workflow.id, payload)\n    )\n```\n\n#### Using ```on_finish``` signal\nSignal is emitted when workflow is finished (or can't move forward due to failed tasks)\n\nHandler params are:\n- workflow instance\n- paylod - None\n\n#### Using ```after_active_tick```\nSignal is emitted when workflow has scheduled new tasks\n\nHandler params are:\n- workflow instance\n- payload - None\n\n\n### Support for custom data\nBoth `Workflow`and `WorkflowNode` have a `custom_payload` dictionary member that can be used to store \nadditional data. For example, one can use those dictionnary to store some application specific \nmetadata.\n\n```python\n...\nwf = Workflow()\nfor task in task_list:\n    sig = create_celery_task(task)\n    sig.freeze()\n    node = wf.add_signature(sig)\n    node.custom_payload['user_id'] = task.user_id\n...\n```\n\n#### Using celery task options\nYou can define custom options for your tasks, as defined in:\nhttps://docs.celeryproject.org/en/stable/reference/celery.app.task.html#celery.app.task.Task.apply_async\n\nThese options may be different between the workflow task and user tasks.\n``` python\nwf = Workflow(options={'priority': 10})\nwf.add_celery_canvas(canvas)\nwf.apply_async(options={'priority': 8})\n```\n\n## TODO\n- Proper documentation (e.g. sphinx)\n- Python pip release\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ovh/celery-dyrygent",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "celery-dyrygent",
+    "package_url": "https://pypi.org/project/celery-dyrygent/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/celery-dyrygent/",
+    "project_urls": {
+      "Bug Reports": "https://github.com/ovh/celery-dyrygent/issues",
+      "Homepage": "https://github.com/ovh/celery-dyrygent",
+      "Source": "https://github.com/ovh/celery-dyrygent"
+    },
+    "release_url": "https://pypi.org/project/celery-dyrygent/0.8.0/",
+    "requires_dist": [
+      "celery (!=4.0.*,!=4.1.*,>=3.1.25)"
+    ],
+    "requires_python": "",
+    "summary": "Celery extension for workflows processing",
+    "version": "0.8.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12697435,
+  "releases": {
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "18b792d29d4dbceab8eefa2d6ee4a958175f76569e3f2078bb048f52c6290815",
+          "md5": "c81e034d56c27f2b1f5ec2efb8cd6564",
+          "sha256": "4664093362973de60a4d1e24f889737c0293d17ad9faf8266fe07aaafaa4507c"
+        },
+        "downloads": -1,
+        "filename": "celery_dyrygent-0.8.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c81e034d56c27f2b1f5ec2efb8cd6564",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 16253,
+        "upload_time": "2022-01-20T21:46:34",
+        "upload_time_iso_8601": "2022-01-20T21:46:34.822722Z",
+        "url": "https://files.pythonhosted.org/packages/18/b7/92d29d4dbceab8eefa2d6ee4a958175f76569e3f2078bb048f52c6290815/celery_dyrygent-0.8.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c0f6a9dc5f2165178d7bb7ea6f8512794355d7330519dcaf562c4cec5786b07",
+          "md5": "b6ee1da788e9d157da5806918c24fd13",
+          "sha256": "bb90afd63b3e8aa8afccb4ec6c0ba68278db9c34fb4b32eea210585e66a92906"
+        },
+        "downloads": -1,
+        "filename": "celery-dyrygent-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b6ee1da788e9d157da5806918c24fd13",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17928,
+        "upload_time": "2022-01-20T21:46:36",
+        "upload_time_iso_8601": "2022-01-20T21:46:36.329958Z",
+        "url": "https://files.pythonhosted.org/packages/5c/0f/6a9dc5f2165178d7bb7ea6f8512794355d7330519dcaf562c4cec5786b07/celery-dyrygent-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "18b792d29d4dbceab8eefa2d6ee4a958175f76569e3f2078bb048f52c6290815",
+        "md5": "c81e034d56c27f2b1f5ec2efb8cd6564",
+        "sha256": "4664093362973de60a4d1e24f889737c0293d17ad9faf8266fe07aaafaa4507c"
+      },
+      "downloads": -1,
+      "filename": "celery_dyrygent-0.8.0-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "c81e034d56c27f2b1f5ec2efb8cd6564",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 16253,
+      "upload_time": "2022-01-20T21:46:34",
+      "upload_time_iso_8601": "2022-01-20T21:46:34.822722Z",
+      "url": "https://files.pythonhosted.org/packages/18/b7/92d29d4dbceab8eefa2d6ee4a958175f76569e3f2078bb048f52c6290815/celery_dyrygent-0.8.0-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5c0f6a9dc5f2165178d7bb7ea6f8512794355d7330519dcaf562c4cec5786b07",
+        "md5": "b6ee1da788e9d157da5806918c24fd13",
+        "sha256": "bb90afd63b3e8aa8afccb4ec6c0ba68278db9c34fb4b32eea210585e66a92906"
+      },
+      "downloads": -1,
+      "filename": "celery-dyrygent-0.8.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b6ee1da788e9d157da5806918c24fd13",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 17928,
+      "upload_time": "2022-01-20T21:46:36",
+      "upload_time_iso_8601": "2022-01-20T21:46:36.329958Z",
+      "url": "https://files.pythonhosted.org/packages/5c/0f/6a9dc5f2165178d7bb7ea6f8512794355d7330519dcaf562c4cec5786b07/celery-dyrygent-0.8.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

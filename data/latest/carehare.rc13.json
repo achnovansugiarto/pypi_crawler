@@ -1,0 +1,662 @@
+{
+  "info": {
+    "author": "Adam Hooper",
+    "author_email": "adam@adamhooper.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: Other/Proprietary License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "carehare\n========\n\nAsyncio RabbitMQ client that handles all the edge cases.\n\nInstallation\n------------\n\n``pip install carehare``\n\nUsage\n-----\n\nConsumer (``async for``)::\n\n    try:\n        async with carehare.connect(\"amqps://guest:guest@localhost\") as connection:\n            try:\n                await connection.queue_declare(\"my-queue\", exclusive=True)\n                async with connection.acking_consumer(\"my-queue\") as consumer:\n                    async for message in consumer:\n                        print(repr(message))\n                        # ... if we raise an exception here, we won't ack.\n                        #\n                        # ... if we `break` from this loop, we won't ack.\n                        #\n                        # Call `consumer.close()` before (or instead of) `break`\n                        # to abort iteration.\n            except carehare.ChannelClosedByServer:\n                logger.info(\"RabbitMQ told this one consumer to go away\")\n            except carehare.ConnectionClosed:\n                # Either RabbitMQ is telling us an error (and the outer context\n                # manager will throw it), or we called connection.close()\n                # ourselves (so we want to close).\n                pass\n    except carehare.ConnectionClosedByServer:\n        # str(error) will give the RabbitMQ error message\n        logger.error(\"RabbitMQ closed our connection\")\n    except carehare.ConnectionClosedByHeartbeatMonitor:\n        logger.error(\"RabbitMQ went away\")\n\nConsumer (``next_delivery``)::\n\n    try:\n        async with carehare.connect(\"amqps://guest:guest@localhost\") as connection:\n            try:\n                await connection.queue_declare(\"my-queue\", exclusive=True)\n                async with connection.acking_consumer(\"my-queue\") as consumer:\n                    while True:\n                        message, delivery_tag = await consumer.next_delivery()\n                        # You must ack() (with no await). If RabbitMQ doesn't\n                        # receive this ack, it may deliver the same message to\n                        # another client.\n                        consumer.ack(delivery_tag)\n                        if message.startswith(b\"okay, go away now\"):\n                            break\n            except carehare.ChannelClosedByServer:\n                logger.info(\"RabbitMQ told this one consumer to go away\")\n            except carehare.ConnectionClosed:\n                # Either RabbitMQ is telling us an error (and the outer context\n                # manager will throw it), or we called connection.close()\n                # ourselves (so we want to close).\n                pass\n    except carehare.ConnectionClosedByServer:\n        # str(error) will give the RabbitMQ error message\n        logger.error(\"RabbitMQ closed our connection\")\n    except carehare.ConnectionClosedByHeartbeatMonitor:\n        logger.error(\"RabbitMQ went away\")\n\nPublisher::\n\n    try:\n        async with carehare.connect(\"amqps://guest:guest@localhost\") as connection:\n            try:\n                await connection.publish(b\"Hello, world!\", routing_key=\"my-queue\")\n            except carehare.ServerSentNack:\n                logger.warn(\"Failed to publish message\")\n            except carehare.ChannelClosedByServer:\n                # str(err) will give the RabbitMQ error message -- for instance,\n                # \"404 NOT_FOUND\" if the exchange does not exist\n                logger.error(\"Problem with the exchange\")\n    except carehare.ConnectionClosedByServer:\n        # str(error) will give the RabbitMQ error message\n        logger.error(\"RabbitMQ closed our connection\")\n    except carehare.ConnectionClosedByHeartbeatMonitor:\n        logger.error(\"RabbitMQ went away\")\n\nDesign decisions\n----------------\n\n``carehare`` is designed to turn RabbitMQ's asynchronous error system into\n_understandable_ Python exceptions.\n\nChannels\n~~~~~~~~\n\nCarehare doesn't let you control RabbitMQ Channels. They aren't Pythonic. (In\nRabbitMQ, an exception on a channel closes the channel -- and cancels all its\npending operations.)\n\nInstead, carehare uses channels to handle errors. For instance, Queue.Declare\ncosts three operations: Channel.Open, Queue.Declare, Channel.Close. Since the\noperation has its own channel, it won't interfere with other operations if it\ncauses an exception.\n\nThere's a speed-up for publishing: we lazily open a Channel per *exchange*.\nError codes like \"not found\", \"access refused\" and \"not implemented\" will make\ncarehare raise an exception on all pending publishes on the same exchange. Don't\nworry: a normal \"Nack\" (\"message wasn't delivered\") will only make your single\nmessage fail.\n\nExceptions\n~~~~~~~~~~\n\n\"Exceptions\" are hardly exceptional: as a programmer, they are your job. These\nones are designed to help you solve them.\n\nConnection methods return ``asyncio.Future`` objects. You must await each one\nand handle its errors.\n\nEven though you're using Python async context managers, exceptions can't\nhappen *everywhere*. Carehare will only raise when you ``await`` a response\nfrom RabbitMQ. \n\nIn particular, ``consumer.ack()`` will never raise! You must call it from the\nmain event loop, but you won't await it.\n\nTo code safely, catch these exceptions religiously:\n\n* ``carehare.ChannelClosedByServer``: RabbitMQ did not like the command you\n  just ran. Read the exception message for details. After you receive this\n  message, you may continue using the RabbitMQ connection.\n* ``carehare.ConnectionClosed``: When the connection shuts down, every pending\n  ``Future`` will raise this. Only the actual ``Connection`` context manager\n  will raise the underlying exception: a ``carehare.ConnectionClosedByServer``\n  with a descriptive error message.\n\nCarehare won't raise ``asyncio.Cancelled``.\n\nBack-pressure\n~~~~~~~~~~~~~\n\nThe core logic is synchronous. It's simpler to reason about. The downside:\nneither RabbitMQ nor users will wait for buffers to empty before sending more\ndata.\n\nUse application-level logic to make sure you don't run out of memory:\n\n* Consuming? Don't worry. Use ``prefetch_count`` to limit the number of messages\n  RabbitMQ sends. Always ack: carehare won't permit ``no-ack``.\n* Publishing? Carehare forces \"publisher confirms\", so each publish returns a\n  ``Future``. Your application is responsible for not calling publish() too many\n  times simultaneously. Use an ``asyncio.Semaphore`` or reason about your\n  specific use (for instance, \"my server will host max 100 clients, and each\n  client can only publish one message at a time\").\n\nComparison to other async RabbitMQ clients\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\nOther clients tend to try and achieve \"RabbitMQ in Python\". They fail when it\ncomes to exceptions:\n\n* ``aiormq``: If your code generates an error during consume, aiormq (4.1.1)\n  will catch it and ignore it -- stalling your program.\n* ``aioamqp``: If your connection produces an unexpected error, aioamqp will\n  catch it and ignore it -- stalling your program. Also, the latest release was\n  in 2019.\n\nThis author believes it's too confusing to model RabbitMQ's API in Python.\nInstead, carehare models your *intent* in Python.\n\nDependencies\n------------\n\nYou'll need Python 3.8+ and a RabbitMQ server.\n\nIf you have Docker, here's how to start a development server::\n\n    test-server/prepare-certs.sh  # Create SSL certificates used in tests\n    docker run --rm -it \\\n         -p 5671:5671 \\\n         -p 5672:5672 \\\n         -p 15672:15672 \\\n         -v \"/$(pwd)\"/test-server:/test-server \\\n         -e RABBITMQ_SSL_CACERTFILE=/test-server/ca.cert \\\n         -e RABBITMQ_SSL_CERTFILE=/test-server/server.cert \\\n         -e RABBITMQ_SSL_KEYFILE=/test-server/server.key \\\n         -e RABBITMQ_SSL_VERIFY=verify_peer \\\n         -e RABBITMQ_SSL_FAIL_IF_NO_PEER_CERT=true \\\n         -e RABBITMQ_CONFIG_FILE=/test-server/rabbitmq \\\n         rabbitmq:3.8.11-management-alpine\n\nDuring testing, see the RabbitMQ management interface at http://localhost:15672.\n\nContributing\n------------\n\nTo add features and fix bugs\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\nFirst, start a development RabbitMQ server (see above).\n\nNow take on the development cycle:\n\n#. ``tox`` # to ensure tests pass.\n#. Write new tests in ``tests/`` and make sure they fail.\n#. Write new code in ``carehare/`` to make the tests pass.\n#. Submit a pull request.\n\nTo deploy\n~~~~~~~~~\n\nUse `semver <https://semver.org/>`_.\n\n#. ``git push`` and make sure Travis tests all pass.\n#. ``git tag vX.X.X``\n#. ``git push --tags``\n\nTravisCI will push to PyPi.\n",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "carehare",
+    "package_url": "https://pypi.org/project/carehare/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/carehare/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/carehare/1.0.2/",
+    "requires_dist": [
+      "pamqp (>=3.0,<4.0)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "asyncio RabbitMQ client",
+    "version": "1.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12455993,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e84732cf64001ed6242b9614d4e8a449bb17d2d2608635eadc77f379a99cddd6",
+          "md5": "3bd0a219539b796857e808a7ec5a2544",
+          "sha256": "b5c9b7a1ad0ff886c15d1e1d8f956c4a53cfea67253072f2396424fe542b12ca"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3bd0a219539b796857e808a7ec5a2544",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19328,
+        "upload_time": "2021-02-18T20:16:43",
+        "upload_time_iso_8601": "2021-02-18T20:16:43.270381Z",
+        "url": "https://files.pythonhosted.org/packages/e8/47/32cf64001ed6242b9614d4e8a449bb17d2d2608635eadc77f379a99cddd6/carehare-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d08dc4fa933a3a4c071921a2c6dda3115e7938c6658c108272bd717d0d61488",
+          "md5": "3b33605d12627a44a2d5b7abcefe7899",
+          "sha256": "98dbdc88efce50e02c22993f0875888d280e130c30ccef9e89d5c5e1bc877a35"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b33605d12627a44a2d5b7abcefe7899",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18829,
+        "upload_time": "2021-02-18T20:16:44",
+        "upload_time_iso_8601": "2021-02-18T20:16:44.663676Z",
+        "url": "https://files.pythonhosted.org/packages/1d/08/dc4fa933a3a4c071921a2c6dda3115e7938c6658c108272bd717d0d61488/carehare-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6dba77b99c2440fb187766c1185a6fb7d80bfc954ff4afc938b633afa329933a",
+          "md5": "e1e23e788b01950253f9f22d119cd672",
+          "sha256": "d30fe019a18ea1e89c6bf1ee70412fa3a2ecbcf6f3924bfc7fd32a91907b5b30"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e1e23e788b01950253f9f22d119cd672",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20277,
+        "upload_time": "2021-03-04T19:02:08",
+        "upload_time_iso_8601": "2021-03-04T19:02:08.593736Z",
+        "url": "https://files.pythonhosted.org/packages/6d/ba/77b99c2440fb187766c1185a6fb7d80bfc954ff4afc938b633afa329933a/carehare-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7996f874f9fa6a0c94c7b815c279041390fa297922a53c564320bf0907d8a62a",
+          "md5": "9fb2ca0abcf5ef6f4bc30151ab1a9fb6",
+          "sha256": "b31e9be833f1f35e216538cdc12b61ae6b820159b2fabdd6aa48e2760cd23caf"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9fb2ca0abcf5ef6f4bc30151ab1a9fb6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19448,
+        "upload_time": "2021-03-04T19:02:09",
+        "upload_time_iso_8601": "2021-03-04T19:02:09.685277Z",
+        "url": "https://files.pythonhosted.org/packages/79/96/f874f9fa6a0c94c7b815c279041390fa297922a53c564320bf0907d8a62a/carehare-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e65772f8927df908f0cbc29ba1ba13f197c324e50ff68923b35e9cb608e95ab9",
+          "md5": "386d911f82a80c0de9ca74c174901271",
+          "sha256": "e17917badac040872eb0be52d90029923397044b5c1d37a004973224e86e6158"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "386d911f82a80c0de9ca74c174901271",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20580,
+        "upload_time": "2021-05-14T14:25:37",
+        "upload_time_iso_8601": "2021-05-14T14:25:37.256738Z",
+        "url": "https://files.pythonhosted.org/packages/e6/57/72f8927df908f0cbc29ba1ba13f197c324e50ff68923b35e9cb608e95ab9/carehare-0.0.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e15023e93b7e8b3602e5e64f1a7c219188ef8abe74d3c2906ba2a14464a5869",
+          "md5": "42285f01f993a226422765aabfd55e48",
+          "sha256": "ebd710150576f4b2dbf11cd1b51c11fb79d6048cecf21b2dcbdefa9d30394192"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "42285f01f993a226422765aabfd55e48",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19703,
+        "upload_time": "2021-05-14T14:25:38",
+        "upload_time_iso_8601": "2021-05-14T14:25:38.472781Z",
+        "url": "https://files.pythonhosted.org/packages/6e/15/023e93b7e8b3602e5e64f1a7c219188ef8abe74d3c2906ba2a14464a5869/carehare-0.0.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48738483831717bd81f73c74d256484a33b123442c2b11d6cf74247999aadb2f",
+          "md5": "a7c3da97b6dfef70199a722d76d6f232",
+          "sha256": "eb8ae71c5df0887cc88943ee04052815bc41b75eae5ca2d21aa577b4f2033cd3"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a7c3da97b6dfef70199a722d76d6f232",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19507,
+        "upload_time": "2021-02-19T17:07:01",
+        "upload_time_iso_8601": "2021-02-19T17:07:01.298845Z",
+        "url": "https://files.pythonhosted.org/packages/48/73/8483831717bd81f73c74d256484a33b123442c2b11d6cf74247999aadb2f/carehare-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e737c4e725c7fb653fffbff7b3306d7b61354d53ec2b75d7e777dbb34de0ce6",
+          "md5": "453e3ae8b8bfd5345744502ac38552c2",
+          "sha256": "7785f106b5fc067f3675dd7e4fda4440374c0cbed8cb2c4e9b83d66e07c1648c"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "453e3ae8b8bfd5345744502ac38552c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18824,
+        "upload_time": "2021-02-19T17:07:02",
+        "upload_time_iso_8601": "2021-02-19T17:07:02.477168Z",
+        "url": "https://files.pythonhosted.org/packages/6e/73/7c4e725c7fb653fffbff7b3306d7b61354d53ec2b75d7e777dbb34de0ce6/carehare-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e18fba6c4759e7f9114958a4924f3b8ea8f7cb57f589ce7490c8f6d0005adbf",
+          "md5": "272ffb2c392f9cd597d5a2dc067b2bee",
+          "sha256": "bf95126ba2ebac672ab8169fe13bafeea8c42e1d066c027b88df5bb217075eea"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "272ffb2c392f9cd597d5a2dc067b2bee",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19800,
+        "upload_time": "2021-02-19T21:30:08",
+        "upload_time_iso_8601": "2021-02-19T21:30:08.635356Z",
+        "url": "https://files.pythonhosted.org/packages/8e/18/fba6c4759e7f9114958a4924f3b8ea8f7cb57f589ce7490c8f6d0005adbf/carehare-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5c31f32a722aa26661e0932eb76c2baecc9b6fe54af639afe9ae873012d01e89",
+          "md5": "9bb9fbe90becdc34b384192e88f317b1",
+          "sha256": "423c91587c16bbbd4c96762b1ca9b36afccd4dd315630aa1a0da9facb1482f7b"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9bb9fbe90becdc34b384192e88f317b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19104,
+        "upload_time": "2021-02-19T21:30:09",
+        "upload_time_iso_8601": "2021-02-19T21:30:09.586482Z",
+        "url": "https://files.pythonhosted.org/packages/5c/31/f32a722aa26661e0932eb76c2baecc9b6fe54af639afe9ae873012d01e89/carehare-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75cfdf2f5d7c11d0bfaddf191c8a08f03a9fe41114af50b9c7aab50ee4450246",
+          "md5": "bd42bb7cf8124279bfd9dc3a96cb2f1a",
+          "sha256": "fad43df36be8d57935e809878253ff09c911082df93b38d33ef7f75b72e3ea63"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bd42bb7cf8124279bfd9dc3a96cb2f1a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20015,
+        "upload_time": "2021-02-24T18:32:03",
+        "upload_time_iso_8601": "2021-02-24T18:32:03.555206Z",
+        "url": "https://files.pythonhosted.org/packages/75/cf/df2f5d7c11d0bfaddf191c8a08f03a9fe41114af50b9c7aab50ee4450246/carehare-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75b359870ae2bf572fea993b6fd2c4a8df4139b5f91874e5b4650231d3b034a3",
+          "md5": "e7df669c4c53dcfb8d72039c3bd20ce1",
+          "sha256": "1c2eb52dce950a8a2d2d2c9b1c4e12df49086556ba8414f646a6d10e783a00e5"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e7df669c4c53dcfb8d72039c3bd20ce1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19230,
+        "upload_time": "2021-02-24T18:32:04",
+        "upload_time_iso_8601": "2021-02-24T18:32:04.959915Z",
+        "url": "https://files.pythonhosted.org/packages/75/b3/59870ae2bf572fea993b6fd2c4a8df4139b5f91874e5b4650231d3b034a3/carehare-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59204c437dc9d49aa65ed8864c3b919bde05ea7536fbbb44765d30f8ea9921cc",
+          "md5": "a43493aca0183e78bcc0d50f14d9dca1",
+          "sha256": "ddd4e59886462128931fa77cac2947f75357820175e3759c1f5cdcee8ef01597"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a43493aca0183e78bcc0d50f14d9dca1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20083,
+        "upload_time": "2021-02-25T19:22:02",
+        "upload_time_iso_8601": "2021-02-25T19:22:02.930785Z",
+        "url": "https://files.pythonhosted.org/packages/59/20/4c437dc9d49aa65ed8864c3b919bde05ea7536fbbb44765d30f8ea9921cc/carehare-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8139edbcb7b58686c64971e16f4e1b217b2dfe8423a6a63d8f2372354ca68018",
+          "md5": "bb0986f96ed0ee5d43bf424d44f51a91",
+          "sha256": "fa4cfe0157a45ae38fbca9e8797b32c8e8e85245aaff0c130cb08595c105b978"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bb0986f96ed0ee5d43bf424d44f51a91",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19296,
+        "upload_time": "2021-02-25T19:22:04",
+        "upload_time_iso_8601": "2021-02-25T19:22:04.182816Z",
+        "url": "https://files.pythonhosted.org/packages/81/39/edbcb7b58686c64971e16f4e1b217b2dfe8423a6a63d8f2372354ca68018/carehare-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dca9b907d241985fd5c9dfc64875c57f5efaf4e2bb6064dad8ca7580d38eb5cd",
+          "md5": "4425f6bd543514e7d52738d6d8644448",
+          "sha256": "f4db056c4553c84d17f8d9935ab8191ecfc69a8ae1fda7ae0ce2b5bce2438164"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4425f6bd543514e7d52738d6d8644448",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20071,
+        "upload_time": "2021-02-25T20:08:37",
+        "upload_time_iso_8601": "2021-02-25T20:08:37.134022Z",
+        "url": "https://files.pythonhosted.org/packages/dc/a9/b907d241985fd5c9dfc64875c57f5efaf4e2bb6064dad8ca7580d38eb5cd/carehare-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a90461309b7137c29e478f8f436d03c36bf4e581063cc23bdcaf084c8dee2341",
+          "md5": "33b97cea8de47d4aa6af692c17d663ec",
+          "sha256": "187631b45c19e098110a0e309906a4cb9ef25095de10ee2fcb69145832d0b710"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "33b97cea8de47d4aa6af692c17d663ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19280,
+        "upload_time": "2021-02-25T20:08:37",
+        "upload_time_iso_8601": "2021-02-25T20:08:37.989395Z",
+        "url": "https://files.pythonhosted.org/packages/a9/04/61309b7137c29e478f8f436d03c36bf4e581063cc23bdcaf084c8dee2341/carehare-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee26f796ef3e1995105697755c8b8f693bc1b0683e21467030c47d8feafdcf09",
+          "md5": "3b110165bd9d5087f237d256fddda843",
+          "sha256": "43884f2c05077762220a8f4a6f181caf1a2514998a8c8d47f6c12e6c5568c48c"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3b110165bd9d5087f237d256fddda843",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20179,
+        "upload_time": "2021-02-26T15:29:21",
+        "upload_time_iso_8601": "2021-02-26T15:29:21.342916Z",
+        "url": "https://files.pythonhosted.org/packages/ee/26/f796ef3e1995105697755c8b8f693bc1b0683e21467030c47d8feafdcf09/carehare-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f1de1990331837398d82ab97126b03a8731949c531692669556f32d3d5cef72",
+          "md5": "92017cad11c2262dfd52f9e9982f992e",
+          "sha256": "1a96ee2cdb2e370bc83eea81bb00152d350ebd7c79dc0937372af5d23ef977e7"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "92017cad11c2262dfd52f9e9982f992e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19371,
+        "upload_time": "2021-02-26T15:29:22",
+        "upload_time_iso_8601": "2021-02-26T15:29:22.423091Z",
+        "url": "https://files.pythonhosted.org/packages/8f/1d/e1990331837398d82ab97126b03a8731949c531692669556f32d3d5cef72/carehare-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bfa31fd0b84ca4485196418a8bc6577460ef2014640f9c5873d6ec20cc9f9449",
+          "md5": "1284ba233b954806d3db171c5d9ad35b",
+          "sha256": "dfe80def26711c618eace2e4656095a52e948d654bfd3c2dbe197e3e8524be2a"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1284ba233b954806d3db171c5d9ad35b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20267,
+        "upload_time": "2021-02-28T18:01:03",
+        "upload_time_iso_8601": "2021-02-28T18:01:03.540731Z",
+        "url": "https://files.pythonhosted.org/packages/bf/a3/1fd0b84ca4485196418a8bc6577460ef2014640f9c5873d6ec20cc9f9449/carehare-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e128560925936a86ca1b90f9194e4cd44447300590b06d4dc7a417f4e92bea73",
+          "md5": "c26cd6a11dbebbd16a4e876285e8f97a",
+          "sha256": "05092f6e120318bb29a12791cf6d1e00fb939cda8c88c4ea3998777a9c326a9a"
+        },
+        "downloads": -1,
+        "filename": "carehare-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c26cd6a11dbebbd16a4e876285e8f97a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19452,
+        "upload_time": "2021-02-28T18:01:04",
+        "upload_time_iso_8601": "2021-02-28T18:01:04.597673Z",
+        "url": "https://files.pythonhosted.org/packages/e1/28/560925936a86ca1b90f9194e4cd44447300590b06d4dc7a417f4e92bea73/carehare-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d56411d6c763a98a1298365575161bb8829df29d425a8cb723dd819d314ea406",
+          "md5": "c0d90a6d2244fb9a0aa4a09127fa5e3f",
+          "sha256": "b8f7ab224449ea7bfebd8067122eb8e1b60e859fb7d1d7ea5c7d638e0cf7b657"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c0d90a6d2244fb9a0aa4a09127fa5e3f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20872,
+        "upload_time": "2021-06-07T21:24:50",
+        "upload_time_iso_8601": "2021-06-07T21:24:50.672155Z",
+        "url": "https://files.pythonhosted.org/packages/d5/64/11d6c763a98a1298365575161bb8829df29d425a8cb723dd819d314ea406/carehare-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "705fc8e0d99fe6d6928cba4b93e43616c9e878f83aba7989ddb85a5ccf0c3442",
+          "md5": "ba697696f69dc0baf3b016b5b390b572",
+          "sha256": "6d746bcd889ab6c5b032a8e9ec78ea63660b1790145b5246a811e789ca136c68"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ba697696f69dc0baf3b016b5b390b572",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19998,
+        "upload_time": "2021-06-07T21:24:51",
+        "upload_time_iso_8601": "2021-06-07T21:24:51.809747Z",
+        "url": "https://files.pythonhosted.org/packages/70/5f/c8e0d99fe6d6928cba4b93e43616c9e878f83aba7989ddb85a5ccf0c3442/carehare-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c34752dd36ba209750915b74ce4c6d24cd5742edf0f9b2540d747d78d041ad5",
+          "md5": "5d5fea69cd3d81f6127c3a69c218cb03",
+          "sha256": "c95d59be79a783039ad9216a69d740067b1fde5a3cae15d1816f7cfab848c4ac"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5d5fea69cd3d81f6127c3a69c218cb03",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20859,
+        "upload_time": "2021-06-08T13:53:21",
+        "upload_time_iso_8601": "2021-06-08T13:53:21.059054Z",
+        "url": "https://files.pythonhosted.org/packages/4c/34/752dd36ba209750915b74ce4c6d24cd5742edf0f9b2540d747d78d041ad5/carehare-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91ccdd9c31b1c9b0320562a73b9e853ced703abe9b3d79959100a411fafa9dd7",
+          "md5": "cf09497b51fd7c1c6f5c140c6ab49b16",
+          "sha256": "5b6e3256198e91f4fecdbac567a076c11ff2652a05643b1e2033a01ab1e75b9e"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cf09497b51fd7c1c6f5c140c6ab49b16",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19965,
+        "upload_time": "2021-06-08T13:53:22",
+        "upload_time_iso_8601": "2021-06-08T13:53:22.331533Z",
+        "url": "https://files.pythonhosted.org/packages/91/cc/dd9c31b1c9b0320562a73b9e853ced703abe9b3d79959100a411fafa9dd7/carehare-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "634e8a483d4b7241af22456f40c27035971dc858205fe22260a369bab45084ae",
+          "md5": "3e5be1ba63b630196e71db9862a666fb",
+          "sha256": "572c24663d19a9bc94137f9a6cec978658753dc35e928a3cb2d63faee39e4a2a"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3e5be1ba63b630196e71db9862a666fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 20876,
+        "upload_time": "2022-01-02T02:40:31",
+        "upload_time_iso_8601": "2022-01-02T02:40:31.552187Z",
+        "url": "https://files.pythonhosted.org/packages/63/4e/8a483d4b7241af22456f40c27035971dc858205fe22260a369bab45084ae/carehare-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6207409a3923a6ecfa688edee5e3f3be96c6398952941be75a997e39c10c2091",
+          "md5": "cc0e1c318a4c405ab089b6ab86f24073",
+          "sha256": "7c6795b2d0a0e486498497f0a113cf021b061a8d20db13834cc1f3e7b6ba7a3c"
+        },
+        "downloads": -1,
+        "filename": "carehare-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc0e1c318a4c405ab089b6ab86f24073",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19980,
+        "upload_time": "2022-01-02T02:40:33",
+        "upload_time_iso_8601": "2022-01-02T02:40:33.113288Z",
+        "url": "https://files.pythonhosted.org/packages/62/07/409a3923a6ecfa688edee5e3f3be96c6398952941be75a997e39c10c2091/carehare-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "634e8a483d4b7241af22456f40c27035971dc858205fe22260a369bab45084ae",
+        "md5": "3e5be1ba63b630196e71db9862a666fb",
+        "sha256": "572c24663d19a9bc94137f9a6cec978658753dc35e928a3cb2d63faee39e4a2a"
+      },
+      "downloads": -1,
+      "filename": "carehare-1.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "3e5be1ba63b630196e71db9862a666fb",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 20876,
+      "upload_time": "2022-01-02T02:40:31",
+      "upload_time_iso_8601": "2022-01-02T02:40:31.552187Z",
+      "url": "https://files.pythonhosted.org/packages/63/4e/8a483d4b7241af22456f40c27035971dc858205fe22260a369bab45084ae/carehare-1.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6207409a3923a6ecfa688edee5e3f3be96c6398952941be75a997e39c10c2091",
+        "md5": "cc0e1c318a4c405ab089b6ab86f24073",
+        "sha256": "7c6795b2d0a0e486498497f0a113cf021b061a8d20db13834cc1f3e7b6ba7a3c"
+      },
+      "downloads": -1,
+      "filename": "carehare-1.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "cc0e1c318a4c405ab089b6ab86f24073",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 19980,
+      "upload_time": "2022-01-02T02:40:33",
+      "upload_time_iso_8601": "2022-01-02T02:40:33.113288Z",
+      "url": "https://files.pythonhosted.org/packages/62/07/409a3923a6ecfa688edee5e3f3be96c6398952941be75a997e39c10c2091/carehare-1.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

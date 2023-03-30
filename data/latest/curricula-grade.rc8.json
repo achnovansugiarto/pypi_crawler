@@ -1,0 +1,438 @@
+{
+  "info": {
+    "author": "Noah Kim",
+    "author_email": "noahbkim@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Curricula Grade\n\nThe other half of `curricula`'s core functionality is automated grading.\nIn order to use automated grading, material writers have to implement tests using the `curricula_grade` toolkit.\nAutomated grading for individual problems can be combined into composite assignments, complete with problem weights and other metadata.\n\n## Writing Tests\n\nWhile somewhat bulkier than unit-test frameworks, the additional syntax and runtime overhead backing the `Grader` make it much easier to generate and manage reports for students.\nLet's walk through an [example](https://github.com/curriculagg/curricula-material-sample/).\nNote that we'll be using `curricula_grade_cpp` as our example assignment is written in C++, but the framework itself is language-agnostic.\n\n```python3\nfrom curricula_grade.shortcuts import *\nfrom curricula_grade.setup.common import check_file_exists\nfrom curricula_grade_cpp.setup.common.gpp import gpp_compile_object\nfrom curricula.library.files import delete_file\n\nfrom pathlib import Path\n\nroot = Path(__file__).absolute().parent\ngrader = Grader()\n\nGPP_OPTIONS = (\"-std=c++14\", \"-Wall\")\n````\n\nTo start off, we include several basic utilities from `curricula_grade`.\nWe also import two commons functions, `check_file_exists` and `gpp_compile_object`.\nLastly, we include `delete_file` and `Path` for generalized file system access.\n\nUsing our imports, we create a `Grader` instance to register tasks to.\nThe `root` and `GPP_OPTIONS` are just constants for reference that we'll use for convenience later.\nWith the boilerplate out of the way, we start by writing a task that checks if a file we're expecting the student to implement is present in the submission:\n\n### Checks\n\n```python3\n@grader.register(tags={\"sanity\"}, graded=False)\ndef check_submission(submission: Submission, resources: dict) -> SetupResult:\n    \"\"\"Check submission.cpp is present.\"\"\"\n\n    header_path = resources[\"source\"] = submission.problem_path.joinpath(\"submission.cpp\")\n    return check_file_exists(header_path)\n```\n\nThe first thing to notice is the `grader.register` decorator we're using.\nThis line indicates to the grader that we want it to run this function, which we'll refer to generally as a runnable, during grading.\nOf the several ways we can register a task to a grader, this is the simplest.\n\nThe arguments passed to `grader.register` define metadata about the task.\nIn this particular case, we're only specifying a tag that the task falls under.\nWe can use tags to specify subsets of tasks to run while grading, which can be useful for sanity checks in an online submission, etc.\nOther metadata that can be assigned in the registration call include the task name and description, which default to the function name and docstring.\n\nWhen a task is executed, it looks at the arguments in its runnable's signature and injects the corresponding resources from the resource pool by name.\nWe ask for the full resources `dict` by including `resources` as a parameter to the runnable.\nBy default, `resources` contains:\n\n- A `Submission`, which describes the submission currently being graded.\n- A `Context`, which includes options passed to the grader, either from the command line or otherwise.\n- A reference to the `resources` map itself.\n- Anything we put in the `resources` map manually.\n  In this particular task, we're putting a new item called `source` into the resource map that points to the path to the file we want to grade.\n  This simply makes it easier to reference later; we can just include a `source` parameter in the `Runnable` signature.\n\nThe last important detail in this example is the annotated return type of the runnable, `SetupResult`.\nBecause we may find ourselves deserializing grading results down the road (to summarize a batch, generate a formatted report, etc.), we need to be able to determine what kind of `Result` subclass we're expecting without executing the runnable.\nIf we use a decorator to register the runnable, it must either have an annotated return type, an attribute `result_type`, or you must subscript the registrar with the result type.\n\nLet's move on to compiling our submission.\n\n### Compilation\n\n```python3\n@grader.register(passing={\"check_submission\"}, tags={\"sanity\"}, graded=False)\ndef build_submission(source: Path, resources: dict) -> SetupResult:\n    \"\"\"Compile the submission.\"\"\"\n\n    result, resources[\"binary\"] = gpp_compile_object(\n        source,\n        destination_path=source.parent.joinpath(\"binary\"),\n        gpp_options=GPP_OPTIONS)\n    return result\n```\n\nThis segment builds a file `submission.cpp` in a target directory using `g++`.\nAs specified by the registrar invocation, this task depends on `check_submission` passing.\nIf `check_submission` returns a `SetupResult(passing=False)`, this task will never be executed.\n\nOur call to `gpp_compile_object` here does exactly what you might expect: invokes `g++` in a subprocess to compile the C++ file.\nYou can take a look at the source in the [`curricula_grade_cpp`](https://github.com/curriculagg/curricula-grade-cpp/blob/master/curricula_grade_cpp/setup/common/gpp.py) library.\nNotice that nothing there is particularly fancy or magical; it's simply boilerplate I've encapsulated for convenience.\n\nNext, we'll actually run a test:\n\n### Tests\n\n```python\n@grader.register()\ndef test_simple_addition(binary: ExecutableFile) -> CorrectnessResult:\n    \"\"\"Check 1 + 1.\"\"\"\n\n    runtime = binary.execute(\"1\", \"1\")\n    if runtime.stdout.strip() != b\"2\":\n        return CorrectnessResult(\n            passing=False,\n            actual=runtime.stdout.strip().decode(),\n            expected=\"2\",\n            error=Error(description=\"incorrect result\"),\n            details=dict(runtime=runtime.dump()))\n    return CorrectnessResult(passing=True)\n```\n\nThis is an actual test case, and it affirms any given submission writes the sum of the first two arguments to `stdout`.\nIn a proper problem, there will most likely be many more of these.\nIn the first line of the runnable body, we invoke the compiled binary in a subprocess, passing two arguments: `1` and `1`.\nLet's take a look at an example submission:\n\n```cpp\n#include <iostream>\n\nusing namespace std;\n\nint main(int argc, char** argv)\n{\n    cout << stoi(argv[1]) + stoi(argv[2]) << endl;\n    return 0;\n}\n```\n\nWe can determine whether this submission prints what we expect it to by comparing the `runtime.stdout`.\nIf it's not `2`, we return a failing result with some extra details on what happened.\nOtherwise, we return a passing result.\n\n### Cleanup\n\nFinally, let's add a cleanup task to avoid leaving extraneous files in our submissions.\nThe only thing we have to do is delete our binary, which we can again ask for via injected arguments:\n\n```python\n@grader.register[CleanupResult](tags={\"sanity\"}, graded=False)\ndef cleanup_submission(binary: ExecutableFile):\n    \"\"\"Delete the binary.\"\"\"\n\n    delete_file(binary.path)\n````\n\nNotice something new is going on here: instead of using the return annotation, we're providing the result type via bracket notation in the registration decorator.\nWhy?\nIf a runnable returns None, the task executor will attempt to instantiate a default `result_type`.\nIn this case, it will substitute a `CleanupResult.default()` for the result automatically.\nIt would not be semantically correct to use a return annotation on this runnable because it does not return anything, and so a secondary mechanism is provided to specify `result_type`, i.e. `grader.register[result_type]`.\n\n### Summary\n\nThe entire grading script is as follows:\n\n```python\nfrom curricula_grade.shortcuts import *\nfrom curricula_grade.setup.common import check_file_exists\nfrom curricula_grade_cpp.setup.common.gpp import gpp_compile_object\nfrom curricula.library.files import delete_file\n\nfrom pathlib import Path\n\nroot = Path(__file__).absolute().parent\ngrader = Grader()\n\nGPP_OPTIONS = (\"-std=c++14\", \"-Wall\")\n\n\n@grader.register(tags={\"sanity\"}, graded=False)\ndef check_submission(submission: Submission, resources: dict) -> SetupResult:\n    \"\"\"Check submission.cpp is present.\"\"\"\n\n    header_path = resources[\"source\"] = submission.problem_path.joinpath(\"submission.cpp\")\n    return check_file_exists(header_path)\n\n\n@grader.register(passing={\"check_submission\"}, tags={\"sanity\"}, graded=False)\ndef build_submission(source: Path, resources: dict) -> SetupResult:\n    \"\"\"Compile the submission.\"\"\"\n\n    result, resources[\"binary\"] = gpp_compile_object(\n        source,\n        destination_path=source.parent.joinpath(\"binary\"),\n        gpp_options=GPP_OPTIONS)\n    return result\n\n\n@grader.register()\ndef test_simple_addition(binary: ExecutableFile) -> CorrectnessResult:\n    \"\"\"Check 1 + 1.\"\"\"\n\n    runtime = binary.execute(\"1\", \"1\")\n    if runtime.stdout.strip() != b\"2\":\n        return CorrectnessResult(\n            passing=False,\n            actual=runtime.stdout.strip().decode(),\n            expected=\"2\",\n            error=Error(description=\"incorrect result\"),\n            details=dict(runtime=runtime.dump()))\n    return CorrectnessResult(passing=True)\n\n\n@grader.register[CleanupResult](tags={\"sanity\"}, graded=False)\ndef cleanup_submission(binary: ExecutableFile):\n    \"\"\"Delete the binary.\"\"\"\n\n    delete_file(binary.path)\n```\n\n## Running the Grader\n\nIn order to grade an assignment, you will first need to make sure that you've constructed the grading artifact correctly.\nIt is recommended you use [`curricula-compile`](https://github.com/curriculagg/curricula-compile) for this, but if you insist on doing it manually, the following directory structure is required:\n\n```\ngrading/\n  index.json\n  problem1/\n    tests.py\n    ...\n  problem2/\n    tests.py\n    ...\n  ...\n```\n\nOnce you've created the grading artifact, you can run grading from the command line.\nCurrently, the options are as follow:\n\n```\nusage: curricula grade run [-h] --grading GRADING [--skip] [--report] [--concise] [--progress] [--sample SAMPLE] [--tags TAGS [TAGS ...]] [--tasks TASKS [TASKS ...]] [--summarize] [--thin] [--amend]\n                           (-f FILE | -d DIRECTORY)\n                           submissions [submissions ...]\n\npositional arguments:\n  submissions           run tests on a single target\n\noptional arguments:\n  -h, --help            show this help message and exit\n  --grading GRADING, -g GRADING\n                        the grading artifact\n  --skip                skip reports that have already been run\n  --report, -r          whether to log test results\n  --concise, -c         whether to report concisely\n  --progress, -p        show progress in batch\n  --sample SAMPLE       randomly sample batch\n  --tags TAGS [TAGS ...]\n                        only run tasks with the specified tags\n  --tasks TASKS [TASKS ...]\n                        only run the specified tasks\n  --summarize           summarize after running batch\n  --thin                shorten output for space\n  --amend               amend any existing report at the destination\n  -f FILE, --file FILE  output file for single report\n  -d DIRECTORY, --directory DIRECTORY\n                        where to write reports to if batched\n```\n\nIf you have all of the submissions in a folder by username, i.e. `submissions/noahbkim` etc., you would do something like this:\n\n```shell\n$ curricula grade run --grading grading/ --progress --concise --summarize submissions/*/ -d reports/\n```\n\nOnce the grader is finished, there will be a `*.report.json` file in `reports/` corresponding to each of the submissions in the arguments.\nYou can then use included tools to format these reports in Markdown, etc.\n\n## Grader Output\n\nGrading an assignment will yield a serializable `AssignmentReport`, which is composed of `ProblemReport` objects for each problem graded automatically.\nThis report, formatted as JSON, will look something like this:\n\n```json\n{\n  \"problem\": {\n    \"short\": \"test\",\n    \"title\": \"Test\"\n  },\n  \"automated\": {\n    \"partial\": false,\n    \"results\": {\n      \"check_submission\": {\n        \"complete\": true,\n        \"passing\": true,\n        \"score\": null,\n        \"error\": null,\n        \"messages\": [],\n        \"task\": {\n          \"name\": \"check_submission\",\n          \"description\": \"Check submission.cpp is present.\"\n        },\n        \"details\": {}\n      },\n      \"build_submission\": {\n        \"complete\": true,\n        \"passing\": true,\n        \"score\": null,\n        \"error\": null,\n        \"messages\": [],\n        \"task\": {\n          \"name\": \"build_submission\",\n          \"description\": \"Compile the submission.\"\n        },\n        \"details\": {\n          \"runtime\": {\n            \"args\": [\n              \"g++\",\n              \"/Users/noahbkim/Repositories/curricula/curricula-grade-cpp/example/submission.cpp\",\n              \"-std=c++14\",\n              \"-Wall\",\n              \"-o\",\n              \"/Users/noahbkim/Repositories/curricula/curricula-grade-cpp/example/binary\"\n            ],\n            \"cwd\": null,\n            \"stdin\": null,\n            \"stdout\": \"\",\n            \"stderr\": \"\",\n            \"elapsed\": 1.189917291,\n            \"code\": 0,\n            \"timeout\": null,\n            \"timed_out\": false,\n            \"raised_exception\": false,\n            \"exception\": null\n          }\n        }\n      },\n      \"test_simple_addition\": {\n        \"complete\": true,\n        \"passing\": true,\n        \"score\": null,\n        \"error\": null,\n        \"messages\": [],\n        \"task\": {\n          \"name\": \"test_simple_addition\",\n          \"description\": \"Check 1 + 1.\"\n        },\n        \"details\": {},\n        \"expected\": null,\n        \"actual\": null\n      },\n      \"cleanup_submission\": {\n        \"complete\": true,\n        \"passing\": true,\n        \"score\": null,\n        \"error\": null,\n        \"messages\": [],\n        \"task\": {\n          \"name\": \"cleanup_submission\",\n          \"description\": \"Delete the binary.\"\n        },\n        \"details\": {}\n      }\n    }\n  }\n}\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/curriculagg/curricula",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "curricula-grade",
+    "package_url": "https://pypi.org/project/curricula-grade/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/curricula-grade/",
+    "project_urls": {
+      "Homepage": "https://github.com/curriculagg/curricula"
+    },
+    "release_url": "https://pypi.org/project/curricula-grade/2.1.1/",
+    "requires_dist": [
+      "curricula (~=2.1.1)"
+    ],
+    "requires_python": ">=3.9",
+    "summary": "A grading toolkit for evaluating student code.",
+    "version": "2.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11500274,
+  "releases": {
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f555248d571c544ca4b5b815d2e83a5a4cd384bc27e68e366e9367a6e891875",
+          "md5": "d6e2e2ed8c66fff5d4a66e888f88b7a4",
+          "sha256": "429293cd7621046b7f8b40ab2873bc3033fb436da95ecbdb97f395d1e3a6ece8"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d6e2e2ed8c66fff5d4a66e888f88b7a4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 46029,
+        "upload_time": "2021-01-23T22:58:36",
+        "upload_time_iso_8601": "2021-01-23T22:58:36.880413Z",
+        "url": "https://files.pythonhosted.org/packages/3f/55/5248d571c544ca4b5b815d2e83a5a4cd384bc27e68e366e9367a6e891875/curricula_grade-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4eba4d68eb3e6762aa4aeaf18e0dbe2f8beda37f85d572374827ed9458a81c2",
+          "md5": "d9560118aa30c1ec6ca9ba4cd1789f0c",
+          "sha256": "7890cc7081e5352c607c23ae71c57f42ee9d7866deadad19e99b9a8f52a87806"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d9560118aa30c1ec6ca9ba4cd1789f0c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 29555,
+        "upload_time": "2021-01-23T22:58:38",
+        "upload_time_iso_8601": "2021-01-23T22:58:38.982063Z",
+        "url": "https://files.pythonhosted.org/packages/d4/eb/a4d68eb3e6762aa4aeaf18e0dbe2f8beda37f85d572374827ed9458a81c2/curricula-grade-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "daa2f7e935544a065707b3f7d24b239acfb8af6c3b6761ed4eb0470149cfd8b6",
+          "md5": "f624eb83aec5c3a72c4b3dbf56679ef4",
+          "sha256": "cef1a5e2e2600902ebfcf51c4902783a274ed86464eea2f121713a6078c39cc6"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f624eb83aec5c3a72c4b3dbf56679ef4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 47122,
+        "upload_time": "2021-01-26T06:11:58",
+        "upload_time_iso_8601": "2021-01-26T06:11:58.711753Z",
+        "url": "https://files.pythonhosted.org/packages/da/a2/f7e935544a065707b3f7d24b239acfb8af6c3b6761ed4eb0470149cfd8b6/curricula_grade-2.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86e0a6f26f8028a73c7ab054f07938959fd71f1e1bb9086fba438f7b5048d7e9",
+          "md5": "95f5698ebd68f894be0d61ffe153b1b5",
+          "sha256": "ab2d3c0cb284797c6ae812b2eff9f56a4cd28b89295552596b9160ce9b9c7446"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "95f5698ebd68f894be0d61ffe153b1b5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 30007,
+        "upload_time": "2021-01-26T06:12:00",
+        "upload_time_iso_8601": "2021-01-26T06:12:00.443836Z",
+        "url": "https://files.pythonhosted.org/packages/86/e0/a6f26f8028a73c7ab054f07938959fd71f1e1bb9086fba438f7b5048d7e9/curricula-grade-2.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d344e1eb39784c9fd99fdb3951bfc3582faefee9b6e4128cf2b3123a681fa28",
+          "md5": "26cf72bcb09d77d673f96d31ed5d1693",
+          "sha256": "8de374d87a6fac1c178437e9ebc132298e3869544662ca425806f719176844da"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "26cf72bcb09d77d673f96d31ed5d1693",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 47701,
+        "upload_time": "2021-02-19T06:26:20",
+        "upload_time_iso_8601": "2021-02-19T06:26:20.005192Z",
+        "url": "https://files.pythonhosted.org/packages/6d/34/4e1eb39784c9fd99fdb3951bfc3582faefee9b6e4128cf2b3123a681fa28/curricula_grade-2.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c347cab87732f5fc008f0439493c3528d8653a18519f972492699f1435b71c77",
+          "md5": "2ce0d9324f4c51cac02b8696629cf4b0",
+          "sha256": "7f2d7b71582865dc75254e87ef66a5e9294d1dd342bc2b11c8af270a6dfc2a95"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2ce0d9324f4c51cac02b8696629cf4b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32229,
+        "upload_time": "2021-02-19T06:26:21",
+        "upload_time_iso_8601": "2021-02-19T06:26:21.830144Z",
+        "url": "https://files.pythonhosted.org/packages/c3/47/cab87732f5fc008f0439493c3528d8653a18519f972492699f1435b71c77/curricula-grade-2.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b000882d978d4668849be7d0232c33173f3affa05198449646c5efd2b866d826",
+          "md5": "2f6616282e30a576da5b6121c6fe560d",
+          "sha256": "3c978ad3afbbe76a983a55ff08ca32af588795cee28f705e9602da8401385823"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2f6616282e30a576da5b6121c6fe560d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 47697,
+        "upload_time": "2021-02-19T07:10:18",
+        "upload_time_iso_8601": "2021-02-19T07:10:18.401544Z",
+        "url": "https://files.pythonhosted.org/packages/b0/00/882d978d4668849be7d0232c33173f3affa05198449646c5efd2b866d826/curricula_grade-2.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fd4334cfb29d9380c95ad8af454acf4cc9c89dc817b88647529bfafcc4dc0d9",
+          "md5": "13ed583581e1996deab5cf280abfd078",
+          "sha256": "35a47bb18d4e3450e25e74985aea19676310464e12e3b77edc9cf4a2a7758db6"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "13ed583581e1996deab5cf280abfd078",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32251,
+        "upload_time": "2021-02-19T07:10:21",
+        "upload_time_iso_8601": "2021-02-19T07:10:21.112000Z",
+        "url": "https://files.pythonhosted.org/packages/6f/d4/334cfb29d9380c95ad8af454acf4cc9c89dc817b88647529bfafcc4dc0d9/curricula-grade-2.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c32e3152f8a61b1f49e4671218b1e60033269b047c1ee8ef4d663ee92128b512",
+          "md5": "485f3f11e4a6b56b9d222dff7de9b3ad",
+          "sha256": "e2206dc96ef1efd5738f20bd3ec33f7bf64aa68e62862c19607803690df89cf1"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "485f3f11e4a6b56b9d222dff7de9b3ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 47919,
+        "upload_time": "2021-03-11T21:10:27",
+        "upload_time_iso_8601": "2021-03-11T21:10:27.634811Z",
+        "url": "https://files.pythonhosted.org/packages/c3/2e/3152f8a61b1f49e4671218b1e60033269b047c1ee8ef4d663ee92128b512/curricula_grade-2.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c0d1bd183fdbddc004ed4118a33e6d589d12fcb1423acdbb6a7b30f0b254474",
+          "md5": "8ee3d7ae2e2d8f88fca4718c539d69bc",
+          "sha256": "4eb289cdcc0bf163a345c0f7a38d004ded6cf645ab6020daf8ecbf8297debce9"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ee3d7ae2e2d8f88fca4718c539d69bc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32332,
+        "upload_time": "2021-03-11T21:10:31",
+        "upload_time_iso_8601": "2021-03-11T21:10:31.078710Z",
+        "url": "https://files.pythonhosted.org/packages/6c/0d/1bd183fdbddc004ed4118a33e6d589d12fcb1423acdbb6a7b30f0b254474/curricula-grade-2.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6dcaf812519b16456f8c8b826e2f72e8c7c72cb0c79c953808d445b475ba1c2f",
+          "md5": "c95dd7ecf78413caa01c54b5adf348cf",
+          "sha256": "cfd1be9467ce3816573c833c09213bbb5cbcab7da939ebc1a4c35a98445d6626"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c95dd7ecf78413caa01c54b5adf348cf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 47974,
+        "upload_time": "2021-04-16T01:23:02",
+        "upload_time_iso_8601": "2021-04-16T01:23:02.470252Z",
+        "url": "https://files.pythonhosted.org/packages/6d/ca/f812519b16456f8c8b826e2f72e8c7c72cb0c79c953808d445b475ba1c2f/curricula_grade-2.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b96f0fea2fec3d7ad64cc3c242b3ec17a24a754a70000e76d821961b947d0636",
+          "md5": "30534404b6c13d9fed8e0db1b455109c",
+          "sha256": "6364b7cbdc90cee66b609feebf264864956f8507206a938dd81ada24f3ce378a"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30534404b6c13d9fed8e0db1b455109c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32230,
+        "upload_time": "2021-04-16T01:23:06",
+        "upload_time_iso_8601": "2021-04-16T01:23:06.235252Z",
+        "url": "https://files.pythonhosted.org/packages/b9/6f/0fea2fec3d7ad64cc3c242b3ec17a24a754a70000e76d821961b947d0636/curricula-grade-2.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f9399cbe7f23818d2b453e27a358022314853802393aa0e45228faf91c71764",
+          "md5": "a75646754028c364b38d29e2875088ab",
+          "sha256": "014048917289548c33a437c8e514fb4e469d2916267ebe8ef018b833911dd63b"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a75646754028c364b38d29e2875088ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 48198,
+        "upload_time": "2021-04-23T02:51:15",
+        "upload_time_iso_8601": "2021-04-23T02:51:15.775387Z",
+        "url": "https://files.pythonhosted.org/packages/1f/93/99cbe7f23818d2b453e27a358022314853802393aa0e45228faf91c71764/curricula_grade-2.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9842e763233ab8fdd40fcd47357fd6f141fdc9182cc1d0fa3d7c766a99f61fa2",
+          "md5": "b6ea2d674a91b47591353295a48f0725",
+          "sha256": "8c2aac3156444e9794b4bbf8e02816cf191808c6e1b21dfb06b914ae6b8bfa52"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b6ea2d674a91b47591353295a48f0725",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32601,
+        "upload_time": "2021-04-23T02:51:20",
+        "upload_time_iso_8601": "2021-04-23T02:51:20.672015Z",
+        "url": "https://files.pythonhosted.org/packages/98/42/e763233ab8fdd40fcd47357fd6f141fdc9182cc1d0fa3d7c766a99f61fa2/curricula-grade-2.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "186d3805ed1af09b40ccf60ff9fc335a030b281dde0a648e45662ed12c6b388c",
+          "md5": "3f9c96fd2b96857776e01f7e54e7c39d",
+          "sha256": "5d41000101009379cc129690d9330273d756dec0009267e145f8588729cf685e"
+        },
+        "downloads": -1,
+        "filename": "curricula_grade-2.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3f9c96fd2b96857776e01f7e54e7c39d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 48261,
+        "upload_time": "2021-09-20T17:21:08",
+        "upload_time_iso_8601": "2021-09-20T17:21:08.839834Z",
+        "url": "https://files.pythonhosted.org/packages/18/6d/3805ed1af09b40ccf60ff9fc335a030b281dde0a648e45662ed12c6b388c/curricula_grade-2.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c7a2f0dc3eccd5560831e9dac77e80fde400132d76618fe443a9e4505970d395",
+          "md5": "b755de4b390eeeac099b0645536ebdd8",
+          "sha256": "a3786d110026680413f85a9d2ff0e34e96ee5ccb365ba3e0946fd1251ab3ea08"
+        },
+        "downloads": -1,
+        "filename": "curricula-grade-2.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b755de4b390eeeac099b0645536ebdd8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 32672,
+        "upload_time": "2021-09-20T17:21:13",
+        "upload_time_iso_8601": "2021-09-20T17:21:13.014545Z",
+        "url": "https://files.pythonhosted.org/packages/c7/a2/f0dc3eccd5560831e9dac77e80fde400132d76618fe443a9e4505970d395/curricula-grade-2.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "186d3805ed1af09b40ccf60ff9fc335a030b281dde0a648e45662ed12c6b388c",
+        "md5": "3f9c96fd2b96857776e01f7e54e7c39d",
+        "sha256": "5d41000101009379cc129690d9330273d756dec0009267e145f8588729cf685e"
+      },
+      "downloads": -1,
+      "filename": "curricula_grade-2.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "3f9c96fd2b96857776e01f7e54e7c39d",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9",
+      "size": 48261,
+      "upload_time": "2021-09-20T17:21:08",
+      "upload_time_iso_8601": "2021-09-20T17:21:08.839834Z",
+      "url": "https://files.pythonhosted.org/packages/18/6d/3805ed1af09b40ccf60ff9fc335a030b281dde0a648e45662ed12c6b388c/curricula_grade-2.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c7a2f0dc3eccd5560831e9dac77e80fde400132d76618fe443a9e4505970d395",
+        "md5": "b755de4b390eeeac099b0645536ebdd8",
+        "sha256": "a3786d110026680413f85a9d2ff0e34e96ee5ccb365ba3e0946fd1251ab3ea08"
+      },
+      "downloads": -1,
+      "filename": "curricula-grade-2.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b755de4b390eeeac099b0645536ebdd8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9",
+      "size": 32672,
+      "upload_time": "2021-09-20T17:21:13",
+      "upload_time_iso_8601": "2021-09-20T17:21:13.014545Z",
+      "url": "https://files.pythonhosted.org/packages/c7/a2/f0dc3eccd5560831e9dac77e80fde400132d76618fe443a9e4505970d395/curricula-grade-2.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,679 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Environment :: Console",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: MIT License",
+      "Natural Language :: English",
+      "Operating System :: MacOS :: MacOS X",
+      "Operating System :: POSIX",
+      "Operating System :: Unix",
+      "Programming Language :: Python",
+      "Topic :: Scientific/Engineering",
+      "Topic :: Scientific/Engineering :: Bio-Informatics"
+    ],
+    "description": "# Production pipelines\n\n## cpg_pipes python package\n\nThe `cpg_pipes` package provides Python functions that help to design a pipeline powered by [Hail Batch](https://hail.is/docs/batch/service.html).\n\n### Installation\n\nRequires Python 3.10\n\n```bash\npip install cpg_pipes\n```\n\n### Motivation\n\nA pipeline can be represented as a set of stages with dependency interrelationships (i.e. a directed acyclic graph of stages). Hail Batch has a concept of jobs that can depend on each other; however, a Hail Batch job corresponds to only one bash script that is run on a cloud VM, which doesn't always solve a higher-level task in the application domain. In contrast, a pipeline stage called \"genotype\" can include multiple jobs that generate intervals, partition input, run a genotyping tool on each partition in parallel, gather outputs, and perform some post-processing. A user might want to treat it as one \"stage\" that sits between an \"alignment\" stage and a \"joint calling\" stage.\n\nAt the CPG, we also want to permanently record outputs of some stages (e.g. individual CRAM and GVCF files, fingerprints, a joint-called matrix table). Specifically, we store those results on buckets according to the storage policy and add entries into the sample metadata database. When rerunning a pipeline, we want to explicitly control whether to reuse existing results. We also want to be able to start the pipeline from a specific stage, making the pipeline assume that all previous stages have finished successfully; or run the pipeline only up to a specific stage.\n\nMotivated by that, we designed the `cpg_pipes` package. It implementes a concept of `Stage` that can act on a `Target`: e.g. a `Sample`, a `Project`, or a `Cohort`. For example, a stage that performs read alignment to produce a CRAM file would act on a sample, and a stage that performs joint-calling would act on an entire cohort. \n\nEach stage declares paths to the outputs it would produce by implementing the abstract `expected_outputs()` method; and it also defines how jobs are added into Hail Batch using the `queue_jobs()` method. \n\nOverall classes and object relationships look as follows:\n\n![uml](docs/classes.png)\n\n### Building pipelines\n\nTo declare a stage, derive a class from `SampleStage`, `ProjectStage`, or `CohortStage`, implement the abstract methods, and wrap the class with a `@stage` decorator:\n\n```python\nfrom cpg_pipes.pipeline import stage, StageInput, StageOutput, SampleStage\nfrom cpg_pipes.targets import Sample\nfrom cpg_pipes import Path, to_path\n\n\n@stage\nclass Align(SampleStage):\n    \"\"\"Stage that runs read alignment\"\"\"\n\n    def expected_outputs(self, sample: Sample) -> Path:\n        \"\"\"Returning a path to a CRAM file that will be generated\"\"\"\n        return to_path('gs://cpg-thousand-genomes-test/cram/NA12878.cram')\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        \"\"\"Defines how jobs are added into a batch object\"\"\"\n        cram_path = self.expected_outputs(sample)\n        # This Job just writes the sample name to a file:\n        j = self.pipe.b.new_job(f'Align {sample.id}')\n        # Just writing a sample name for a demonstration:\n        j.command(f'echo {sample.id} > {j.output}')\n        self.pipe.b.write_output(j.output, cram_path)\n        # Construct StageOutput object, where we pass a path to the results, \n        # and all added jobs:\n        return self.make_outputs(sample, data=cram_path, jobs=[j])\n```\n\nThe `queue_jobs` method is expected to return an output of type `StageOutput`: you can call `self.make_outputs()` to construct that object.\n\nStages can depend on each other. Use the `required_stages` parameter to `@stage` to set dependencies, and use the `inputs` parameter in `queue_jobs` to get the output of a previous stage:\n\n```python\nfrom cpg_pipes.pipeline import stage, StageInput, StageOutput, SampleStage\nfrom cpg_pipes.targets import Sample\n\n\n@stage(required_stages=[Align])\nclass ReadCramFile(SampleStage):\n    \"\"\"Stage that reads the CRAM file genereated by a Align stage\"\"\"\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        # Read the `Align` stage outputs:\n        cram_path = inputs.as_path(sample, stage=Align)\n        return ...\n```\n\nStage of differnet levels can depend on each other, and `cpg_pipes` will resolve that correctly. E.g. joint-calling taking GVCF outputs to produce a cohort-level VCF:\n\n```python\nfrom cpg_pipes.pipeline import stage, StageInput, StageOutput, SampleStage,\n    CohortStage\nfrom cpg_pipes.targets import Sample, Cohort\n\n\n@stage\nclass HaplotypeCaller(SampleStage):\n    \"\"\"Stage that runs gatk Haplotype caller to generate a GVCF for a sample\"\"\"\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        jobs = ...\n        return self.make_outputs(sample, data=self.expected_outputs(sample), jobs=jobs)\n\n\n@stage(required_stages=HaplotypeCaller)\nclass JointCalling(CohortStage):\n    \"\"\"Stage that runs joint calling on GVCFs\"\"\"\n\n    def queue_jobs(self, cohort: Cohort, inputs: StageInput) -> StageOutput | None:\n        # Get outputs from previous stage. Because the HaplotypeCaller stage\n        # acts on a sample, we use a method `as_path_by_target` that returns\n        # a dictionary index by sample ID:\n        gvcf_by_sample_id = inputs.as_path_by_target(stage=HaplotypeCaller)\n        job = ...\n        return self.make_outputs(cohort, data=self.expected_outputs(cohort), jobs=[job])\n\n    ...\n```\n\nTo submit the constructed pipeline to Hail Batch, create a pipeline with `create_pipeline`, and call `submit_batch()`. You need to pass a name, a description, a version of a run, the namespace according to the storage policies (`test` / `main` / `tmp`), and the `analysis_dataset` name that would be used to communicate with the sample metadata DB.\n\n```python\nfrom cpg_pipes.pipeline import create_pipeline\nfrom cpg_pipes import Namespace\n\npipeline = create_pipeline(\n    name='my_pipeline',\n    description='My pipeline',\n    namespace=Namespace.TEST,\n    analysis_dataset='fewgenomes',\n)\npipeline.run()\n```\n\n### Input sources\n\nClass `cpg_pipes.providers.InputProvider` provides an interface for an input data provider, with two implementations: `CsvInputProvider` and `SmdbInputProvider`. The former one allows you to specify inputs in a CSV file. E.g.:\n\n```\n$ cat inputs.tsv\ndataset,sample,external_id,fqs_r1,fqs_r2,cram,sex\nhgdp,NA12878,NA12878,NA12878_R1.fq.gz|NA12878_R2.fq.gz,,F\nhgdp,NA12879,NA12879,NA12879_R1.fq.gz|NA12879_R2.fq.gz,,M\n```\n\n```python\nfrom cpg_pipes.providers import InputProviderType\nfrom cpg_pipes.pipeline import create_pipeline\n\npipeline = create_pipeline(\n    ...,\n    input_provider_type=InputProviderType.CSV,\n    input_csv='inputs.csv',\n)\n```\n\n`SmdbInputProvider` allows to pull input data from the CPG [sample metadata database](https://github.com/populationgenomics/sample-metadata):\n\n```python\nfrom cpg_pipes.providers import InputProviderType\nfrom cpg_pipes.pipeline import create_pipeline\n\npipeline = create_pipeline(\n    ...,\n    datasets=['hgdp'],\n    input_provider_type=InputProviderType.CPG,\n)\n```\n\nThe defailt input provider type is `InputProviderType.NONE`, which means that no samples and datasets are loaded, but you can add them manually into the automatically created `cohort` object:\n\n```\n>>> pipeline.cohort.get_datasets()\n['hgdp']\n\n>>> for dataset in pipeline.cohort.get_datasets():\n>>>     samples = dataset.get_samples()\n>>>     print(samples[0])\nSample(id='CPG68197', external_id='HGDP00001', dataset=Dataset(\"hgdp\"), meta={}, alignment_input=CramPath('gs://cpg-nagim-test/cram/HGDP00001.cram'), pedigree=None),\n...\n```\n\nIf a `Participant` entry is available, `sample.participant_id` will be populated. If a corresponding `Sequence` is available, `reads` metadata will be parsed and populated as `sample.alignment_input`, along with `sample.sequencing_type`. If corresponding `Analysis` entries exist, they will be populated as `sample.sanalysis_by_type`. If `Family` data is available, it will be parsed and populated as `sample.pedigree`.\n\n### Storage policies\n\nOutputs are written according to provided storage policy. Class `cpg_pipes.providers.StoragePolicy` provides an interface for abstract policy, with one implementation: `CpgStoragePolicy`, which implements the [CPG storage policy](https://github.com/populationgenomics/team-docs/tree/main/storage_policies). The default cloud storage provider is Google Cloud Storage, which can be overridden with `cloud` parameter to `create_pipeline` (or `--cloud <val>` in the command line).\n\n### Bioinformatics jobs\n\nThe `cpg_pipes.jobs` module defines functions that create Hail Batch Jobs for different bioinformatics purposes: alignment, fastqc, deduplication, variant calling, VQSR, etc. E.g. to implement the joint calling stage above, you can use:\n\n```python\nfrom cpg_pipes.pipeline import stage, SampleStage, CohortStage, StageInput, StageOutput\nfrom cpg_pipes.targets import Sample, Cohort\nfrom cpg_pipes.jobs import haplotype_caller, joint_genotyping\nfrom cpg_pipes.filetypes import CramPath, GvcfPath\n\n\n@stage\nclass HaplotypeCaller(SampleStage):\n    \"\"\"Stage that runs gatk HaplotypeCaller to produde a GVCF\"\"\"\n\n    def queue_jobs(self, sample: Sample, inputs: StageInput) -> StageOutput | None:\n        \"\"\"Call the function from the jobs module\"\"\"\n        cram_path = inputs.as_path(target=sample, stage=Align)\n        expected_path = self.expected_outputs(sample)\n        jobs = haplotype_caller.produce_gvcf(\n            b=self.pipe.b,\n            sample_name=sample.id,\n            cram_path=CramPath(cram_path),\n            output_path=expected_path,\n            scatter_count=50,\n            tmp_prefix=sample.dataset.tmp_prefix(),\n            refs=self.refs,\n            sequencing_type=sample.sequencing_type,\n        )\n        return self.make_outputs(sample, data=expected_path, jobs=jobs)\n\n\n@stage(required_stages=HaplotypeCaller)\nclass JointCalling(CohortStage):\n    \"\"\"Stage that runs joint calling on GVCFs\"\"\"\n\n    def queue_jobs(self, cohort: Cohort, inputs: StageInput) -> StageOutput | None:\n        \"\"\"Call the function from the jobs module\"\"\"\n        gvcf_by_sid = {\n            sample.id: GvcfPath(inputs.as_path(target=sample, stage=HaplotypeCaller))\n            for sample in cohort.get_samples()\n        }\n        jobs = joint_genotyping.make_joint_genotyping_jobs(\n            b=self.pipe.b,\n            out_vcf_path=self.expected_outputs(cohort)['vcf'],\n            out_siteonly_vcf_path=self.expected_outputs(cohort)['siteonly_vcf'],\n            gvcf_by_sid=gvcf_by_sid,\n            refs=self.refs,\n            sequencing_type=cohort.get_sequencing_type(),\n            tmp_bucket=cohort.analysis_dataset.tmp_prefix(),\n        )\n        return self.make_outputs(cohort, data=self.expected_outputs(cohort), jobs=jobs)\n```\n\nAvailable jobs include alignment:\n\n```python\nfrom cpg_pipes.jobs import align\n\nsample = ...\nj = align.align(\n    b=...,\n    alignment_input=sample.alignment_input,\n    output_path=...,\n    realignment_shards_num=10\n)\n```\n\nGetting intervals for sharding variant calling:\n\n```python\nfrom cpg_pipes.jobs import split_intervals\nj, intervals = split_intervals.get_intervals(b=..., scatter_count=20)\n```\n\nGenerate somalier pedigree fingerprints:\n\n```python\nfrom cpg_pipes.jobs import somalier\nfingerprint_job, fingerprint_path = somalier.extact_job(\n    b=...,\n    gvcf_or_cram_or_bam_path=...,\n    refs=...,\n)\n```\n\nInfer pedigree relashionships and sex of samples in a dataset, and check with a probided PED file:\n\n```python\nfrom cpg_pipes.jobs import somalier\ndataset = ...\nj, somalier_samples_path, somalier_pairs_path = somalier.ancestry(\n    b=...,\n    dataset=...,\n    refs=...,\n    input_path_by_sid=...,\n    out_tsv_path=...,\n    out_html_path=...,\n    out_html_url=...,\n)\n```\n\nVQSR (from a site-only VCF or a Hail matrix table):\n\n```python\nfrom cpg_pipes.jobs import vqsr\ncohort = ...\nj = vqsr.make_vqsr_jobs(\n    b=...,\n    input_vcf_or_mt_path=...,\n    gvcf_count=len(cohort.get_samples()),\n    out_path=...,\n    refs=...,\n    sequencing_type=cohort.get_sequencing_type(),\n    tmp_prefix=cohort.tmp_prefix(),\n    use_as_annotations=True,\n)\n```\n\nThere other jobs available - refer to the code examples.\n\n### Pipelines\n\nThere are full pipelines available in the `pipelines` folder, specifically:\n\n- `pipelines/seqr_loader.py` takes CRAM/FASTQ, aligns and joint-genotypes, then annotates using Hail Query and creates an Elasticsearch index for Seqr.\n- `pipelines/somalier.py` uses Somalier and an input PED file to check pedigree and sex of CRAMs or GVCFs,\n- `pipelines/qc.py` takes CRAMs and runs CRAM QC and summarises it in a MultiQC report,\n- `pipelines/cram_gvcf.py` takes CRAM/FASTQ, and runs alignment and genotyping for each sample,\n- `pipelines/gatk_sv` orchestrates workflows of [GATK-SV](https://github.com/populationgenomics/gatk-sv).\n\n### Click options\n\nThe `cpg_pipes/pipeline/cli_opts.py` module provides CLI options for Click that handles default parameters that can be used to customise a pipeline. The basic usage is as follows:\n\n```python\nimport click\nfrom cpg_pipes.pipeline import create_pipeline, pipeline_entry_point\n\n\n@click.command()\n@pipeline_entry_point\ndef main(**kwargs):\n    pipeline = create_pipeline(\n        name='my_pipeline',\n        description='My pipeline',\n        **kwargs,\n    )\n```\n\nWhen calling such a pipelne script from the command-line, the options defined in `@pipeline_click_options` will be available and passed to the `create_pipeline` factory.\n\nYou can add more custom options like this:\n\n```python\nimport click\nfrom cpg_pipes.pipeline import pipeline_entry_point, create_pipeline\n\n\n@click.command()\n@pipeline_entry_point\n@click.option('--custom-option')\ndef main(**kwargs):\n    custom_option = kwargs.pop('custom_option')\n    pipeline = create_pipeline(\n        name='my_pipeline',\n        description='My pipeline',\n        **kwargs,\n    )\n```\n\n### Batch helpers\n\nThe `cpg_pipes.hb.batch` module provides a helper function `setup_batch` to set up Hail Batch in the CPG context:\n\n```python\nfrom cpg_pipes.hb.batch import setup_batch\nb = setup_batch('My batch')\n```\n\nIt will create an instance of Batch that extends the standard Hail Batch, that records stats of added jobs and prints statistics before submission, highlighting labelled jobs, e.g.:\n\n```\nWill submit 186 jobs:\n  BWA: 3 for 3 samples\n  Somalier extract (CRAMs): 3 for 3 samples\n  HaplotypeCaller: 3 for 3 samples\n  ReblockGVCF: 3 for 3 samples\n  Somalier extract (GVCFs): 3 for 3 samples\n  Other jobs: 171\n```\n\nThe Batch instance also constructs the job name if the names of a sample and a dataset are provided as attributes, e.g.:\n\n```bash\n>>> j = b.new_job('My job', dict(sample='CPG196535', dataset='fewgenomes'))\n>>> print(j.name)\nfewgenomes/CPG196535: My job\n```\n\n`cpg_pipes.hb.command` provides a helper to set up a command that can be used to add monitoring of disk space, or authenticate with GCP to make `gsutil` work:\n\n```python\nfrom cpg_pipes.hb.command import wrap_command\nb = ...\nj = b.new_job('My job')\nj.command(wrap_command(\n    'sleep 600',\n    monitor_space=True,\n    setup_gcp=True,\n))\n```\n\nThis will wrap the command as follows:\n\n```\nset -o pipefail\nset -ex\nexport GOOGLE_APPLICATION_CREDENTIALS=/gsa-key/key.json\ngcloud -q auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS\n\n(while true; do df -h; du -sh /io; du -sh /io/batch; sleep 600; done) &\n\nsleep 600\n\ndf -h; du -sh /io; du -sh /io/batch\n```\n\n### Reusing existing results\n\nBy default, if expected result exist, empty jobs will be submitted suffixed with ` [reuse]`. You can disable that check with `--no-check-expected-outputs`.\n\nYou can also start from a specific stage with `--first-stage`, or finish on specific one with `--last-stage`.\n\nYou can use `@skip` decorator to force skipping a stage:\n\n```python\nfrom cpg_pipes.pipeline import stage, skip, SampleStage\n\n@skip(reason='Stage is not needed')\n@stage\nclass MyStage1(SampleStage):\n    ...\n```\n\n`assume_outputs_exist=True` would also tell the code that the expected results of that stage exist, and there is no need to check bucket objects for existence:\n\n```python\nfrom cpg_pipes.pipeline import stage, skip, SampleStage\n\n@skip\n@stage(assume_outputs_exist=True)\nclass MyStage2(SampleStage):\n    ...\n```\n\nYou can also force the pipeline to skip certain samples with `--skip-samples/-S`, or take only certain samples with `--only-samples/-s`, or force processing certain samples with `--force-samples`.\n\n### Running pipelines\n\nTo start the `seqr_loader` pipeline on 2 datasets `acute-care` and `perth-neuro` in the test namespace, using `seqr` as analysis dataset, and write the Elasticsearch index for `perth-neuro`:\n\n```sh\npython pipelines/seqr_loader.py \\\n-n main \\\n--analysis-dataset seqr \\\n--dataset acute-care \\\n--dataset perth-neuro \\\n--skip-sample CPG11783 \\\n--skip-sample CPG13326 \\\n--keep-scratch\n```\n\nAlternatively, you can put the command line options into a config YAML file:\n\n```sh\npython pipelines/seqr_loader.py --config pipelines/configs/seqr.yml\n```\n\nAnother useful pipeline is `pipelines/somalier.py` to verify inferred sample\nrelatedness and sex against a provided PED file(s):\n\n```sh\npython pipelines/somalier.py --config pipelines/configs/seqr.yml\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/populationgenomics/production-pipelines",
+    "keywords": "bioinformatics",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cpg-pipes",
+    "package_url": "https://pypi.org/project/cpg-pipes/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/cpg-pipes/",
+    "project_urls": {
+      "Homepage": "https://github.com/populationgenomics/production-pipelines"
+    },
+    "release_url": "https://pypi.org/project/cpg-pipes/0.3.10/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Hail Batch bioinformatics pipelines",
+    "version": "0.3.10",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14761299,
+  "releases": {
+    "0.2.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ea432bef1768c649dd11f6bb0ae8f8120311735e168bc289e6ea7c82187c431",
+          "md5": "6af33f0bce3e01ccf26a973e52df876e",
+          "sha256": "f68e624b6f1a2ea464878205983bfd264ede15ed5205aaf5bfceeb000e84d34f"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6af33f0bce3e01ccf26a973e52df876e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 36419,
+        "upload_time": "2022-02-28T06:16:36",
+        "upload_time_iso_8601": "2022-02-28T06:16:36.758706Z",
+        "url": "https://files.pythonhosted.org/packages/7e/a4/32bef1768c649dd11f6bb0ae8f8120311735e168bc289e6ea7c82187c431/cpg-pipes-0.2.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e96aa50d4d37e02ba8bed82f874e8922b39778db7af41bc26e723e559457ceb6",
+          "md5": "5497b01db04af3986a035290e5d1f210",
+          "sha256": "40d6a8de915288fa4c733e010766c5616a7ea45bb4627636dd913c4da62ab0b4"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5497b01db04af3986a035290e5d1f210",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 55608,
+        "upload_time": "2021-11-14T07:26:12",
+        "upload_time_iso_8601": "2021-11-14T07:26:12.049423Z",
+        "url": "https://files.pythonhosted.org/packages/e9/6a/a50d4d37e02ba8bed82f874e8922b39778db7af41bc26e723e559457ceb6/cpg_pipes-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75deffa13a22c0eed0e290f80f0a718e56aa798485b01fc7e3d030349c43cdac",
+          "md5": "172d104b6d6b9faff57fce66d7f44958",
+          "sha256": "1707b91fa1a524c9855e83f936b1a25f05538dc3468bd0f5e73bce5ddfe3f86d"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "172d104b6d6b9faff57fce66d7f44958",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23567,
+        "upload_time": "2021-11-14T07:26:13",
+        "upload_time_iso_8601": "2021-11-14T07:26:13.631567Z",
+        "url": "https://files.pythonhosted.org/packages/75/de/ffa13a22c0eed0e290f80f0a718e56aa798485b01fc7e3d030349c43cdac/cpg-pipes-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f69b495ef209dfedb2744ba8d65dce7e8f0cf05af3db1fdd847079814480e5fe",
+          "md5": "baf22587ead966a162674d646d06cbe8",
+          "sha256": "2fe100d1785fc2b62859c8880343db1511cff080ab0a375113a867cf50ad9a7c"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "baf22587ead966a162674d646d06cbe8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 68265,
+        "upload_time": "2021-11-14T08:00:41",
+        "upload_time_iso_8601": "2021-11-14T08:00:41.062457Z",
+        "url": "https://files.pythonhosted.org/packages/f6/9b/495ef209dfedb2744ba8d65dce7e8f0cf05af3db1fdd847079814480e5fe/cpg_pipes-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d3766a8823dad4883896d59c0e2104d60abbe5bb5279b6ecf2fbd13fb2083d8",
+          "md5": "6b8840653014369c0b1808dd25f9b158",
+          "sha256": "06b8d412dbc36ff9c332fba3d786a80e66d60ad57b8a1968df4461f828dd676c"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6b8840653014369c0b1808dd25f9b158",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 35549,
+        "upload_time": "2021-11-14T08:00:42",
+        "upload_time_iso_8601": "2021-11-14T08:00:42.303510Z",
+        "url": "https://files.pythonhosted.org/packages/0d/37/66a8823dad4883896d59c0e2104d60abbe5bb5279b6ecf2fbd13fb2083d8/cpg-pipes-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07272398afa71bb32b4c95b50d515a301e50e79af1ed85c816f6743f2981610c",
+          "md5": "4a45f6cb3c9b40e0cdba378941938682",
+          "sha256": "0c7aba272e87056f201e92f167852c47c49cba0a838f55dcbafc5b1acf3af35e"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a45f6cb3c9b40e0cdba378941938682",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 34154,
+        "upload_time": "2021-12-15T09:36:00",
+        "upload_time_iso_8601": "2021-12-15T09:36:00.343112Z",
+        "url": "https://files.pythonhosted.org/packages/07/27/2398afa71bb32b4c95b50d515a301e50e79af1ed85c816f6743f2981610c/cpg_pipes-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a30ee92d1a5f41a6896a890a475e028eeb4c10d50c360a10934cd9b3f251163",
+          "md5": "a6dc2394aa88b88607f6b94b3cdd6869",
+          "sha256": "164f50985321a9960225c1c8be0fa39ea89c89e0396719760f85539742e5f2b0"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a6dc2394aa88b88607f6b94b3cdd6869",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 42478,
+        "upload_time": "2021-12-15T09:36:02",
+        "upload_time_iso_8601": "2021-12-15T09:36:02.255575Z",
+        "url": "https://files.pythonhosted.org/packages/4a/30/ee92d1a5f41a6896a890a475e028eeb4c10d50c360a10934cd9b3f251163/cpg-pipes-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc40d4740b6d7805ff4e66131b16886eb89849fb41fdc3b454f3b68d2ca05dd9",
+          "md5": "9cdc05e6c2d21515dd4430ab53552b4c",
+          "sha256": "e5d2bbea241b1fdb957134338f72d7f909d59cdecf0716a5165206862b718365"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9cdc05e6c2d21515dd4430ab53552b4c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 35284,
+        "upload_time": "2022-01-19T12:20:53",
+        "upload_time_iso_8601": "2022-01-19T12:20:53.753421Z",
+        "url": "https://files.pythonhosted.org/packages/cc/40/d4740b6d7805ff4e66131b16886eb89849fb41fdc3b454f3b68d2ca05dd9/cpg_pipes-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dc6e4dc15e9d00354a16d86550cbfe6a6e019602c01f27845ef4b26e0bb4c152",
+          "md5": "3629cda59399c4d5c8f1d666218c4f3d",
+          "sha256": "ed7239542d3adf61e7743f6e247550b450392c019ac9f5e859f37375ae7e917f"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3629cda59399c4d5c8f1d666218c4f3d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43463,
+        "upload_time": "2022-01-19T12:20:55",
+        "upload_time_iso_8601": "2022-01-19T12:20:55.202785Z",
+        "url": "https://files.pythonhosted.org/packages/dc/6e/4dc15e9d00354a16d86550cbfe6a6e019602c01f27845ef4b26e0bb4c152/cpg-pipes-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e5de7a78dd5a4274336358b67edfc6d6fd4884b48ff4518de5e2b136bd3acf0",
+          "md5": "e4cac0b269258a4198d54567510bbda6",
+          "sha256": "97958d1baf19bf4819e168a8e5f48c9647c42633d052457f33063954c2caa771"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e4cac0b269258a4198d54567510bbda6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 35284,
+        "upload_time": "2022-01-19T12:55:46",
+        "upload_time_iso_8601": "2022-01-19T12:55:46.368335Z",
+        "url": "https://files.pythonhosted.org/packages/4e/5d/e7a78dd5a4274336358b67edfc6d6fd4884b48ff4518de5e2b136bd3acf0/cpg_pipes-0.2.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d0d63d881af16619a9413ca9be18972db0bd3163e594e7a5d8858ca33187e98",
+          "md5": "f2e01205ff5b3e963dbf3776714f01f2",
+          "sha256": "85d7b01c00fe34ec11fbb7845c290d1c05ca6c3efd320dd225e5d1d05e6eec53"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f2e01205ff5b3e963dbf3776714f01f2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43464,
+        "upload_time": "2022-01-19T12:55:48",
+        "upload_time_iso_8601": "2022-01-19T12:55:48.158405Z",
+        "url": "https://files.pythonhosted.org/packages/4d/0d/63d881af16619a9413ca9be18972db0bd3163e594e7a5d8858ca33187e98/cpg-pipes-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3667bfc0b5bf46de5a4bb9a01724f68d2b25619e9325b04fc6e1a8b3ff7d1a68",
+          "md5": "471033d0889ae38efbc082cc366f6ff7",
+          "sha256": "c4751fcd7c29534b0b83fa7bf0386aaa93ae753a8d1057d5dca87551a73c6324"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "471033d0889ae38efbc082cc366f6ff7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 35283,
+        "upload_time": "2022-01-19T13:19:47",
+        "upload_time_iso_8601": "2022-01-19T13:19:47.585778Z",
+        "url": "https://files.pythonhosted.org/packages/36/67/bfc0b5bf46de5a4bb9a01724f68d2b25619e9325b04fc6e1a8b3ff7d1a68/cpg_pipes-0.2.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "44a4acf16d732e91253ab6c0576fda397679b504d452b7ece5273cc3ef992a3a",
+          "md5": "b953e9629b91e764b6c318e89d2f2efe",
+          "sha256": "72d0a40c8f37ee1a58bb96e2f79937b8d8dcda4577dde46282241e3431f383f0"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b953e9629b91e764b6c318e89d2f2efe",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 43460,
+        "upload_time": "2022-01-19T13:19:48",
+        "upload_time_iso_8601": "2022-01-19T13:19:48.665761Z",
+        "url": "https://files.pythonhosted.org/packages/44/a4/acf16d732e91253ab6c0576fda397679b504d452b7ece5273cc3ef992a3a/cpg-pipes-0.2.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6b20da50aa60478f6f698361c5b857f2e35acad734b3798c1b12bc582d58350c",
+          "md5": "8c51e2126cc1fbf1f235ed88b42bc900",
+          "sha256": "33be111b4a26e69bcce41ac909586fe9ae1b6f5d1b07881ebf2835a99ebda76d"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8c51e2126cc1fbf1f235ed88b42bc900",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39229,
+        "upload_time": "2022-02-01T23:43:08",
+        "upload_time_iso_8601": "2022-02-01T23:43:08.910086Z",
+        "url": "https://files.pythonhosted.org/packages/6b/20/da50aa60478f6f698361c5b857f2e35acad734b3798c1b12bc582d58350c/cpg_pipes-0.2.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76744667bbbbf94cc34dc33f2dd8f64f23e6236400d2376ca7027e08f36d382d",
+          "md5": "14c498a5c1f8be096fec9791d635730a",
+          "sha256": "1073dfe4925ee5523df95a4f3d095e19809e73aa0809a9a10e7fe5f878e92d5b"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "14c498a5c1f8be096fec9791d635730a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 48453,
+        "upload_time": "2022-02-01T23:43:10",
+        "upload_time_iso_8601": "2022-02-01T23:43:10.984582Z",
+        "url": "https://files.pythonhosted.org/packages/76/74/4667bbbbf94cc34dc33f2dd8f64f23e6236400d2376ca7027e08f36d382d/cpg-pipes-0.2.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4159db3493187bb6eeea7ffef95f6eae41e258ad6f954672b802b4a3adc511dd",
+          "md5": "0d100c1cc33d4b2b96a36d05dcd5a32b",
+          "sha256": "48d2a434a78e194d899088b7b52c71ad07b40a69486696746fe5114d0c7f457b"
+        },
+        "downloads": -1,
+        "filename": "cpg_pipes-0.2.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0d100c1cc33d4b2b96a36d05dcd5a32b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 39010,
+        "upload_time": "2022-02-08T05:43:15",
+        "upload_time_iso_8601": "2022-02-08T05:43:15.662399Z",
+        "url": "https://files.pythonhosted.org/packages/41/59/db3493187bb6eeea7ffef95f6eae41e258ad6f954672b802b4a3adc511dd/cpg_pipes-0.2.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "61e78871fc274700ca12dd15b2d09cbefbf2c70590865e38cfb2b45fb930ae8c",
+          "md5": "106e809b6b1f96b6a731cc41445b5323",
+          "sha256": "4405446b02445a52475dd2de98198ebf76caaab00b9f1470101ed7fdd627d8db"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.2.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "106e809b6b1f96b6a731cc41445b5323",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46909,
+        "upload_time": "2022-02-08T05:43:17",
+        "upload_time_iso_8601": "2022-02-08T05:43:17.277868Z",
+        "url": "https://files.pythonhosted.org/packages/61/e7/8871fc274700ca12dd15b2d09cbefbf2c70590865e38cfb2b45fb930ae8c/cpg-pipes-0.2.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8625237d38e19964d385c81d5ec88bced8f18570985f27ce12a6a8dc6ed9e302",
+          "md5": "1bf80e8095e5cbb432ffe2701d5e124f",
+          "sha256": "a8648c4ddbfe4605d0f82b49306a325f448860abc06ea22ab4d85d0244e67068"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1bf80e8095e5cbb432ffe2701d5e124f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 38512,
+        "upload_time": "2022-03-16T02:17:32",
+        "upload_time_iso_8601": "2022-03-16T02:17:32.010622Z",
+        "url": "https://files.pythonhosted.org/packages/86/25/237d38e19964d385c81d5ec88bced8f18570985f27ce12a6a8dc6ed9e302/cpg-pipes-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c7eaf271fd0b6c9636c706f75e389c48097e5b3b319d1500e84154b22f46be2a",
+          "md5": "c41f86a88980f69692e760d7171be9af",
+          "sha256": "fdbdbe9b17a42dde7c0a5892653ea11a5e5d4d94e642d71a84e0d596661b82d0"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c41f86a88980f69692e760d7171be9af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26285,
+        "upload_time": "2022-05-12T07:12:48",
+        "upload_time_iso_8601": "2022-05-12T07:12:48.558795Z",
+        "url": "https://files.pythonhosted.org/packages/c7/ea/f271fd0b6c9636c706f75e389c48097e5b3b319d1500e84154b22f46be2a/cpg-pipes-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "568e9916f92c2985cc0f753e2602fcc747a904e5508520d179a0c6ddf625328a",
+          "md5": "f83f39ccad76a09275e79bfc1d895f65",
+          "sha256": "ea862faeb6a1d3152473d1fe05b215c61e0d3a1944d0aaf755e69d73290e5db9"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f83f39ccad76a09275e79bfc1d895f65",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 115407,
+        "upload_time": "2022-08-15T06:06:16",
+        "upload_time_iso_8601": "2022-08-15T06:06:16.327424Z",
+        "url": "https://files.pythonhosted.org/packages/56/8e/9916f92c2985cc0f753e2602fcc747a904e5508520d179a0c6ddf625328a/cpg-pipes-0.3.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ef1134c99b6e246d38322f084c0ce3644104c8c007928071858830e2985be32",
+          "md5": "0428ed5f05298cf208c66f33e0c37c01",
+          "sha256": "41aa24330812caaac150d79b22d733f19b27fc2f156f883148a47189fc36e86d"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0428ed5f05298cf208c66f33e0c37c01",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26232,
+        "upload_time": "2022-06-16T16:15:11",
+        "upload_time_iso_8601": "2022-06-16T16:15:11.158131Z",
+        "url": "https://files.pythonhosted.org/packages/9e/f1/134c99b6e246d38322f084c0ce3644104c8c007928071858830e2985be32/cpg-pipes-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4754bf62a62b56257bf5270d5a44e73b74a10eb4b2efd203b8c5c9b21c7b6b35",
+          "md5": "813990d6bf068d275562552a5c78d5cc",
+          "sha256": "097625627d4cf063c1d3e8d30f261498525f50ebe72b822c3e30787e43d26434"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "813990d6bf068d275562552a5c78d5cc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26243,
+        "upload_time": "2022-06-17T07:19:48",
+        "upload_time_iso_8601": "2022-06-17T07:19:48.514849Z",
+        "url": "https://files.pythonhosted.org/packages/47/54/bf62a62b56257bf5270d5a44e73b74a10eb4b2efd203b8c5c9b21c7b6b35/cpg-pipes-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da94452d8de07a536f4d6193d302f8320e1034b22218268d615071e552c1314e",
+          "md5": "777f8ee88d788496c41a0f3607b659fc",
+          "sha256": "02676cf3082d9db4ece83a30cfe9f4dc1897d7117c5f458ee4f20023e7a0b460"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "777f8ee88d788496c41a0f3607b659fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 26656,
+        "upload_time": "2022-06-22T03:38:51",
+        "upload_time_iso_8601": "2022-06-22T03:38:51.164771Z",
+        "url": "https://files.pythonhosted.org/packages/da/94/452d8de07a536f4d6193d302f8320e1034b22218268d615071e552c1314e/cpg-pipes-0.3.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3d6ef180df61d76cb4a12d7255f2e3e057ce96b74914acd442a26b98fedc708c",
+          "md5": "9cefd8af082340294a87ccd25657a35d",
+          "sha256": "86d72fe8a8d312884044c3e4c4dc675e9f61753421c5435e0ce9c73ee5cf863c"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9cefd8af082340294a87ccd25657a35d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 111036,
+        "upload_time": "2022-08-08T23:06:48",
+        "upload_time_iso_8601": "2022-08-08T23:06:48.332045Z",
+        "url": "https://files.pythonhosted.org/packages/3d/6e/f180df61d76cb4a12d7255f2e3e057ce96b74914acd442a26b98fedc708c/cpg-pipes-0.3.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc44b8bb008f7bcedbc029f5d17d9003542449a06abaaf8b740a1a3c4988fa4f",
+          "md5": "29b3f6053594ece5b9ec28eb83c1e0b8",
+          "sha256": "bc95d8f27eb259219d145a14c3a0073d3a6a2cf41a31c69ed6645a2657a0bd65"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "29b3f6053594ece5b9ec28eb83c1e0b8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 113319,
+        "upload_time": "2022-08-11T02:24:47",
+        "upload_time_iso_8601": "2022-08-11T02:24:47.472010Z",
+        "url": "https://files.pythonhosted.org/packages/bc/44/b8bb008f7bcedbc029f5d17d9003542449a06abaaf8b740a1a3c4988fa4f/cpg-pipes-0.3.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bcafa0fc4d40072f4a3dce384075ee2d801185bb0a68c5bcbfa3ae75a4f1389a",
+          "md5": "aba333c78c473f64188700fe025001d7",
+          "sha256": "c8e95831024ff116bb31b046bead88a2fb06073d12faf0cfb338b24db8911d93"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aba333c78c473f64188700fe025001d7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 119486,
+        "upload_time": "2022-08-11T06:53:25",
+        "upload_time_iso_8601": "2022-08-11T06:53:25.761935Z",
+        "url": "https://files.pythonhosted.org/packages/bc/af/a0fc4d40072f4a3dce384075ee2d801185bb0a68c5bcbfa3ae75a4f1389a/cpg-pipes-0.3.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e53257f5d7ece86c8c2737ac3d064f04d73870ef94c35f7c23a900c2fde0120",
+          "md5": "7362870b9d31082d1f725d38c58517fc",
+          "sha256": "0adb32e896458eb684c5891a7fec6410361478e677bee92a2b80ce1359b1670b"
+        },
+        "downloads": -1,
+        "filename": "cpg-pipes-0.3.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7362870b9d31082d1f725d38c58517fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 115404,
+        "upload_time": "2022-08-15T05:36:23",
+        "upload_time_iso_8601": "2022-08-15T05:36:23.141515Z",
+        "url": "https://files.pythonhosted.org/packages/9e/53/257f5d7ece86c8c2737ac3d064f04d73870ef94c35f7c23a900c2fde0120/cpg-pipes-0.3.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "568e9916f92c2985cc0f753e2602fcc747a904e5508520d179a0c6ddf625328a",
+        "md5": "f83f39ccad76a09275e79bfc1d895f65",
+        "sha256": "ea862faeb6a1d3152473d1fe05b215c61e0d3a1944d0aaf755e69d73290e5db9"
+      },
+      "downloads": -1,
+      "filename": "cpg-pipes-0.3.10.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f83f39ccad76a09275e79bfc1d895f65",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 115407,
+      "upload_time": "2022-08-15T06:06:16",
+      "upload_time_iso_8601": "2022-08-15T06:06:16.327424Z",
+      "url": "https://files.pythonhosted.org/packages/56/8e/9916f92c2985cc0f753e2602fcc747a904e5508520d179a0c6ddf625328a/cpg-pipes-0.3.10.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,527 @@
+{
+  "info": {
+    "author": "HangukQuant",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# credit_semaphore\nAsynchronous Semaphore Based on Credits for Efficient Credit-Based API Throttling\n========\n\nThis library provides an asynchronous semaphore that generalizes the asyncio semaphore to handle rate limiting using a credit based system. A common use case is in API throttling, such as APIs that allow access limits up to '1000 requests / min' or '200 cpu credits / sec' and so on.\n\nUsage\n-----\nA simple interface is provided for the credit semaphore.\n\n```python\nasync def transact(self, coroutine, credits, refund_time, transaction_id=None, verbose=False):\n    ...\n```\nThe credit semaphore has a `transact` asynchronous function that takes in 3 key parameters\n\n- `coroutine`: the coroutine to run, for instance `asyncio.sleep(1)`.\n- `credits`: the number of credits (float or integer) the coroutine costs.\n- `refund_time`: the time in seconds it takes for the credits to be returned to the semaphore.\n- `transaction_id` (optional): this is an identifier for the transaction, and can be used with `verbose=True` for printing out when a particular transaction acquires and releases the semaphore.\n- `verbose` (optional): prints to terminal the transaction status when acquiring and releasing the semaphore.\n\nInstalling\n----------\n\nFrom pip (https://pypi.org/project/credit-semaphore/):\n\n```sh\npip install credit_semaphore\n```\n\nExample & Behavior\n----\nSuppose we have a financial API endpoint that has rate limits as such:\n| Period     | Credits Awarded / app |\n|------------|-----------------------|\n| 10 seconds | 40                  |\n\nThe API gives us 40 credits to use every 10 seconds (capped at 40 credits max).\nDifferent endpoints can have variable credit costs, depending on the server load. \n\nSuppose we have the following endpoints and their respective costs:\n| Endpoint   | Cost (credits / req)  |\n|------------|-----------------------|\n| getTick    | 20                    |\n| getOHLCV   | 30                    |\n| getPrice   | 5                     |\n| ...        | ...                   |\n\nOur function calls are as simple as doing \n\n`semaphore.transact(getTick(), credits=x, refund_time=y)`\n\nand awaiting this statement would give us the same result as `await getTick()`, except with the credit accounting.\n\n#### Opportunistic on Exit\nSuppose a completed transaction exits a semaphore with 2 waiting transactions, `txn A` arrival < `txn B`. If the semaphore has not enough credits to execute `txn A`, it can first run `txn B`. This helps to maximise throughput.\n\n#### Fair on Entry\nIf a new transaction is submitted to the semaphore with enough credits to execute but with existing waiter transactions, the new transaction queues behind the current waiters. This helps with fairness of transaction priorities.\n\n###### Note that the opportunistic exit and fair entry means that if a big transaction is sitting behind small transactions which are constantly being submitted to the semaphore at a fast rate, the big transaction will not get a chance to run.\n\n#### FIFO Behavior\nIf there are multiple waiters in the semaphore, and multiple tasks have enough credits to execute, the first admitted transaction will be the earlier received transaction.\n\n#### Exit Behavior\nThe transaction will exit the semaphore after the coroutine is completed. This is independent of the credit refunding, which is performed later after `refund_time` seconds.\n\n#### Exception Behavior\nIf the coroutine throws an `Exception`, we will assume the credit has already been consumed and will be refunded after `refund_time` seconds. The `Exception` is thrown back to the caller.\n\nA sample run\n-\n\n\n```python\nimport asyncio\nfrom credit_semaphore.async_credit_semaphore import AsyncCreditSemaphore\n\nasync def example():\n\n    import random\n    from datetime import datetime\n\n    async def getTick(work, id):\n        print(f\"{datetime.now()}::getTick processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getTick processed {id}\")\n        return True\n\n    async def getOHLCV(work, id):\n        print(f\"{datetime.now()}::getOHLCV processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getOHLCV processed {id}\")\n        return True\n\n    async def getPrice(work, id):\n        print(f\"{datetime.now()}::getPrice processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getPrice processed {id}\")\n        return True\n\n    sem = AsyncCreditSemaphore(40)\n\n    tick_req = lambda x: getTick(random.randint(1, 5), x)\n    ohlcv_req = lambda x: getOHLCV(random.randint(1, 5), x)\n    price_req = lambda x: getPrice(random.randint(1, 5), x)\n\n    transactions = [\n        sem.transact(coroutine=tick_req(1), credits=20, refund_time=10, transaction_id=1, verbose=True),\n        sem.transact(coroutine=ohlcv_req(2), credits=30, refund_time=10, transaction_id=2, verbose=True),\n        sem.transact(coroutine=ohlcv_req(3), credits=30, refund_time=10, transaction_id=3, verbose=True),\n        sem.transact(coroutine=price_req(4), credits=5, refund_time=10, transaction_id=4, verbose=True),\n        sem.transact(coroutine=tick_req(5), credits=20, refund_time=10, transaction_id=5, verbose=True),\n        sem.transact(coroutine=tick_req(6), credits=20, refund_time=10, transaction_id=6, verbose=True),\n    ]\n\n    results = await asyncio.gather(*transactions)\n\nif __name__ == \"__main__\":\n    asyncio.run(example())\n```\n\nOutput:\n```\nTXN 1 acquiring CreditSemaphore\nTXN 1 entered CreditSemaphore...\n2022-10-08 10:51:32.835343::getTick processing 1 takes 3 seconds\nTXN 2 acquiring CreditSemaphore\nTXN 3 acquiring CreditSemaphore\nTXN 4 acquiring CreditSemaphore\nTXN 5 acquiring CreditSemaphore\nTXN 6 acquiring CreditSemaphore\n2022-10-08 10:51:35.838601::getTick processed 1\nTXN 1 exits CreditSemaphore, schedule refund in 10...\nTXN 2 entered CreditSemaphore...\n2022-10-08 10:51:45.848903::getOHLCV processing 2 takes 1 seconds\nTXN 4 entered CreditSemaphore...\n2022-10-08 10:51:45.848992::getPrice processing 4 takes 4 seconds\n2022-10-08 10:51:46.850197::getOHLCV processed 2\nTXN 2 exits CreditSemaphore, schedule refund in 10...\n2022-10-08 10:51:49.850880::getPrice processed 4\nTXN 4 exits CreditSemaphore, schedule refund in 10...\nTXN 3 entered CreditSemaphore...\n2022-10-08 10:51:56.854937::getOHLCV processing 3 takes 5 seconds\n2022-10-08 10:52:01.857848::getOHLCV processed 3\nTXN 3 exits CreditSemaphore, schedule refund in 10...\nTXN 5 entered CreditSemaphore...\n2022-10-08 10:52:11.867476::getTick processing 5 takes 5 seconds\nTXN 6 entered CreditSemaphore...\n2022-10-08 10:52:11.867588::getTick processing 6 takes 1 seconds\n2022-10-08 10:52:12.868778::getTick processed 6\nTXN 6 exits CreditSemaphore, schedule refund in 10...\n2022-10-08 10:52:16.872035::getTick processed 5\nTXN 5 exits CreditSemaphore, schedule refund in 10...\n```\n\nCleaner Usage\n-----\nConvenience functions are written for possible usage in service class wrappers that are responsible for interfacing with some external API. We allow this access with the decorator `@consume_credits`, which take the parameters\n\n- `costs`: same as `credits`\n- `refund_in`: same as `refund_time` \n- `attrname`: (str) the variable name of the credit semaphore object, defaults to `credit_semaphore' \n- `verbose`: (bool) defaults to True, same as before\n- `timeout`: to deal with the scenario where a costly transaction sits behind multiple cheap transactions rapidly being submitted to the semaphore, we can optionally add a timeout to our transaction. This raises `asyncio.TimeoutError` if our transaction takes more than the specified number of seconds to complete. Can also be used to timeout unstable network requests which are not responsive and hangs. Defaults to 0 (no timeout).\n\n#### Sample\n```python\nimport asyncio\n\nfrom datetime import datetime\n\nfrom credit_semaphore.semutils import consume_credits\nfrom credit_semaphore.async_credit_semaphore import AsyncCreditSemaphore\n\nclass DbService():\n\n    def __init__(self):\n        self.mysem = AsyncCreditSemaphore(40)\n        self.anothersem = AsyncCreditSemaphore(40)\n\n    #uses credit semaphore mysem\n    @consume_credits(costs=20, refund_in=10, attrname=\"mysem\")\n    async def getTick(self, work, id):\n        print(f\"{datetime.now()}::getTick processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getTick processed {id}\")\n        return True\n\n    #uses a different credit semaphore\n    @consume_credits(costs=30, refund_in=10, timeout=60, attrname=\"anothersem\")\n    async def getOHLCV(self, work, id):\n        print(f\"{datetime.now()}::getOHLCV processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getOHLCV processed {id}\")\n        return True\n\n    #this is not tracked by the semaphore!\n    async def getPrice(self, work, id):\n        print(f\"{datetime.now()}::getPrice processing {id} takes {work} seconds\")\n        await asyncio.sleep(work)\n        print(f\"{datetime.now()}::getPrice processed {id}\")\n        return True\n\nasync def main():\n    tester = DbService()\n    transactions = [\n        tester.getOHLCV(work=1, id=1),\n        tester.getTick(work=4, id=2),\n        tester.getTick(work=1, id=3),\n        tester.getTick(work=5, id=4)\n    ]\n    results = await asyncio.gather(*transactions)\n\n    try:\n        transactions = [\n            tester.getOHLCV(work=61, id=1)\n        ]\n        results = await asyncio.gather(*transactions)\n\n    except asyncio.TimeoutError as err:\n        print(err)\n        print(\"batch is terminated\")\n        \nif __name__ == \"__main__\":\n    asyncio.run(main())\n```\n\nTechnical Notes & Best Practices\n-----\n- Wrap unstable networks and expensive tasks in a timeout transaction. This is to prevent the coroutine from 'await'-ing forever.\n\n- Since the transaction does not know when the coroutine actually performs the credit-costing request, the coroutine passed in to the `transact` function or decorated with the `@consume_credits` should be closest to the costful logic as possible. It should not perform heavy compute or multiple requests so that the credits can refunded as quickly as possible for efficiency. \n\n- Functions that call credit consuming functions should not be decorated with `@consume_credits` to avoid double counting.\n\n- For a timeout transaction that does not get a chance to run due to it sitting behind other transactions that are opportunistically processed, a `RuntimeWarning: Enable tracemalloc to get the object allocation traceback` may be seen together with the `asyncio.TimeoutError`. This is because the transact contains the coroutine, and the transact is wrapped in an asyncio `task`. If it is unable to enter the semaphore by timeout, the coroutine is never awaited and complains when garbage collected. This is a non-issue. If the timeout occurs after the coroutine has acquired the semaphore, this warning will not be seen but the `asyncio.TimeoutError` will still be thrown.\n\n- The `transact` function only takes in coroutines, and not other `awaitable` objects. This is because our semaphore is not `task`-safe, since `task` runs on iteration of the event loop while the desired behavior is only for the coroutine to be put on the event loop after acquiring the semaphore. \n\n## Happy Throttling!\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://pypi.org/project/credit-semaphore/",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/hangukquant/credit_semaphore",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "credit-semaphore",
+    "package_url": "https://pypi.org/project/credit-semaphore/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/credit-semaphore/",
+    "project_urls": {
+      "Download": "https://pypi.org/project/credit-semaphore/",
+      "Homepage": "https://github.com/hangukquant/credit_semaphore"
+    },
+    "release_url": "https://pypi.org/project/credit-semaphore/0.1.3/",
+    "requires_dist": [
+      "opencv-python"
+    ],
+    "requires_python": "",
+    "summary": "Semaphore Based on Credits for Efficient Credit-Based API Throttling",
+    "version": "0.1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15382408,
+  "releases": {
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3da72d3a7728633322c995b281d366db2d49fbf10fc8d127bfa3a6102b1b0e2f",
+          "md5": "3977fbb8858b14c6529ba8c6cdea854c",
+          "sha256": "afa4a9b658df68be5d0fc7ab3de5b063d077ff87e4dfe7b35fc1d53dc07b8dbc"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3977fbb8858b14c6529ba8c6cdea854c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 2369,
+        "upload_time": "2022-10-05T05:18:51",
+        "upload_time_iso_8601": "2022-10-05T05:18:51.162458Z",
+        "url": "https://files.pythonhosted.org/packages/3d/a7/2d3a7728633322c995b281d366db2d49fbf10fc8d127bfa3a6102b1b0e2f/credit_semaphore-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c78a732c0b74c094c4f49a8230352589e5e220294ac96417326776a5229b0c8",
+          "md5": "a8b7af458c8767d2ac50de4d3600a89c",
+          "sha256": "99195176665685ed6c5dabe9b333b60e6f5dc999098f794a9b01b55dd9415fda"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a8b7af458c8767d2ac50de4d3600a89c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1874,
+        "upload_time": "2022-10-05T05:18:52",
+        "upload_time_iso_8601": "2022-10-05T05:18:52.741450Z",
+        "url": "https://files.pythonhosted.org/packages/2c/78/a732c0b74c094c4f49a8230352589e5e220294ac96417326776a5229b0c8/credit_semaphore-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aba94c5d7336aca5b4765c299f0e4ac1f019b3a7d155fc0ea00190beb61077e4",
+          "md5": "b94b5385d18b51f84ec6424f17fa92b1",
+          "sha256": "c2e5ada1fdf9c009005bbbd0a16f87aeefcd1af88c068229f5f93a8208ec1de2"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b94b5385d18b51f84ec6424f17fa92b1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 2332,
+        "upload_time": "2022-10-05T05:23:44",
+        "upload_time_iso_8601": "2022-10-05T05:23:44.876688Z",
+        "url": "https://files.pythonhosted.org/packages/ab/a9/4c5d7336aca5b4765c299f0e4ac1f019b3a7d155fc0ea00190beb61077e4/credit_semaphore-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f8b799d7e08db5c9a1bcd9f967037a8b1983fceb8b7db352b065f58383e93a51",
+          "md5": "d028d12a9bc97bdad1a500ec79cca8ef",
+          "sha256": "4f825d82a462b75332554963e687fc6e67fada85056f16079c7c3e97ea720f56"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d028d12a9bc97bdad1a500ec79cca8ef",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1847,
+        "upload_time": "2022-10-05T05:23:46",
+        "upload_time_iso_8601": "2022-10-05T05:23:46.581883Z",
+        "url": "https://files.pythonhosted.org/packages/f8/b7/99d7e08db5c9a1bcd9f967037a8b1983fceb8b7db352b065f58383e93a51/credit_semaphore-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84e42df7487efa3616d4a33bdb2d3e1259a6fcfe36b3f2f4f406f869d123dcd3",
+          "md5": "8ab09b5cc75261a70351c38eebda9e4a",
+          "sha256": "2c39a518b8ec862b31cba7c78c6138874079df8fe86a576a7ca4a303d9c61afa"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ab09b5cc75261a70351c38eebda9e4a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3326,
+        "upload_time": "2022-10-05T05:25:38",
+        "upload_time_iso_8601": "2022-10-05T05:25:38.288591Z",
+        "url": "https://files.pythonhosted.org/packages/84/e4/2df7487efa3616d4a33bdb2d3e1259a6fcfe36b3f2f4f406f869d123dcd3/credit_semaphore-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "60d9d1acb605c60fce7f87bb6b6e9c89975da7a1770bbf9df11f68245b472961",
+          "md5": "607cc3a84928a50179b06fd4f71cac3b",
+          "sha256": "8acc464f75f34224bec67e92b790c7c3aa820e5f986bb98db96ab6abea93d4df"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "607cc3a84928a50179b06fd4f71cac3b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1840,
+        "upload_time": "2022-10-05T05:25:39",
+        "upload_time_iso_8601": "2022-10-05T05:25:39.592765Z",
+        "url": "https://files.pythonhosted.org/packages/60/d9/d1acb605c60fce7f87bb6b6e9c89975da7a1770bbf9df11f68245b472961/credit_semaphore-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9450c424c6de740db1f53209191396d87d46e764d42bb5275f448aebf6fda1fa",
+          "md5": "62928a4a53b6d6e143236a09044e4d94",
+          "sha256": "9aab86178baacaaa848fdac9fd43ecdeae200bf392865694cadcf3c01b8a45b3"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "62928a4a53b6d6e143236a09044e4d94",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3371,
+        "upload_time": "2022-10-05T05:26:57",
+        "upload_time_iso_8601": "2022-10-05T05:26:57.955077Z",
+        "url": "https://files.pythonhosted.org/packages/94/50/c424c6de740db1f53209191396d87d46e764d42bb5275f448aebf6fda1fa/credit_semaphore-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50d71883d5e4a3169c405253d41b1b26f678894e46ce0362e5cb2f962a9fcddc",
+          "md5": "4c5e7897530c4cdc59b15432e8617100",
+          "sha256": "c6521f1e5703d7c3f660c84b4bb2dd05d65d75bd40196bb86bf36038a7fd88dd"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c5e7897530c4cdc59b15432e8617100",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1845,
+        "upload_time": "2022-10-05T05:26:59",
+        "upload_time_iso_8601": "2022-10-05T05:26:59.653589Z",
+        "url": "https://files.pythonhosted.org/packages/50/d7/1883d5e4a3169c405253d41b1b26f678894e46ce0362e5cb2f962a9fcddc/credit_semaphore-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5dcd354112664ae94b0977ef7f59f0c465b2b4b62f7cbb175f24ae4d6e066285",
+          "md5": "d5fd46e19a09fbe0808f0975f1e5066c",
+          "sha256": "00062b3e7bbc89cc82f8a42894836d4ff9e980fe29320a4a7321364e7a286ae4"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d5fd46e19a09fbe0808f0975f1e5066c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 2409,
+        "upload_time": "2022-10-06T08:28:13",
+        "upload_time_iso_8601": "2022-10-06T08:28:13.855902Z",
+        "url": "https://files.pythonhosted.org/packages/5d/cd/354112664ae94b0977ef7f59f0c465b2b4b62f7cbb175f24ae4d6e066285/credit_semaphore-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da9cab5e803fc78b60b174b50182bae64b10f146b88255c7ceb63eb8f62c9517",
+          "md5": "2091859c5db209a7e601738ceb9003be",
+          "sha256": "c0a71bfc9cc7e053da719a531d4b194823fb004df9c21a1f62785b04c9daf8f0"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2091859c5db209a7e601738ceb9003be",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1903,
+        "upload_time": "2022-10-06T08:28:15",
+        "upload_time_iso_8601": "2022-10-06T08:28:15.438453Z",
+        "url": "https://files.pythonhosted.org/packages/da/9c/ab5e803fc78b60b174b50182bae64b10f146b88255c7ceb63eb8f62c9517/credit_semaphore-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b825a437d94523cd00e3a33ed9f0247bb8b399cce66358a7c486cdc27d0a1dd",
+          "md5": "a64b3a00020c221d8412deb37ee20fe1",
+          "sha256": "d23a6dfb8b72bb114847d0a005b9bf3181e589a148eb40ca744e3127637fb500"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a64b3a00020c221d8412deb37ee20fe1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 2409,
+        "upload_time": "2022-10-06T08:34:31",
+        "upload_time_iso_8601": "2022-10-06T08:34:31.608529Z",
+        "url": "https://files.pythonhosted.org/packages/1b/82/5a437d94523cd00e3a33ed9f0247bb8b399cce66358a7c486cdc27d0a1dd/credit_semaphore-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11f2e6879965f727ade480d97a81428c89c05ee5b4c090e703d3a4c2fffbd416",
+          "md5": "3074aec2d047b0c65612a31cb259258b",
+          "sha256": "716e6aa16ac734dc3c71189db12249366daa3f2267e9df4dddb9d1289bfa4787"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3074aec2d047b0c65612a31cb259258b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 1908,
+        "upload_time": "2022-10-06T08:34:32",
+        "upload_time_iso_8601": "2022-10-06T08:34:32.930417Z",
+        "url": "https://files.pythonhosted.org/packages/11/f2/e6879965f727ade480d97a81428c89c05ee5b4c090e703d3a4c2fffbd416/credit_semaphore-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca209e69914362659a05f107535b1322a6b2a05eb3d486c0cdcc07671c0d24ef",
+          "md5": "9b323017b3a3533e4da743cda460fd7b",
+          "sha256": "5fb58c67729237157cdebadbf58224c1771e89f811d841061aa20381a4ae95de"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9b323017b3a3533e4da743cda460fd7b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 4564,
+        "upload_time": "2022-10-08T11:51:44",
+        "upload_time_iso_8601": "2022-10-08T11:51:44.798427Z",
+        "url": "https://files.pythonhosted.org/packages/ca/20/9e69914362659a05f107535b1322a6b2a05eb3d486c0cdcc07671c0d24ef/credit_semaphore-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06da368b674f2053358846d5db93656ae5842fb140570521a6159470f19e9d5c",
+          "md5": "c4ee8d14ea26fc17afa7cd50f594bd49",
+          "sha256": "811f763579593f9c8ce1c6ebd624edab054599b20198a1940337738a8d4f6dd9"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c4ee8d14ea26fc17afa7cd50f594bd49",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4224,
+        "upload_time": "2022-10-08T11:51:47",
+        "upload_time_iso_8601": "2022-10-08T11:51:47.026367Z",
+        "url": "https://files.pythonhosted.org/packages/06/da/368b674f2053358846d5db93656ae5842fb140570521a6159470f19e9d5c/credit_semaphore-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3aea2cc480f7b686d502018d72745a052a0f452b4f362cbd8d78fa8b64dce651",
+          "md5": "34607c3790ee03c8671946c82f46a671",
+          "sha256": "00cfd42ab2136b1666f54f1bd81e27656f0024319abe80203ff4f50246338fcc"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "34607c3790ee03c8671946c82f46a671",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6470,
+        "upload_time": "2022-10-08T15:12:52",
+        "upload_time_iso_8601": "2022-10-08T15:12:52.629165Z",
+        "url": "https://files.pythonhosted.org/packages/3a/ea/2cc480f7b686d502018d72745a052a0f452b4f362cbd8d78fa8b64dce651/credit_semaphore-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7d18229def51f78d8c6d86e5b16309cc4704c699877e52eb4c677196aeeae99",
+          "md5": "4bedf0fab808790cebaaee795cc120a9",
+          "sha256": "714a45052c2ae90a480b513537adde3618a29b2336e6f7eee22015c167a61415"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bedf0fab808790cebaaee795cc120a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6163,
+        "upload_time": "2022-10-08T15:12:56",
+        "upload_time_iso_8601": "2022-10-08T15:12:56.518132Z",
+        "url": "https://files.pythonhosted.org/packages/e7/d1/8229def51f78d8c6d86e5b16309cc4704c699877e52eb4c677196aeeae99/credit_semaphore-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "36b204998ed57d41b613654e84564252e0d3a680a21a9bbd9de90f3cfd594b54",
+          "md5": "9397c44c76a6128a74d13af0fc56b1a0",
+          "sha256": "4843769648e7de9804d7a00bf90b430332c81f4133e415a0755252134239f399"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9397c44c76a6128a74d13af0fc56b1a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6491,
+        "upload_time": "2022-10-08T15:18:41",
+        "upload_time_iso_8601": "2022-10-08T15:18:41.619128Z",
+        "url": "https://files.pythonhosted.org/packages/36/b2/04998ed57d41b613654e84564252e0d3a680a21a9bbd9de90f3cfd594b54/credit_semaphore-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a573d92c5e0c4edf11a4ce952f908642df433ceafcb248d4dfc2657b8de99a67",
+          "md5": "af50299e664eae96786cd188447345d8",
+          "sha256": "6b6808cbe4855fdd47dccc630f719722fba367d0dca36711206586ef246a8eee"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af50299e664eae96786cd188447345d8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 6901,
+        "upload_time": "2022-10-08T15:18:43",
+        "upload_time_iso_8601": "2022-10-08T15:18:43.476679Z",
+        "url": "https://files.pythonhosted.org/packages/a5/73/d92c5e0c4edf11a4ce952f908642df433ceafcb248d4dfc2657b8de99a67/credit_semaphore-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f12a1183d7fb05e473add546e4e73e75a3f638d33fae89d27d95df137be4d113",
+          "md5": "7ea66e5092d3fd9d89df8a54b2c15ce5",
+          "sha256": "b034bf51973fb9e657371b3081bb9077cd6a268dd0db94afe8a25b574beebf74"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7ea66e5092d3fd9d89df8a54b2c15ce5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7306,
+        "upload_time": "2022-10-12T04:46:37",
+        "upload_time_iso_8601": "2022-10-12T04:46:37.591849Z",
+        "url": "https://files.pythonhosted.org/packages/f1/2a/1183d7fb05e473add546e4e73e75a3f638d33fae89d27d95df137be4d113/credit_semaphore-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1df4238c87a1e50c699f1eb1c1a59527c870b57d34596c54704e893bdc0a1ea",
+          "md5": "af5f57d63eef5cf93415ad9a4eb7b553",
+          "sha256": "2f204d6df2867df2757e74504a43a48c981b5c15a5de0f743bad3da0c7b0b2b6"
+        },
+        "downloads": -1,
+        "filename": "credit_semaphore-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af5f57d63eef5cf93415ad9a4eb7b553",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7230,
+        "upload_time": "2022-10-12T04:46:39",
+        "upload_time_iso_8601": "2022-10-12T04:46:39.644542Z",
+        "url": "https://files.pythonhosted.org/packages/e1/df/4238c87a1e50c699f1eb1c1a59527c870b57d34596c54704e893bdc0a1ea/credit_semaphore-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f12a1183d7fb05e473add546e4e73e75a3f638d33fae89d27d95df137be4d113",
+        "md5": "7ea66e5092d3fd9d89df8a54b2c15ce5",
+        "sha256": "b034bf51973fb9e657371b3081bb9077cd6a268dd0db94afe8a25b574beebf74"
+      },
+      "downloads": -1,
+      "filename": "credit_semaphore-0.1.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7ea66e5092d3fd9d89df8a54b2c15ce5",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 7306,
+      "upload_time": "2022-10-12T04:46:37",
+      "upload_time_iso_8601": "2022-10-12T04:46:37.591849Z",
+      "url": "https://files.pythonhosted.org/packages/f1/2a/1183d7fb05e473add546e4e73e75a3f638d33fae89d27d95df137be4d113/credit_semaphore-0.1.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e1df4238c87a1e50c699f1eb1c1a59527c870b57d34596c54704e893bdc0a1ea",
+        "md5": "af5f57d63eef5cf93415ad9a4eb7b553",
+        "sha256": "2f204d6df2867df2757e74504a43a48c981b5c15a5de0f743bad3da0c7b0b2b6"
+      },
+      "downloads": -1,
+      "filename": "credit_semaphore-0.1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "af5f57d63eef5cf93415ad9a4eb7b553",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 7230,
+      "upload_time": "2022-10-12T04:46:39",
+      "upload_time_iso_8601": "2022-10-12T04:46:39.644542Z",
+      "url": "https://files.pythonhosted.org/packages/e1/df/4238c87a1e50c699f1eb1c1a59527c870b57d34596c54704e893bdc0a1ea/credit_semaphore-0.1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,166 @@
+{
+  "info": {
+    "author": "Cloudstate",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3.6"
+    ],
+    "description": "# Project description\n\nCloudstate is a specification, protocol, and reference implementation for providing distributed state management patterns suitable for **Serverless** computing. \nThe current supported and envisioned patterns include:\n\n* **Event Sourcing**\n* **Conflict-Free Replicated Data Types (CRDTs)**\n* **Key-Value storage**\n* **P2P messaging**\n* **CQRS read side projections**\n\nCloudstate is polyglot, which means that services can be written in any language that supports gRPC, \nand with language specific libraries provided that allow idiomatic use of the patterns in each language. \nCloudstate can be used either by itself, in combination with a Service Mesh, \nor it is envisioned that it will be integrated with other Serverless technologies such as [Knative](https://knative.dev/).\n\nRead more about the design, architecture, techniques, and technologies behind Cloudstate in [this section in the documentation](https://github.com/cloudstateio/cloudstate/blob/master/README.md#enter-cloudstate). \n\nThe Cloudstate Python user language support is a library that implements the Cloudstate protocol and offers an pythonistic API \nfor writing entities that implement the types supported by the Cloudstate protocol.\n\nThe Cloudstate documentation can be found [here](https://cloudstate.io/docs/)\n\n## Install and update using pip:\n\n```\npip install -U cloudstate\n```\n\n## A Simple EventSourced Example:\n\n### 1. Define your gRPC contract\n\n```\n// This is the public API offered by the shopping cart entity.\nsyntax = \"proto3\";\n\nimport \"google/protobuf/empty.proto\";\nimport \"cloudstate/entity_key.proto\";\nimport \"google/api/annotations.proto\";\nimport \"google/api/http.proto\";\n\npackage com.example.shoppingcart;\n\nmessage AddLineItem {\n    string user_id = 1 [(.cloudstate.entity_key) = true];\n    string product_id = 2;\n    string name = 3;\n    int32 quantity = 4;\n}\n\nmessage RemoveLineItem {\n    string user_id = 1 [(.cloudstate.entity_key) = true];\n    string product_id = 2;\n}\n\nmessage GetShoppingCart {\n    string user_id = 1 [(.cloudstate.entity_key) = true];\n}\n\nmessage LineItem {\n    string product_id = 1;\n    string name = 2;\n    int32 quantity = 3;\n}\n\nmessage Cart {\n    repeated LineItem items = 1;\n}\n\nservice ShoppingCart {\n    rpc AddItem(AddLineItem) returns (google.protobuf.Empty) {\n        option (google.api.http) = {\n            post: \"/cart/{user_id}/items/add\",\n            body: \"*\",\n        };\n    }\n\n    rpc RemoveItem(RemoveLineItem) returns (google.protobuf.Empty) {\n        option (google.api.http).post = \"/cart/{user_id}/items/{product_id}/remove\";\n    }\n\n    rpc GetCart(GetShoppingCart) returns (Cart) {\n        option (google.api.http) = {\n          get: \"/carts/{user_id}\",\n          additional_bindings: {\n            get: \"/carts/{user_id}/items\",\n            response_body: \"items\"\n          }\n        };\n    }\n}\n\n```\n\n### 2. Generate Python files\n\nIt is necessary to compile your .proto files using the protoc compiler in order to generate Python files. \nSee [this official gRPC for Python quickstart](https://grpc.io/docs/languages/python/quickstart/) if you are not familiar with the gRPC protocol.\n\nHere is an example of how to compile the sample proto file:\n```\npython -m grpc_tools.protoc -I../../protos --python_out=. --grpc_python_out=. ../../protos/shoppingcart.proto\n```\n\n### 3. Implement your business logic under an EventSourced Cloudstate Entity\n\n```\nfrom dataclasses import dataclass, field\nfrom typing import MutableMapping\n\nfrom google.protobuf.empty_pb2 import Empty\n\nfrom cloudstate.event_sourced_context import EventSourcedCommandContext\nfrom cloudstate.event_sourced_entity import EventSourcedEntity\nfrom shoppingcart.domain_pb2 import (Cart as DomainCart, LineItem as DomainLineItem, ItemAdded, ItemRemoved)\nfrom shoppingcart.shoppingcart_pb2 import (Cart, LineItem, AddLineItem, RemoveLineItem)\nfrom shoppingcart.shoppingcart_pb2 import (_SHOPPINGCART, DESCRIPTOR as FILE_DESCRIPTOR)\n\n\n@dataclass\nclass ShoppingCartState:\n    entity_id: str\n    cart: MutableMapping[str, LineItem] = field(default_factory=dict)\n\n\ndef init(entity_id: str) -> ShoppingCartState:\n    return ShoppingCartState(entity_id)\n\n\nentity = EventSourcedEntity(_SHOPPINGCART, [FILE_DESCRIPTOR], init)\n\n\ndef to_domain_line_item(item):\n    domain_item = DomainLineItem()\n    domain_item.productId = item.product_id\n    domain_item.name = item.name\n    domain_item.quantity = item.quantity\n    return domain_item\n\n\n@entity.snapshot()\ndef snapshot(state: ShoppingCartState):\n    cart = DomainCart()\n    cart.items = [to_domain_line_item(item) for item in state.cart.values()]\n    return cart\n\n\ndef to_line_item(domain_item):\n    item = LineItem()\n    item.product_id = domain_item.productId\n    item.name = domain_item.name\n    item.quantity = domain_item.quantity\n    return item\n\n\n@entity.snapshot_handler()\ndef handle_snapshot(state: ShoppingCartState, domain_cart: DomainCart):\n    state.cart = {domain_item.productId: to_line_item(domain_item) for domain_item in domain_cart.items}\n\n\n@entity.event_handler(ItemAdded)\ndef item_added(state: ShoppingCartState, event: ItemAdded):\n    cart = state.cart\n    if event.item.productId in cart:\n        item = cart[event.item.productId]\n        item.quantity = item.quantity + event.item.quantity\n    else:\n        item = to_line_item(event.item)\n        cart[item.product_id] = item\n\n\n@entity.event_handler(ItemRemoved)\ndef item_removed(state: ShoppingCartState, event: ItemRemoved):\n    del state.cart[event.productId]\n\n\n@entity.command_handler(\"GetCart\")\ndef get_cart(state: ShoppingCartState):\n    cart = Cart()\n    cart.items.extend(state.cart.values())\n    return cart\n\n\n@entity.command_handler(\"AddItem\")\ndef add_item(item: AddLineItem, ctx: EventSourcedCommandContext):\n    if item.quantity <= 0:\n        ctx.fail(\"Cannot add negative quantity of to item {}\".format(item.productId))\n    else:\n        item_added_event = ItemAdded()\n        item_added_event.item.CopyFrom(to_domain_line_item(item))\n        ctx.emit(item_added_event)\n    return Empty()\n\n\n@entity.command_handler(\"RemoveItem\")\ndef remove_item(state: ShoppingCartState, item: RemoveLineItem, ctx: EventSourcedCommandContext):\n    cart = state.cart\n    if item.product_id not in cart:\n        ctx.fail(\"Cannot remove item {} because it is not in the cart.\".format(item.productId))\n    else:\n        item_removed_event = ItemRemoved()\n        item_removed_event.productId = item.product_id\n        ctx.emit(item_removed_event)\n    return Empty()\n```\n\n### 4. Register Entity\n\n```\nfrom cloudstate.cloudstate import CloudState\nfrom shoppingcart.shopping_cart_entity import entity as shopping_cart_entity\nimport logging\n\nif __name__ == '__main__':\n    logging.basicConfig()\n    CloudState().register_event_sourced_entity(shopping_cart_entity).start()\n```\n\n### 5. Deployment\n\nCloudstate runs on Docker and Kubernetes you need to package your application so that it works as a Docker container \nand can deploy it together with Cloudstate Operator on Kubernetes, the details and examples of all of which can be found [here](https://code.visualstudio.com/docs/containers/quickstart-python), [here](https://github.com/cloudstateio/python-support/blob/master/shoppingcart/Dockerfile) and [here](https://cloudstate.io/docs/core/current/user/deployment/index.html).\n\n## Contributing\n\nFor guidance on setting up a development environment and how to make a contribution to Cloudastate, \nsee the contributing [project page](https://github.com/cloudstateio/python-support) or consult an official documentation [here](https://cloudstate.io/docs/).\n\n## Links\n\n* [Website:](https://cloudstate.io/)\n* [Documentation:](https://cloudstate.io/docs/)\n* [Releases:](https://pypi.org/project/cloudstate/)\n* [Code:](https://github.com/cloudstateio/python-support)\n* [Issue tracker:](https://github.com/cloudstateio/python-support/issues)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/cloudstateio/python-support",
+    "keywords": "",
+    "license": "Apache 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "cloudstate",
+    "package_url": "https://pypi.org/project/cloudstate/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/cloudstate/",
+    "project_urls": {
+      "Documentation": "https://cloudstate.io/docs/user/lang/index.html",
+      "Homepage": "https://github.com/cloudstateio/python-support",
+      "Source": "https://github.com/cloudstateio/python-support"
+    },
+    "release_url": "https://pypi.org/project/cloudstate/0.1.1/",
+    "requires_dist": [
+      "protobuf (==3.11.3)",
+      "google-api (==0.1.12)",
+      "grpcio (==1.28.1)",
+      "grpcio-tools (==1.28.1)",
+      "attrs (==19.3.0)",
+      "googleapis-common-protos (>=1.51.0)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Cloudstate Python Support Library",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7691153,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b2d1e782429308fdeaef0b413b77e9b483300f6efe3b367f7cb9e0f9b89dbc0",
+          "md5": "228cc2a801c0d31c8bd6d7ae4c345b53",
+          "sha256": "2a7aa3f5b9f94ba432e7251d359c0f94860b2d962f5b315e5acdf9f933dffde5"
+        },
+        "downloads": -1,
+        "filename": "cloudstate-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "228cc2a801c0d31c8bd6d7ae4c345b53",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21893,
+        "upload_time": "2020-05-30T09:33:53",
+        "upload_time_iso_8601": "2020-05-30T09:33:53.333554Z",
+        "url": "https://files.pythonhosted.org/packages/0b/2d/1e782429308fdeaef0b413b77e9b483300f6efe3b367f7cb9e0f9b89dbc0/cloudstate-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "790887dc3cc9546e209a239823dc9be9f56d949d8b72d5bd69b4a47d6dcb81e8",
+          "md5": "5256074331023e04a3ac9067ed208b54",
+          "sha256": "06a9eab0efe5600c814ff18107cdacc65e67f48a6ad482aec48c3a8b07acab62"
+        },
+        "downloads": -1,
+        "filename": "cloudstate-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5256074331023e04a3ac9067ed208b54",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24257,
+        "upload_time": "2020-07-13T15:12:34",
+        "upload_time_iso_8601": "2020-07-13T15:12:34.036994Z",
+        "url": "https://files.pythonhosted.org/packages/79/08/87dc3cc9546e209a239823dc9be9f56d949d8b72d5bd69b4a47d6dcb81e8/cloudstate-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30b2c7085e24d3bc8a8b6244698b9a27570af5902e8763599430345160aadca0",
+          "md5": "8ac4cca9d6b77dc4d67396e79aca6819",
+          "sha256": "8c7e7bc79f2f03da2149ad06914f79fc8911b1fba95424ac0d738b41a2b8ead2"
+        },
+        "downloads": -1,
+        "filename": "cloudstate-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ac4cca9d6b77dc4d67396e79aca6819",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 22609,
+        "upload_time": "2020-07-13T15:22:14",
+        "upload_time_iso_8601": "2020-07-13T15:22:14.601745Z",
+        "url": "https://files.pythonhosted.org/packages/30/b2/c7085e24d3bc8a8b6244698b9a27570af5902e8763599430345160aadca0/cloudstate-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "790887dc3cc9546e209a239823dc9be9f56d949d8b72d5bd69b4a47d6dcb81e8",
+        "md5": "5256074331023e04a3ac9067ed208b54",
+        "sha256": "06a9eab0efe5600c814ff18107cdacc65e67f48a6ad482aec48c3a8b07acab62"
+      },
+      "downloads": -1,
+      "filename": "cloudstate-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5256074331023e04a3ac9067ed208b54",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 24257,
+      "upload_time": "2020-07-13T15:12:34",
+      "upload_time_iso_8601": "2020-07-13T15:12:34.036994Z",
+      "url": "https://files.pythonhosted.org/packages/79/08/87dc3cc9546e209a239823dc9be9f56d949d8b72d5bd69b4a47d6dcb81e8/cloudstate-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "30b2c7085e24d3bc8a8b6244698b9a27570af5902e8763599430345160aadca0",
+        "md5": "8ac4cca9d6b77dc4d67396e79aca6819",
+        "sha256": "8c7e7bc79f2f03da2149ad06914f79fc8911b1fba95424ac0d738b41a2b8ead2"
+      },
+      "downloads": -1,
+      "filename": "cloudstate-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "8ac4cca9d6b77dc4d67396e79aca6819",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 22609,
+      "upload_time": "2020-07-13T15:22:14",
+      "upload_time_iso_8601": "2020-07-13T15:22:14.601745Z",
+      "url": "https://files.pythonhosted.org/packages/30/b2/c7085e24d3bc8a8b6244698b9a27570af5902e8763599430345160aadca0/cloudstate-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

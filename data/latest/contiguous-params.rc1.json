@@ -1,0 +1,147 @@
+{
+  "info": {
+    "author": "Philipp Jund",
+    "author_email": "ijund.phil@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved :: Apache Software License",
+      "Natural Language :: English",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Topic :: Scientific/Engineering",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Mathematics",
+      "Topic :: Software Development",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# Contiguous Parameters for Pytorch\n\nAccelerate training by storing parameters in one contiguous chunk of memory.\n\n## Speed up your optimizer with 3 lines of code! \nThis graphic shows a GPU step trace comparison with and without contiguous params for a Resnet50 on Cifar10, using *Adam and gradient clipping*.\nThe upper trace is with the default optimizer, the trace below is with the parameter wrapper.\n![Gradient norm + Adam](visualizations/adam_gradnorm_trace_comparison.png)\n\nStep trace comparison for a Resnet50 on Cifar10, using *SGD*. \n![Gradient norm + Adam](visualizations/sgd_trace_comparison.png)\n\n\n## What's the difference to Apex?\nApex implements the full optimizer update in C++ and is limited to the supported\noptimizers. This wrapper allows to use any optimizer as long as it updates the\nparameters inplace.\n\n\n## How does it work?\nLaunching Cuda kernels comes with a small overhead, resulting in low GPU utilization\nwhen launching numerous fast-returning kernels. A typical example for this is the\noptimizer step.\nThis package accelerates training by copying all parameters into one contiguous\nbuffer, resetting the parameters to be views into the buffer, and applying\noptimizer updates on the contiguous representation. Depending on the model, the \noptimizer, the type of GPU used, etc, this can drastically reduce the time required for the optimizer's step function, resulting in speedups from anywhere between 7x to 100x.\n\n\nFor this to work, two requirements need to be fulfilled:\n1. The computation graph may only alter the parameters and gradients inplace\n   and should not replace the parameter/gradient tensors with new ones.\n   Make sure to call `parameters.assert_buffer_is_valid()` to detect any buffer\n   invalidation.\n2. All operations executed on `parameters.contiguous()` must not rely on shape\n   information or statistics of the parameter as these would be computed on the\n   full buffer instead of each of the original parameters. For such operations,\n   keep using `parameters.original()`.\n\n## Disclaimer\nThis is still a rather new project and considered experimental. If you encounter\na bug, please file an issue if there is no matching existing issue! Also, if you\nfind this project helpful, consider leaving a star to keep me motivated or spread\nthe word and help people to train their models faster :)\n\n## Install\n```\npip install git+https://github.com/philjd/contiguous_pytorch_params.git\n```\n\n## Example Usage\n```python\nimport torch\nfrom torch import nn\nfrom contiguous_params import ContiguousParams\n\ndata = torch.randn(5, 1, 8)\nmodel = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))\n\n# Create the contiguous parameters.\nparameters = ContiguousParams(model.parameters())  # <--- (1) Wrap parameters.\n\n# Use parameters.contiguous() instead of model.parameters() to initialize\n# the optimizer. Note that the optimizer must update the parameters inplace.\noptimizer = torch.optim.Adam(parameters.contiguous())    # <--- (2) Optimize view.\n\n# Run the training loop as usual.\nfor x in data:\n    loss = model(x).sum()\n    loss.backward()\n    # Gradient clipping also profits from contiguous memory.\n    nn.utils.clip_grad_norm_(parameters.contiguous(), 0.1)\n    optimizer.step()\n    optimizer.zero_grad()\n    # !!!!!!!\n    # Always make sure to call buffer_is_valid() at least once, to detect\n    # if operations invalidated the buffer by overwriting/copying parameters.\n    # (Except when running in DDP mode, there the buffer check doesn't work.)\n    # !!!!!!!\n    parameters.assert_buffer_is_valid()  # <--- (3) Check that the optimizer only applies valid ops.\n``` \n\n## Debugging\nCommon Problems that might occur:\n- The loss is not going down. One reason for this could be that gradients are\n  disconnected and don't use the contiguous grad buffer. This can happen\n  when the optimizer with the contiguous params is created before moving the\n  model to its device. A good check is to verify that the gradient_buffer\n  tensor is non-zero.\n- A function updates a parameter with an operation that is not inplace (inplace\n  ops have an underscore suffix). This can be catched with the\n  `ContiguousParams.assert_buffer_is_valid()` function, so make sure to use it\n  at least once per forward pass.\n- Operations try to change the parameter views inplace. This happens for\n  example when `nn.Module.zero_grad()` is used instead of\n  `optimizer.zero_grad()`. Either override your module's zero_grad function\n  to link to the optmizer's zero_grad or manually `zero_` the contiguous grad\n  buffer.\n\n\n## Testing\n```\npytest test.py\n```\n\n## Benchmarking\nRun `python benchmark.py`. This applies several updates with the original method\nas well as using contiguous parameters. You should see a speed up of ~100x.\nTo take a look at the timeline, open chromium, navigate to `chrome://tracing/`,\nclick load, and select the `*timeline.json` file.\n\n## Distributed Data Parallel Training\nTraining with DDP is also easy, we just need to make sure that the parameters for each replica are contiguous.\nTo understand where we should insert the ContiguousParams into our `nn.Module`, let's first recap how DDP\nworks:\n1. Create the reference model.\n2. Replicate the model onto the respective devices.\n3. Wrap as DDP module. This creates hooks between gradients, ensuring that they\n   get synced across devices during `backward`. Note: DDP does not allow Parameters to change\n   after this step.\n4. Initialize an optimizer for each device with the device's parameters. Each\n   device calls `optimizer.step` for its own parameters but with the same\n   gradients, due to syncing. This means we perform the same update on each\n   device and end up with the same set of parameters, saving the round of\n   syncing of parameters before the forward pass, which would be necessary if\n   we would use only one device for computing `step`.\n\nThis means, the contiguous parameters need to be created after step 2 but\nbefore step 3. The easiest way to do this is to create your optimizer after\nmoving the model to the desired device, otherwise you need to wrap the `Module.cuda`\nand `Module.cpu` functions and recreate the contiguous parameters there.\nNote: the buffer invalidation check currently doesn't work with DDP.\n\nContiguous params work with pytorch_lightning's DDP implementation for versions > 0.9\nor on master after [this commit](https://github.com/PyTorchLightning/pytorch-lightning/commit/e3528afae3f178cf9d5d8ea6bc3f8a876646054a).\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "http://www.github.com/philjd/contiguous_pytorch_params/tags",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "http://www.github.com/philjd/contiguous_pytorch_params",
+    "keywords": "pytorch,contiguous,parameters,speed up,accelerate",
+    "license": "Apache 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "contiguous-params",
+    "package_url": "https://pypi.org/project/contiguous-params/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/contiguous-params/",
+    "project_urls": {
+      "Download": "http://www.github.com/philjd/contiguous_pytorch_params/tags",
+      "Homepage": "http://www.github.com/philjd/contiguous_pytorch_params"
+    },
+    "release_url": "https://pypi.org/project/contiguous-params/1.0.0/",
+    "requires_dist": [
+      "torch (>=1.5.1)"
+    ],
+    "requires_python": ">=3.6.0",
+    "summary": "Make pytorch parameters contiguous to speed up training by 100x.",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8515780,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d3de55417b9589ba9f8dd6507dcbeb6533113712b7fce4070a3c0296191e6ae",
+          "md5": "6aaa1a5b5201b555bed7902ef48b4577",
+          "sha256": "b1d2b684ace8ecddf81357d1f0cf07dc55be773b08839c1fbd472ff40e56ca0f"
+        },
+        "downloads": -1,
+        "filename": "contiguous_params-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6aaa1a5b5201b555bed7902ef48b4577",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.0",
+        "size": 5706,
+        "upload_time": "2020-10-27T18:05:34",
+        "upload_time_iso_8601": "2020-10-27T18:05:34.460434Z",
+        "url": "https://files.pythonhosted.org/packages/4d/3d/e55417b9589ba9f8dd6507dcbeb6533113712b7fce4070a3c0296191e6ae/contiguous_params-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab07fafec28f3750e111706c662e3652c580d9fc3fff693fbeecf39f54cd101b",
+          "md5": "22f791ec674c6e8dd3b8409e0a9d8755",
+          "sha256": "2cc88550f7a64da83242d577c6f1030b9065ec6ba833fb7b1c2391d00a5082db"
+        },
+        "downloads": -1,
+        "filename": "contiguous_params-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "22f791ec674c6e8dd3b8409e0a9d8755",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.0",
+        "size": 5656,
+        "upload_time": "2020-10-27T18:05:37",
+        "upload_time_iso_8601": "2020-10-27T18:05:37.183856Z",
+        "url": "https://files.pythonhosted.org/packages/ab/07/fafec28f3750e111706c662e3652c580d9fc3fff693fbeecf39f54cd101b/contiguous_params-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4d3de55417b9589ba9f8dd6507dcbeb6533113712b7fce4070a3c0296191e6ae",
+        "md5": "6aaa1a5b5201b555bed7902ef48b4577",
+        "sha256": "b1d2b684ace8ecddf81357d1f0cf07dc55be773b08839c1fbd472ff40e56ca0f"
+      },
+      "downloads": -1,
+      "filename": "contiguous_params-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "6aaa1a5b5201b555bed7902ef48b4577",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6.0",
+      "size": 5706,
+      "upload_time": "2020-10-27T18:05:34",
+      "upload_time_iso_8601": "2020-10-27T18:05:34.460434Z",
+      "url": "https://files.pythonhosted.org/packages/4d/3d/e55417b9589ba9f8dd6507dcbeb6533113712b7fce4070a3c0296191e6ae/contiguous_params-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ab07fafec28f3750e111706c662e3652c580d9fc3fff693fbeecf39f54cd101b",
+        "md5": "22f791ec674c6e8dd3b8409e0a9d8755",
+        "sha256": "2cc88550f7a64da83242d577c6f1030b9065ec6ba833fb7b1c2391d00a5082db"
+      },
+      "downloads": -1,
+      "filename": "contiguous_params-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "22f791ec674c6e8dd3b8409e0a9d8755",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6.0",
+      "size": 5656,
+      "upload_time": "2020-10-27T18:05:37",
+      "upload_time_iso_8601": "2020-10-27T18:05:37.183856Z",
+      "url": "https://files.pythonhosted.org/packages/ab/07/fafec28f3750e111706c662e3652c580d9fc3fff693fbeecf39f54cd101b/contiguous_params-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

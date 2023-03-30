@@ -1,0 +1,794 @@
+{
+  "info": {
+    "author": "Adam Hooper",
+    "author_email": "adam@adamhooper.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: Other/Proprietary License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "channels_rabbitmq\n=================\n\nA Django Channels channel layer that uses RabbitMQ as its backing store.\n\nDoes not support `Worker and Background Tasks\n<https://channels.readthedocs.io/en/stable/topics/worker.html>`_.\n(See `Rationale\n<https://github.com/CJWorkbench/channels_rabbitmq/pull/11#issuecomment-499185070>`_\nand use ``await get_channel_layer().current_connection`` to send to job queues.)\n\nWorks with Python 3.8 or 3.9.\n\nInstallation\n------------\n\n``pip install channels_rabbitmq``\n\nUsage\n-----\n\nThen set up the channel layer in your Django settings file like so::\n\n    CHANNEL_LAYERS = {\n        \"default\": {\n            \"BACKEND\": \"channels_rabbitmq.core.RabbitmqChannelLayer\",\n            \"CONFIG\": {\n                \"host\": \"amqp://guest:guest@127.0.0.1/asgi\",\n                # \"ssl_context\": ... (optional)\n            },\n        },\n    }\n\nPossible options for ``CONFIG`` are listed below.\n\n``host``\n~~~~~~~~\n\nURL of the server to connect to, adhering to `RabbitMQ spec\n<https://www.rabbitmq.com/uri-spec.html>`_. To connect to a RabbitMQ cluster,\nuse a DNS server to resolve a hostname to multiple IP addresses.\nchannels_rabbitmq will automatically reconnect if at least one of them is\nreachable in case of a disconnection.\n\n``expiry``\n~~~~~~~~~~\n\nMinimum number of seconds a message should wait in a RabbitMQ queue, before it\nmay be silently dropped.\n\nDefaults to ``60``. You generally shouldn't need to change this, but you may\nwant to turn it down if you have peaky traffic you wish to drop, or up if you\nhave peaky traffic you want to backlog until you get to it.\n\n``local_capacity``\n~~~~~~~~~~~~~~~~~~\n\nNumber of incoming messages queued in memory. Defaults to ``100``. (A message\nsent to a group with two channels counts as one message.) When ``local_capacity``\nmessages are queued, the message backlog will grow on RabbitMQ.\n\n(This controls the ``prefetch_count`` on the RabbitMQ queue.)\n\n``local_expiry``\n~~~~~~~~~~~~~~~~\n\nMinimum number of seconds a message received from RabbitMQ must be held in\nmemory waiting for ``receive()``, before it may be dropped. Defaults to\n``expiry``.\n\nA warning will be logged when a message expires locally. The warning can\nindicate that a channel has more messages than it can handle; or that\nmessages are being sent to a channel that does not exist. (Perhaps a missing\nchannel was implied by ``group_add()``, and a matching ``group_discard()``\nwas never called.)\n\nIf ``local_expiry < expiry``, then you can end up ignoring (and logging)\nmessages locally while they still exist in the RabbitMQ queue. These messages\nwill be acked, so RabbitMQ will behave as though they were delivered.\n\n``remote_capacity``\n~~~~~~~~~~~~~~~~~~~\n\nNumber of messages stored on RabbitMQ for each client. Defaults to ``100``.\n(A message sent to a group with three channels on two distinct clients counts\nas two messages.) When ``remote_capacity`` messages are queued in RabbitMQ,\nthe channel will refuse new messages. Calls from any client to ``send()`` or\n``group_send()`` to the at-capacity client will raise ``ChannelFull``.\n\n``ssl_context``\n~~~~~~~~~~~~~~~\n\nAn `SSL context\n<https://docs.python.org/3/library/ssl.html#ssl-contexts>`_. Changes the\ndefault ``host`` port to 5671 (instead of 5672).\n\nFor instance, to connect to an TLS RabbitMQ service that will verify your\nclient::\n\n    import ssl\n    ssl_context = ssl.create_default_context(\n        cafile=str(Path(__file__).parent.parent / 'ssl' / 'server.cert'),\n    )\n    ssl_context.load_cert_chain(\n        certfile=str(Path(__file__).parent.parent / 'ssl' / 'client.certchain'),\n        keyfile=str(Path(__file__).parent.parent / 'ssl' / 'client.key'),\n    )\n    CHANNEL_LAYERS['default']['CONFIG']['ssl_context'] = ssl_context\n\nBy default, there is no SSL context; all messages (and passwords) are\nare transmitted in cleartext.\n\n``groups_exchange``\n~~~~~~~~~~~~~~~~~~~\n\nGlobal direct exchange name used by channels to exchange group messages.\nDefaults to ``\"groups\"``. See also `Design decisions`_.\n\nAccessing Carehare\n------------------\n\nWe use `carehare`_ for its thorough handling of errors.\n\nDjango Channels' specification does not account for \"connecting\" and\n\"disconnecting\". This layer does its best by constantly reconnecting, forever.\n\nCall ``await get_channel_layer().current_connection`` to access an open Carehare\nconnection. This lets you use job queues without \"Worker and Background Tasks\".\nLike this::\n\n    # raise asyncio.CancelledError on failure\n    connection = await get_channel_layer().carehare_connection\n\n    # raise carehare.ConnectionClosed or carehare.ChannelClosed on error\n    await connection.publish(b\"task\", routing_key=\"job_queue\")\n\n(The Carehare documentation explains how to build workers.)\n\nA note on errors: a \"connected\" connection isn't guaranteed to *stay* connected\nthroughout every publish. It was merely connected *at some point in the past*.\nWhen a disconnect occurs, all pending operations on that connection will raise\n``carehare.ConnectionClosed``. This channel layer will log the error, and\n``get_channel_layer().carehare_connection`` will point to a new Future. (This\nerror+reconnect is *guaranteed to happen* in production.)\n\nPublish messages from Celery\n----------------------------\n\nMany `Celery\n<https://docs.celeryproject.org/en/stable/getting-started/introduction.html>`_\nusers want to send messages to websockets users.\n\nThis is doable, though not intuitive. Don't use any Django Channels code:\nChannels layers depend on long-running connections, and Celery bans those.\nSame goes for carehare: don't use it from Celery.\n\nInstead, from a Celery-worker ``@task`` you can send messages to your\nDjango-Channels consumers using Celery's RabbitMQ connection::\n\n    from typing import Any, Dict\n\n    import msgpack\n\n    def publish_message_to_group(message: Dict[str, Any], group: str) -> None:\n        with current_app.producer_pool.acquire(block=True) as producer:\n            producer.publish(\n                msgpack.packb({\n                  \"__asgi_group__\": group,\n                  **message,\n                }),\n                exchange=\"groups\",  # groups_exchange\n                content_encoding=\"binary\",\n                routing_key=group,\n                retry=False,  # Channel Layer at-most once semantics\n            )\n\nTo call it, from a Celery-worker ``@task``...::\n\n    publish_message_to_group({ \"type\": \"chat.message\", \"text\": \"hi\" }, \"a-group\")\n\n... and a Django-Channels consumer like this will receive it::\n\n    class WebsocketConnectionConsumer(AsyncWebsocketConsumer):\n        async def connect(self):\n            await self.channel_layer.group_add(\"a-group\", self.channel_name)\n\n        async def disconnect(self):\n            await self.channel_layer.group_discard(\"a-group\", self.channel_name)\n\n        async def chat_message(self, event):\n            assert event[\"text\"] == \"hi\"\n\nAlternatively, write your workers asynchronously, directly in `carehare`_.\nIt's more lightweight and faster than Celery, and the error handling is\nsimpler.\n\nDesign decisions\n----------------\n\nTo scale enormously, this layer only creates one RabbitMQ queue per instance.\nThat means one web server gets one RabbitMQ queue, no matter how many\nwebsocket connections are open. For each message being sent, the client-side\nlayer determines the RabbitMQ queue name and uses it as the routing key.\n\nGroups are implemented using a single, global RabbitMQ direct exchange called\n\"groups\" by default. To send a message to a group, the layer sends the message\nto the \"groups\" exchange with the group name as the routing key. The client\nbinds and unbinds during ``group_add()`` and ``group_remove()`` to ensure\nmessages for any of its groups will reach it. See also the `groups_exchange`_\noption.\n\nRabbitMQ queues are ``exclusive``: when a client disconnects (through close or\ncrash), RabbitMQ will delete the queue and unbind the groups.\n\nOnce a connection has been created, it pollutes the event loop so that\n``async_to_sync()`` will destroy the connection if it was created within\n``async_to_sync()``. Each connection starts a background async loop that pulls\nmessages from RabbitMQ and routes them to receiver queues; each ``receive()``\nqueries receiver queues. Empty queues with no connections are deleted.\n\nDeviations from the Channel Layer Specification\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\nThe `Channel Layer Specification\n<https://channels.readthedocs.io/en/latest/channel_layer_spec.html>`_ bends to\nRedis-related restrictions. RabbitMQ cannot emulate Redis. Here are the\ndifferences:\n\n* **No ``flush`` extension**: To flush all state, simply disconnect all clients.\n  (RabbitMQ won't allow one client to delete another client's data structures.)\n* **No ``group_expiry`` option**: The `group_expiry option\n  <https://channels.readthedocs.io/en/latest/channel_layer_spec.html#persistence>`_\n  recovers when a ``group_add()`` has no matching ``group_discard()``. But the\n  \"group membership expiry\" logic has a fatal flaw: it disconnects legitimate\n  members. ``channels_rabbitmq`` addresses each root problem instead:\n\n  * Web-server crash: RabbitMQ wipes all state related to a web server when\n    the web server disconnects. There's no problem here for ``group_expiry``\n    to solve.\n  * Programming errors: You may err and call ``group_add()`` without\n    eventually calling ``group_discard()``. Redis can't detect this\n    programming error (because it can't detect web-server crashes). RabbitMQ\n    can. The ``local_expiry`` option keeps your site running after you\n    erroneously miss a ``group_discard()``. The channel layer warns when\n    discarding expired messages. Monitor your server logs to detect your\n    errors.\n* **No \"normal channels\"**: `Normal channels\n  <https://channels.readthedocs.io/en/latest/channel_layer_spec.html#channels>`_\n  are job queues. In most projects, \"normal channel\" readers are worker\n  processes, ideally divorced from Websockets and Django.\n\n  If you want an async, RabbitMQ-based job queue, investigate `carehare\n  <https://github.com/CJWorkbench/carehare>`_.\n\n  If you're using Celery with the same RabbitMQ server, you can `publish\n  messages from Celery`_, too.\n\nDependencies\n------------\n\nYou'll need Python 3.8+ and a RabbitMQ server.\n\nIf you have Docker, here's how to start a development server::\n\n    ssl/prepare-certs.sh  # Create SSL certificates used in tests\n    docker run --rm -it \\\n         -p 5671:5671 \\\n         -p 5672:5672 \\\n         -p 15672:15672 \\\n         -v \"/$(pwd)\"/ssl:/ssl \\\n         -e RABBITMQ_SSL_CACERTFILE=/ssl/ca.cert \\\n         -e RABBITMQ_SSL_CERTFILE=/ssl/server.cert \\\n         -e RABBITMQ_SSL_KEYFILE=/ssl/server.key \\\n         -e RABBITMQ_SSL_VERIFY=verify_peer \\\n         -e RABBITMQ_SSL_FAIL_IF_NO_PEER_CERT=true \\\n         rabbitmq:3.7.8-management-alpine\n\nYou can access the RabbitMQ management interface at http://localhost:15672.\n\nContributing\n------------\n\nTo add features and fix bugs\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\nFirst, start a development RabbitMQ server::\n\n    ssl/prepare-certs.sh  # Create SSL certificates used in tests\n    docker run --rm -it \\\n         -p 5671:5671 \\\n         -p 5672:5672 \\\n         -p 15672:15672 \\\n         -v \"/$(pwd)\"/ssl:/ssl \\\n         -e RABBITMQ_SSL_CACERTFILE=/ssl/ca.cert \\\n         -e RABBITMQ_SSL_CERTFILE=/ssl/server.cert \\\n         -e RABBITMQ_SSL_KEYFILE=/ssl/server.key \\\n         -e RABBITMQ_SSL_VERIFY=verify_peer \\\n         -e RABBITMQ_SSL_FAIL_IF_NO_PEER_CERT=true \\\n         rabbitmq:3.8.11-management-alpine\n\nNow take on the development cycle:\n\n#. ``tox`` # to ensure tests pass.\n#. Write new tests in ``tests/`` and make sure they fail.\n#. Write new code in ``channels_rabbitmq/`` to make the tests pass.\n#. Submit a pull request.\n\nTo deploy\n~~~~~~~~~\n\nUse `semver <https://semver.org/>`_.\n\n#. ``git push`` and make sure Travis tests all pass.\n#. ``git tag vX.X.X``\n#. ``git push --tags``\n\nTravisCI will push to PyPi.\n",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "channels-rabbitmq",
+    "package_url": "https://pypi.org/project/channels-rabbitmq/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/channels-rabbitmq/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/channels-rabbitmq/4.0.1/",
+    "requires_dist": [
+      "carehare (>=1.0,<2.0)",
+      "channels (>=3.0,<5)",
+      "msgpack (>=1.0,<2.0)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "RabbitMQ-based ASGI channel layer implementation",
+    "version": "4.0.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15562220,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93e4e1f470eed9590114a4a84c5842cf3434fecba2df53a9bb8f893c8d4afad0",
+          "md5": "14253ee0bc2e6a8ff2b28eb74ca22d0c",
+          "sha256": "f73e416690677cf6c5c08c4bb0f0329101ce1c4db37aba5b1706124327032a13"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "14253ee0bc2e6a8ff2b28eb74ca22d0c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 17964,
+        "upload_time": "2020-12-29T18:10:09",
+        "upload_time_iso_8601": "2020-12-29T18:10:09.597090Z",
+        "url": "https://files.pythonhosted.org/packages/93/e4/e1f470eed9590114a4a84c5842cf3434fecba2df53a9bb8f893c8d4afad0/channels_rabbitmq-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56e32ffb08cb4bc00f2206cbbda23b598fdcb6789c183ac435d8f2a236f57e83",
+          "md5": "021c2a67d78230084d5a65780d7b79e8",
+          "sha256": "949281397bef2672f80caaa9e9f7921d1712645015826e421766099736159ae5"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "021c2a67d78230084d5a65780d7b79e8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 21057,
+        "upload_time": "2020-12-29T18:10:10",
+        "upload_time_iso_8601": "2020-12-29T18:10:10.774543Z",
+        "url": "https://files.pythonhosted.org/packages/56/e3/2ffb08cb4bc00f2206cbbda23b598fdcb6789c183ac435d8f2a236f57e83/channels_rabbitmq-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e07502eb02015bb8f27ce526981c8b62e8ffab0b7331f1894cd4e7d1973ef58",
+          "md5": "cdbb0fea2da438c0b907e05e9415b81b",
+          "sha256": "fed0596637c588e90f7902ccae69ac4d5e6b2fbe7f2d6e03a909b67a01627810"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cdbb0fea2da438c0b907e05e9415b81b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11516,
+        "upload_time": "2018-10-23T19:02:26",
+        "upload_time_iso_8601": "2018-10-23T19:02:26.268758Z",
+        "url": "https://files.pythonhosted.org/packages/9e/07/502eb02015bb8f27ce526981c8b62e8ffab0b7331f1894cd4e7d1973ef58/channels_rabbitmq-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fd8f8ef715965ba5386ba7833804f14ad0ed47f8d0662305b132f1a51dbfd882",
+          "md5": "2cd7021cbc8ee92d0ba3e706368e0f10",
+          "sha256": "3e1e66ddcead244b764fcc2ce5f0709be643767cad1d0edb4948e09a6ddae4f1"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2cd7021cbc8ee92d0ba3e706368e0f10",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14508,
+        "upload_time": "2019-02-06T15:15:08",
+        "upload_time_iso_8601": "2019-02-06T15:15:08.262668Z",
+        "url": "https://files.pythonhosted.org/packages/fd/8f/8ef715965ba5386ba7833804f14ad0ed47f8d0662305b132f1a51dbfd882/channels_rabbitmq-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b9cd2e0e8b55d5af2a62f4a0f4bc7c7d5682950f30dc29b7427ead226bd7480",
+          "md5": "18e2dc7700cb77af250703383719face",
+          "sha256": "4069914ebaeb77241db0a1ccfbf80affc543aafae4a5fb5dbd2e81d2851fec45"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "18e2dc7700cb77af250703383719face",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14509,
+        "upload_time": "2019-02-21T21:40:35",
+        "upload_time_iso_8601": "2019-02-21T21:40:35.419954Z",
+        "url": "https://files.pythonhosted.org/packages/4b/9c/d2e0e8b55d5af2a62f4a0f4bc7c7d5682950f30dc29b7427ead226bd7480/channels_rabbitmq-0.0.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b70ecc8ca8a5bf1ac071c7992c7d4ad97706462fbbd8812a6738f91066eb607",
+          "md5": "538f4b7b334673b554afa983572a1674",
+          "sha256": "c0e153892504a7101dd723c0f576024ac767f21adebc60bab2ddb4935baa1997"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "538f4b7b334673b554afa983572a1674",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11585,
+        "upload_time": "2018-10-23T21:46:31",
+        "upload_time_iso_8601": "2018-10-23T21:46:31.978410Z",
+        "url": "https://files.pythonhosted.org/packages/3b/70/ecc8ca8a5bf1ac071c7992c7d4ad97706462fbbd8812a6738f91066eb607/channels_rabbitmq-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "214443a9e9dea80d6dbce82c51108ec64754f1eace632bcab6284ec1fca7f9e0",
+          "md5": "372d16d4d27abaf421eb330230480b69",
+          "sha256": "902a5c344b24ab1dd41ecf00c388ad02b561d348d87361e94b64a2b0dadb6880"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "372d16d4d27abaf421eb330230480b69",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12297,
+        "upload_time": "2018-10-24T16:55:23",
+        "upload_time_iso_8601": "2018-10-24T16:55:23.030331Z",
+        "url": "https://files.pythonhosted.org/packages/21/44/43a9e9dea80d6dbce82c51108ec64754f1eace632bcab6284ec1fca7f9e0/channels_rabbitmq-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0c53b77556fe65c27f54bc001046f438fe31bfee0597a9ee3509cb4804c8d54",
+          "md5": "e095a0c75bda0c204c0f05cdf18360e2",
+          "sha256": "1407d1a1310daf5cdd037f445d08c30e08d4b494e81db9455bbac149c06dd828"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e095a0c75bda0c204c0f05cdf18360e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12738,
+        "upload_time": "2019-01-31T22:43:18",
+        "upload_time_iso_8601": "2019-01-31T22:43:18.536727Z",
+        "url": "https://files.pythonhosted.org/packages/c0/c5/3b77556fe65c27f54bc001046f438fe31bfee0597a9ee3509cb4804c8d54/channels_rabbitmq-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3719bd92319e2f20ae42b7c346b1cf9471b53939499c064ee0a282472f7fccce",
+          "md5": "759fbbe44f281ff25eeae0fba055ab70",
+          "sha256": "467b6e26e4ea60613a4bccb383ac7edad3f6860123f44a53e0a9fc87cc9686b2"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "759fbbe44f281ff25eeae0fba055ab70",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12738,
+        "upload_time": "2019-02-01T19:19:56",
+        "upload_time_iso_8601": "2019-02-01T19:19:56.374552Z",
+        "url": "https://files.pythonhosted.org/packages/37/19/bd92319e2f20ae42b7c346b1cf9471b53939499c064ee0a282472f7fccce/channels_rabbitmq-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98958cedee784d20b2b48cae145abcf284340f5b6aebb724cfc195f2a4d9ce1d",
+          "md5": "a923e7ea990bf3add454d1dd2faf87b7",
+          "sha256": "8edacf451c5b24a2400a1a6e5b7c9d3cb80b8f9bd054bdaf839856a2b32b9b92"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a923e7ea990bf3add454d1dd2faf87b7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14465,
+        "upload_time": "2019-02-05T22:07:30",
+        "upload_time_iso_8601": "2019-02-05T22:07:30.177414Z",
+        "url": "https://files.pythonhosted.org/packages/98/95/8cedee784d20b2b48cae145abcf284340f5b6aebb724cfc195f2a4d9ce1d/channels_rabbitmq-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f784ebb1027d9845814e7d00c6311e46bdba95d0fcf8c9026284ec42d0d9762",
+          "md5": "5a75114d091d25acdda3e92c39c47795",
+          "sha256": "18b62d1ef830a7021bf24acdbfafaa7a8acfcaad16d0ed82213d3fa22e08929f"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5a75114d091d25acdda3e92c39c47795",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14541,
+        "upload_time": "2019-04-24T15:37:30",
+        "upload_time_iso_8601": "2019-04-24T15:37:30.371976Z",
+        "url": "https://files.pythonhosted.org/packages/7f/78/4ebb1027d9845814e7d00c6311e46bdba95d0fcf8c9026284ec42d0d9762/channels_rabbitmq-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7807e969ac4ab432312f592d082a77ad62851b6327402820566d5109925416a4",
+          "md5": "8d2c9c972f9d7e60dc0307d56a15004c",
+          "sha256": "ced2786bb65bc2c5ff13f1c05d6991a8520334e7a79b95d81e21b14e21e8189c"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8d2c9c972f9d7e60dc0307d56a15004c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14606,
+        "upload_time": "2019-05-06T15:46:29",
+        "upload_time_iso_8601": "2019-05-06T15:46:29.954744Z",
+        "url": "https://files.pythonhosted.org/packages/78/07/e969ac4ab432312f592d082a77ad62851b6327402820566d5109925416a4/channels_rabbitmq-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3fd64daeac98d4f29568a973dd8db9976a349dee518b18a56e5d47e6d8d1e82c",
+          "md5": "ebe35798840686c159631bfd24dee268",
+          "sha256": "eef8a89fb7caf1c0ebf81e0d0d63e5655c396f28511d511791f953957bb1114f"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ebe35798840686c159631bfd24dee268",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15671,
+        "upload_time": "2019-05-09T21:58:36",
+        "upload_time_iso_8601": "2019-05-09T21:58:36.200433Z",
+        "url": "https://files.pythonhosted.org/packages/3f/d6/4daeac98d4f29568a973dd8db9976a349dee518b18a56e5d47e6d8d1e82c/channels_rabbitmq-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cbfc80dde1595ac89eb7ced85fdce593ce97e5c32b5a3a96e11dadc9e8bb76bd",
+          "md5": "fc731f744ae1dac9237a71b2200ba760",
+          "sha256": "a967b77dc71435634e15ee8b65ba4dc0ac241fb9016bf85b614b85c8182b42b2"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fc731f744ae1dac9237a71b2200ba760",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16074,
+        "upload_time": "2019-05-23T18:24:22",
+        "upload_time_iso_8601": "2019-05-23T18:24:22.893668Z",
+        "url": "https://files.pythonhosted.org/packages/cb/fc/80dde1595ac89eb7ced85fdce593ce97e5c32b5a3a96e11dadc9e8bb76bd/channels_rabbitmq-1.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f5ed2d7941410d043e3465bc3ec9abaa44e5b5537cc03eda69d7d05dac8a8b1b",
+          "md5": "b64c489fbc97753d8f799d6f8d6035a5",
+          "sha256": "b1dcc8751e12246c66fe4480f62dcd24f84f0010e5c5e03d093215414b4ba80f"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b64c489fbc97753d8f799d6f8d6035a5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 16204,
+        "upload_time": "2019-06-10T21:18:24",
+        "upload_time_iso_8601": "2019-06-10T21:18:24.890700Z",
+        "url": "https://files.pythonhosted.org/packages/f5/ed/2d7941410d043e3465bc3ec9abaa44e5b5537cc03eda69d7d05dac8a8b1b/channels_rabbitmq-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "23059ff094ce3aba57c0e5ed78ae53024588b7ef07caf6338f292444dfff3389",
+          "md5": "eba7b822bd16769726ada2c2a42f3606",
+          "sha256": "f1f6801497a70a1a857d8f5cc1c84fbb56be81fc26cfe6ec069c87e82b17e0de"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eba7b822bd16769726ada2c2a42f3606",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 17954,
+        "upload_time": "2019-06-16T19:26:55",
+        "upload_time_iso_8601": "2019-06-16T19:26:55.248716Z",
+        "url": "https://files.pythonhosted.org/packages/23/05/9ff094ce3aba57c0e5ed78ae53024588b7ef07caf6338f292444dfff3389/channels_rabbitmq-1.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a0ad9596ac9c839c167c8b30143099e087e104c2dc8dba9fe534ae6dbe5a649e",
+          "md5": "81dae3a17cde2f5f332ae500756ca9e2",
+          "sha256": "d4c10a4ed7c3c4cf98fe31f49157c943a86aef52d0f405d22d3f54bf9b67dc82"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81dae3a17cde2f5f332ae500756ca9e2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18049,
+        "upload_time": "2019-07-09T16:25:40",
+        "upload_time_iso_8601": "2019-07-09T16:25:40.671057Z",
+        "url": "https://files.pythonhosted.org/packages/a0/ad/9596ac9c839c167c8b30143099e087e104c2dc8dba9fe534ae6dbe5a649e/channels_rabbitmq-1.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4318e6bb3eed3b8c44be823b38cb21a1ca3292c4dbab0b5e99c50807eb3c47aa",
+          "md5": "c729ab0e7cd965332c46b94f4310a28e",
+          "sha256": "f9e16f2d8c6ffccb6184d4db13181c3bcbbe8cec0e126d63e4b65bcf4a2d1fbe"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c729ab0e7cd965332c46b94f4310a28e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18044,
+        "upload_time": "2019-08-22T18:51:35",
+        "upload_time_iso_8601": "2019-08-22T18:51:35.914439Z",
+        "url": "https://files.pythonhosted.org/packages/43/18/e6bb3eed3b8c44be823b38cb21a1ca3292c4dbab0b5e99c50807eb3c47aa/channels_rabbitmq-1.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "659e2229a397a0881a15ba971b83cc94af5355b9d95858c30e7430c3972007c1",
+          "md5": "e306d178982710bd60062c9f2642fadd",
+          "sha256": "018026891ce96ecbc8ee7e7e8ab5457f59933345b92db50857efc3071c071126"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e306d178982710bd60062c9f2642fadd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20386,
+        "upload_time": "2019-12-30T22:04:06",
+        "upload_time_iso_8601": "2019-12-30T22:04:06.554891Z",
+        "url": "https://files.pythonhosted.org/packages/65/9e/2229a397a0881a15ba971b83cc94af5355b9d95858c30e7430c3972007c1/channels_rabbitmq-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f81efb872be0847ace0262d4c7eaab46519e50f1507f55b3d709890d199c6c2",
+          "md5": "63edf968a9afbcfad6604785ad83785c",
+          "sha256": "17b3410b7c20c0ec85a2291a75f9c263ae88c3f89825711b2284df87208aaab3"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "63edf968a9afbcfad6604785ad83785c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19920,
+        "upload_time": "2020-03-10T04:12:52",
+        "upload_time_iso_8601": "2020-03-10T04:12:52.058843Z",
+        "url": "https://files.pythonhosted.org/packages/4f/81/efb872be0847ace0262d4c7eaab46519e50f1507f55b3d709890d199c6c2/channels_rabbitmq-1.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b96b89a2cc6aebe044a7f21555e9b145763e93ccf820eee8f7ed6590a8fd953a",
+          "md5": "20cdd6baf30ee53385e5678431ff391a",
+          "sha256": "47e40535b6796e1a15cd525114becd9591d3fee443e55eaa1ebe25d0c0161a9d"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20cdd6baf30ee53385e5678431ff391a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21562,
+        "upload_time": "2020-12-23T15:53:33",
+        "upload_time_iso_8601": "2020-12-23T15:53:33.886675Z",
+        "url": "https://files.pythonhosted.org/packages/b9/6b/89a2cc6aebe044a7f21555e9b145763e93ccf820eee8f7ed6590a8fd953a/channels_rabbitmq-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e5bc16689686f3784e037566bc2c6cab14a7bd98777eeb686bc531fa38cb7e6",
+          "md5": "8ce3373db8e52187fb26ea859057adc5",
+          "sha256": "de644cbc6319e1bd4d4c228669b9c07ad762d4cd2ada22811575d39ef852d32e"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8ce3373db8e52187fb26ea859057adc5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 17964,
+        "upload_time": "2020-12-29T19:54:16",
+        "upload_time_iso_8601": "2020-12-29T19:54:16.701040Z",
+        "url": "https://files.pythonhosted.org/packages/3e/5b/c16689686f3784e037566bc2c6cab14a7bd98777eeb686bc531fa38cb7e6/channels_rabbitmq-1.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0bdae3e7e8eb70f14e56d522dd5e1e3cda8f41e9de8560289e49cf2d1765f7b1",
+          "md5": "48b6f9cd7b7ae4a1cbe51c0d8805a9dc",
+          "sha256": "d986c43b0d11ff6fa17318384734fb42dd09b283144a5ccf013ccf727aed4bc7"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "48b6f9cd7b7ae4a1cbe51c0d8805a9dc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 21057,
+        "upload_time": "2020-12-29T19:54:17",
+        "upload_time_iso_8601": "2020-12-29T19:54:17.585283Z",
+        "url": "https://files.pythonhosted.org/packages/0b/da/e3e7e8eb70f14e56d522dd5e1e3cda8f41e9de8560289e49cf2d1765f7b1/channels_rabbitmq-1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "2.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0e4100a6d600c9728022d4e7a6c098f0030f58acf6f369650fa1f6bff00140a4",
+          "md5": "3bd17bbf05e2c009e12b1bb55ca3828c",
+          "sha256": "6e5fac6ba31f297a3a84d2bb5038b269b7b5a56740847ab7905b6584663bd435"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-2.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3bd17bbf05e2c009e12b1bb55ca3828c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 17982,
+        "upload_time": "2021-01-11T16:00:48",
+        "upload_time_iso_8601": "2021-01-11T16:00:48.216136Z",
+        "url": "https://files.pythonhosted.org/packages/0e/41/00a6d600c9728022d4e7a6c098f0030f58acf6f369650fa1f6bff00140a4/channels_rabbitmq-2.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e85f6d9e393b9778ccaa311e7e01501627a1fab73f444b2f847c10b1567cf8b",
+          "md5": "c709a502c9464b9be71fbff26d3faab2",
+          "sha256": "c141bd681ba646944ca3fa998282014ce418f74d66589a08d112801cddb0f40b"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-2.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c709a502c9464b9be71fbff26d3faab2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 21007,
+        "upload_time": "2021-01-11T16:00:49",
+        "upload_time_iso_8601": "2021-01-11T16:00:49.228042Z",
+        "url": "https://files.pythonhosted.org/packages/7e/85/f6d9e393b9778ccaa311e7e01501627a1fab73f444b2f847c10b1567cf8b/channels_rabbitmq-2.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "3.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "805520e357762744cbae519fd3e317f7cf398a3ce0a65aa175499bfa1c5df337",
+          "md5": "4ade759434da8c0a639210f2e317caf3",
+          "sha256": "3a7a99fa2ad07b7cc3e37bad48dd1094eabce5ba946b51ba4d56e4346f066119"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-3.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4ade759434da8c0a639210f2e317caf3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 16189,
+        "upload_time": "2021-02-25T21:10:14",
+        "upload_time_iso_8601": "2021-02-25T21:10:14.649026Z",
+        "url": "https://files.pythonhosted.org/packages/80/55/20e357762744cbae519fd3e317f7cf398a3ce0a65aa175499bfa1c5df337/channels_rabbitmq-3.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0510ac8f913e7c2072f7bd708f72e3b20d60386b0c5deda24ba412824394b0c0",
+          "md5": "2470c6ab56e56a266cc23761a955eca7",
+          "sha256": "869b52d2e9002cc74f7a4108651d84914cf0adc2f2b30b4a79659fd42745fc83"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-3.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2470c6ab56e56a266cc23761a955eca7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18983,
+        "upload_time": "2021-02-25T21:10:16",
+        "upload_time_iso_8601": "2021-02-25T21:10:16.175259Z",
+        "url": "https://files.pythonhosted.org/packages/05/10/ac8f913e7c2072f7bd708f72e3b20d60386b0c5deda24ba412824394b0c0/channels_rabbitmq-3.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "4.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c13306d5f5542877daff0fc0dccc402faf00bf8a830f6ad5d272acb4d7e274bf",
+          "md5": "574d56dd493705625fad4f5bfcc9e910",
+          "sha256": "368445774ba1d1adcc5b913372687f191a77968c436b55471746093197fdf7c2"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-4.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "574d56dd493705625fad4f5bfcc9e910",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17003,
+        "upload_time": "2021-06-08T13:28:58",
+        "upload_time_iso_8601": "2021-06-08T13:28:58.957494Z",
+        "url": "https://files.pythonhosted.org/packages/c1/33/06d5f5542877daff0fc0dccc402faf00bf8a830f6ad5d272acb4d7e274bf/channels_rabbitmq-4.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e13e9eee3fd4c60617789d3e0f355c6b621d6f5a5fbd4d1df034ba8895abcf3",
+          "md5": "beb259fda3ea8eddee9c6f94800dcb2b",
+          "sha256": "c016d68df80391ed4b5a404c3833fd741847d6720d7dd2a2dda2f6719d23186e"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-4.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "beb259fda3ea8eddee9c6f94800dcb2b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 19762,
+        "upload_time": "2021-06-08T13:28:59",
+        "upload_time_iso_8601": "2021-06-08T13:28:59.941735Z",
+        "url": "https://files.pythonhosted.org/packages/4e/13/e9eee3fd4c60617789d3e0f355c6b621d6f5a5fbd4d1df034ba8895abcf3/channels_rabbitmq-4.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "4.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76fe8142e4ed136f12a0e1c68b7038c8c5928a634a2ccc375b72e82c588138bd",
+          "md5": "20c40b19c587d6b38a974458eca5ceb6",
+          "sha256": "d634d8889fc3c96db885d015ead31c27ee9ff0d4f10cd50a7f259e9fa291d39d"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-4.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "20c40b19c587d6b38a974458eca5ceb6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 17693,
+        "upload_time": "2022-10-28T03:01:14",
+        "upload_time_iso_8601": "2022-10-28T03:01:14.138007Z",
+        "url": "https://files.pythonhosted.org/packages/76/fe/8142e4ed136f12a0e1c68b7038c8c5928a634a2ccc375b72e82c588138bd/channels_rabbitmq-4.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "047cbb2d1f131a92f258a80ff4f5fb413a053cb14ddb815d0b8b8b2096aa29c6",
+          "md5": "bf40a25c1613c3ccff23ec0a2705fb50",
+          "sha256": "b5f404fce16eb7c2f9325bd37e604811e045faab8d568f1b14aad07982a504a8"
+        },
+        "downloads": -1,
+        "filename": "channels_rabbitmq-4.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bf40a25c1613c3ccff23ec0a2705fb50",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21154,
+        "upload_time": "2022-10-28T03:01:15",
+        "upload_time_iso_8601": "2022-10-28T03:01:15.742611Z",
+        "url": "https://files.pythonhosted.org/packages/04/7c/bb2d1f131a92f258a80ff4f5fb413a053cb14ddb815d0b8b8b2096aa29c6/channels_rabbitmq-4.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "76fe8142e4ed136f12a0e1c68b7038c8c5928a634a2ccc375b72e82c588138bd",
+        "md5": "20c40b19c587d6b38a974458eca5ceb6",
+        "sha256": "d634d8889fc3c96db885d015ead31c27ee9ff0d4f10cd50a7f259e9fa291d39d"
+      },
+      "downloads": -1,
+      "filename": "channels_rabbitmq-4.0.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "20c40b19c587d6b38a974458eca5ceb6",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 17693,
+      "upload_time": "2022-10-28T03:01:14",
+      "upload_time_iso_8601": "2022-10-28T03:01:14.138007Z",
+      "url": "https://files.pythonhosted.org/packages/76/fe/8142e4ed136f12a0e1c68b7038c8c5928a634a2ccc375b72e82c588138bd/channels_rabbitmq-4.0.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "047cbb2d1f131a92f258a80ff4f5fb413a053cb14ddb815d0b8b8b2096aa29c6",
+        "md5": "bf40a25c1613c3ccff23ec0a2705fb50",
+        "sha256": "b5f404fce16eb7c2f9325bd37e604811e045faab8d568f1b14aad07982a504a8"
+      },
+      "downloads": -1,
+      "filename": "channels_rabbitmq-4.0.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "bf40a25c1613c3ccff23ec0a2705fb50",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 21154,
+      "upload_time": "2022-10-28T03:01:15",
+      "upload_time_iso_8601": "2022-10-28T03:01:15.742611Z",
+      "url": "https://files.pythonhosted.org/packages/04/7c/bb2d1f131a92f258a80ff4f5fb413a053cb14ddb815d0b8b8b2096aa29c6/channels_rabbitmq-4.0.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

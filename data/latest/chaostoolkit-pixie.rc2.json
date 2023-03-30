@@ -1,0 +1,192 @@
+{
+  "info": {
+    "author": "Chaos Toolkit",
+    "author_email": "contact@chaostoolkit.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: Freely Distributable",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Programming Language :: Python :: Implementation",
+      "Programming Language :: Python :: Implementation :: CPython"
+    ],
+    "description": "# Chaos Toolkit Extension for the Pixie/eBPF platform\n\n[![Version](https://img.shields.io/pypi/v/chaostoolkit-pixie.svg)](https://img.shields.io/pypi/v/chaostoolkit-pixie.svg)\n[![License](https://img.shields.io/pypi/l/chaostoolkit-pixie.svg)](https://img.shields.io/pypi/l/chaostoolkit-pixie.svg)\n[![Build, Test, and Lint](https://github.com/chaostoolkit-incubator/chaostoolkit-pixie/actions/workflows/build.yaml/badge.svg)](https://github.com/chaostoolkit-incubator/chaostoolkit-pixie/actions/workflows/build.yaml)\n[![Python versions](https://img.shields.io/pypi/pyversions/chaostoolkit-pixie.svg)](https://www.python.org/)\n\nThis extension allows you to run [Pixie](https://px.dev/) script during your\nexperiments.\n\n## Install\n\nThis package requires Python 3.8+ as Pixie's dependency requires it.\n\nTo be used from your experiment, this package must be installed in the Python\nenvironment where [chaostoolkit][] already lives.\n\n[chaostoolkit]: https://github.com/chaostoolkit/chaostoolkit\n\n```\n$ pip install chaostoolkit-pixie\n```\n\n## Usage\n\nThis extension provides two probes to run Pixie scripts, either directly\nembedded into the experiment or in a file local to the experiment.\n\nFor instance, a complete script:\n\n```json\n{\n    \"version\": \"1.0.0\",\n    \"title\": \"Consumer service remains fast under higher traffic load\",\n    \"description\": \"Showcase for how we remain responsive under a certain load. This should help us figure how many replicas we should run\",\n    \"secrets\": {\n        \"pixie\": {\n            \"api_key\": {\n                \"type\": \"env\",\n                \"key\": \"PIXIE_API_KEY\"\n            }\n        }\n    },\n    \"configuration\": {\n        \"pixie_cluster_id\": {\n            \"type\": \"env\",\n            \"key\": \"PIXIE_CLUSTER_ID\"\n        }\n    },\n    \"steady-state-hypothesis\": {\n        \"title\": \"Run a Pixie script and evaluate it\",\n        \"probes\": [\n            {\n                \"type\": \"probe\",\n                \"name\": \"p99-latency-of-consumer-service-for-past-2m-remained-under-300ms\",\n                \"tolerance\": {\n                    \"type\": \"probe\",\n                    \"name\": \"compute-median\",\n                    \"provider\": {\n                        \"type\": \"python\",\n                        \"module\": \"chaospixie.tolerances\",\n                        \"func\": \"percentile_should_be_below\",\n                        \"secrets\": [\"pixie\"],\n                        \"arguments\": {\n                            \"column\": \"latency_p99\",\n                            \"percentile\": 99,\n                            \"convert_from_nanoseconds\": \"milliseconds\",\n                            \"treshold\": 300.0\n                        }\n                    }\n                },\n                \"provider\": {\n                    \"type\": \"python\",\n                    \"module\": \"chaospixie.probes\",\n                    \"func\": \"run_script_from_local_file\",\n                    \"secrets\": [\"pixie\"],\n                    \"arguments\": {\n                        \"script_path\": \"./pixiescript.py\"\n                    }\n                }\n            }\n        ]\n    },\n    \"method\": [\n        {\n            \"type\": \"action\",\n            \"name\": \"send-10-requests-per-second-for-60s\",\n            \"provider\": {\n                \"type\": \"process\",\n                \"path\": \"ddosify\",\n                \"arguments\": \"-d 60 -n 600 -o stdout-json -t http://mydomain.com/consumer\"\n            }\n        }\n    ]\n}\n```\n\nThis assumes you have a a service named `consumer`. Pixie monitors its\nlatency and produces percentiles for it. We then use a probe tolerance to\nevaluate the returned latency for the past 2 minutes and we measure if the\nlatency was mainly (99-percentile) under 300ms.\n\nIn this example, we use [ddosify](https://github.com/ddosify/ddosify) to\ninduce the load, but you can use your favourite tooling of course.\n\nThe Pixie script we run is as follows:\n\n```python\nimport px\n\nns_per_ms = 1000 * 1000\nns_per_s = 1000 * ns_per_ms\nwindow_ns = px.DurationNanos(10 * ns_per_s)\nfilter_unresolved_inbound = True\nfilter_health_checks = True\nfilter_ready_checks = True\n\n\ndef inbound_let_timeseries(start_time: str, service: px.Service):\n    ''' Compute the let as a timeseries for requests received by `service`.\n\n    Args:\n    @start_time: The timestamp of data to start at.\n    @service: The name of the service to filter on.\n\n    '''\n    df = let_helper(start_time)\n    df = df[px.has_service_name(df.service, service)]\n\n    df = df.groupby(['timestamp']).agg(\n        latency_quantiles=('latency', px.quantiles),\n        error_rate_per_window=('failure', px.mean),\n        throughput_total=('latency', px.count),\n        bytes_total=('resp_body_size', px.sum)\n    )\n\n    # Format the result of LET aggregates into proper scalar formats and\n    # time series.\n    df.latency_p50 = px.DurationNanos(px.floor(px.pluck_float64(df.latency_quantiles, 'p50')))\n    df.latency_p90 = px.DurationNanos(px.floor(px.pluck_float64(df.latency_quantiles, 'p90')))\n    df.latency_p99 = px.DurationNanos(px.floor(px.pluck_float64(df.latency_quantiles, 'p99')))\n    df.request_throughput = df.throughput_total / window_ns\n    df.errors_per_ns = df.error_rate_per_window * df.request_throughput / px.DurationNanos(1)\n    df.error_rate = px.Percent(df.error_rate_per_window)\n    df.bytes_per_ns = df.bytes_total / window_ns\n    df.time_ = df.timestamp\n\n    return df[['time_', 'latency_p50', 'latency_p90', 'latency_p99',\n               'request_throughput', 'errors_per_ns', 'error_rate', 'bytes_per_ns']]\n\n\ndef let_helper(start_time: str):\n    ''' Compute the initial part of the let for requests.\n        Filtering to inbound/outbound traffic by service is done by the calling function.\n\n    Args:\n    @start_time: The timestamp of data to start at.\n\n    '''\n    df = px.DataFrame(table='http_events', start_time=start_time)\n    # Filter only to inbound service traffic (server-side).\n    # Don't include traffic initiated by this service to an external location.\n    df = df[df.trace_role == 2]\n    df.service = df.ctx['service']\n    df.pod = df.ctx['pod']\n    df.latency = df.latency\n\n    df.timestamp = px.bin(df.time_, window_ns)\n\n    df.failure = df.resp_status >= 400\n    filter_out_conds = ((df.req_path != '/healthz' or not filter_health_checks) and (\n        df.req_path != '/readyz' or not filter_ready_checks)) and (\n        df['remote_addr'] != '-' or not filter_unresolved_inbound)\n\n    df = df[filter_out_conds]\n    return df\n\n\ndf = inbound_let_timeseries(\"-2m\", \"default/consumer\")\npx.display(df)\n```\n\nThis is an abridged script from Pixie itself.\n\nThat's it!\n\n## Configuration\n\n<Specify any extra configuration your extension relies on here>\n\n## Test\n\nTo run the tests for the project execute the following:\n\n```\n$ pytest\n```\n\n### Formatting and Linting\n\nWe use a combination of [`black`][black], [`flake8`][flake8], and [`isort`][isort]\nto both lint and format this repositories code.\n\n[black]: https://github.com/psf/black\n[flake8]: https://github.com/PyCQA/flake8\n[isort]: https://github.com/PyCQA/isort\n\nBefore raising a Pull Request, we recommend you run formatting against your\ncode with:\n\n```console\n$ make format\n```\n\nThis will automatically format any code that doesn't adhere to the formatting\nstandards.\n\nAs some things are not picked up by the formatting, we also recommend you run:\n\n```console\n$ make lint\n```\n\nTo ensure that any unused import statements/strings that are too long, etc.\nare also picked up.\n\n## Contribute\n\nIf you wish to contribute more functions to this package, you are more than\nwelcome to do so. Please, fork this project, make your changes following the\nusual [PEP 8][pep8] code style, sprinkling with tests and submit a PR for\nreview.\n\n[pep8]: https://pycodestyle.readthedocs.io/en/latest/\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://chaostoolkit.org",
+    "keywords": "",
+    "license": "Apache License Version 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "chaostoolkit-pixie",
+    "package_url": "https://pypi.org/project/chaostoolkit-pixie/",
+    "platform": "any",
+    "project_url": "https://pypi.org/project/chaostoolkit-pixie/",
+    "project_urls": {
+      "CI: GitHub": "https://github.com/chaostoolkit-incubator/chaostoolkit-pixie/actions",
+      "Docs: RTD": "https://docs.chaostoolkit.org",
+      "GitHub: issues": "https://github.com/chaostoolkit-incubator/chaostoolkit-pixie/issues",
+      "GitHub: repo": "https://github.com/chaostoolkit-incubator/chaostoolkit-pixie",
+      "Homepage": "https://chaostoolkit.org"
+    },
+    "release_url": "https://pypi.org/project/chaostoolkit-pixie/0.1.1/",
+    "requires_dist": [
+      "chaostoolkit-lib (~=1.25)",
+      "pxapi (~=0.5)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Chaos Toolkit extension",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14685271,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "83450418711e1d1528c0753d3ab64318aff5aef0f6d8cfed44aeaf9b1b3b17c9",
+          "md5": "32c775a129d615add2e8df72796cd066",
+          "sha256": "ec2cecf97129f308b805305a8b14a748c43970ef5c89cbd4f7b5caf7d79d684b"
+        },
+        "downloads": -1,
+        "filename": "chaostoolkit_pixie-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "32c775a129d615add2e8df72796cd066",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.8",
+        "size": 12506,
+        "upload_time": "2022-08-07T22:21:33",
+        "upload_time_iso_8601": "2022-08-07T22:21:33.599726Z",
+        "url": "https://files.pythonhosted.org/packages/83/45/0418711e1d1528c0753d3ab64318aff5aef0f6d8cfed44aeaf9b1b3b17c9/chaostoolkit_pixie-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a1dadd12eea19418298cc36e6f9a05dd2588373d4ac638ee9c42ff0bc45590dc",
+          "md5": "3830ec3b3c9b2b025c015f4824fb1126",
+          "sha256": "8bba584f5e6338c5980a584c4067409873e574168de54b484ace84c824dcc186"
+        },
+        "downloads": -1,
+        "filename": "chaostoolkit-pixie-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3830ec3b3c9b2b025c015f4824fb1126",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 18311,
+        "upload_time": "2022-08-07T22:21:36",
+        "upload_time_iso_8601": "2022-08-07T22:21:36.291852Z",
+        "url": "https://files.pythonhosted.org/packages/a1/da/dd12eea19418298cc36e6f9a05dd2588373d4ac638ee9c42ff0bc45590dc/chaostoolkit-pixie-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12e3ce98ab5ec13a81123cb0168913ebcdd0b36c657ce75bf88e2de6144cd8bc",
+          "md5": "aeafab35c03f80c3273003c78917b138",
+          "sha256": "c5bf6396ad939b73e476e79d2be73ae6930e4fb9e5d166c1e677da31e85949fb"
+        },
+        "downloads": -1,
+        "filename": "chaostoolkit_pixie-0.1.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "aeafab35c03f80c3273003c78917b138",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.8",
+        "size": 12499,
+        "upload_time": "2022-08-08T07:03:25",
+        "upload_time_iso_8601": "2022-08-08T07:03:25.021177Z",
+        "url": "https://files.pythonhosted.org/packages/12/e3/ce98ab5ec13a81123cb0168913ebcdd0b36c657ce75bf88e2de6144cd8bc/chaostoolkit_pixie-0.1.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d1945dae7efc56d579a65c33e386008747a5170707a027574197a7c82ac36d7",
+          "md5": "46e27d1c12cd93e99454a9870b1307b0",
+          "sha256": "f432958b5f1337293eefe9548fecb59c49810de16b92f1b190fccccc4f9c7741"
+        },
+        "downloads": -1,
+        "filename": "chaostoolkit-pixie-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "46e27d1c12cd93e99454a9870b1307b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15250,
+        "upload_time": "2022-08-08T07:03:27",
+        "upload_time_iso_8601": "2022-08-08T07:03:27.619301Z",
+        "url": "https://files.pythonhosted.org/packages/6d/19/45dae7efc56d579a65c33e386008747a5170707a027574197a7c82ac36d7/chaostoolkit-pixie-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "12e3ce98ab5ec13a81123cb0168913ebcdd0b36c657ce75bf88e2de6144cd8bc",
+        "md5": "aeafab35c03f80c3273003c78917b138",
+        "sha256": "c5bf6396ad939b73e476e79d2be73ae6930e4fb9e5d166c1e677da31e85949fb"
+      },
+      "downloads": -1,
+      "filename": "chaostoolkit_pixie-0.1.1-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "aeafab35c03f80c3273003c78917b138",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=3.8",
+      "size": 12499,
+      "upload_time": "2022-08-08T07:03:25",
+      "upload_time_iso_8601": "2022-08-08T07:03:25.021177Z",
+      "url": "https://files.pythonhosted.org/packages/12/e3/ce98ab5ec13a81123cb0168913ebcdd0b36c657ce75bf88e2de6144cd8bc/chaostoolkit_pixie-0.1.1-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6d1945dae7efc56d579a65c33e386008747a5170707a027574197a7c82ac36d7",
+        "md5": "46e27d1c12cd93e99454a9870b1307b0",
+        "sha256": "f432958b5f1337293eefe9548fecb59c49810de16b92f1b190fccccc4f9c7741"
+      },
+      "downloads": -1,
+      "filename": "chaostoolkit-pixie-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "46e27d1c12cd93e99454a9870b1307b0",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 15250,
+      "upload_time": "2022-08-08T07:03:27",
+      "upload_time_iso_8601": "2022-08-08T07:03:27.619301Z",
+      "url": "https://files.pythonhosted.org/packages/6d/19/45dae7efc56d579a65c33e386008747a5170707a027574197a7c82ac36d7/chaostoolkit-pixie-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
