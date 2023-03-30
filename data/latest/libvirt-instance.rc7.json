@@ -1,0 +1,402 @@
+{
+  "info": {
+    "author": "Sergej Alikov",
+    "author_email": "sergej@alikov.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# libvirt-instance\n\n`libvirt-instance` is a CLI tool for creating virtual machines. It uses the\nLibvirt API, and is compatible with other Libvirt applications.\n\nThink of it as a more opinionated alternative to `virt-install`.\n\n\n## Project goals\n\n- Make creating Libvirt virtual machines (VMs) via the command-line interface\n  simpler for human operators, by providing a way to group some commonly-used\n  configurations as presets.\n- Provide a convenient way to deploy cloud instances on Libvirt without the\n  need for a metadata service (the\n  [NoCloud](https://cloudinit.readthedocs.io/en/latest/topics/datasources/nocloud.html)\n  data source is used to provide metadata to instances).\n\nThe tool does not support deleting Libvirt resources, and there are no plans to\nimplement that so far. Any delete operations can be performed using `virsh`.\n\n\n## Installation\n\nThis package depends on `libvirt-python`. Installing into a virtualenv might\nrequire GCC, Python3 and Libvirt development OS packages to be installed.\nRun `dnf --enablerepo=devel install gcc python3-devel libvirt-devel` to install\nthose packages if you're using RockyLinux 9.\n\nOtherwise (when not using virtualenv), having the `python3-libvirt` OS package\ninstalled should be sufficient.\n\n`libvirt-instance` can be installed by running `pip3 install libvirt-instance`.\nIt requires Python 3.9+ to run.\n\n\n## Showcase\n\nWhile both local and remote Libvirt daemons are supported, the following example\nis using a local Libvirt daemon for sake of simplicity. The commands should be\nexecuted by a user who has sufficient Libvirt access privileges.\n\n```shell\nURI=qemu:///system\n\n# All operations on disks are done using the Libvirt pool APIs.\n# Libvirt doesn't usually come with any storage pools defined, so let's define\n# one named \"images\".\nvirsh -c \"$URI\" pool-define-as images dir --target /var/lib/libvirt/images\nvirsh -c \"$URI\" pool-autostart images\nvirsh -c \"$URI\" pool-start images\n\n# Create a config file with a preset for disks from the above pool,\n# and a preset for network interfaces in the default Libvirt NAT network (this\n# network exists by default).\ncat <<\"EOF\" >./libvirt-instance-config.yaml\npreset:\n  disk:\n    local:\n      type: volume\n      pool: images\n      bus: virtio\n      cache: none\n  interface:\n    nat:\n      type: network\n      model-type: virtio\n      network: default\nEOF\n\n# Fetch a cloud image from the Internet and upload it to Libvirt as a volume,\n# so we can use it as the base image for VM disks.\ncurl -LfsS \\\n  https://download.fedoraproject.org/pub/fedora/linux/releases/37/Cloud/x86_64/images/Fedora-Cloud-Base-37-1.7.x86_64.raw.xz \\\n  | xzcat >./f37-cloud-amd64.raw\nimage_size=$(stat --printf=\"%s\" ./f37-cloud-amd64.raw)\nvirsh -c \"$URI\" vol-create-as images f37-cloud-amd64.raw \"${image_size}b\" --format raw\nvirsh -c \"$URI\" vol-upload f37-cloud-amd64.raw ./f37-cloud-amd64.raw --pool images\n\n# Generate a passphraseless SSH key for this demo.\nssh-keygen -f mykey -N ''\n\n# Create user-data.\ncat <<EOF >./user-data\n#cloud-config\nssh_authorized_keys:\n  - $(cat ./mykey.pub)\npackages:\n  - nginx\nruncmd:\n  - systemctl start nginx\nEOF\n\n# Create network-config.\ncat <<\"EOF\" >./network-config\nversion: 2\nethernets:\n    eth0:\n        dhcp4: false\n        dhcp6: false\n        addresses:\n          - 192.168.122.10/24\n        gateway4: 192.168.122.1\n        nameservers:\n          addresses:\n            - 1.1.1.1\n            - 8.8.8.8\nEOF\n\n# Create the VM.\n# headless-server-x86_64 is a built-in domain preset.\ninstance_id=$(\n  libvirt-instance -c \"$URI\" --config-file ./libvirt-instance-config.yaml create \\\n                   --domain-preset headless-server-x86_64 \\\n                   --memory 2GiB \\\n                   --vcpu 2 \\\n                   --disk local,5GiB,source=f37-cloud-amd64.raw \\\n                   --nic nat \\\n                   --cloud-seed-disk=local \\\n                   --cloud-user-data-file ./user-data \\\n                   --cloud-network-config-file ./network-config \\\n                   myvm \\\n    | jq -er '.\"instance-id\"')\n\n# Start the VM.\nvirsh -c \"$URI\" start \"$instance_id\"\n\n# Wait until cloud-init has finished executing.\nuntil\n  ssh -i mykey \\\n      -o IdentitiesOnly=true \\\n      -o StrictHostKeyChecking=no \\\n      -o UserKnownHostsFile=/dev/null \\\n      fedora@192.168.122.10 \\\n      cloud-init status --wait\ndo\n  sleep 1\ndone\n\n# Get a page from Nginx on the VM.\ncurl http://192.168.122.10/\n\n# Cleanup.\nvirsh -c \"$URI\" destroy \"$instance_id\"\nvirsh -c \"$URI\" undefine \"$instance_id\" --nvram --remove-all-storage\n```\n\n\n## More examples\n\nCreating non-image-based VMs is also an option.\n\n### VM with two disks and the PXE boot as the first option\n\n```shell\nlibvirt-instance -c \"$URI\" --config-file ./libvirt-instance-config.yaml create \\\n                 --domain-preset headless-server-x86_64 \\\n                 --memory 2GiB \\\n                 --vcpu 2 \\\n                 --disk local,5GiB,boot-order=2 \\\n                 --disk local,10GiB \\\n                 --nic nat,boot-order=1 \\\n                 myvm\n```\n\nAlternative/non-native architectures are also supported. `libvirt-instance` comes\nwith two built-in domain presets - `headless-server-x86_64` and\n`headless-server-aarch64`. More presets can be defined in a config file.\n\nRun `libvirt-instance get-config` to see the currently-defined presets.\n\n### VM with encrypted disks\n\n```shell\ncat <<EOF >./secret.xml\n<secret ephemeral='no' private='yes'>\n  <uuid>8eb167eb-b3bb-4047-91f4-a3ca1eb643ab</uuid>\n</secret>\nEOF\n\nvirsh -c \"$URI\" secret-define ./secret.xml\n\nvirsh -c \"$URI\" secret-set-value 8eb167eb-b3bb-4047-91f4-a3ca1eb643ab --interactive\n# Enter new value for secret:\n\n# encryption-secret could also be specified in a preset in libvirt-instance-config.yaml.\nlibvirt-instance -c \"$URI\" --config-file ./libvirt-instance-config.yaml create \\\n                 --domain-preset headless-server-x86_64 \\\n                 --memory 2GiB \\\n                 --vcpu 2 \\\n                 --disk local,5GiB,encryption-secret=8eb167eb-b3bb-4047-91f4-a3ca1eb643ab \\\n                 --disk local,10GiB,encryption-secret=8eb167eb-b3bb-4047-91f4-a3ca1eb643ab \\\n                 --nic nat \\\n                 myvm\n```\n\n\n### ARM cloud image-based Fedora VM on a non-ARM KVM host\n\n```shell\ncurl -LfsS \\\n  https://download.fedoraproject.org/pub/fedora/linux/releases/37/Cloud/aarch64/images/Fedora-Cloud-Base-37-1.7.aarch64.raw.xz \\\n  | xzcat >./f37-cloud-arm64.raw\nimage_size=$(stat --printf=\"%s\" ./f37-cloud-arm64.raw)\nvirsh -c \"$URI\" vol-create-as images f37-cloud-arm64.raw \"${image_size}b\" --format raw\nvirsh -c \"$URI\" vol-upload f37-cloud-arm64.raw ./f37-cloud-arm64.raw --pool images\n\nlibvirt-instance -c \"$URI\" --config-file ./libvirt-instance-config.yaml create \\\n                 --domain-preset headless-server-aarch64 \\\n                 --cpu-model cortex-a57 \\\n                 --domain-type qemu \\\n                 --memory 2GiB \\\n                 --vcpu 2 \\\n                 --disk local,5GiB,source=f37-cloud-arm64.raw \\\n                 --nic nat \\\n                 --cloud-seed-disk=local \\\n                 --cloud-user-data-file ./user-data \\\n                 --cloud-network-config-file ./network-config \\\n                 myvm\n```\n\n\n## Configuration file\n\nSome defaults and presets are already built in. Configuration file is a way to\nadd more presets, or override existing presets and settings.\n\nThree types of presets are currently supported: `domain`, `disk`, and `interface`.\n\nThe default location of the config file is `/etc/libvirt-instance-config.yaml`.\nThe `--config-file` CLI argument provides a way to override that.\n\nRun `libvirt-instance get-config` to see the current config.\n\n\n### Domain presets\n\nExample config snippet:\n\n```yaml\npreset:\n  domain:\n    windows-server:\n      arch-name: x86_64\n      machine-type: pc\n      xml-file: /path/to/windows-server-base.xml\n```\n\nThe above preset can be selected on the CLI using `--domain-preset windows-server`\nwhen creating a new VM.\n\n`arch-name` can be any arhitecture (e.g. `x86_64`, `aarch64`) supported by the\ntarget host.\n\n`machine-type` can be any machine type (e.g. `pc`, `q35`, `virt`) supported by\nthe chosen architecture.\n\n`xml-file` specifies a file containing some\n[domain XML](https://libvirt.org/formatdomain.html) used as the foundation for\nthe VM being created. The tool will fill in the architecture, domain and\nmachine type, CPU (count and model), memory size, network interface,\ndisk (including any necessary SCSI controllers) entries into the base XML\nautomatically using the information from presets and CLI arguments.\n\nDomain XML may alternatively be provided inline via the `xml` key.\n\n\n### Disk presets\n\nAll operations on disks are done using Libvirt pool APIs, so disk presets may\nonly reference Libvirt pools.\n\nCurrently `dir`, `logical`, and `rbd` pools are supported.\n\nExample config snippet:\n\n```yaml\npreset:\n  disk:\n    ceph-ssd:\n      type: volume\n      pool: ceph-rbd-ssd\n      bus: scsi\n      cache: writeback\n    ceph-hdd:\n      type: volume\n      pool: ceph-rbd\n      bus: virtio\n      cache: writeback\n    local-secure:\n      type: volume\n      pool: images\n      bus: virtio\n      cache: none\n      encryption-format: luks\n      encryption-secret: 8eb167eb-b3bb-4047-91f4-a3ca1eb643ab\n      encryption-cipher: aes-256-cbc-sha256\n      encryption-ivgen: essiv-sha256\n    x86worker:\n      type: volume\n      pool: images\n      bus: virtio\n      cache: none\n      source: fedora37-cloud-amd64.raw\n      source-pool: ceph-rbd\n\n```\nCLI examples for the above: `--disk ceph-ssd,16GiB --disk ceph-hdd,1TiB`,\n`--disk x86worker,32GiB`.\n\nThe only supported value for `type` is `volume` at the moment.\n\n`pool` specifies a target Libvirt pool for the volumes. This pool will also be\nused to pull any information about volumes when adding disk devices to the\ndomain XML.\n\n`bus` (optional) is either `virtio` for virtio-blk disks, or `scsi` for\nvirtio-scsi disks. Defaults to `virtio`.\n\n`cache` (optional) specifies any disk cache mode supported by Libvirt.\ndefaults to `none`.\n\n`source` (optional) specifies a Libvirt volume containing the base image for\ndisks.\n\n`source-pool` (optional) specifies the Libvirt pool for the `source` image.\nDefaults to the same value as `pool` when not specified.\n\n`boot-order` (optional) sets the device position in the boot order.\n\n`encryption-secret` (optional) specified a Libvirt secret UUID, and enables\ndisk encryption when set.\n\n`encryption-format` (optional) sets encryption format (default is `luks`).\n\n`encryption-cipher` (optional) specifies encryption cipher details. Format\nis `name-size-mode-hash`, for example `aes-128-cbc-sha256`.\n\n`encryption-ivgen` (optional) specifies the initialization vector generation\nalgorithm. Format is `name-hash`, for example `essiv-sha256`.\n\nSee\n[Libvirt Storage volume encryption XML format documentation](https://libvirt.org/formatstorageencryption.html)\nfor more details about encryption parameters.\n\nIn most cases, the resulting disk device description in the domain XML will be a\nvolume reference (`<disk type=\"volume\">`). Some pool types (`rbd` for instance)\ndo not support backing volume disks yet\n(see [domain_conf.c#L29929-L29939](https://github.com/libvirt/libvirt/blob/v8.10.0/src/conf/domain_conf.c#L29929-L29939).\nWhen adding disks from such pools, `libvirt-instance` will transparently inline\nthe disk definition into the domain XML using the information (MONs, auth)\nfrom the pool.\n\n\n### Interface presets\n\nCurrently `bridge` and `network` type interfaces are supported.\n\nExample config snippet:\n\n```yaml\npreset:\n  interface:\n    nat:\n      type: network\n      model-type: virtio\n      network: default\n    dmz:\n      type: bridge\n      model-type: virtio\n      bridge: br0\n    storage:\n      type: bridge\n      model-type: virtio\n      bridge: br1\n      mtu: 9000\n```\n\nCLI examples for the above: `--nic nat`, `--nic dmz --nic storage`.\n\n`model-type` (optional) specifies any model type supported by Libvirt\n(e.g. `virtio`, `e1000`, `rtl8139`, etc). Defaults to `virtio`.\n\n`network` specifies the Libvirt network name for `type: network` interfaces.\n\n`bridge` specifies the name of an existing network bridge for `type: bridge`\ninterfaces.\n\n`mtu` (optional) sets the MTU on the host-side TAP interface.\nNote, the MTU also needs to be configured inside the guest.\n\n`boot-order` (optional) sets the device position in the boot order.\n\nTechnically, `mac-address` (optional) can also be specified in an interface\npreset, but it makes more sense to specify any MAC addresses on the command line\n(e.g. `--nic nat,mac-address=00:11:22:33:44:55:66`).\n\n\n## CLI options\n\nSee `libvirt-instance --help` and `libvirt-instance create --help` for the full\nlist of CLI options.\nThere are also some examples in the \"Showcase\" and \"More examples\" sections\nillustrating how different options work together.\n\n`--disk <SPEC>` may be specified more than once to attach multiple disks to a\nVM. Disks are created using the `<VM-NAME>-disk<N>` naming scheme. If a volume\nwith the same name already exists in the target pool - `libvirt-instance` will\nexit with an error.\nDisks are attached to the instance in the same order as specified on the command\nline.\n\nThe `pool`, `bus`, `cache`, `source`, `source-pool`, and `boot-order` options\nmay be included in the disk spec, taking precedence over any corresponding\noptions from the chosen preset.\nFor example:\n`--disk local,10GiB,bus=scsi,cache=writeback,source=jammy-server-cloudimg-amd64.img`.\n\n`--nic <SPEC>` may also be specified more than once. The `mac-address`,\n`model-type`, `network`, `bridge`, `mtu`, and `boot-order` options are supported\nby `--nic`, similar to `--disk` options.\n\n`--cloud-seed-disk` enables the cloud-init support and is required when\neither `--cloud-user-data-file` or `--cloud-network-config-file` have been\nspecified.\nIt works like `--disk` without the size part. `--cloud-seed-disk` specifies\nwhich disk preset to use when creating the\n[NoCloud](https://cloudinit.readthedocs.io/en/latest/topics/datasources/nocloud.html)\nseed disk.\nThe naming pattern for the seed disk is `<VM-NAME>-seed`.\nExample: `--cloud-seed-disk local,bus=scsi`.\n\n\n## Developing\n\nSee [DEVELOPING.md](DEVELOPING.md)\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/node13h/libvirt-instance",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "libvirt-instance",
+    "package_url": "https://pypi.org/project/libvirt-instance/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/libvirt-instance/",
+    "project_urls": {
+      "Homepage": "https://github.com/node13h/libvirt-instance",
+      "Repository": "https://github.com/node13h/libvirt-instance"
+    },
+    "release_url": "https://pypi.org/project/libvirt-instance/0.1.6/",
+    "requires_dist": [
+      "PyYAML (>=5.4.1,<6.0.0)",
+      "libvirt-python (>=8.0.0,<9.0.0)",
+      "pycdlib (>=1.13.0,<2.0.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "VM provisioning and management tool",
+    "version": "0.1.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17448889,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bccae8cfd1d23f5b3ca22facd52fb2e22f11d4813a274abc95d226df1a2081f4",
+          "md5": "bd4a91662da36344e99f5a6e6e9356f5",
+          "sha256": "781dcfeb6f5d4a7b4fcef369f625097b726440b08495b948651255050aba9bf7"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bd4a91662da36344e99f5a6e6e9356f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 19160,
+        "upload_time": "2022-12-30T19:09:34",
+        "upload_time_iso_8601": "2022-12-30T19:09:34.154021Z",
+        "url": "https://files.pythonhosted.org/packages/bc/ca/e8cfd1d23f5b3ca22facd52fb2e22f11d4813a274abc95d226df1a2081f4/libvirt_instance-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "648fa089c3128831fd34d402a38cbd030840e9be519dfd4b269471c7c744d186",
+          "md5": "77cdb7deea6292e0c530434672cb2fae",
+          "sha256": "9097679e773f6fac954c6f11e11c7e79378e7ade88674fc3487e579b25fcfe1f"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "77cdb7deea6292e0c530434672cb2fae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 21451,
+        "upload_time": "2022-12-30T19:09:32",
+        "upload_time_iso_8601": "2022-12-30T19:09:32.398655Z",
+        "url": "https://files.pythonhosted.org/packages/64/8f/a089c3128831fd34d402a38cbd030840e9be519dfd4b269471c7c744d186/libvirt-instance-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a510bdff1c76172bff97b742df23fdd983b26e6151ed61aa78467169c2244f8d",
+          "md5": "925fdf8935661ea9de15d7ea81591ef1",
+          "sha256": "8a2ecb2378431dd0cd40dca7a72a7a55800a5d68f1829af1b29630747c535eae"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "925fdf8935661ea9de15d7ea81591ef1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 19317,
+        "upload_time": "2022-12-30T21:20:22",
+        "upload_time_iso_8601": "2022-12-30T21:20:22.442799Z",
+        "url": "https://files.pythonhosted.org/packages/a5/10/bdff1c76172bff97b742df23fdd983b26e6151ed61aa78467169c2244f8d/libvirt_instance-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ca0b331017cc528483825de2858e19d2c6079cc606fd3a94e7bfa6035dc30996",
+          "md5": "1ea83c2f3310ad4d867bbc194d66890d",
+          "sha256": "7dca5fd2ca67fab2f923cbf419cff9e6f28cbd5a9292072efbabe98c53f24052"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1ea83c2f3310ad4d867bbc194d66890d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 21862,
+        "upload_time": "2022-12-30T21:20:20",
+        "upload_time_iso_8601": "2022-12-30T21:20:20.983088Z",
+        "url": "https://files.pythonhosted.org/packages/ca/0b/331017cc528483825de2858e19d2c6079cc606fd3a94e7bfa6035dc30996/libvirt-instance-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ed8e3a859b54922bf30ae648928475758cfe16550c488bde1a63b3c2dfc34e3e",
+          "md5": "2d41eb6eca773be5a804304cd61ebf5d",
+          "sha256": "b68619ea4b8a9f37abd0e6a41f848b194f37fee46282611597342128b902d8f9"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2d41eb6eca773be5a804304cd61ebf5d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 19325,
+        "upload_time": "2023-02-02T21:41:59",
+        "upload_time_iso_8601": "2023-02-02T21:41:59.667851Z",
+        "url": "https://files.pythonhosted.org/packages/ed/8e/3a859b54922bf30ae648928475758cfe16550c488bde1a63b3c2dfc34e3e/libvirt_instance-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c1441968eeb4ebcc6c33b14ac0abb6d1fe2bdb558d148c2326e31fb33e07a4d6",
+          "md5": "a724168c6e6f3636da0fb8dc82a6c08e",
+          "sha256": "e2dc9f9098b187b9d2bab43049f883156b91b6d45fb951b53a769cf2ea4a34cf"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a724168c6e6f3636da0fb8dc82a6c08e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 21934,
+        "upload_time": "2023-02-02T21:41:57",
+        "upload_time_iso_8601": "2023-02-02T21:41:57.811991Z",
+        "url": "https://files.pythonhosted.org/packages/c1/44/1968eeb4ebcc6c33b14ac0abb6d1fe2bdb558d148c2326e31fb33e07a4d6/libvirt-instance-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "17b8f3de296b926af0e4d3938caf55f36d83a98940540e88281e18f8de76187c",
+          "md5": "1c394d266e494174fe76d2192ae66c73",
+          "sha256": "12b3c0b117f4feac40e738056329d905ac10bf976c08082bce3eb05a244f4aec"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1c394d266e494174fe76d2192ae66c73",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 20462,
+        "upload_time": "2023-02-22T21:27:13",
+        "upload_time_iso_8601": "2023-02-22T21:27:13.996463Z",
+        "url": "https://files.pythonhosted.org/packages/17/b8/f3de296b926af0e4d3938caf55f36d83a98940540e88281e18f8de76187c/libvirt_instance-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a18e2a46d2e5658033d7041a1a1dc759954226c7535a989a87dab300294f0349",
+          "md5": "7911b044c344c265bbfffd838af34268",
+          "sha256": "26b14f207040b43d956b22140e7fd36769916ecff2a1188c3d2795d50a4dc44a"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7911b044c344c265bbfffd838af34268",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 23674,
+        "upload_time": "2023-02-22T21:27:11",
+        "upload_time_iso_8601": "2023-02-22T21:27:11.670840Z",
+        "url": "https://files.pythonhosted.org/packages/a1/8e/2a46d2e5658033d7041a1a1dc759954226c7535a989a87dab300294f0349/libvirt-instance-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0cb7c40de54306f4c5fab0333b04d49b0d3b4ab5edcd5d0e3c11613bb8e10493",
+          "md5": "59797a4a05fb01b6c1d359b4e0858aca",
+          "sha256": "92c9320b60c0d5e5fa90861216a9ed432f4d7a9dcac96454876df9364ebabee4"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "59797a4a05fb01b6c1d359b4e0858aca",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 20470,
+        "upload_time": "2023-02-23T22:22:01",
+        "upload_time_iso_8601": "2023-02-23T22:22:01.432802Z",
+        "url": "https://files.pythonhosted.org/packages/0c/b7/c40de54306f4c5fab0333b04d49b0d3b4ab5edcd5d0e3c11613bb8e10493/libvirt_instance-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cdc9dea0b4c338aa74f203192edcc0bbf3a2305f1b59b713ef818c4bb883be04",
+          "md5": "3f01a76b5dda6cfeaeba1f5c39fa3936",
+          "sha256": "581618f529a6f9de596cc3ec91c5e0f0851ba7077de3de383b073a91b1581bb2"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3f01a76b5dda6cfeaeba1f5c39fa3936",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 23701,
+        "upload_time": "2023-02-23T22:21:59",
+        "upload_time_iso_8601": "2023-02-23T22:21:59.645149Z",
+        "url": "https://files.pythonhosted.org/packages/cd/c9/dea0b4c338aa74f203192edcc0bbf3a2305f1b59b713ef818c4bb883be04/libvirt-instance-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4ec025cb41a52d7470c61e6b9b0ae9b4a9e9d9cfb53663a0c6914bddc02f2e7d",
+          "md5": "480af407190d1a64d8c350ea32b502dc",
+          "sha256": "78eeeea1801f6acb2ca977b81bd8c39792f76954ba3c3ee3a3a4f4538c13ed08"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "480af407190d1a64d8c350ea32b502dc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 20513,
+        "upload_time": "2023-02-26T13:43:50",
+        "upload_time_iso_8601": "2023-02-26T13:43:50.393919Z",
+        "url": "https://files.pythonhosted.org/packages/4e/c0/25cb41a52d7470c61e6b9b0ae9b4a9e9d9cfb53663a0c6914bddc02f2e7d/libvirt_instance-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8419f5a3dbc97a56aa71e9acba547ed4ec8efad682caa09435fd244f1d4cd729",
+          "md5": "c3e07232bd49ec4fb7f077b9f0c8328c",
+          "sha256": "b012b9bb66d1a397dcb29cf0648e64c7c5ae5dc2c9fd715f95bafc57c5003d9a"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c3e07232bd49ec4fb7f077b9f0c8328c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 23744,
+        "upload_time": "2023-02-26T13:43:48",
+        "upload_time_iso_8601": "2023-02-26T13:43:48.078140Z",
+        "url": "https://files.pythonhosted.org/packages/84/19/f5a3dbc97a56aa71e9acba547ed4ec8efad682caa09435fd244f1d4cd729/libvirt-instance-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8fa6a8244da7fcd2e17841ddf6eb76dcadec0328e9a169e87ece16775c9496f8",
+          "md5": "04ded57e686a8ca120dd3a2ae49d4d0c",
+          "sha256": "5a17358667cd58998f117480a4a7f0c73f4185b956afdfc74bcbb8200fc9fc72"
+        },
+        "downloads": -1,
+        "filename": "libvirt_instance-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "04ded57e686a8ca120dd3a2ae49d4d0c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 20533,
+        "upload_time": "2023-03-26T11:02:09",
+        "upload_time_iso_8601": "2023-03-26T11:02:09.974096Z",
+        "url": "https://files.pythonhosted.org/packages/8f/a6/a8244da7fcd2e17841ddf6eb76dcadec0328e9a169e87ece16775c9496f8/libvirt_instance-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "54de37a1ce01369b97c017aef26fa409c505c3fd52bda51966c9aadbd4ad1efe",
+          "md5": "b311768366e00a1c4a7f360747728536",
+          "sha256": "612d6d864b6f7616a1eea31789fc71471790e683afa7efb1b3cc71cb5464db08"
+        },
+        "downloads": -1,
+        "filename": "libvirt-instance-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b311768366e00a1c4a7f360747728536",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 23767,
+        "upload_time": "2023-03-26T11:02:07",
+        "upload_time_iso_8601": "2023-03-26T11:02:07.450080Z",
+        "url": "https://files.pythonhosted.org/packages/54/de/37a1ce01369b97c017aef26fa409c505c3fd52bda51966c9aadbd4ad1efe/libvirt-instance-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8fa6a8244da7fcd2e17841ddf6eb76dcadec0328e9a169e87ece16775c9496f8",
+        "md5": "04ded57e686a8ca120dd3a2ae49d4d0c",
+        "sha256": "5a17358667cd58998f117480a4a7f0c73f4185b956afdfc74bcbb8200fc9fc72"
+      },
+      "downloads": -1,
+      "filename": "libvirt_instance-0.1.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "04ded57e686a8ca120dd3a2ae49d4d0c",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 20533,
+      "upload_time": "2023-03-26T11:02:09",
+      "upload_time_iso_8601": "2023-03-26T11:02:09.974096Z",
+      "url": "https://files.pythonhosted.org/packages/8f/a6/a8244da7fcd2e17841ddf6eb76dcadec0328e9a169e87ece16775c9496f8/libvirt_instance-0.1.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "54de37a1ce01369b97c017aef26fa409c505c3fd52bda51966c9aadbd4ad1efe",
+        "md5": "b311768366e00a1c4a7f360747728536",
+        "sha256": "612d6d864b6f7616a1eea31789fc71471790e683afa7efb1b3cc71cb5464db08"
+      },
+      "downloads": -1,
+      "filename": "libvirt-instance-0.1.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b311768366e00a1c4a7f360747728536",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 23767,
+      "upload_time": "2023-03-26T11:02:07",
+      "upload_time_iso_8601": "2023-03-26T11:02:07.450080Z",
+      "url": "https://files.pythonhosted.org/packages/54/de/37a1ce01369b97c017aef26fa409c505c3fd52bda51966c9aadbd4ad1efe/libvirt-instance-0.1.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

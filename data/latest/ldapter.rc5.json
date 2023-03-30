@@ -1,0 +1,313 @@
+{
+  "info": {
+    "author": "Carl Harris",
+    "author_email": "ceharris414@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "ldapter\n=======\n\nA lightweight adapter API for python-ldap that provides simplified \naccess to LDAP objects and attributes in native Python types, as well as\ntransparent read-through caching support using either a simple in-memory\ncache or Redis.\n\nInstallation\n------------\n\n_Ldapter_ is available from PyPi and can be installed using `pip` or\nwhatever package management solution you prefer.\n\n```shell\npip install ldapter\n```\n\nIf you want to use `datetime` types to represent ISO-8601 formatted \ndate strings in your LDAP entries, you'll also need to install\npython-dateutil\n\n```shell\npip install python-dateutil\n```\n\nRunning the Demo\n----------------\n\nThe source repository includes a demo. Of course, you'll need an LDAP\nserver and (optionally) a Redis cache in order to see _ldapter_ at work.\nTo make this easy, the repository includes everything you need to run\nthe demo using Docker and Docker Compose on your local workstation.\n\nStart up the demo LDAP server and Redis cache in a terminal.\n\n```shell\ncd src/demo/docker\ndocker compose up --build\n```\n\nDepending on the version of Docker you have installed, you might find \nthat you need to use `docker-compose` instead of `docker compose` in\nthe second line above.\n\nRun the demo in another terminal.\n\n```shell\ncd src/demo/python\nPYTHONPATH=../main/python python demo.py\n```\n\nUsing the ldapter API\n---------------------\n\nThe `Directory` object class is the top-level API.\n\n```python\nfrom ldapter import Directory\nfrom ldapter import inet_org_person_schema\n\n# Create a directory adapter with no cache.\ndirectory = Directory(schema=inet_org_person_schema())\n```\n\nThe `Directory.fetch_all` method returns a list of tuples, each of which \ncontains a `DistinguishedName` and an `Entry`. The list will be empty if\nthe LDAP search returned no entries.\n\n```python\nfrom ldapter import Directory, Scope\nfrom ldapter import inet_org_person_schema\n\ndirectory = Directory(schema=inet_org_person_schema())\nbase = \"dc=example,dc=org\"\nsearch_filter = \"uid=fletcher\"\nfor dn, entry in directory.fetch_all(base, Scope.SUBTREE, search_filter):\n    print(dn)\n    for k, v in entry.items():\n        print(f\"{k}: {v}\")\n```\n\nA `DistinguishedName` is an object that implements a subset of the\ndict protocol, allowing relative names (RDN) to be easily extracted.\n\nAn `Entry` is an object that uses the directory schema to transform\nattribute values into useful Python data types. It implements a subset \nof the dict protocol, so that attribute values can be easily accessed\nby name. A single-valued attribute has a common Python\ndata type (e.g. str, int, bool, datetime) or `DistinguishedName`.\nA multi-valued attribute is a Python list whose values are one of\nthese types.\n\nCaching Strategy\n----------------\n\nWhen an LDAP search is performed (via the `Directory.fetch_all` or\n`Directory.fetch_one` methods) a resulting set of matching\nLDAP entries is returned (which may be empty). Each entry has an LDAP distinguished name that serves as the\n\"primary key\" for retrieving that specific entry. Each retrieved object\nis placed into the cache using its distinguished name as the key. \nAdditionally, the search base, scope, and filter expression specified for\nthe search are used as a key for a cache entry that contains the\nset of distinguished names found by the search.\n\nConceptually you can think of the cache as a simple hash table \nwhere each entry has a key string and corresponding JSON value (an\narray or object). If we perform a search using `dc=example,dc=org` \nas the base, SUBTREE as the scope, and a filter expression such as \n`(&(sn=Smith)(givenName=Mary*)`, the cache might have entries such as the\nfollowing:\n\n| Key   | Value |\n|-------|-------|\n| s:dc=example,dc=org:SUBTREE:(&(sn=Smith)(givenName=Mary*) | \\[\"uid=liz,dc=example,dc=org\", \"uid=mas87,dc=example,dc=org\", \"uid=msmith,dc=example,dc=org\", ...] |\n| e:uid=liz,dc=example,dc=org | { \"uid\": \"liz\", sn=\"Smith\", \"givenName\": \"Mary Elizabeth\", ... } |\n| e:uid=mas87,dc=example,dc=org | { \"uid\": \"mas87\", sn=\"Smith\", \"givenName\": \"Mary Anne\", ... } |\n| e:uid=msmith,dc=example,dc=org | { \"uid\": \"msmith\", sn=\"Smith\", \"givenName\": \"Mary\", ... } |\n\nThe keys are prefixed with a namespace identifier based on the type\nof the value. In this example, we use `s:` for a search result and `e:` \nfor an LDAP entry. This makes the keys easy to distinguish when viewing\nthe cache and prevents any potential for collisions of keys representing\ndifferent types.\n\nOn a subsequent search request with the same base, scope, and filter \nexpression, the cached list of distinguished names is retrieved, \nand those names are used to retrieve the corresponding LDAP entries from\nthe cache. In this way, different searches can share the same LDAP\nentries in the cache -- any given LDAP entry is stored at most once.\n\nNo attempt is made to analyze the filter expression to predict what might\nbe returned by the LDAP server. Cached searches are simply the list of \ndistinguished names that matched the given search criteria when the \nsearch was performed. This strategy works well for accelerating searches\nthat are performed repeatedly with the _same_ search criteria, but it\ndoes nothing for a search whose criteria are even slightly different\nfrom a previously executed search. As discussed below in [Optimizing\nSingle Entry Fetches](#optimizing-single-entry-fetches), additional\noptimizations are included to accelerate the common case of fetching \nLDAP entries using the distinguished name as a primary key.\n\n### Using a Cache\n\nThe module includes two cache providers.\n\n1. A provider that acts as a Redis client.\n2. A provider that uses a simple dict-based in-memory cache.\n\nThe simple dict-based cache is suitable mostly for testing. For \noptimal performance and persistence beyond the runtime of a Python\nscript, Redis is recommended.\n\nTo use a cache, specify the cache provider when creating a `Directory`.\n\n```python\nfrom ldapter import Directory\nfrom ldapter import RedisDirectoryCache\nfrom ldapter import inet_org_person_schema\n\n# Create a directory adapter that uses a Redis cache\ncache = RedisDirectoryCache(host=\"localhost\", port=6379, db=0)\ndirectory = Directory(schema=inet_org_person_schema(), cache=cache)\n```\n\nBy default, the Redis cache provider uses the same time-to-live (TTL) \nfor all LDAP search result lists and corresponding LDAP entries. In most\ncases, you will want to differentiate the TTL for an entry, based on the\nobject type, since the probability that an entry will be updated in the\nsource LDAP server tends to vary based on object type. For example,\nattributes about a person change relatively infrequently, while the\ncomposition of groups of people changes more often and it may be\nimportant to observe such changes when groups are used for \nauthorization.\n\nWhen constructing the cache object, you can specify a dict with\nTTLs for different object types defined in the schema.\n\n```python\nfrom datetime import timedelta\nfrom ldapter import Directory\nfrom ldapter import RedisDirectoryCache\nfrom ldapter import inet_org_person_schema\n\n# Create a directory adapter that uses a Redis cache\ncache = RedisDirectoryCache(\n    host=\"localhost\", port=6379, db=0,\n    search_ttl=timedelta(minutes=15),\n    entry_ttl={\n        \"inetOrgPerson\": timedelta(hours=4)\n    })\n\ndirectory = Directory(schema=inet_org_person_schema(), cache=cache)\n```\n\nThe `search_ttl` is used when caching the search criteria (base, scope, \nfilter) and corresponding list of distinguished names that were \nretrieved by a search.\n\nThe `entry_ttl` dict is used when caching the LDAP entries returned by\na search.  By default, the Redis cache provider uses the `objectClass` \nattribute to distinguish LDAP entries by type. It checks the `entry_ttl`\ndict for a TTL specific to the given type. If not found it uses the\n`search_ttl` as the fallback.\n\n### Configuring Redis\n\nWhen using the Redis cache provider, the cache eviction policy is an\nimportant consideration. When the cache encounters memory pressure, \nRedis can evict some cache entries to make room for new additions to\nthe cache. For LDAP, the Redis Least Frequently Used (LFU) eviction\npolicy tends to be good choice. The LFU policy uses an estimator of\ncache entry usage frequency, and tends to prefer evicting cache entries\nthat are unlikely to be needed based on frequency, rather than last\naccess time.\n\nAll cache entries managed by _ldapter_ have a TTL that controls the\nmaximum lifetime of the cache entry -- whether a search result list or \nand LDAP object entry. To configure Redis to evict cache entries based \non the LFU policy, configure a maximum memory size and specify the \nvolatile LFU policy in the Redis configuration.\n\n```\nmaxmemory 2gb\nmaxmemory-policy volatile-lfu \n```\n\n### Optimizing Single Entry Fetches\n\nWhen fetching a specific LDAP entry using the entry's distinguished \nname, the caching implementation can provide an additional optimization,\nallowing a single object search to be satisfied from cache entries\ncreated by prior searches.\n\nA common situation where this optimization is useful is when a UI \nprovides a means to search for a person using the person's name as\nsearch criteria.\n\n```python\npeople = directory.fetch_all(\n    \"dc=example,dc=org\", Scope.SUBTREE, \"(&(sn=Smith)(givenName=Mary*))\")\n```\n\nSince the surname and given name are both quite common, this is likely\nto return several matching entries. In the UI, the matches are presented\nwith other distinguishing attributes (middle name, department, etc)\nallowing the user to select specific person. Often, after the specific\nperson has been selected, there will be a need to fetch the specific\nperson entry again soon after the original search is performed. The subsequent\nsearch could be performed using a filter expression based on some unique\nattribute of LDAP person entry.\n\n```python\nperson = directory.fetch_one(\n    \"dc=example,dc=org\", Scope.SUBTREE, \"uid=liz\")\n```\n\nThis approach will indeed work. However, it will not necessarily\ntake advantage of the fact the person entry to be fetched was just placed\ninto the cache by the prior search. In fact, it will perform an LDAP\nsearch unless the same search criteria (base, scope, filter expression) was \nperformed recently to retrieve this person's LDAP entry.\n\nHowever, if the subsequent fetch for this person object instead used\nthe distinguished name of the person entry, the previously cached \nentry would be returned without the need to perform an LDAP search.\n\n```python\nimport random\nfrom ldapter import Directory, Scope\nfrom ldapter import RedisDirectoryCache\nfrom ldapter import inet_org_person_schema\n\n# Create a directory adapter that uses a Redis cache with default config\ncache = RedisDirectoryCache()\ndirectory = Directory(schema=inet_org_person_schema(), cache=cache)\n\n# Find everyone named Mary Smith\npeople = directory.fetch_all(\n    \"dc=example,dc=org\", Scope.SUBTREE, \"(&(sn=Smith)(givenName=Mary*))\")\n\n# pick one at random\nselected = random.randint(0, len(people))\nselected_person = people[selected]\n\n# get the DN from the selected tuple\ndn = selected_person[0]\n\n# this fetch will be always be satisfied from cache\nperson = directory.fetch_one(dn, Scope.BASE)\n```\n\nWhen the scope is BASE, the search is essentially a primary key search\nand has no filter expression. If the cache contains the entry with the\nrequested DN, there's no reason to perform the search.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://code.vt.edu/crest/ldapter",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "ldapter",
+    "package_url": "https://pypi.org/project/ldapter/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/ldapter/",
+    "project_urls": {
+      "Bug Tracker": "https://code.vt.edu/crest/ldapter/-/issues",
+      "Homepage": "https://code.vt.edu/crest/ldapter"
+    },
+    "release_url": "https://pypi.org/project/ldapter/0.0.10/",
+    "requires_dist": [
+      "python-ldap",
+      "python-dateutil",
+      "redis"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "A lightweight adapter API for python-ldap with read-through caching to Redis",
+    "version": "0.0.10",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11751858,
+  "releases": {
+    "0.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3d96ba0e783533bc29ca90096ff073f46bd76dacef21a9d3e2c4f9903e46be20",
+          "md5": "9a93c12e20a520d6c4ae71e7468392da",
+          "sha256": "1b93a178fe2bc28b28a0464773bb7ec9c32672c6913352d2315a81f256627b5c"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9a93c12e20a520d6c4ae71e7468392da",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 13853,
+        "upload_time": "2021-10-17T17:05:18",
+        "upload_time_iso_8601": "2021-10-17T17:05:18.816598Z",
+        "url": "https://files.pythonhosted.org/packages/3d/96/ba0e783533bc29ca90096ff073f46bd76dacef21a9d3e2c4f9903e46be20/ldapter-0.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2902acb5d947159de08e096134377d6aecf535e8e9abeaacab06d61a825600a8",
+          "md5": "0e9a1a9e087d7300da3afdbc6251c787",
+          "sha256": "ab5ca1bdd79ea0714f8f7697004754b338b91e4fcf470b177aeb1077d7cc1da0"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0e9a1a9e087d7300da3afdbc6251c787",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15450,
+        "upload_time": "2021-10-17T17:05:20",
+        "upload_time_iso_8601": "2021-10-17T17:05:20.178161Z",
+        "url": "https://files.pythonhosted.org/packages/29/02/acb5d947159de08e096134377d6aecf535e8e9abeaacab06d61a825600a8/ldapter-0.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b55a52b37e45c9aedebc6dff8aeabe90ee6454147e401bbf9e99871ddc52e46",
+          "md5": "95bbdf38002b3e2d88bef5e0d31cc196",
+          "sha256": "6651b13bc0cd329452f7fad71ac402253af3544b3acb25d4605117af14807060"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "95bbdf38002b3e2d88bef5e0d31cc196",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.",
+        "size": 13771,
+        "upload_time": "2021-05-06T17:39:12",
+        "upload_time_iso_8601": "2021-05-06T17:39:12.764267Z",
+        "url": "https://files.pythonhosted.org/packages/2b/55/a52b37e45c9aedebc6dff8aeabe90ee6454147e401bbf9e99871ddc52e46/ldapter-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "95487439d7ff40311606a4ba5988fb7d7686b871818b2853dd967020866cbba3",
+          "md5": "7e30806743d9de36cd61317f02bd5e5b",
+          "sha256": "1806025b0695c14cf5c16fa724865ec283915628aa33176e497c3c3f2a1e0297"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7e30806743d9de36cd61317f02bd5e5b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.",
+        "size": 16274,
+        "upload_time": "2021-05-06T17:39:14",
+        "upload_time_iso_8601": "2021-05-06T17:39:14.822037Z",
+        "url": "https://files.pythonhosted.org/packages/95/48/7439d7ff40311606a4ba5988fb7d7686b871818b2853dd967020866cbba3/ldapter-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "765572722485f04679cff18eb81ff2b3dc72d5b6124db7bbc553676d918b30cd",
+          "md5": "a42492a41ef0565cd45b91de643a1399",
+          "sha256": "09cbc4f6977d5f182c680de1a10a0f995fb3528905695e07c69b71e69250438a"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a42492a41ef0565cd45b91de643a1399",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.",
+        "size": 13772,
+        "upload_time": "2021-05-06T17:45:11",
+        "upload_time_iso_8601": "2021-05-06T17:45:11.282505Z",
+        "url": "https://files.pythonhosted.org/packages/76/55/72722485f04679cff18eb81ff2b3dc72d5b6124db7bbc553676d918b30cd/ldapter-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a23c799ba5386a6818695f59323e6e3ad8af9b1a1871fab8e90fae79b0bffab",
+          "md5": "6bc73f60bdd17be43abd6f3d32bce054",
+          "sha256": "b50528cbdbb8887b6d7f5c579536dc93c00ab179bf7205deaa6b7bea9cf35f49"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6bc73f60bdd17be43abd6f3d32bce054",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.",
+        "size": 16289,
+        "upload_time": "2021-05-06T17:45:13",
+        "upload_time_iso_8601": "2021-05-06T17:45:13.256191Z",
+        "url": "https://files.pythonhosted.org/packages/0a/23/c799ba5386a6818695f59323e6e3ad8af9b1a1871fab8e90fae79b0bffab/ldapter-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef044ec7daa66948e3da2ad5978c217546bd0fbba9babee3a1985cb78e4e62d2",
+          "md5": "dcdb581934104b74a18a471503b2724b",
+          "sha256": "a63d0facc2605c5ca315e0c5a59b174067a058c5904520f8a5f8fbd7cc6d2cb3"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dcdb581934104b74a18a471503b2724b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 13788,
+        "upload_time": "2021-05-30T14:35:28",
+        "upload_time_iso_8601": "2021-05-30T14:35:28.768746Z",
+        "url": "https://files.pythonhosted.org/packages/ef/04/4ec7daa66948e3da2ad5978c217546bd0fbba9babee3a1985cb78e4e62d2/ldapter-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a73d5dca2b4dd0f8571d590d2ba8f76e2f1cd4e573140595c62755f495b9fa86",
+          "md5": "15d893d3663936771721c6b7e1a0294f",
+          "sha256": "17e1da536143372933e6ee1fd2d3e264e16c55aa042d6ab0f7f28929970388d9"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "15d893d3663936771721c6b7e1a0294f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15410,
+        "upload_time": "2021-05-30T14:35:29",
+        "upload_time_iso_8601": "2021-05-30T14:35:29.944275Z",
+        "url": "https://files.pythonhosted.org/packages/a7/3d/5dca2b4dd0f8571d590d2ba8f76e2f1cd4e573140595c62755f495b9fa86/ldapter-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3eb18d514fc272f9c642d0147b1c52c7794218d1ca709d36f2cd51c0a09129bf",
+          "md5": "871d68d27fda734c54fdfdfa1e4a33f6",
+          "sha256": "af029da6b8a1d0eef607e9ffd41e3935fe175934ab24924e2e2ee43cc703360d"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "871d68d27fda734c54fdfdfa1e4a33f6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 13799,
+        "upload_time": "2021-10-17T16:31:47",
+        "upload_time_iso_8601": "2021-10-17T16:31:47.873095Z",
+        "url": "https://files.pythonhosted.org/packages/3e/b1/8d514fc272f9c642d0147b1c52c7794218d1ca709d36f2cd51c0a09129bf/ldapter-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02414df138ab507641fe3b2e7f46f148116b1fce399de18b4d58ab17cca3c72c",
+          "md5": "b20648e5f027631b606098277c031e26",
+          "sha256": "1297fc9a87c6919424af09204ce22aba67b226cb1a290803856d5a51eaae9d1d"
+        },
+        "downloads": -1,
+        "filename": "ldapter-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b20648e5f027631b606098277c031e26",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 15436,
+        "upload_time": "2021-10-17T16:31:49",
+        "upload_time_iso_8601": "2021-10-17T16:31:49.401019Z",
+        "url": "https://files.pythonhosted.org/packages/02/41/4df138ab507641fe3b2e7f46f148116b1fce399de18b4d58ab17cca3c72c/ldapter-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3d96ba0e783533bc29ca90096ff073f46bd76dacef21a9d3e2c4f9903e46be20",
+        "md5": "9a93c12e20a520d6c4ae71e7468392da",
+        "sha256": "1b93a178fe2bc28b28a0464773bb7ec9c32672c6913352d2315a81f256627b5c"
+      },
+      "downloads": -1,
+      "filename": "ldapter-0.0.10-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "9a93c12e20a520d6c4ae71e7468392da",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 13853,
+      "upload_time": "2021-10-17T17:05:18",
+      "upload_time_iso_8601": "2021-10-17T17:05:18.816598Z",
+      "url": "https://files.pythonhosted.org/packages/3d/96/ba0e783533bc29ca90096ff073f46bd76dacef21a9d3e2c4f9903e46be20/ldapter-0.0.10-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2902acb5d947159de08e096134377d6aecf535e8e9abeaacab06d61a825600a8",
+        "md5": "0e9a1a9e087d7300da3afdbc6251c787",
+        "sha256": "ab5ca1bdd79ea0714f8f7697004754b338b91e4fcf470b177aeb1077d7cc1da0"
+      },
+      "downloads": -1,
+      "filename": "ldapter-0.0.10.tar.gz",
+      "has_sig": false,
+      "md5_digest": "0e9a1a9e087d7300da3afdbc6251c787",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 15450,
+      "upload_time": "2021-10-17T17:05:20",
+      "upload_time_iso_8601": "2021-10-17T17:05:20.178161Z",
+      "url": "https://files.pythonhosted.org/packages/29/02/acb5d947159de08e096134377d6aecf535e8e9abeaacab06d61a825600a8/ldapter-0.0.10.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

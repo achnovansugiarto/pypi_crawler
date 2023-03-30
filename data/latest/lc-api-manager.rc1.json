@@ -1,0 +1,137 @@
+{
+  "info": {
+    "author": "libcommon",
+    "author_email": "libcommon@protonmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# api-manager-py\n\n## Overview\n\nMany APIs with rate limits push responsibility on API users to manage rate limiting, including those with SDKs.\n`api-manager-py` is a Python library that aims to abstract away the complexity of managing rate limits,\nallowing developers to focus on retrieving desired data without hacking together buggy, case-by-case solutions.\nThe API management functionality does not require using a specific library for interacting with an API, and will\nautomatically cache responses based on input parameters to reduce network IO. Simply implement a small API client\ninterface and start making requests.\n\n## Installation\n\n### Install from PyPi (preferred method)\n\n```bash\npip install lc-api-manager\n```\n\n### Install from GitHub with Pip\n\n```bash\npip install git+https://github.com/libcommon/api-manager-py.git@vx.x.x#egg=lc_api_manager\n```\n\nwhere `x.x.x` is the version you want to download.\n\n## Install by Manual Download\n\nTo download the source distribution and/or wheel files, navigate to\n`https://github.com/libcommon/api-manager-py/tree/releases/vx.x.x/dist`, where `x.x.x` is the version you want to install,\nand download either via the UI or with a tool like wget. Then to install run:\n\n```bash\npip install <downloaded file>\n```\n\nDo _not_ change the name of the file after downloading, as Pip requires a specific naming convention for installation files.\n\n## Dependencies\n\n`api-manager-py` depends on the [lc-cache](https://pypi.org/project/lc-cache/) library for caching API responses. Only\nPython versions >= 3.6 are officially supported.\n\n## Getting Started\n\nThe first step is to implement an `APIClient` and choose a library to make HTTP requests. One common choice is the\n[Requests](https://2.python-requests.org/en/master/) library, which we'll use to implement a client for the [GitHub REST API\nv3](https://developer.github.com/v3/). The domain for GitHub's API is `https://api.github.com`, so the client's `request` method\nonly needs the HTTP method (`GET`, `POST`, etc.), API endpoint (i.e., `/repos/<username>/<repo_name>`), and optional `headers`,\n`params`, and `data` dictionaries (see: [Requests documentation](https://2.python-requests.org/en/master/user/quickstart/#make-a-request)).\n\n```python\nfrom hashlib import sha256\nfrom typing import Any, Dict, Optional\n\nimport requests\nfrom requests import Response\n\nfrom lc_api_manager import APIClient\n\nclass GitHubAPIClient(APIClient):\n    \"\"\"API client for GitHub Rest API v3.\"\"\"\n    __slots__ = (\"_headers\",)\n\n    def __init__(self, auth_token: Optional[str] = None) -> None:\n        \"\"\"Initialize API client with optional GitHub API oauth token\n        see: https://developer.github.com/v3/#authentication.\n        \"\"\"\n        if auth_token:\n            self._headers = {\"Authorization\": \"token {}\".format(auth_token)}\n        else:\n            self._headers = dict()\n\n    def process_response_for_cache(self, response: Optional[Response]) -> Optional[str]:\n        \"\"\"Return the SHA-256 hash of the API response if not None.\"\"\"\n        if response:\n            return sha256(response.text.encode(\"utf8\")).hexdigest()\n        return None\n\n    def request(http_method: str,\n                api_endpoint: str,\n                headers: Optional[Dict[str, Any]],\n                params: Optional[Dict[str, Any]],\n                data: Optional[Dict[Any, Any]]) -> Response:\n        \"\"\"Make request to GitHub REST API endpoint with provided\n        headers, URL parameters, and data and return response.\"\"\"\n        # Merge authorization header with provided headers\n        merged_headers = self._headers\n        if headers:\n            merged_headers.update(headers)\n\n        # Construct full URL and make request\n        url = \"https://api.github.com/{}\".format(api_endpoint.lstrip(\"/\"))\n        response = requests.request(http_method.upper(), url, params=params, data=data, headers=merged_headers)\n\n        # Raise error if status code is 4XX or 5XX\n        response.raise_for_status()\n        return response\n```\n\nWith a functional `APIClient`, we can start making requests and caching them using the built-in `APIManager` class:\n\n```python\nfrom lc_api_manager import APIManager\nfrom lc_cache import HashmapCache\n\ndef main() -> int:\n    \"\"\"Make 60 unauthenticated requests to an API endpoint in rapid succession.\"\"\"\n    api_manager = APIManager(3600, # GitHub API allows 60 unauthenticated requests per hour\n                             60,\n                             GitHubAPIClient(),\n                             HashmapCache())\n\n    # Make 60 requests to the same API endpoint\n    for _ in range(60):\n        # The API manager will make the request on first iteration,\n        # but will return cached response on the other 59\n        response = api_manager.request(\"GET\", \"repos/libcommon/api-manager-py\", params=dict(per_page=100))\n\n    # Check rate limit status, should be 59 requests remaining\n    # See: https://developer.github.com/v3/rate_limit/\n    response = api_manager.request(\"GET\", \"rate_limit\")\n    requests_remaining = response.json().get(\"resources\").get(\"core\").get(\"remaining\")\n    assert(requests_remaining == 59)\n\n    return 0\n\nif __name__ == \"__main__\":\n    main()\n```\n\nIf you are running multiple Python processes requesting data from the same API, and want to ensure that all of them\nrespect the rate limit requirements, you could override the `APIManager.update_state` method. The `APIManager` constructor\nhas a parameter called `updated_state_before_request`, which defaults to False. If you set this to `True`, the `update_state`\nmethod will be called before every API request, and thus can be used to sync rate limiting state across multiple processes.\nFor example, you could use the `/rate_limit` GitHub API endpoint to implement this method:\n\n```python\nfrom lc_api_manager import APIManager\n\n\ndef GitHubAPIManager(APIManager):\n    \"\"\"API manager for GitHub REST API v3 that syncs rate limiting state.\"\"\"\n    __slots__ = ()\n\n    def __init__(self, *args, **kwargs) -> None:\n        if not kwargs.get(\"update_state_before_request\"):\n            kwargs[\"update_state_before_request\"] = True\n        super().__init__(*args, **kwargs)\n\n    def update_state(self) -> None:\n        \"\"\"Make request to /rate_limit endpoint and update rate limit status.\"\"\"\n        response = self._client.request(\"GET\", \"rate_limit\")\n        requests_remaining = response.json().get(\"resources\").get(\"core\").get(\"remaining\")\n        self._count = self._threshold - requests_remaining\n```\n\n## Contributing/Suggestions\n\nContributions and suggestions are welcome! To make a feature request, report a bug, or otherwise comment on existing\nfunctionality, please file an issue. For contributions please submit a PR, but make sure to lint, type-check, and test\nyour code before doing so. Thanks in advance!\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/libcommon/api-manager-py",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "lc-api-manager",
+    "package_url": "https://pypi.org/project/lc-api-manager/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/lc-api-manager/",
+    "project_urls": {
+      "Homepage": "https://github.com/libcommon/api-manager-py",
+      "Issue Tracker": "https://github.com/libcommon/api-manager-py/issues",
+      "Releases": "https://github.com/libcommon/api-manager-py/releases"
+    },
+    "release_url": "https://pypi.org/project/lc-api-manager/0.1.1/",
+    "requires_dist": [
+      "lc-cache"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7291308,
+  "releases": {
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e56bce7fe1e68f06b52e4bbeddebf80828933f897ea66745e7c5a82487c77100",
+          "md5": "4d9e0fb84421303ae675cc14a50deeaf",
+          "sha256": "672022ca0da6efba06084e377b017f39183b99c1af8c3eec868851aaf7c4b093"
+        },
+        "downloads": -1,
+        "filename": "lc_api_manager-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4d9e0fb84421303ae675cc14a50deeaf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 10527,
+        "upload_time": "2020-05-21T04:53:36",
+        "upload_time_iso_8601": "2020-05-21T04:53:36.550843Z",
+        "url": "https://files.pythonhosted.org/packages/e5/6b/ce7fe1e68f06b52e4bbeddebf80828933f897ea66745e7c5a82487c77100/lc_api_manager-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a503e5c85f598d06d71b17b583eec4af6003f90585db0c42c1b4c237ec8ad8aa",
+          "md5": "72a2fd4b22779e653c7d51f842b61467",
+          "sha256": "a118ce7acc00b24d50906addb84e2f0053ffae900139b6d471c553b4299e2f38"
+        },
+        "downloads": -1,
+        "filename": "lc_api_manager-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "72a2fd4b22779e653c7d51f842b61467",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8640,
+        "upload_time": "2020-05-21T04:53:38",
+        "upload_time_iso_8601": "2020-05-21T04:53:38.510984Z",
+        "url": "https://files.pythonhosted.org/packages/a5/03/e5c85f598d06d71b17b583eec4af6003f90585db0c42c1b4c237ec8ad8aa/lc_api_manager-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e56bce7fe1e68f06b52e4bbeddebf80828933f897ea66745e7c5a82487c77100",
+        "md5": "4d9e0fb84421303ae675cc14a50deeaf",
+        "sha256": "672022ca0da6efba06084e377b017f39183b99c1af8c3eec868851aaf7c4b093"
+      },
+      "downloads": -1,
+      "filename": "lc_api_manager-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "4d9e0fb84421303ae675cc14a50deeaf",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 10527,
+      "upload_time": "2020-05-21T04:53:36",
+      "upload_time_iso_8601": "2020-05-21T04:53:36.550843Z",
+      "url": "https://files.pythonhosted.org/packages/e5/6b/ce7fe1e68f06b52e4bbeddebf80828933f897ea66745e7c5a82487c77100/lc_api_manager-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a503e5c85f598d06d71b17b583eec4af6003f90585db0c42c1b4c237ec8ad8aa",
+        "md5": "72a2fd4b22779e653c7d51f842b61467",
+        "sha256": "a118ce7acc00b24d50906addb84e2f0053ffae900139b6d471c553b4299e2f38"
+      },
+      "downloads": -1,
+      "filename": "lc_api_manager-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "72a2fd4b22779e653c7d51f842b61467",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 8640,
+      "upload_time": "2020-05-21T04:53:38",
+      "upload_time_iso_8601": "2020-05-21T04:53:38.510984Z",
+      "url": "https://files.pythonhosted.org/packages/a5/03/e5c85f598d06d71b17b583eec4af6003f90585db0c42c1b4c237ec8ad8aa/lc_api_manager-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

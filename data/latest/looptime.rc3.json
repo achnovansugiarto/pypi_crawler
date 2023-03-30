@@ -1,0 +1,218 @@
+{
+  "info": {
+    "author": "Sergey Vasilyev",
+    "author_email": "nolar@nolar.info",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Fast-forward asyncio event loop time (in tests)\n\n[![CI](https://github.com/nolar/looptime/workflows/Thorough%20tests/badge.svg)](https://github.com/nolar/looptime/actions/workflows/thorough.yaml)\n[![codecov](https://codecov.io/gh/nolar/looptime/branch/main/graph/badge.svg)](https://codecov.io/gh/nolar/looptime)\n[![Coverage Status](https://coveralls.io/repos/github/nolar/looptime/badge.svg?branch=main)](https://coveralls.io/github/nolar/looptime?branch=main)\n[![Total alerts](https://img.shields.io/lgtm/alerts/g/nolar/looptime.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nolar/looptime/alerts/)\n[![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/nolar/looptime.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/nolar/looptime/context:python)\n[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)\n\n## What?\n\nFake the flow of time in asyncio event loops.\nThe effects of time removal can be seen from both sides:\n\n* From the **event loop's (i.e. your tests') point of view,**\n  all external activities, such as synchronous executor calls (thread pools)\n  and i/o with sockets, servers, files, happen in zero amount of the loop time —\n  even if it takes some real time.\n  This hides the code overhead and network latencies from the time measurements,\n  making the loop time sharply and predictably advancing in configured steps.\n\n* From the **observer's (i.e. your) point of view,**\n  all activities of the event loop, such as sleeps, events/conditions waits,\n  timeouts, \"later\" callbacks, happen in near-zero amount of the real time\n  (above the usual code overhead).\n  This speeds up the execution of tests without breaking the tests' time-based\n  design, even if they are designed to run in seconds or minutes.\n\nFor the latter case, there are a few exceptions when the event loop's activities\nare synced with the true-time external activities, such as thread pools or i/o,\nso that they spend the real time above the usual code overhead (if configured).\n\nThe library was originally developed for [Kopf](https://github.com/nolar/kopf),\na framework for [Kubernetes Operators in Python](https://github.com/nolar/kopf),\nwhich actively uses asyncio tests in pytest (≈7000 unit-tests in ≈2 minutes).\nYou can see how this library changes and simplifies the tests in\n[Kopf's PR #881](https://github.com/nolar/kopf/pull/881).\n\n\n## Why?\n\nWithout `looptime`, the event loops use `time.monotonic()` for the time,\nwhich also captures the code overhead and the network latencies, adding little\nrandom fluctuations to the time measurements (approx. 0.01-0.001 seconds).\n\nWithout `looptime`, the event loops spend the real wall-clock time\nwhen there is no i/o happening but some callbacks are scheduled for later.\nIn controlled environments like unit tests and fixtures, this time is wasted.\n\nAlso, because I can! (It was a little over-engineering exercise for fun.)\n\n\n## Problem\n\nIt is difficult to test complex asynchronous coroutines with the established\nunit-testing practices since there are typically two execution flows happening\nat the same time:\n\n* One is for the coroutine-under-test which moves between states\n  in the background.\n* Another one is for the test itself, which controls the flow\n  of that coroutine-under-test: it sets events, injects data, etc.\n\nIn textbook cases with simple coroutines that are more like regular functions,\nit is possible to design a test so that it runs straight to the end in one hop\n— with all the preconditions set and data prepared in advance in the test setup.\n\nHowever, in real-world cases, the tests often must verify that\nthe coroutine stops at some point, waits for a condition for some limited time,\nand then passes or fails.\n\nThe problem is often \"solved\" by mocking the low-level coroutines of sleep/wait\nthat we expect the coroutine-under-test to call. But this violates the main\nprinciple of good unit-tests: test the promise, not the implementation.\nMocking and checking the low-level coroutines is based on the assumptions\nof how the coroutine is implemented internally, which can change over time.\nGood tests do not change on refactoring if the protocol remains the same.\n\nAnother (straightforward) approach is to not mock the low-level routines, but\nto spend the real-world time, just in short bursts as hard-coded in the test.\nNot only it makes the whole test-suite slower, it also brings the execution\ntime close to the values where the code overhead affects the timing\nand makes it difficult to assert on the coroutine's pure time.\n\n\n## Solution\n\nSimilar to the mentioned approaches, to address this issue, `looptime`\ntakes care of mocking the event loop and removes this hassle from the tests.\n\nHowever, unlike the tests, `looptime` does not mock the typically used\nlow-level coroutines (e.g. sleep), primitives (e.g. events/conditions),\nor library calls (e.g. requests getting/posting, sockets reading/writing, etc).\n\n`looptime` goes deeper and mocks the very foundation of it all — the time itself.\nThen, it controllably moves the time forward in sharp steps when the event loop\nrequests the actual true-time sleep from the underlying selectors (i/o sockets).\n\n\n## Examples\n\nHere, we assume that the async tests are supported. For example,\nuse [`pytest-asyncio`](https://github.com/pytest-dev/pytest-asyncio):\n\n```bash\npip install pytest-asyncio\npip install looptime\n```\n\nNothing is needed to make async tests run with the fake time, it just works:\n\n```python\nimport asyncio\nimport pytest\n\n\n@pytest.mark.asyncio\nasync def test_me():\n    await asyncio.sleep(100)\n    assert asyncio.get_running_loop().time() == 100\n```\n\n```bash\npytest --looptime\n```\n\nThe test will be executed in approximately **0.01 seconds**,\nwhile the event loop believes it is 100 seconds old.\n\nIf the command line or ini-file options for all tests is not desirable,\nindividual tests can be marked for fast time forwarding explicitly:\n\n```python\nimport asyncio\nimport pytest\n\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_me():\n    await asyncio.sleep(100)\n    assert asyncio.get_running_loop().time() == 100\n```\n\n```bash\npytest\n```\n\nUnder the hood, the library solves some nuanced situations with time in tests.\nSee \"Nuances\" below for more complicated (and nuanced) examples.\n\n\n## Markers\n\n`@pytest.mark.looptime` configures the test's options if and when it is\nexecuted with the timeline replaced to fast-forwarding time.\nIn normal mode with no configs/CLI options specified,\nit marks the test to be executed with the time replaced.\n\n`@pytest.mark.looptime(False)` (with the positional argument)\nexcludes the test from the time fast-forwarding under any circumstances.\nThe test will be executed with the loop time aligned with the real-world time.\nUse it only for the tests that are designed to be true-time-based.\n\nNote that markers can be applied not only to individual tests,\nbut also to whole test suites (classes, modules, packages):\n\n```python\nimport asyncio\nimport pytest\n\npytestmark = [\n  pytest.mark.asyncio,\n  pytest.mark.looptime(end=60),\n]\n\n\nasync def test_me():\n    await asyncio.sleep(100)\n```\n\nThe markers can also be artificially injected by plugins/hooks if needed:\n\n```python\nimport asyncio\nimport pytest\n\n@pytest.hookimpl(hookwrapper=True)\ndef pytest_pycollect_makeitem(collector, name, obj):\n    if collector.funcnamefilter(name) and asyncio.iscoroutinefunction(obj):\n        pytest.mark.asyncio(obj)\n        pytest.mark.looptime(end=60)(obj)\n    yield\n```\n\nAll in all, the `looptime` plugin uses the most specific (the \"closest\") value\nfor each setting separately (i.e. not the closest marker as a whole).\n\n\n## Options\n\n`--looptime` enables time fast-forwarding for all tests that are not explicitly\nmarked as using the fake loop time —including those not marked at all—\nas if all tests were implicitly marked.\n\n`--no-looptime` runs all tests —both marked and unmarked— with the real time.\nThis flag effectively disables the plugin.\n\n\n## Settings\n\nThe marker accepts several settings for the test. The closest to the test\nfunction applies. This lets you define the test-suite defaults\nand override them on the directory, module, class, function, or test level:\n\n```python\nimport asyncio\nimport pytest\n\npytestmark = pytest.mark.looptime(end=10, idle_timeout=1)\n\n@pytest.mark.asyncio\n@pytest.mark.looptime(end=101)\nasync def test_me():\n    await asyncio.sleep(100)\n    assert asyncio.get_running_loop().time() == 100\n```\n\n\n### The time zero\n\n`start` (`float` or `None`, or a no-argument callable that returns the same)\nis the initial time of the event loop.\n\nIf it is callable, it is invoked once per event loop to get the value:\ne.g. `start=time.monotonic` to align with the true time,\nor `start=lambda: random.random() * 100` to add some unpredictability.\n\n`None` is treated the same as `0.0`.\n\nThe default is `0.0`.\n\n\n### The end of time\n\n`end` (`float` or `None`, or a no-argument callable that returns the same)\nis the final time in the event loop (the internal fake time).\nIf it is reached, all tasks get terminated and the test is supposed to fail.\nThe injected exception is `LoopTimeoutError`,\na subclass of `asyncio.TimeoutError`.\n\nAll test-/fixture-finalizing routines will have their fair chance to execute\nas long as they do not move the loop time forward, i.e. they take zero time:\ne.g. with `asyncio.sleep(0)`, simple `await` statements, etc.\n\nIf set to `None`, there is no end of time, and the event loop runs\nas long as needed. Note: `0` means ending the time immediately on start.\n\nIf it is a callable, it is called once per event loop to get the value:\ne.g. `end=lambda: time.monotonic() + 10`.\n\nThe end of time is not the same as timeouts — see the nuances below\non differences with `async-timeout`.\n\n\n## Nuances\n\n### Preliminary execution\n\nConsider this test:\n\n```python\nimport asyncio\nimport async_timeout\nimport pytest\n\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_me():\n    async with async_timeout.timeout(9):\n        await asyncio.sleep(1)\n```\n\nNormally, it should not fail. However, with fake time (without workarounds)\nthe following scenario is possible:\n\n* `async_timeout` library sets its delayed timer at 9 seconds since now.\n* the event loop notices that there is only one timer at T0+9s.\n* the event loop fast-forwards time to be `9`.\n* since there are no other handles/timers, that timer is executed.\n* `async_timeout` fails the test with `asyncio.TimeoutError`\n* The `sleep()` never gets any chance to be scheduled or executed.\n\nTo solve this, `looptime` performs several dummy zero-time no-op cycles\nbefore actually moving the time forward. This gives other coroutines,\ntasks, and handles their fair chance to be entered, spawned, scheduled.\nThis is why the example works as intended.\n\nThe `noop_cycles` (`int`) setting is how many cycles the event loop makes.\nThe default is `42`. Why 42? Well, …\n\n\n### Slow executors\n\nConsider this test:\n\n```python\nimport asyncio\nimport async_timeout\nimport contextlib\nimport pytest\nimport threading\n\n\ndef sync_fn(event: threading.Event):\n    event.set()\n\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_me(event_loop):\n    sync_event = threading.Event()\n    with contextlib.suppress(asyncio.TimeoutError):\n        async with async_timeout.timeout(9):\n            await event_loop.run_in_executor(None, sync_fn, sync_event)\n    assert sync_event.is_set()\n```\n\nWith the true time, this test will finish in a fraction of a second.\nHowever, with the fake time (with no workarounds), the following happens:\n\n* A new synchronous event is created, it is unset by default.\n* A synchronous task is submitted to a thread pool executor.\n* The thread pool starts spawning a new thread and passing the task there.\n* An asynchronous awaitable (future) is returned, which is chained\n  with its synchronous counterpart.\n* `looptime` performs its no-op cycles, letting all coroutines to start,\n  but it does this in near-zero true-time.\n* The event loop forwards its time to 9 seconds and raises a timeout error.\n* The test suppresses the timeout, checks the assertion, and fails:\n  the sync event is still unset.\n* A fraction of a second (e.g. `0.001` second) later, the thread starts,\n  calls the function and sets the sync event, but it is too late.\n\nCompared to the fake fast-forwarding time, even such fast things as threads\nare too slow to start. Unfortunately, `looptime` and the event loop can\nneither control what is happening outside of the event loop nor predict\nhow long it will take.\n\nTo work around this, `looptime` remembers all calls to executors and then\nkeeps track of the futures they returned. Instead of fast-forwarding the time\nby 9 seconds all at once, `looptime` fast-forwards the loop's fake time\nin small steps and also does the true-time sleep for that step.\nSo, the fake time and real time move along while waiting for executors.\n\nLuckily for this case, in 1 or 2 such steps, the executor's thread will\ndo its job, the event will be set, so as the synchronous & asynchronous\nfutures of the executor. The latter one (the async future) will also\nlet the `await` move on.\n\nThe `idle_step` (`float` or `None`) setting is the duration of a single\ntime step when fast-forwarding the time if there are executors used —\ni.e. if some synchronous tasks are running in the thread pools.\n\nNote that the steps are both true-time and fake-time: they spend the same\namount of the observer's true time as they increment the loop's fake time.\n\nA negative side effect: the thread spawning can be potentially much faster,\ne.g. finish in in 0.001 second; but it will be rounded to be the round number\nof steps with no fractions: e.g. 0.01 or 0.02 seconds in this example.\n\nA trade-off: the smaller step will get the results faster,\nbut will spend more CPU power on resultless cycles.\n\n\n### I/O idle\n\nConsider this test:\n\n```python\nimport aiohttp\nimport pytest\n\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_me():\n    async with aiohttp.ClientSession(timeout=None) as session:\n        await session.get('http://some-unresponsive-web-site.com')\n```\n\nHow long should it take if there are no implicit timeouts deep in the code?\nWith no workarounds, the test will hang forever waiting for the i/o to happen.\nThis mostly happens when the only thing left in the event loop is the i/o,\nall internal scheduled callbacks are gone.\n\n`looptime` can artificially limit the lifetime of the event loop.\nThis can be done as a default setting for the whole test suite, for example.\n\nThe `idle_timeout` (`float` or `None`) setting is the true-time limit\nof the i/o wait in the absence of scheduled handles/timers/timeouts.\n(This i/o includes the dummy i/o used by `loop.call_soon_threadsafe()`.)\n`None` means there is no timeout waiting for the i/o, i.e. it waits forever.\nThe default is `1.0` seconds.\n\nIf nothing happens within this time, the event loop assumes that nothing\nwill happen ever, so it is a good idea to cease its existence: it injects\n`IdleTimeoutError` (a subclass of `asyncio.TimeoutError`) into all tasks.\n\nThis is similar to how the end-of-time behaves, except that it is measured\nin the true-time timeline, while the end-of-time is the fake-time timeline.\nBesides, once an i/o happens, the idle timeout is reset, while the end-of-time\nstill can be reached.\n\nThe `idle_step` (`float` or `None`) setting synchronises the flow\nof the fake-time with the flow of the true-time while waiting for the i/o\nor synchronous futures, i.e. when nothing happens in the event loop itself.\nIt sets the single step increment of both timelines.\n\nIf the step is not set or set to `None`, the loop time does not move regardless\nof how long the i/o or synchronous futures take in the true time\n(with or without the timeout).\n\nIf the `idle_step` is set, but the `idle_timeout` is `None`,\nthen the fake time flows naturally in sync with the true time infinitely.\n\nThe default is `None`.\n\n\n### Timeouts vs. the end-of-time\n\nThe end of time might look like a global timeout, but it is not the same,\nand it is better to use other methods for restricting the execution time:\ne.g. [`async-timeout`](https://github.com/aio-libs/async-timeout)\nor native `asyncio.wait_for(…, timeout=…)`.\n\nFirst, the mentioned approaches can be applied to arbitrary code blocks,\neven multiple times independently,\nwhile `looptime(end=N)` applies to the lifecycle of the whole event loop,\nwhich is usually the duration of the whole test and monotonically increases.\n\nSecond, `looptime(end=N)` syncs the loop time with the real time for N seconds,\ni.e. it does not instantly fast-forward the loop time when the loops\nattempts to make an \"infinite sleep\" (technically, `selector.select(None)`).\n`async_timeout.timeout()` and `asyncio.wait_for()` set a delayed callback,\nso the time fast-forwards to it on the first possible occasion.\n\nThird, once the end-of-time is reached in the event loop, all further attempts\nto run async coroutines will fail (except those taking zero loop time).\nIf the async timeout is reached, further code can proceed normally.\n\n```python\nimport asyncio\nimport pytest\n\n@pytest.mark.asyncio\n@pytest.mark.looptime(end=10)\nasync def test_the_end_of_time(chronometer, looptime):\n    with chronometer:\n        with pytest.raises(asyncio.TimeoutError):\n            await asyncio.Event().wait()\n    assert looptime == 10\n    assert chronometer >= 10\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_async_timeout(chronometer, looptime):\n    with chronometer:\n        with pytest.raises(asyncio.TimeoutError):\n            await asyncio.wait_for(asyncio.Event().wait(), timeout=10)\n    assert looptime == 10\n    assert chronometer < 0.1\n```\n\n\n### Time resolution\n\nPython (so as many other languages) has issues with calculating the floats:\n\n```\n>>> 0.2-0.05\n0.15000000000000002\n>>> 0.2-0.19\n0.010000000000000009\n>>> 0.2+0.21\n0.41000000000000003\n>>> 100_000 * 0.000_001\n0.09999999999999999\n```\n\nThis can break the assertions on the time and durations. To work around\nthe issue, `looptime` internally performs all the time math in integers.\nThe time arguments are converted to the internal integer form\nand back to the floating-point form when needed.\n\nThe `resolution` (`float`) setting is the minimum supported time step.\nAll time steps smaller than that are rounded to the nearest value.\n\nThe default is 1 microsecond, i.e. `0.000001` (`1e-6`), which is good enough\nfor typical unit-tests while keeps the integers smaller than 32 bits\n(1 second => 20 bits; 32 bits => 4294 seconds ≈1h11m).\n\nNormally, you should not worry about it or configure it.\n\n_A side-note: in fact, the reciprocal (1/x) of the resolution is used.\nFor example, with the resolution `0.001`, the time\n`1.0` (float) becomes `1000` (int),\n`0.1` (float) becomes `100` (int),\n`0.01` (float) becomes `10` (int),\n`0.001` (float) becomes `1` (int);\neverything smaller than `0.001` becomes `0` and probably misbehaves._\n\n\n## Extras\n\n### Chronometers\n\nFor convenience, the library also provides a class and a fixture\nto measure the duration of arbitrary code blocks in real-world time:\n\n* `looptime.Chronometer` (a context manager class).\n* `chronometer` (a pytest fixture).\n\nIt can be used as a sync or async context manager:\n\n```python\nimport asyncio\nimport pytest\n\n@pytest.mark.asyncio\n@pytest.mark.looptime\nasync def test_me(chronometer):\n    with chronometer:\n        await asyncio.sleep(1)\n        await asyncio.sleep(1)\n    assert chronometer.seconds < 0.01  # random code overhead\n```\n\nUsually, the loop-time duration is not needed or can be retrieved via\n`asyncio.get_running_loop().time()`. If needed, it can be measured using\nthe provided context manager class with the event loop's clock:\n\n```python\nimport asyncio\nimport looptime\nimport pytest\n\n@pytest.mark.asyncio\n@pytest.mark.looptime(start=100)\nasync def test_me(chronometer, event_loop):\n    with chronometer, looptime.Chronometer(event_loop.time) as loopometer:\n        await asyncio.sleep(1)\n        await asyncio.sleep(1)\n    assert chronometer.seconds < 0.01  # random code overhead\n    assert loopometer.seconds == 2  # precise timing, no code overhead\n    assert event_loop.time() == 102\n```\n\n\n### Loop time assertions\n\nThe `looptime` **fixture** is syntax sugar for easy loop time assertions::\n\n```python\nimport asyncio\nimport pytest\n\n@pytest.mark.asyncio\n@pytest.mark.looptime(start=100)\nasync def test_me(looptime):\n    await asyncio.sleep(1.23)\n    assert looptime == 101.23\n```\n\nTechnically, it is a proxy object to `asyncio.get_running_loop().time()`.\nThe proxy object supports the direct comparison with numbers (integers/floats),\nso as some basic arithmetics (adding, subtracting, multiplication, etc).\nHowever, it adjusts to the time precision of 1 nanosecond (1e-9): every digit\nbeyond that precision is ignored — so you can be not afraid of\n`123.456/1.2` suddenly becoming `102.88000000000001` and not equal to `102.88`\n(as long as the time proxy object is used and not converted to a native float).\n\nThe proxy object can be used to create a new proxy that is bound to a specific\nevent loop (it works for loops both with fake- and real-world time)::\n\n```python\nimport asyncio\nfrom looptime import patch_event_loop\n\ndef test_me(looptime):\n    new_loop = patch_event_loop(asyncio.new_event_loop(), start=100)\n    new_loop.run_until_complete(asyncio.sleep(1.23))\n    assert looptime @ new_loop == 101.23\n```\n\nMind that it is not the same as `Chronographer` for the whole test.\nThe time proxy reflects the time of the loop, not the duration of the test:\nthe loop time can start at a non-zero point; even if it starts at zero,\nthe loop time also includes the time of all fixtures setups.\n\n\n### Custom event loops\n\nDo you use a custom event loop? No problem! Create a test-specific descendant\nwith the provided mixin — and it will work the same as the default event loop.\n\n```python\nimport looptime\nimport pytest\nfrom wherever import CustomEventLoop\n\n\nclass LooptimeCustomEventLoop(looptime.LoopTimeEventLoop, CustomEventLoop):\n  pass\n\n\n@pytest.fixture\ndef event_loop():\n    return LooptimeCustomEventLoop()\n```\n\nOnly selector-based event loops are supported: the event loop must rely on\n`self._selector.select(timeout)` to sleep for `timeout` true-time seconds.\nEverything that inherits from `asyncio.BaseEventLoop` should work.\n\nYou can also patch almost any event loop class or event loop object\nthe same way as `looptime` does that (via some dirty hackery):\n\n```python\nimport asyncio\nimport looptime\nimport pytest\n\n\n@pytest.fixture\ndef event_loop():\n    loop = asyncio.new_event_loop()\n    return looptime.patch_event_loop(loop)\n```\n\n`looptime.make_event_loop_class(cls)` constructs a new class that inherits\nfrom the referenced class and the specialised event loop class mentioned above.\nThe resulting classes are cached, so it can be safely called multiple times.\n\n`looptime.patch_event_loop()` replaces the event loop's class with the newly\nconstructed one. For those who care, it is an equivalent of the following hack\n(some restrictions apply to the derived class):\n\n```python\nloop.__class__ = looptime.make_event_loop_class(loop.__class__)\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/nolar/looptime",
+    "keywords": "asyncio,event loop,time,python,pytest",
+    "license": "MIT",
+    "maintainer": "Sergey Vasilyev",
+    "maintainer_email": "nolar@nolar.info",
+    "name": "looptime",
+    "package_url": "https://pypi.org/project/looptime/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/looptime/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/nolar/looptime/issues",
+      "Homepage": "https://github.com/nolar/looptime",
+      "Source Code": "https://github.com/nolar/looptime"
+    },
+    "release_url": "https://pypi.org/project/looptime/0.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "Fast-forward asyncio event loop time (in tests)",
+    "version": "0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12407973,
+  "releases": {
+    "0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f449be8db04f0bb5a08b15e9dd38111891f9d6bebc4efee9cee8b7c246027ef",
+          "md5": "1c2d18902f6324eed95c765e371924e4",
+          "sha256": "9be5ffd3c317bbdd2e2d510522c364a5d7fd1d689b329a9979b085684324f5dd"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1c2d18902f6324eed95c765e371924e4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 2783,
+        "upload_time": "2021-12-16T13:26:04",
+        "upload_time_iso_8601": "2021-12-16T13:26:04.195515Z",
+        "url": "https://files.pythonhosted.org/packages/5f/44/9be8db04f0bb5a08b15e9dd38111891f9d6bebc4efee9cee8b7c246027ef/looptime-0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "931426171aff6d2949aeafdf740bffc2d254e18cd035aafd4d41aeebf8154a56",
+          "md5": "d39825a63e39f8c77092a786282fb9c9",
+          "sha256": "dcc648a40544fd22671f522dbea4f574c1b352161c2e14292121fa1585d27666"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d39825a63e39f8c77092a786282fb9c9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 5761,
+        "upload_time": "2021-12-16T13:26:05",
+        "upload_time_iso_8601": "2021-12-16T13:26:05.178288Z",
+        "url": "https://files.pythonhosted.org/packages/93/14/26171aff6d2949aeafdf740bffc2d254e18cd035aafd4d41aeebf8154a56/looptime-0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f29200ab98c541b0b384243bdb28300303e528bcd94e930f7a9b6b60be03353",
+          "md5": "d5dd514e763ab779cd950a1d386e636a",
+          "sha256": "024ce1d779240238526f434a205ce35df0117da05f738ef81b9e58b399b37695"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d5dd514e763ab779cd950a1d386e636a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 19214,
+        "upload_time": "2021-12-26T11:45:06",
+        "upload_time_iso_8601": "2021-12-26T11:45:06.370501Z",
+        "url": "https://files.pythonhosted.org/packages/4f/29/200ab98c541b0b384243bdb28300303e528bcd94e930f7a9b6b60be03353/looptime-0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7952635302f350325a9bceea4cf878873be1a2d6b85cfdf875d0545458afd163",
+          "md5": "34b479e8e6102f5c50d492e267d1e62a",
+          "sha256": "10e2354cdf83c1d21d4f91900e8462b99c603dec276a28119b20ae6962442f88"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "34b479e8e6102f5c50d492e267d1e62a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31466,
+        "upload_time": "2021-12-26T11:45:08",
+        "upload_time_iso_8601": "2021-12-26T11:45:08.068892Z",
+        "url": "https://files.pythonhosted.org/packages/79/52/635302f350325a9bceea4cf878873be1a2d6b85cfdf875d0545458afd163/looptime-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a35369aa72058ff465e64d035cd4aff299ae579627dfffc9bc3c9bf6a15a8240",
+          "md5": "07b0480687fc81fa751e28aa6ee6acb7",
+          "sha256": "01755261e8e919de973f442961c4eadf309ce7fcf3102b626bc0bc4a734ad400"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "07b0480687fc81fa751e28aa6ee6acb7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 19196,
+        "upload_time": "2021-12-26T12:07:12",
+        "upload_time_iso_8601": "2021-12-26T12:07:12.465887Z",
+        "url": "https://files.pythonhosted.org/packages/a3/53/69aa72058ff465e64d035cd4aff299ae579627dfffc9bc3c9bf6a15a8240/looptime-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f01c8f106ee9dc41e325310f8708cf7b63a3104a2f8e49955cc93505fad37763",
+          "md5": "5aa0c28dd8af57adcdc63ef1e3effc21",
+          "sha256": "f2cbea15d01099fd4df4b78d3b36e9f5c7202706e1846f44135ef037e174b278"
+        },
+        "downloads": -1,
+        "filename": "looptime-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5aa0c28dd8af57adcdc63ef1e3effc21",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31429,
+        "upload_time": "2021-12-26T12:07:14",
+        "upload_time_iso_8601": "2021-12-26T12:07:14.006995Z",
+        "url": "https://files.pythonhosted.org/packages/f0/1c/8f106ee9dc41e325310f8708cf7b63a3104a2f8e49955cc93505fad37763/looptime-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a35369aa72058ff465e64d035cd4aff299ae579627dfffc9bc3c9bf6a15a8240",
+        "md5": "07b0480687fc81fa751e28aa6ee6acb7",
+        "sha256": "01755261e8e919de973f442961c4eadf309ce7fcf3102b626bc0bc4a734ad400"
+      },
+      "downloads": -1,
+      "filename": "looptime-0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "07b0480687fc81fa751e28aa6ee6acb7",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 19196,
+      "upload_time": "2021-12-26T12:07:12",
+      "upload_time_iso_8601": "2021-12-26T12:07:12.465887Z",
+      "url": "https://files.pythonhosted.org/packages/a3/53/69aa72058ff465e64d035cd4aff299ae579627dfffc9bc3c9bf6a15a8240/looptime-0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f01c8f106ee9dc41e325310f8708cf7b63a3104a2f8e49955cc93505fad37763",
+        "md5": "5aa0c28dd8af57adcdc63ef1e3effc21",
+        "sha256": "f2cbea15d01099fd4df4b78d3b36e9f5c7202706e1846f44135ef037e174b278"
+      },
+      "downloads": -1,
+      "filename": "looptime-0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "5aa0c28dd8af57adcdc63ef1e3effc21",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 31429,
+      "upload_time": "2021-12-26T12:07:14",
+      "upload_time_iso_8601": "2021-12-26T12:07:14.006995Z",
+      "url": "https://files.pythonhosted.org/packages/f0/1c/8f106ee9dc41e325310f8708cf7b63a3104a2f8e49955cc93505fad37763/looptime-0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

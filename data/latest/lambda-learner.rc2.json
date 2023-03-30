@@ -1,0 +1,185 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "Intended Audience :: Science/Research",
+      "License :: OSI Approved",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Lambda Learner\n\n## What is it\n\nLambda Learner is a library for iterative incremental training of a class of supervised machine learning models. Using the Generalized Additive Mixed-Effect (GAME) framework, one can divide a model into two components, (a) Fixed Effects - a typically large \"fixed effects\" model (generalization) that is trained on the whole dataset to improve the model’s performance on previously unseen user-item pairs, and (b) Random Effects - a series of simpler linear \"random-effects\" models (memorization) trained on data corresponding to each entity (e.g. user or article or ad) for more granular personalization.\n\nThe two main choices in defining a GAME architecture are 1) choosing the model class for the fixed effects model, and 2) choosing which random effects to include. The fixed effects model can be of any model class, typically [Tensorflow](https://github.com/tensorflow/tensorflow), [DeText](https://github.com/linkedin/detext), [GDMix](https://github.com/linkedin/gdmix), [XGBoost](https://github.com/dmlc/xgboost). As for the random effects, this choice is framed by your training data; specifically by the keys/ids of your training examples. If your training examples are keyed by a single id space (say userId), then you will have one series of random effects keyed by userId (per-user random effects). If your data is keyed by multiple id spaces (say userId, movieId), then you can have up to one series of random effects for every id type (per-user random effects, and per-movie random effects). However it's not necessary to have random effects for all ids, with the choice being largely a modeling concern.\n\nLambda Learner currently supports using any fixed-effects model, but only random effects for a single id type.\n\nBringing these two pieces together, the residual score from the fixed effects model is improved using a random effect linear model, with the global model's output score acting as the bias/offset for the linear model. Once the fixed effects model has been trained, the training of random effects can occur independently and in parallel. The library supports incremental updates to the random effects components of a GAME model in response to mini-batches from data streams. Currently the following algorithms for updating a random effect are supported:\n\n- Linear regression.\n- Logistic regression.\n- Sequential Bayesian logistic regression (as described in the [Lambda Learner paper](https://arxiv.org/abs/2010.05154)).\n\nThe library supports maintaining a model coefficient Hessian matrix, representing uncertainty about model coefficient values, in addition to point estimates of the coefficients. This allows us to use the random effects as a multi-armed bandit using techniques such as Thompson Sampling.\n\n\n## Why Lambda Learner\n\nOne of the most well-established applications of machine learning is in deciding what content to show website visitors. When observation data comes from high-velocity, user-generated data streams, machine learning methods perform a balancing act between model complexity, training time, and computational costs. Furthermore, when model freshness is critical, the training of models becomes time-constrained. Parallelized batch offline training, although horizontally scalable, is often not time-considerate or cost effective.\n\nLambda Learner is capable of incrementally training the memorization part of the model (the random-effects components) as a performance booster over the generalization part. The frequent updates to these booster models over already powerful fixed-effect models improve personalization. Additionally, it allows for applications that require online bandits that are updated quickly.\n\nIn the GAME paradigm, random effects components can be trained independently of each other. This means that their update can be easily parallelized across nodes in a distributed computation framework. For example, this library can be used on top of Python Beam or PySpark. The distributed compute framework is used for parallelization and data orchestration, while the Lambda Learner library implements the update of random effects in individual compute tasks (DoFns in Beam or Task closures in PySpark).\n\n\n## Installation\n\n```bash\npip install lambda-learner\n```\n\n## Tutorial: How to use Lambda Learner\n\n### Prepare your dataset and initial model\n\nLet's assume we have a minibatch of data, a random effects model for a specific key, and the already trained global fixed effects model. In order to use Lambda Learner, we need to format the data and model into appropriate data structures as follows:\n\n```python\ntraining_data: List[TrainingRecord] = ...\ntest_data: List[TrainingRecord] = ...\nmodel_coefficients: List[Feature] = ...\nmodel_coefficienet_variances: List[Feature] = ...\n```\n\nA `TrainingRecord` represents a labeled example. The most important fields in this structure are:\n\n- `label` => The datum label. For example, this could be binarized (0.0, or 1.0) for a classification task, or in the range [0.0,1.0] for a regression task.\n- `features` => A list of `Feature`s. `Feature` is a Name-Term-Value representation which we'll discuss next.\n- `offset` => The score that the associated fixed-effects model produces for this datum. The score from a deep or non-linear fixed-effect model is captured in just one parameter. We use this score as the residual to train the random-effect models.\n\nBoth features (from the training data) and model coefficients are represented using the `Feature` class. `Feature` is a Name-Term-Value (NTV) representation, where the name is the feature name, the term is a string index for the feature (supporting categorical and numerical vector features), and the value is the numerical value corresponding to a name-term pair. When a `Feature` is used to describe a model, the value is the coefficient weight.\n\nHere's a toy example of data and a model using single feature: a categorical representing a user's favorite season of the year. In actual practice, you would create these data structures by reading in external resources and wrangling them into this form.\n\n```python\ntraining_data = [\n\tTrainingRecord(\n\t\tlabel=1.0,\n\t\tweight=1.0,\n\t\toffset=0.6786987785,  # determined by scoring this example using your global model.\n\t\tfeatures=[\n\t\t\t# one feature with multiple terms, a categorical vector\n\t\t\tFeature(\"season\", \"winter\", 1.0),\n\t\t\tFeature(\"season\", \"spring\", 0.0),\n\t\t\tFeature(\"season\", \"summer\", 0.0),\n\t\t\tFeature(\"season\", \"fall\", 0.0)\n\t\t]\n\t),\n\t# more records...\n]\n\nmodel_coefficients = [\n\t# All models need an intercept feature, corresponding to the `offset` field in the data.\n\tFeature(\"intercept\", \"intercept\", 1.0),\n\n\t# one feature with multiple terms, a categorical vector\n\tFeature(\"season\", \"winter\", 0.423),\n\tFeature(\"season\", \"spring\", 0.564),\n\tFeature(\"season\", \"summer\", 0.234),\n\tFeature(\"season\", \"fall\", 0.0344)\n]\n```\n\nIn the future, other storage formats besides NTV may be supported.\n\n### Create an index map\n\nNTV is a very human-readable format for representing the model coefficients and data record features. However, in order to train the model, we need to transform both the model data into an indexed, vector representation. An `IndexMap` is a (bi-directional) mapping between a Name-Term and an integer index, which we use to translate from the human-readable NTV representation to an trainable indexed representation.\n\n```python\nindex_map, index_map_metadata = IndexMap.from_records_means_and_variances(\n\ttraining_data, model_coefficients, model_coefficienet_variances)\n```\n\n`index_map_metadata` contains index map statistics, which can be logged or used for monitoring.\n\n### Transform your model and data into an indexed representation\n\nNow that we have an `index_map`, we can use helper functions from `representation_utils.py` to transform our data and model from NTV-representations to indexed representations, as follows:\n\n```python\nindexed_training_data = nt_domain_data_to_index_domain_data(training_data, index_map)\nindexed_test_data = nt_domain_data_to_index_domain_data(test_data, index_map)\n\nregularization_penalty = 10.0\ninitial_model = nt_domain_coeffs_to_index_domain_coeffs(model_coefficients, model_coefficienet_variances, index_map, regularization_penalty)\n```\n\nThe data and model are now ready for training.\n\n### Perform training\n\nTo perform training, choose one of the `Trainer` subclasses appropriate for your task:\n\n- `TrainerSquareLossWithL2` for linear regression.\n- `TrainerLogisticLossWithL2` or `TrainerSequentialBayesianLogisticLossWithL2` for classification.\n\n```python\nforgetting_factor = 0.8\nlr_trainer = TrainerSequentialBayesianLogisticLossWithL2(\n    training_data=indexed_training_data,\n    initial_model=initial_model,\n    penalty=regularization_penalty,\n    delta=forgetting_factor)\n\nupdated_model, updated_model_loss, training_metadata = lr_trainer.train()\n```\n\n`training_metadata` contains the metadata returned by the scipy `fmin_l_bfgs_b` optimizer, which be logged or used when debugging. See [Scipy docs](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.fmin_l_bfgs_b.html) for more information.\n\n`updated_model` is an `IndexedModel` which is the result or this minibatch training iteration.\n\n\n### Perform scoring and metric evaluation\n\nNext we'll score our test set using `updated_model`, and evaluate the model's performance. `evaluate` can compute several metrics in one go, but here we request just AUC ([area under the ROC curve](https://www.wikiwand.com/en/Receiver_operating_characteristic#/Area_under_the_curve)), a common binary classification metric.\n\n```python\nscores = score_linear_model(updated_model, indexed_test_data)\ntrained_model_metrics = evaluate(metric_list=['auc'], y_scores=scores, y_targets=indexed_test_data.y)\ntrained_model_auc = post_train_metrics['auc']\n```\n\n### Transform your data back into a human readable representation\n\nFinally, we transform our model back into a NTV representation using another helper from `representation_utils.py`.\n\n```python\nmeans, variances = index_domain_coeffs_to_nt_domain_coeffs(updated_model, index_map)\n```\n\n`means` and `variances` represent the updated model coefficients and their variances. These can now be stored and subsequently used for inference or further updated on the next data minibatch.\n\n## Citing\n\nPlease cite Lambda Learner in your publications if it helps your research:\n\n```\n@misc{ramanath2020lambda,\n      title={Lambda Learner: Fast Incremental Learning on Data Streams},\n      author={Rohan Ramanath and Konstantin Salomatin and Jeffrey D. Gee and Kirill Talanine and Onkar Dalal and Gungor Polatkan and Sara Smoot and Deepak Kumar},\n      year={2020},\n      eprint={2010.05154},\n      archivePrefix={arXiv},\n      primaryClass={cs.LG}\n}\n```\n\n## Contributing\n\nPlease read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct, and the process for submitting pull requests to us.\n\n\n## License\n\nThis project is licensed under the BSD 2-CLAUSE LICENSE - see the [LICENSE](LICENSE) file for details.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/linkedin/lambda-learner",
+    "keywords": "lambda-learner incremental training",
+    "license": "BSD-2-CLAUSE",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "lambda-learner",
+    "package_url": "https://pypi.org/project/lambda-learner/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/lambda-learner/",
+    "project_urls": {
+      "Documentation": "https://github.com/linkedin/lambda-learner/blob/main/README.md",
+      "Homepage": "https://github.com/linkedin/lambda-learner",
+      "Source": "https://github.com/linkedin/lambda-learner",
+      "Tracker": "https://github.com/linkedin/lambda-learner/issues"
+    },
+    "release_url": "https://pypi.org/project/lambda-learner/0.1.0/",
+    "requires_dist": [
+      "numpy (>=1.19.4)",
+      "scipy (>=1.5.4)",
+      "scikit-learn (>=0.24.0)",
+      "typing-extensions (>=3.7.4)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "",
+    "version": "0.1.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9199497,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37ced3559b6ab8de1874c2b7cb29a265a23078a6ccace8f2c8dad14c6212a7a2",
+          "md5": "54269ee0a07c6408a178a289c7fdf332",
+          "sha256": "e31a9625ed6f125f62b15ca7af0b009d04224805faa5f94a8c1e77844d26d1df"
+        },
+        "downloads": -1,
+        "filename": "lambda_learner-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "54269ee0a07c6408a178a289c7fdf332",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 25629,
+        "upload_time": "2020-12-24T06:10:20",
+        "upload_time_iso_8601": "2020-12-24T06:10:20.735146Z",
+        "url": "https://files.pythonhosted.org/packages/37/ce/d3559b6ab8de1874c2b7cb29a265a23078a6ccace8f2c8dad14c6212a7a2/lambda_learner-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5bb1077f1d1a974233933db1d10f3112a93e8e06cf15f8e83b2c568357b214c6",
+          "md5": "cc56795dd09dacf726cdec8cca62ca94",
+          "sha256": "8095e92bc73afbe76ed4b85306747cd7dde060bc88be922b2f7e9f898be4d65c"
+        },
+        "downloads": -1,
+        "filename": "lambda-learner-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc56795dd09dacf726cdec8cca62ca94",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 17079,
+        "upload_time": "2020-12-24T06:10:22",
+        "upload_time_iso_8601": "2020-12-24T06:10:22.447090Z",
+        "url": "https://files.pythonhosted.org/packages/5b/b1/077f1d1a974233933db1d10f3112a93e8e06cf15f8e83b2c568357b214c6/lambda-learner-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "035c071c9855a7b21c00e3eacc00f789279b71212b2c66dd4730ffd608c5b2f1",
+          "md5": "99e66a4bf6840796caccb3119e62d968",
+          "sha256": "41cc6be4d77a1f85706924fdd02b64d3c8c5544146b752b83fd515f520c68dec"
+        },
+        "downloads": -1,
+        "filename": "lambda_learner-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "99e66a4bf6840796caccb3119e62d968",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 25636,
+        "upload_time": "2021-01-22T00:47:13",
+        "upload_time_iso_8601": "2021-01-22T00:47:13.424236Z",
+        "url": "https://files.pythonhosted.org/packages/03/5c/071c9855a7b21c00e3eacc00f789279b71212b2c66dd4730ffd608c5b2f1/lambda_learner-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea81fd048da3e0bbac8837e8b730b5933181dd67e95cf2b5a453f3bf50adf3a4",
+          "md5": "170bb57039fae94d44fda84a8e462767",
+          "sha256": "e949945a218f8bde05e5e3e205ae3a1efd2fe2c4a329225f61436d040ace2e5e"
+        },
+        "downloads": -1,
+        "filename": "lambda-learner-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "170bb57039fae94d44fda84a8e462767",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 18640,
+        "upload_time": "2021-01-22T00:47:14",
+        "upload_time_iso_8601": "2021-01-22T00:47:14.707728Z",
+        "url": "https://files.pythonhosted.org/packages/ea/81/fd048da3e0bbac8837e8b730b5933181dd67e95cf2b5a453f3bf50adf3a4/lambda-learner-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "035c071c9855a7b21c00e3eacc00f789279b71212b2c66dd4730ffd608c5b2f1",
+        "md5": "99e66a4bf6840796caccb3119e62d968",
+        "sha256": "41cc6be4d77a1f85706924fdd02b64d3c8c5544146b752b83fd515f520c68dec"
+      },
+      "downloads": -1,
+      "filename": "lambda_learner-0.1.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "99e66a4bf6840796caccb3119e62d968",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 25636,
+      "upload_time": "2021-01-22T00:47:13",
+      "upload_time_iso_8601": "2021-01-22T00:47:13.424236Z",
+      "url": "https://files.pythonhosted.org/packages/03/5c/071c9855a7b21c00e3eacc00f789279b71212b2c66dd4730ffd608c5b2f1/lambda_learner-0.1.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ea81fd048da3e0bbac8837e8b730b5933181dd67e95cf2b5a453f3bf50adf3a4",
+        "md5": "170bb57039fae94d44fda84a8e462767",
+        "sha256": "e949945a218f8bde05e5e3e205ae3a1efd2fe2c4a329225f61436d040ace2e5e"
+      },
+      "downloads": -1,
+      "filename": "lambda-learner-0.1.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "170bb57039fae94d44fda84a8e462767",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 18640,
+      "upload_time": "2021-01-22T00:47:14",
+      "upload_time_iso_8601": "2021-01-22T00:47:14.707728Z",
+      "url": "https://files.pythonhosted.org/packages/ea/81/fd048da3e0bbac8837e8b730b5933181dd67e95cf2b5a453f3bf50adf3a4/lambda-learner-0.1.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
