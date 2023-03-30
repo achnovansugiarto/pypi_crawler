@@ -1,0 +1,184 @@
+{
+  "info": {
+    "author": "Facility Solutions Group",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Internet"
+    ],
+    "description": "Asyncio Python Client for Google Cloud Pub/Sub\n==============================================\n\n|pypi| |pythons-aio|\n\nInstallation\n------------\n\n.. code-block:: console\n\n    $ pip install --upgrade gcloud-aio-pubsub\n\nUsage\n-----\n\nThis Pub/Sub implementation is based on ``google-cloud-pubsub >= 0.29.4``\n\nCurrently we have only implemented an asyncio version of ``SubscriberClient``\nas the subscription pattern does not work with asyncio by default. The official\nGoogle publisher returns a future which is mostly useable as-is. We've not yet\nseen a need to build a non-asyncio threadsafe version of the library -- the\nupstream Google libraries have this well-handled.\n\nHere's the rough usage pattern for subscribing:\n\n.. code-block:: python\n\n    from gcloud.aio.pubsub import SubscriberClient\n    from google.cloud.pubsub_v1.subscriber.message import Message\n\n    client = SubscriberClient()\n    # create subscription if it doesn't already exist\n    client.create_subscription('subscription_name', 'topic_name')\n\n    async def message_callback(message: Message) -> None:\n        try:\n            # just an example: process the message however you need to here...\n            result = handle(message)\n            await upload_result(result)\n        except Exception:\n            message.nack()\n        else:\n            message.ack()\n\n    # subscribe to the subscription, receiving a Future that acts as a keepalive\n    keep_alive = client.subscribe('subscription_name', message_callback)\n\n    # have the client run forever, pulling messages from this subscription,\n    # passing them to the specified callback function, and wrapping it in an\n    # asyncio task.\n    client.run_forever(keep_alive)\n\nConfiguration\n-------------\n\nOur create_subscription method is a thing wrapper and thus supports all keyword\nconfiguration arguments from the official pubsub client which you can find in\nthe `official Google documentation`_.\n\nWhen subscribing to a subscription you can optionally pass in a ``FlowControl``\nand/or ``Scheduler`` instance.\n\n.. code-block:: python\n\n    example_flow_control = FlowControl(\n        max_messages=1,\n        resume_threshold=0.8,\n        max_request_batch_size=1,\n        max_request_batch_latency=0.1,\n        max_lease_duration=10,\n    )\n\n    keep_alive = client.subscribe(\n        'subscription_name',\n        message_callback,\n        flow_control=example_flow_control\n    )\n\nUnderstanding how modifying ``FlowControl`` affects how your pubsub runtime\nwill operate can be confusing so here's a handy dandy guide!\n\nWelcome to @TheKevJames's guide to configuring Google Pubsub Subscription\npolicies! Settle in, grab a drink, and stay a while.\n\nThe Subscriber is controlled by a FlowControl configuration tuple defined\n`here <https://github.com/GoogleCloudPlatform/google-cloud-python/blob/de5b775811d914270df3249ac24e165964c10dd2/pubsub/google/cloud/pubsub_v1/types.py#L53-L67>`_:\nthat configuration object ``f`` gets used by the Subscriber in the following\nways:\n\nMax Concurrency\n~~~~~~~~~~~~~~~\n\nThe subscriber is allowed to lease new tasks whenever its currently leased\ntasks ``x`` satisfy:\n\n.. code-block:: python\n\n    (\n        (len(x) < f.resume_threshold * f.max_messages)\n        and (sum(x.bytes) < f.resume_threshold * f.max_bytes)\n    )\n\nIn practice, this means we should set these values with the following\nrestrictions:\n\n- the maximum number of concurrently leased tasks at peak is:\n  ``= (f.max_messages * f.resume_threshold) + f.max_request_batch_size``\n- the maximum memory usage of our leased tasks at peak is:\n  ``= (f.max_bytes * f.resume_threshold) + (f.max_request_batch_size *\n  bytes_per_task)``\n- these values are constrain each other, ie. we limit ourselves to the lesser\n  of these values given:\n  ``max_tasks * bytes_per_task <> max_memory``\n\nAside: it seems like OCNs on Pubsub are ~1538 bytes each\n\nLeasing Requests\n~~~~~~~~~~~~~~~~\n\nWhen leasing new tasks, the ``Subscriber`` uses the following algorithm:\n\n.. code-block:: python\n\n    def lease_more_tasks():\n        start = time.now()\n        yield queue.Queue.get(block=True)  # always returns >=1\n\n        for _ in range(f.max_request_batch_size - 1):\n            elapsed = time.now() - start\n            yield queue.Queue.get(\n                block=False,\n                timeout=f.max_request_batch_latency-elapsed)\n            if elapsed >= f.max_request_batch_latency:\n                break\n\nIn practice, this means we should set ``f.max_request_batch_size`` given the\nabove concurrent concerns and set ``f.max_request_batch_latency`` given\nwhatever latency ratio we are willing to accept.\n\nThe expected best-case time for ``Queue.get()`` off a full queue is no worse\nthan 0.3ms. This Queue should be filling up as fast as grpc can make requests\nto Google Pubsub, which should be Fast Enough(tm) to keep it filled, given\n*those* requests are batched.\n\nTherefore, we can expect:\n\n- avg_lease_latency: ``~= f.max_request_batch_size * 0.0003``\n- worst_case_latency: ``~= f.max_request_batch_latency``\n\nNote that leasing occurs based on ``f.resume_threshold``, so some of this\nlatency is concurrent with task execution.\n\nTask Expiry\n~~~~~~~~~~~\n\nAny task which has not been acked or nacked counts against the current leased\ntask count. Our worker thread should ensure all tasks are acked or nacked, but\nthe ``FlowControl`` config allows us to handle any other cases. Note that\nleasing works as follows:\n\n- When a subscriber leases a task, Google Pubsub will not re-lease that\n  task until ``subscription.ack_deadline_seconds = 10`` (configurable\n  per-subscription) seconds have passed.\n- If a client calls ``ack()`` on a task, it is immediately removed from Google\n  Pubsub.\n- If a client calls ``nack()`` on a task, it immediately allows Google Pubsub\n  to re-lease that task to a new client. The client drops the task from its\n  memory.\n- If ``f.max_lease_duration`` passes between a message being leased and acked,\n  the client will send a ``nack`` (see above workflow). It will NOT drop the\n  task from its memory -- eg. the ``worker(task)`` process may still be run.\n\nNotes:\n\n- all steps are best-effort, eg. read \"a task will be deleted\" as \"a task will\n  probably get deleted, if the distributed-system luck is with you\"\n- in the above workflow \"Google Pubsub\" refers to the server-side system, eg.\n  managed by Google where the tasks are actually stored.\n\nIn practice, we should thus set ``f.max_lease_duration`` to no lower than\nour 95% percentile task latency at high load. The lower this value is,\nthe better our throughput will be in extreme cases.\n\nConfusion\n~~~~~~~~~\n\n``f.max_requests`` is defined, but seems to be unused.\n\nContributing\n------------\n\nPlease see our `contributing guide`_.\n\n.. _contributing guide: https://github.com/talkiq/gcloud-aio/blob/master/.github/CONTRIBUTING.rst\n.. _official Google documentation: https://github.com/googleapis/google-cloud-python/blob/11c72ade8b282ae1917fba19e7f4e0fe7176d12b/pubsub/google/cloud/pubsub_v1/gapic/subscriber_client.py#L236\n\n.. |pypi| image:: https://img.shields.io/pypi/v/gcloud-aio-pubsub.svg?style=flat-square\n    :alt: Latest PyPI Version\n    :target: https://pypi.org/project/gcloud-aio-pubsub/\n\n.. |pythons-aio| image:: https://img.shields.io/pypi/pyversions/gcloud-aio-pubsub.svg?style=flat-square\n    :alt: Python Version Support\n    :target: https://pypi.org/project/gcloud-aio-pubsub/\n\n\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/fsgsmartbuildings/gcloud-aio",
+    "keywords": "",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "gcloud-aio-pubsub-fsg",
+    "package_url": "https://pypi.org/project/gcloud-aio-pubsub-fsg/",
+    "platform": "Posix; MacOS X; Windows",
+    "project_url": "https://pypi.org/project/gcloud-aio-pubsub-fsg/",
+    "project_urls": {
+      "Homepage": "https://github.com/fsgsmartbuildings/gcloud-aio"
+    },
+    "release_url": "https://pypi.org/project/gcloud-aio-pubsub-fsg/1.1.3/",
+    "requires_dist": [
+      "google-cloud-pubsub (<2.0.0,>=0.29.4)"
+    ],
+    "requires_python": ">= 3.6",
+    "summary": "Asyncio Python Client for Google Cloud Pub/Sub",
+    "version": "1.1.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7482783,
+  "releases": {
+    "1.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "75ac5ad7967a7572d8f7d2b81545845faf4af9a4ae9c4435a58ff2110850d187",
+          "md5": "2eb5ad83f4a05aaa4c4b7c47e3629372",
+          "sha256": "678c3c9d9198ee707a3e6fb98244015d3ae84037bff4537987f5db0c7c4bdc91"
+        },
+        "downloads": -1,
+        "filename": "gcloud_aio_pubsub_fsg-1.1.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2eb5ad83f4a05aaa4c4b7c47e3629372",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">= 3.6",
+        "size": 10270,
+        "upload_time": "2020-06-15T19:43:58",
+        "upload_time_iso_8601": "2020-06-15T19:43:58.970778Z",
+        "url": "https://files.pythonhosted.org/packages/75/ac/5ad7967a7572d8f7d2b81545845faf4af9a4ae9c4435a58ff2110850d187/gcloud_aio_pubsub_fsg-1.1.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30c2eb12aae116d6ef4d17263895b6b6134908170acd4889e392638a67967851",
+          "md5": "e4b747b3ce1dbb43b36722231f92b976",
+          "sha256": "74d2ed344ca1ee73a8091a359981a7a91079d814fb85a182458f920d7dd26897"
+        },
+        "downloads": -1,
+        "filename": "gcloud-aio-pubsub-fsg-1.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e4b747b3ce1dbb43b36722231f92b976",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">= 3.6",
+        "size": 10081,
+        "upload_time": "2020-06-15T19:44:01",
+        "upload_time_iso_8601": "2020-06-15T19:44:01.439821Z",
+        "url": "https://files.pythonhosted.org/packages/30/c2/eb12aae116d6ef4d17263895b6b6134908170acd4889e392638a67967851/gcloud-aio-pubsub-fsg-1.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "05fd1827c56c52ea9ef5b5c919f09b638bf92d7a7d320b0c542532a6a458772c",
+          "md5": "78d37ebd8375f7e213ae734e8d0af96a",
+          "sha256": "3532964a30c244c340a9d1eece3efa42dba4445a725c62866bed4babb9403957"
+        },
+        "downloads": -1,
+        "filename": "gcloud_aio_pubsub_fsg-1.1.3-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "78d37ebd8375f7e213ae734e8d0af96a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">= 3.6",
+        "size": 10276,
+        "upload_time": "2020-06-15T19:59:42",
+        "upload_time_iso_8601": "2020-06-15T19:59:42.499523Z",
+        "url": "https://files.pythonhosted.org/packages/05/fd/1827c56c52ea9ef5b5c919f09b638bf92d7a7d320b0c542532a6a458772c/gcloud_aio_pubsub_fsg-1.1.3-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39beb4b9ad3e64e6e043adfaed1aea846530c110249753d669808232696891f0",
+          "md5": "7753a9065eddd374c38428072b53d902",
+          "sha256": "d939590f58458ca28d0eacf2776f1ba7cf1b3cb07afd82081c23426fa5d4037d"
+        },
+        "downloads": -1,
+        "filename": "gcloud-aio-pubsub-fsg-1.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7753a9065eddd374c38428072b53d902",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">= 3.6",
+        "size": 10098,
+        "upload_time": "2020-06-15T19:59:44",
+        "upload_time_iso_8601": "2020-06-15T19:59:44.496006Z",
+        "url": "https://files.pythonhosted.org/packages/39/be/b4b9ad3e64e6e043adfaed1aea846530c110249753d669808232696891f0/gcloud-aio-pubsub-fsg-1.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "05fd1827c56c52ea9ef5b5c919f09b638bf92d7a7d320b0c542532a6a458772c",
+        "md5": "78d37ebd8375f7e213ae734e8d0af96a",
+        "sha256": "3532964a30c244c340a9d1eece3efa42dba4445a725c62866bed4babb9403957"
+      },
+      "downloads": -1,
+      "filename": "gcloud_aio_pubsub_fsg-1.1.3-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "78d37ebd8375f7e213ae734e8d0af96a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">= 3.6",
+      "size": 10276,
+      "upload_time": "2020-06-15T19:59:42",
+      "upload_time_iso_8601": "2020-06-15T19:59:42.499523Z",
+      "url": "https://files.pythonhosted.org/packages/05/fd/1827c56c52ea9ef5b5c919f09b638bf92d7a7d320b0c542532a6a458772c/gcloud_aio_pubsub_fsg-1.1.3-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "39beb4b9ad3e64e6e043adfaed1aea846530c110249753d669808232696891f0",
+        "md5": "7753a9065eddd374c38428072b53d902",
+        "sha256": "d939590f58458ca28d0eacf2776f1ba7cf1b3cb07afd82081c23426fa5d4037d"
+      },
+      "downloads": -1,
+      "filename": "gcloud-aio-pubsub-fsg-1.1.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "7753a9065eddd374c38428072b53d902",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">= 3.6",
+      "size": 10098,
+      "upload_time": "2020-06-15T19:59:44",
+      "upload_time_iso_8601": "2020-06-15T19:59:44.496006Z",
+      "url": "https://files.pythonhosted.org/packages/39/be/b4b9ad3e64e6e043adfaed1aea846530c110249753d669808232696891f0/gcloud-aio-pubsub-fsg-1.1.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,272 @@
+{
+  "info": {
+    "author": "Ghost Security",
+    "author_email": "info@ghost.security",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# AWS to GCP Workload Identity Federation\n\nIf you have workloads running in AWS and want to access GCP services without exporting static GCP service account credentials, this module can leverage workload identity federation to dynamically exchange credentials from an IAM Role in AWS for either an OAuth2 Access Token or Identity Token for a given GCP Service Account.\n\n## Getting Started\n\n### AWS Setup\n\nSet some shell variables for AWS related items for easier setup:\n\n```bash\nexport AWS_ACCOUNT_ID=\"123456789012\"\nexport AWS_ROLE_NAME=\"demo-wif-iam-role\"\nexport AWS_ASSUME_ROLE_ARN=\"arn:aws:sts::${AWS_ACCOUNT_ID}:assumed-role/${AWS_ROLE_NAME}\"\n```\n\nNote that the `AWS_ROLE_NAME` can be the name of an existing role (for example, attached to an EC2 instance or Lambda) or you can create a new one.  It needs no specific policies attached on the AWS side, but you can if that role needs to use AWS services as well.\n\nHere's an example role that can be attached to EC2 or Lambda with no AWS related policies attached:\n\n```bash\naws iam get-role --role-name demo-wif-iam-role\n{\n    \"Role\": {\n        \"Path\": \"/\",\n        \"RoleName\": \"demo-wif-iam-role\",\n        \"RoleId\": \"AROA3K4K4NKZMWMTAAMLD\",\n        \"Arn\": \"arn:aws:iam::123456789012:role/demo-wif-iam-role\",\n        \"CreateDate\": \"2022-07-08T15:38:50+00:00\",\n        \"AssumeRolePolicyDocument\": {\n            \"Version\": \"2012-10-17\",\n            \"Statement\": [\n                {\n                    \"Effect\": \"Allow\",\n                    \"Principal\": {\n                        \"Service\": [\n                            \"ec2.amazonaws.com\",\n                            \"lambda.amazonaws.com\"\n                        ]\n                    },\n                    \"Action\": \"sts:AssumeRole\"\n                }\n            ]\n        },\n        \"Description\": \"Allows EC2 instances to call AWS services on your behalf.\",\n        \"MaxSessionDuration\": 3600,\n        \"Tags\": [\n            {\n                \"Key\": \"env\",\n                \"Value\": \"dev\"\n            }\n        ],\n        \"RoleLastUsed\": {\n            \"LastUsedDate\": \"2022-07-29T14:40:18+00:00\",\n            \"Region\": \"us-east-1\"\n        }\n    }\n}\n```\n\n### GCP Setup\n\nSet some shell variables for GCP related items:\n\n```bash\nexport GCP_PROJECT_ID=\"my-project-id\"\nexport GCP_WORKLOAD_POOL_ID=\"aws-to-gcp-pool\"\nexport GCP_WORKLOAD_PROVIDER_ID=\"aws-to-gcp-provider\"\nexport GCP_SA_NAME=\"my-wif-sa\"\n```\n\nAuthenticate with `gcloud` as an `roles/owner` on the target GCP project, and set the current project:\n\n```bash\ngcloud config set project \"${GCP_PROJECT_ID}\"\n```\n\nObtain the GCP Project Number:\n\n```bash\nexport GCP_PROJECT_NUMBER=\"$(gcloud projects describe ${GCP_PROJECT_ID} --format='value(projectNumber)')\"\n```\n\nEnable the necessary services in the project:\n\n```bash\ngcloud services enable sts.googleapis.com iamcredentials.googleapis.com\n```\n\nCreate the Workload Identity Pool:\n\n```bash\ngcloud iam workload-identity-pools create \"${GCP_WORKLOAD_POOL_ID}\" \\\n  --location=\"global\" \\\n  --display-name=\"${GCP_WORKLOAD_POOL_ID}\" \\\n  --description=\"${GCP_WORKLOAD_POOL_ID}\"\n```\n\nCreate an `aws` Provider in the Workload Identity Pool:\n\n```bash\ngcloud iam workload-identity-pools providers create-aws \"${GCP_WORKLOAD_PROVIDER_ID}\" \\\n  --account-id=\"${AWS_ACCOUNT_ID}\" \\\n  --location=\"global\" \\\n  --workload-identity-pool=\"${GCP_WORKLOAD_POOL_ID}\"\n```\n\nCreate a dedicated GCP service account that the AWS IAM Role will be connected to:\n\n```bash\nexport GCP_SA_EMAIL=\"${GCP_SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com\"\ngcloud iam service-accounts create \"${GCP_SA_NAME}\" \\\n  --display-name=\"${GCP_SA_NAME}\" \\\n  --description=\"WIF from AWS to ${GCP_SA_NAME}\"\n```\n\nOr reference an existing GCP service account:\n\n```bash\nexport GCP_SA_EMAIL=\"my-existing-sa@my-project-id.iam.gserviceaccount.com\"\n```\n\nGrant permissions directly on the service account so the AWS Role ARN can exchange STS for its GCP token(s):\n\n```bash\ngcloud iam service-accounts add-iam-policy-binding \"${GCP_SA_EMAIL}\" \\\n  --member \"principalSet://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${GCP_WORKLOAD_POOL_ID}/attribute.aws_role/${AWS_ASSUME_ROLE_ARN}\" \\\n  --role roles/iam.workloadIdentityUser\n```\n\nGrant permissions as usual for the GCP service account to access services in GCP.  Next, list the workload identity pools/providers to get the full `gcp_workload_provider_path` to use in the module:\n\n```bash\nfor pool in \"$(gcloud iam workload-identity-pools list --location global --format='value(name)')\"; do\n  gcloud iam workload-identity-pools providers list --location global --workload-identity-pool=\"${pool}\" --format='value(name)';\ndone\n\nprojects/4556456456456/locations/global/workloadIdentityPools/aws-to-gcp-pool/providers/aws-to-gcp-provider\n```\n\n## Usage\n\n```python\n#!/usr/bin/env python3\n\nfrom gs_aws_to_gcp_workload_identity.main import AwsToGcpTokenService\n\naws_to_gcp_token_service = AwsToGcpTokenService(\n    gcp_workload_provider_path=\"<insert full workload identity path>\",\n    gcp_service_account_email=\"<insert GCP service account email>\",\n    aws_assume_role_arn=None # Insert a role ARN to explicitly assume first if needed\n)\n\n# Most GCP services take the OAuth2 access token as the Bearer Token\naccess_token, expiry_utc_epoch = aws_to_gcp_token_service.get_oauth_token()\n\n# Certain services like GCP Functions require Identity Tokens for Authenticated\n# invocations and need the function URL in the token's `audience` field\nfunction_url=\"https://us-central1-my-project-id.cloudfunctions.net/hello_world\"\nid_token, expiry_utc_epoch = aws_to_gcp_token_service.get_identity_token(audience=function_url)\n\n# Call GCP services here\n```\n\n## Samples\n\nSee [SAMPLES.md](./SAMPLES.md) for working examples.\n\n## FAQ\n\n- **What about performance and rate limits?** - Performing this token exchange requires several calls to AWS' STS APIs and GCP's STS/IAM APIs, so this module caches the credentials after the first exchange and refreshes them only if they are expired or under 300s from expiring.  This should help reduce the API quote/rate limit usage.  Running hundreds of Lambdas at once is likely to hit some of these, for example.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/ghostsecurity/gs-aws-to-gcp-workload-identity",
+    "keywords": "aws,gcp,workload,identity,federation",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "gs-aws-to-gcp-workload-identity",
+    "package_url": "https://pypi.org/project/gs-aws-to-gcp-workload-identity/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/gs-aws-to-gcp-workload-identity/",
+    "project_urls": {
+      "Homepage": "https://github.com/ghostsecurity/gs-aws-to-gcp-workload-identity",
+      "Repository": "https://github.com/ghostsecurity/gs-aws-to-gcp-workload-identity"
+    },
+    "release_url": "https://pypi.org/project/gs-aws-to-gcp-workload-identity/0.1.4/",
+    "requires_dist": [
+      "boto3 (>=1.24.40,<2.0.0)",
+      "botocore (>=1.27.40,<2.0.0)",
+      "requests (>=2.28.1,<3.0.0)",
+      "jwt (>=1.3.1,<2.0.0)",
+      "google-auth (>=2.9.1,<3.0.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "Helper for obtaining GCP Tokens via AWS-to-GCP Workload Identity Federation",
+    "version": "0.1.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14594417,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe45e738e984739b5cfbb83bc31240cf6e37d0b9501ca85112af057d134aad43",
+          "md5": "69f41ff46691566aeb3227247fdc5319",
+          "sha256": "849cc54a03a93686257cd69f861104837b49c69c3b717eb70d859181fba438a0"
+        },
+        "downloads": -1,
+        "filename": "gs_aws_to_gcp_workload_identity-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "69f41ff46691566aeb3227247fdc5319",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9662,
+        "upload_time": "2022-07-29T17:33:34",
+        "upload_time_iso_8601": "2022-07-29T17:33:34.545814Z",
+        "url": "https://files.pythonhosted.org/packages/fe/45/e738e984739b5cfbb83bc31240cf6e37d0b9501ca85112af057d134aad43/gs_aws_to_gcp_workload_identity-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e10b765f4d82b30d76e9d1360b4ae7d522aa9eff6143cf7cd700aaf21388f013",
+          "md5": "5bcad4a99ee5e4e7630095c4502710d4",
+          "sha256": "f36e5f648186caa10dde74fc6bc46f2eb2e4db26408ae793dce7a1bafe41ec46"
+        },
+        "downloads": -1,
+        "filename": "gs-aws-to-gcp-workload-identity-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5bcad4a99ee5e4e7630095c4502710d4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 8200,
+        "upload_time": "2022-07-29T17:33:32",
+        "upload_time_iso_8601": "2022-07-29T17:33:32.645387Z",
+        "url": "https://files.pythonhosted.org/packages/e1/0b/765f4d82b30d76e9d1360b4ae7d522aa9eff6143cf7cd700aaf21388f013/gs-aws-to-gcp-workload-identity-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ac7e6208f86cc1c5c39cd43167963caa1dc752c18f67cd20086c2ea2d46fc2a",
+          "md5": "0953c2090de3c628243468e80d8290d6",
+          "sha256": "df35f23f20deeecf7394afbf7a6355a8d367fbd27c6e362019e0cebf6ad5ff39"
+        },
+        "downloads": -1,
+        "filename": "gs_aws_to_gcp_workload_identity-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0953c2090de3c628243468e80d8290d6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10723,
+        "upload_time": "2022-07-29T17:46:03",
+        "upload_time_iso_8601": "2022-07-29T17:46:03.890575Z",
+        "url": "https://files.pythonhosted.org/packages/9a/c7/e6208f86cc1c5c39cd43167963caa1dc752c18f67cd20086c2ea2d46fc2a/gs_aws_to_gcp_workload_identity-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f2f6592e510050ee88a04be373af4ffa5855abc300b4597f2b09d1045eb26de",
+          "md5": "7af23ba39dc6676bb2284d58216c68ca",
+          "sha256": "196ec18af9f7a735c78f12551f55fc494df1f661b4efdd5282c9c8fc3b593078"
+        },
+        "downloads": -1,
+        "filename": "gs-aws-to-gcp-workload-identity-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7af23ba39dc6676bb2284d58216c68ca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10111,
+        "upload_time": "2022-07-29T17:46:02",
+        "upload_time_iso_8601": "2022-07-29T17:46:02.332530Z",
+        "url": "https://files.pythonhosted.org/packages/9f/2f/6592e510050ee88a04be373af4ffa5855abc300b4597f2b09d1045eb26de/gs-aws-to-gcp-workload-identity-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8ecd10d519952a7a05bb26379641277ace4d9caae8bdaad6703010adb9bdc183",
+          "md5": "7b8392d87275c119b6a3f2d356ae0569",
+          "sha256": "aaae6882e799d7a578e55d644e5ae7a3043b7230b54b1e3df9a881e8335dfc67"
+        },
+        "downloads": -1,
+        "filename": "gs_aws_to_gcp_workload_identity-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7b8392d87275c119b6a3f2d356ae0569",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10659,
+        "upload_time": "2022-07-29T20:00:44",
+        "upload_time_iso_8601": "2022-07-29T20:00:44.549293Z",
+        "url": "https://files.pythonhosted.org/packages/8e/cd/10d519952a7a05bb26379641277ace4d9caae8bdaad6703010adb9bdc183/gs_aws_to_gcp_workload_identity-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cb6c7a6543d57f54c4824c38387991eec0df6c2edf6fd72d4f4627da89edba18",
+          "md5": "c33902219010050a1e96be3fe6e68b0b",
+          "sha256": "c4ce62b3607ea81f77455ede7f31788d01f4e886281d4ec3cd0e1db8e4f56391"
+        },
+        "downloads": -1,
+        "filename": "gs-aws-to-gcp-workload-identity-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c33902219010050a1e96be3fe6e68b0b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10114,
+        "upload_time": "2022-07-29T20:00:42",
+        "upload_time_iso_8601": "2022-07-29T20:00:42.888472Z",
+        "url": "https://files.pythonhosted.org/packages/cb/6c/7a6543d57f54c4824c38387991eec0df6c2edf6fd72d4f4627da89edba18/gs-aws-to-gcp-workload-identity-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6787b7f63e49bca8e2a1d50c97cd4b6ab8e9bd59816141b9f2d1ea41fadd645e",
+          "md5": "0648368daf4e9949e6a517cda782f3ad",
+          "sha256": "45fc512155f931fe4813bb316f36d8cce2a96de58ddf053767e5a4aae329a4da"
+        },
+        "downloads": -1,
+        "filename": "gs_aws_to_gcp_workload_identity-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0648368daf4e9949e6a517cda782f3ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 10604,
+        "upload_time": "2022-07-29T20:22:08",
+        "upload_time_iso_8601": "2022-07-29T20:22:08.787257Z",
+        "url": "https://files.pythonhosted.org/packages/67/87/b7f63e49bca8e2a1d50c97cd4b6ab8e9bd59816141b9f2d1ea41fadd645e/gs_aws_to_gcp_workload_identity-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f1e55853d5e6fa59910bb382d8dcf452ee05066d62b286aa518dfef74975f39",
+          "md5": "d15cce3b8c6d2c61079dff547f2a9cc8",
+          "sha256": "890bec0d0bb57f32e56fb7b28fe4aa6eaf5469f5deb3d75f1ae0eb032c5e22a0"
+        },
+        "downloads": -1,
+        "filename": "gs-aws-to-gcp-workload-identity-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d15cce3b8c6d2c61079dff547f2a9cc8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9,<4.0",
+        "size": 9989,
+        "upload_time": "2022-07-29T20:22:07",
+        "upload_time_iso_8601": "2022-07-29T20:22:07.394970Z",
+        "url": "https://files.pythonhosted.org/packages/5f/1e/55853d5e6fa59910bb382d8dcf452ee05066d62b286aa518dfef74975f39/gs-aws-to-gcp-workload-identity-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6787b7f63e49bca8e2a1d50c97cd4b6ab8e9bd59816141b9f2d1ea41fadd645e",
+        "md5": "0648368daf4e9949e6a517cda782f3ad",
+        "sha256": "45fc512155f931fe4813bb316f36d8cce2a96de58ddf053767e5a4aae329a4da"
+      },
+      "downloads": -1,
+      "filename": "gs_aws_to_gcp_workload_identity-0.1.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "0648368daf4e9949e6a517cda782f3ad",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 10604,
+      "upload_time": "2022-07-29T20:22:08",
+      "upload_time_iso_8601": "2022-07-29T20:22:08.787257Z",
+      "url": "https://files.pythonhosted.org/packages/67/87/b7f63e49bca8e2a1d50c97cd4b6ab8e9bd59816141b9f2d1ea41fadd645e/gs_aws_to_gcp_workload_identity-0.1.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5f1e55853d5e6fa59910bb382d8dcf452ee05066d62b286aa518dfef74975f39",
+        "md5": "d15cce3b8c6d2c61079dff547f2a9cc8",
+        "sha256": "890bec0d0bb57f32e56fb7b28fe4aa6eaf5469f5deb3d75f1ae0eb032c5e22a0"
+      },
+      "downloads": -1,
+      "filename": "gs-aws-to-gcp-workload-identity-0.1.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "d15cce3b8c6d2c61079dff547f2a9cc8",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9,<4.0",
+      "size": 9989,
+      "upload_time": "2022-07-29T20:22:07",
+      "upload_time_iso_8601": "2022-07-29T20:22:07.394970Z",
+      "url": "https://files.pythonhosted.org/packages/5f/1e/55853d5e6fa59910bb382d8dcf452ee05066d62b286aa518dfef74975f39/gs-aws-to-gcp-workload-identity-0.1.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

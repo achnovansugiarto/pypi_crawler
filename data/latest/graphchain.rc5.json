@@ -1,0 +1,295 @@
+{
+  "info": {
+    "author": "Laurent Sorber",
+    "author_email": "laurent@radix.ai",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "[![License](https://img.shields.io/github/license/mashape/apistatus.svg)](https://choosealicense.com/licenses/mit/) [![PyPI](https://img.shields.io/pypi/v/graphchain.svg)](https://pypi.python.org/pypi/graphchain/)\n\n# Graphchain\n\n## What is graphchain?\n\nGraphchain is like [joblib.Memory](https://joblib.readthedocs.io/en/latest/memory.html) for dask graphs. [Dask graph computations](https://docs.dask.org/en/latest/spec.html) are cached to a local or remote location of your choice, specified by a [PyFilesystem FS URL](https://docs.pyfilesystem.org/en/latest/openers.html).\n\nWhen you change your dask graph (by changing a computation's implementation or its inputs), graphchain will take care to only recompute the minimum number of computations necessary to fetch the result. This allows you to iterate quickly over your graph without spending time on recomputing previously computed keys.\n\n<p align=\"center\">\n    <img src=\"https://imgs.xkcd.com/comics/is_it_worth_the_time_2x.png\" width=\"400\" /><br />\n    <span>Source: <a href=\"https://xkcd.com/1205/\">xkcd.com/1205/</a></span>\n</p>\n\nThe main difference between graphchain and joblib.Memory is that in graphchain a computation's materialised inputs are _not_ serialised and hashed (which can be very expensive when the inputs are large objects such as pandas DataFrames). Instead, a chain of hashes (hence the name graphchain) of the computation object and its dependencies (which are also computation objects) is used to identify the cache file.\n\nAdditionally, the result of a computation is only cached if it is estimated that loading that computation from cache will save time compared to simply computing the computation. The decision on whether to cache depends on the characteristics of the cache location, which are different when caching to the local filesystem compared to caching to S3 for example.\n\n## Usage by example\n\n### Basic usage\n\nInstall graphchain with pip to get started:\n\n```sh\npip install graphchain\n```\n\nTo demonstrate how graphchain can save you time, let's first create a simple dask graph that (1) creates a few pandas DataFrames, (2) runs a relatively heavy operation on these DataFrames, and (3) summarises the results.\n\n```python\nimport dask\nimport graphchain\nimport pandas as pd\n\ndef create_dataframe(num_rows, num_cols):\n    print(\"Creating DataFrame...\")\n    return pd.DataFrame(data=[range(num_cols)]*num_rows)\n\ndef expensive_computation(df, num_quantiles):\n    print(\"Running expensive computation on DataFrame...\")\n    return df.quantile(q=[i / num_quantiles for i in range(num_quantiles)])\n\ndef summarize_dataframes(*dfs):\n    print(\"Summing DataFrames...\")\n    return sum(df.sum().sum() for df in dfs)\n\ndsk = {\n    \"df_a\": (create_dataframe, 10_000, 1000),\n    \"df_b\": (create_dataframe, 10_000, 1000),\n    \"df_c\": (expensive_computation, \"df_a\", 2048),\n    \"df_d\": (expensive_computation, \"df_b\", 2048),\n    \"result\": (summarize_dataframes, \"df_c\", \"df_d\")\n}\n```\n\nUsing `dask.get` to fetch the `\"result\"` key takes about 6 seconds:\n\n```python\n>>> %time dask.get(dsk, \"result\")\n\nCreating DataFrame...\nRunning expensive computation on DataFrame...\nCreating DataFrame...\nRunning expensive computation on DataFrame...\nSumming DataFrames...\n\nCPU times: user 7.39 s, sys: 686 ms, total: 8.08 s\nWall time: 6.19 s\n```\n\nOn the other hand, using `graphchain.get` for the first time to fetch `'result'` takes only 4 seconds:\n\n```python\n>>> %time graphchain.get(dsk, \"result\")\n\nCreating DataFrame...\nRunning expensive computation on DataFrame...\nSumming DataFrames...\n\nCPU times: user 4.7 s, sys: 519 ms, total: 5.22 s\nWall time: 4.04 s\n```\n\nThe reason `graphchain.get` is faster than `dask.get` is because it can load `df_b` and `df_d` from cache after `df_a` and `df_c` have been computed and cached. Note that graphchain will only cache the result of a computation if loading that computation from cache is estimated to be faster than simply running the computation.\n\nRunning `graphchain.get` a second time to fetch `\"result\"` will be almost instant since this time the result itself is also available from cache:\n\n```python\n>>> %time graphchain.get(dsk, \"result\")\n\nCPU times: user 4.79 ms, sys: 1.79 ms, total: 6.58 ms\nWall time: 5.34 ms\n```\n\nNow let's say we want to change how the result is summarised from a sum to an average:\n\n```python\ndef summarize_dataframes(*dfs):\n    print(\"Averaging DataFrames...\")\n    return sum(df.mean().mean() for df in dfs) / len(dfs)\n```\n\nIf we then ask graphchain to fetch `\"result\"`, it will detect that only `summarize_dataframes` has changed and therefore only recompute this function with inputs loaded from cache:\n\n```python\n>>> %time graphchain.get(dsk, \"result\")\n\nAveraging DataFrames...\n\nCPU times: user 123 ms, sys: 37.2 ms, total: 160 ms\nWall time: 86.6 ms\n```\n\n### Storing the graphchain cache remotely\n\nGraphchain's cache is by default `./__graphchain_cache__`, but you can ask graphchain to use a cache at any [PyFilesystem FS URL](https://docs.pyfilesystem.org/en/latest/openers.html) such as `s3://mybucket/__graphchain_cache__`:\n\n```python\ngraphchain.get(dsk, \"result\", location=\"s3://mybucket/__graphchain_cache__\")\n```\n\n### Excluding keys from being cached\n\nIn some cases you may not want a key to be cached. To avoid writing certain keys to the graphchain cache, you can use the `skip_keys` argument:\n\n```python\ngraphchain.get(dsk, \"result\", skip_keys=[\"result\"])\n```\n\n### Using graphchain with dask.delayed\n\nAlternatively, you can use graphchain together with dask.delayed for easier dask graph creation:\n\n```python\nimport dask\nimport pandas as pd\n\n@dask.delayed\ndef create_dataframe(num_rows, num_cols):\n    print(\"Creating DataFrame...\")\n    return pd.DataFrame(data=[range(num_cols)]*num_rows)\n\n@dask.delayed\ndef expensive_computation(df, num_quantiles):\n    print(\"Running expensive computation on DataFrame...\")\n    return df.quantile(q=[i / num_quantiles for i in range(num_quantiles)])\n\n@dask.delayed\ndef summarize_dataframes(*dfs):\n    print(\"Summing DataFrames...\")\n    return sum(df.sum().sum() for df in dfs)\n\ndf_a = create_dataframe(num_rows=10_000, num_cols=1000)\ndf_b = create_dataframe(num_rows=10_000, num_cols=1000)\ndf_c = expensive_computation(df_a, num_quantiles=2048)\ndf_d = expensive_computation(df_b, num_quantiles=2048)\nresult = summarize_dataframes(df_c, df_d)\n```\n\nAfter which you can compute `result` by setting the `delayed_optimize` method to `graphchain.optimize`:\n\n```python\nimport graphchain\nfrom functools import partial\n\noptimize_s3 = partial(graphchain.optimize, location=\"s3://mybucket/__graphchain_cache__/\")\n\nwith dask.config.set(scheduler=\"sync\", delayed_optimize=optimize_s3):\n    print(result.compute())\n```\n\n### Using a custom a serializer/deserializer\n\nBy default graphchain will cache dask computations with [joblib.dump](https://joblib.readthedocs.io/en/latest/generated/joblib.dump.html) and LZ4 compression. However, you may also supply a custom `serialize` and `deserialize` function that writes and reads computations to and from a [PyFilesystem filesystem](https://docs.pyfilesystem.org/en/latest/introduction.html), respectively. For example, the following snippet shows how to serialize dask DataFrames with [dask.dataframe.to_parquet](https://docs.dask.org/en/stable/generated/dask.dataframe.to_parquet.html), while other objects are serialized with joblib:\n\n```python\nimport dask.dataframe\nimport graphchain\nimport fs.osfs\nimport joblib\nimport os\nfrom functools import partial\nfrom typing import Any\n\ndef custom_serialize(obj: Any, fs: fs.osfs.OSFS, key: str) -> None:\n    \"\"\"Serialize dask DataFrames with to_parquet, and other objects with joblib.dump.\"\"\"\n    if isinstance(obj, dask.dataframe.DataFrame):\n        obj.to_parquet(os.path.join(fs.root_path, \"parquet\", key))\n    else:\n        with fs.open(f\"{key}.joblib\", \"wb\") as fid:\n            joblib.dump(obj, fid)\n\ndef custom_deserialize(fs: fs.osfs.OSFS, key: str) -> Any:\n    \"\"\"Deserialize dask DataFrames with read_parquet, and other objects with joblib.load.\"\"\"\n    if fs.exists(f\"{key}.joblib\"):\n        with fs.open(f\"{key}.joblib\", \"rb\") as fid:\n            return joblib.load(fid)\n    else:\n        return dask.dataframe.read_parquet(os.path.join(fs.root_path, \"parquet\", key))\n\noptimize_parquet = partial(\n    graphchain.optimize,\n    location=\"./__graphchain_cache__/custom/\",\n    serialize=custom_serialize,\n    deserialize=custom_deserialize\n)\n\nwith dask.config.set(scheduler=\"sync\", delayed_optimize=optimize_parquet):\n    print(result.compute())\n```\n\n## Contributing\n\n<details>\n<summary>Setup: once per device</summary>\n\n1. [Generate an SSH key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#generating-a-new-ssh-key) and [add the SSH key to your GitHub account](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account).\n1. Configure SSH to automatically load your SSH keys:\n    ```sh\n    cat << EOF >> ~/.ssh/config\n    Host *\n      AddKeysToAgent yes\n      IgnoreUnknown UseKeychain\n      UseKeychain yes\n    EOF\n    ```\n1. [Install Docker Desktop](https://www.docker.com/get-started).\n    - Enable _Use Docker Compose V2_ in Docker Desktop's preferences window.\n    - _Linux only_:\n        - [Configure Docker and Docker Compose to use the BuildKit build system](https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds). On macOS and Windows, BuildKit is enabled by default in Docker Desktop.\n        - Export your user's user id and group id so that [files created in the Dev Container are owned by your user](https://github.com/moby/moby/issues/3206):\n            ```sh\n            cat << EOF >> ~/.bashrc\n            export UID=$(id --user)\n            export GID=$(id --group)\n            EOF\n            ```\n1. [Install VS Code](https://code.visualstudio.com/) and [VS Code's Remote-Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers). Alternatively, install [PyCharm](https://www.jetbrains.com/pycharm/download/).\n    - _Optional:_ Install a [Nerd Font](https://www.nerdfonts.com/font-downloads) such as [FiraCode Nerd Font](https://github.com/ryanoasis/nerd-fonts/tree/master/patched-fonts/FiraCode) with `brew tap homebrew/cask-fonts && brew install --cask font-fira-code-nerd-font` and [configure VS Code](https://github.com/tonsky/FiraCode/wiki/VS-Code-Instructions) or [configure PyCharm](https://github.com/tonsky/FiraCode/wiki/Intellij-products-instructions) to use `'FiraCode Nerd Font'`.\n\n</details>\n\n<details open>\n<summary>Setup: once per project</summary>\n\n1. Clone this repository.\n2. Start a [Dev Container](https://code.visualstudio.com/docs/remote/containers) in your preferred development environment:\n    - _VS Code_: open the cloned repository and run <kbd>Ctrl/⌘</kbd> + <kbd>⇧</kbd> + <kbd>P</kbd> → _Remote-Containers: Reopen in Container_.\n    - _PyCharm_: open the cloned repository and [configure Docker Compose as a remote interpreter](https://www.jetbrains.com/help/pycharm/using-docker-compose-as-a-remote-interpreter.html#docker-compose-remote).\n    - _Terminal_: open the cloned repository and run `docker compose run --rm dev` to start an interactive Dev Container.\n\n</details>\n\n<details>\n<summary>Developing</summary>\n\n- This project follows the [Conventional Commits](https://www.conventionalcommits.org/) standard to automate [Semantic Versioning](https://semver.org/) and [Keep A Changelog](https://keepachangelog.com/) with [Commitizen](https://github.com/commitizen-tools/commitizen).\n- Run `poe` from within the development environment to print a list of [Poe the Poet](https://github.com/nat-n/poethepoet) tasks available to run on this project.\n- Run `poetry add {package}` from within the development environment to install a run time dependency and add it to `pyproject.toml` and `poetry.lock`.\n- Run `poetry remove {package}` from within the development environment to uninstall a run time dependency and remove it from `pyproject.toml` and `poetry.lock`.\n- Run `poetry update` from within the development environment to upgrade all dependencies to the latest versions allowed by `pyproject.toml`.\n- Run `cz bump` to bump the package's version, update the `CHANGELOG.md`, and create a git tag.\n\n</details>\n\n## Developed by Radix\n\n[Radix](https://radix.ai) is a Belgium-based Machine Learning company.\n\nOur vision is to make technology work for and with us. We believe that if technology is used in a creative way, jobs become more fulfilling, people become the best version of themselves, and companies grow.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/radix-ai/graphchain",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "graphchain",
+    "package_url": "https://pypi.org/project/graphchain/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/graphchain/",
+    "project_urls": {
+      "Homepage": "https://github.com/radix-ai/graphchain",
+      "Repository": "https://github.com/radix-ai/graphchain"
+    },
+    "release_url": "https://pypi.org/project/graphchain/1.4.0/",
+    "requires_dist": [
+      "cloudpickle (>=1.0.0,<3.0.0)",
+      "dask (>=2020.12.0)",
+      "fs-s3fs (>=1,<2)",
+      "joblib (>=1,<2)",
+      "lz4 (>=3,<5)"
+    ],
+    "requires_python": ">=3.8,<3.11",
+    "summary": "An efficient cache for the execution of dask graphs.",
+    "version": "1.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14921961,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f7a1b0f9a1f7d5ceef14a1f377d33232733cfed1abe880d363163e0f7e090d47",
+          "md5": "cd5bff8f22ba739d89945f0954b6f9c8",
+          "sha256": "59a708bd5701ab905716d55f8e280ee94c7b201c2291f8bb21a67d4eec259e88"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cd5bff8f22ba739d89945f0954b6f9c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14132,
+        "upload_time": "2018-10-20T10:57:54",
+        "upload_time_iso_8601": "2018-10-20T10:57:54.915690Z",
+        "url": "https://files.pythonhosted.org/packages/f7/a1/b0f9a1f7d5ceef14a1f377d33232733cfed1abe880d363163e0f7e090d47/graphchain-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e84da23ac756f15767c3725893a18506ada073ab297039e01c2aa9fd10400165",
+          "md5": "18908f059ae65876538b824cdc265c32",
+          "sha256": "e604e5326ffa6cf62d333e1ce50018c4fa380ad9598330c2aea38e8930f7b7b8"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "18908f059ae65876538b824cdc265c32",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 15029,
+        "upload_time": "2019-04-29T15:12:48",
+        "upload_time_iso_8601": "2019-04-29T15:12:48.272456Z",
+        "url": "https://files.pythonhosted.org/packages/e8/4d/a23ac756f15767c3725893a18506ada073ab297039e01c2aa9fd10400165/graphchain-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8866abd03a4d0fb929233d4851a08897173799bba9770799cd768336967f2ea9",
+          "md5": "d270551d6000b9f5423411250bdb763d",
+          "sha256": "f34d8cf983a64ec8f2c090395e141f5f464ca335a26a9a166e8146aa7458a86e"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d270551d6000b9f5423411250bdb763d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 15733,
+        "upload_time": "2019-04-29T15:12:54",
+        "upload_time_iso_8601": "2019-04-29T15:12:54.238963Z",
+        "url": "https://files.pythonhosted.org/packages/88/66/abd03a4d0fb929233d4851a08897173799bba9770799cd768336967f2ea9/graphchain-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a9b3945e32c1af305b6811639a42b2538fc724198bc6c06bafc1344608a9caa3",
+          "md5": "f1637c1a2c133f20559a3c4a1b597245",
+          "sha256": "a92a5615509d50482206ed5b19ed96d997a1a2ffb6c4b50dabdd9875ad3c4aa5"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f1637c1a2c133f20559a3c4a1b597245",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10707,
+        "upload_time": "2022-01-21T13:37:46",
+        "upload_time_iso_8601": "2022-01-21T13:37:46.288574Z",
+        "url": "https://files.pythonhosted.org/packages/a9/b3/945e32c1af305b6811639a42b2538fc724198bc6c06bafc1344608a9caa3/graphchain-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e52dc50fa72c8e6308eddcd4f1a40af7e6544f9709990f65bc7f8c80336c25f4",
+          "md5": "fd9a981b2d7a192ab032c8f095a7c385",
+          "sha256": "310986742d90c1cb1e33fd51ec641586516b8b3e013712bcc273ad88e37d3811"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fd9a981b2d7a192ab032c8f095a7c385",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 13828,
+        "upload_time": "2022-01-21T13:37:47",
+        "upload_time_iso_8601": "2022-01-21T13:37:47.420893Z",
+        "url": "https://files.pythonhosted.org/packages/e5/2d/c50fa72c8e6308eddcd4f1a40af7e6544f9709990f65bc7f8c80336c25f4/graphchain-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "978c85c288786f4b3f56cef4a5694aa0f9cb92c0916ebda10ab46db4e8c45d10",
+          "md5": "488570066b0d3f4588cc2115f2bce313",
+          "sha256": "b7fc627779eec771d190c83faee75bd79c5901488b14e6b8e13dbb4b44ff8ac6"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "488570066b0d3f4588cc2115f2bce313",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 11861,
+        "upload_time": "2022-06-16T11:30:59",
+        "upload_time_iso_8601": "2022-06-16T11:30:59.550644Z",
+        "url": "https://files.pythonhosted.org/packages/97/8c/85c288786f4b3f56cef4a5694aa0f9cb92c0916ebda10ab46db4e8c45d10/graphchain-1.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff4f72e31dbb44ba4b35551e8ed2aabbdddfbade5feb8902824ae8aec6035eb1",
+          "md5": "095b40d9c753ef59651a2d54a2ce7630",
+          "sha256": "3e06dafb7e17d3ede09c00d11fe989bc0b0139246ea306633c6694e53b800672"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "095b40d9c753ef59651a2d54a2ce7630",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15747,
+        "upload_time": "2022-06-16T11:31:00",
+        "upload_time_iso_8601": "2022-06-16T11:31:00.829607Z",
+        "url": "https://files.pythonhosted.org/packages/ff/4f/72e31dbb44ba4b35551e8ed2aabbdddfbade5feb8902824ae8aec6035eb1/graphchain-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e769cf285e010d9914066996d6b5b5b9c3c3630a6fbec9f5f67539285570edac",
+          "md5": "40d4c7831ca4c6405c29e8ed9d7992a3",
+          "sha256": "eb1e5884a4a6d05f6b8fea5ce3298050d2ca2a65d48864d235cdf690e2148a34"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "40d4c7831ca4c6405c29e8ed9d7992a3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 13268,
+        "upload_time": "2022-08-29T08:51:12",
+        "upload_time_iso_8601": "2022-08-29T08:51:12.144768Z",
+        "url": "https://files.pythonhosted.org/packages/e7/69/cf285e010d9914066996d6b5b5b9c3c3630a6fbec9f5f67539285570edac/graphchain-1.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5d94e6a79a0dc1cf5bf7ecd6bb687189cd2e7b3957fddbe739894b84caaae1a5",
+          "md5": "83c2b6e22a00f2a1a8476ae9dbed138e",
+          "sha256": "2d15dc58bb4570d43641d0dfd2eafc343d3679c25af53a86da275e4d9aeb478d"
+        },
+        "downloads": -1,
+        "filename": "graphchain-1.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "83c2b6e22a00f2a1a8476ae9dbed138e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 18476,
+        "upload_time": "2022-08-29T08:51:14",
+        "upload_time_iso_8601": "2022-08-29T08:51:14.034251Z",
+        "url": "https://files.pythonhosted.org/packages/5d/94/e6a79a0dc1cf5bf7ecd6bb687189cd2e7b3957fddbe739894b84caaae1a5/graphchain-1.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e769cf285e010d9914066996d6b5b5b9c3c3630a6fbec9f5f67539285570edac",
+        "md5": "40d4c7831ca4c6405c29e8ed9d7992a3",
+        "sha256": "eb1e5884a4a6d05f6b8fea5ce3298050d2ca2a65d48864d235cdf690e2148a34"
+      },
+      "downloads": -1,
+      "filename": "graphchain-1.4.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "40d4c7831ca4c6405c29e8ed9d7992a3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<3.11",
+      "size": 13268,
+      "upload_time": "2022-08-29T08:51:12",
+      "upload_time_iso_8601": "2022-08-29T08:51:12.144768Z",
+      "url": "https://files.pythonhosted.org/packages/e7/69/cf285e010d9914066996d6b5b5b9c3c3630a6fbec9f5f67539285570edac/graphchain-1.4.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5d94e6a79a0dc1cf5bf7ecd6bb687189cd2e7b3957fddbe739894b84caaae1a5",
+        "md5": "83c2b6e22a00f2a1a8476ae9dbed138e",
+        "sha256": "2d15dc58bb4570d43641d0dfd2eafc343d3679c25af53a86da275e4d9aeb478d"
+      },
+      "downloads": -1,
+      "filename": "graphchain-1.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "83c2b6e22a00f2a1a8476ae9dbed138e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<3.11",
+      "size": 18476,
+      "upload_time": "2022-08-29T08:51:14",
+      "upload_time_iso_8601": "2022-08-29T08:51:14.034251Z",
+      "url": "https://files.pythonhosted.org/packages/5d/94/e6a79a0dc1cf5bf7ecd6bb687189cd2e7b3957fddbe739894b84caaae1a5/graphchain-1.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

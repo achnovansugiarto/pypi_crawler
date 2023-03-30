@@ -1,0 +1,107 @@
+{
+  "info": {
+    "author": "Dmitry Kovalenko",
+    "author_email": "dmytro.kovalenko@ironsrc.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# GDBT (Grafana Dashboard Templater)\n\n**GDBT** is an infrastructure-as-code tool for Grafana dashboards. This is similar to Terraform, but specializes on templating dashboards based on various evaluations.\n\n## Table of Contents\n\n- [GDBT (Grafana Dashboard Templater)](#gdbt-grafana-dashboard-templater)\n  - [Table of Contents](#table-of-contents)\n  - [Installation](#installation)\n  - [Reference](#reference)\n    - [Concepts](#concepts)\n    - [Global configuration](#global-configuration)\n    - [Resource definitions](#resource-definitions)\n      - [Caveats](#caveats)\n    - [CLI](#cli)\n      - [Commands](#commands)\n  - [Development](#development)\n    - [How does it work?](#how-does-it-work)\n    - [Source code structure](#source-code-structure)\n    - [Standards](#standards)\n    - [Prerequisites](#prerequisites)\n    - [Using Poetry](#using-poetry)\n      - [Documentation](#documentation)\n    - [Building](#building)\n    - [Releases](#releases)\n      - [Release process](#release-process)\n    - [CI/CD](#cicd)\n\n## Installation\n\nYou can install GDBT using Pip _(Python 3.9+ required!)_:\n\n```bash\npip install gdbt\n```\n\nRefer to *[CLI reference](#cli)* for further info.\n\n## Reference\n\n### Concepts\n\n**Resource**. A single object in Grafana, either folder or a dashboard.\n\n**Resource definition**. GDBT configuration file. Describes resource kind and its model as well as relevant lookups, evaluations and loops.\n\n**Scope**. A subdirectory of the whole GDBT configuration that includes a subset of resource definitions. You can run GDBT against any available scope, keeping other resources unaffected. This can be done by either running GDBT from a subdirectory or using `-s` / `--scope` option.\n\n**Lookup**. Static key-value configuration, useful for mapping or easy template variable modification. Available as `lookups` dictionary in the template.\n\n**Evaluation**. Dynamic variant of lookup. Can be used to retrieve values at runtime, for example — fetch a list of metric label values from Prometheus.\n\n**Evaluation lock**. Evaluations are cached in lock files to make sure that identical code *always* generates identical resource set. The lock files are stored beside resource definitions with the same filename and `.lock` extension. To update the lock file, run your command with `-u` or `--update` flag. Locks are updated automatically when relevant evaluation definition is changed.\n\n**Loop**. Allows you to iterate over an array, making a separate resource for each array item. The iterable can be provided from an evaluation or a lookup. Current item is available in the template as `loop.item`.\n\n### Global configuration\n\nUsed for global preferences, like defining providers or state storage configuration. It is written in TOML and always resides in the root directory of your configuration as `config.toml`.\n\nExample configuration:\n\n```toml\n[providers]\n\n[providers.example-grafana]\nkind = \"grafana\"\nendpoint = \"https://grafana.example.com\"\ntoken = \"$GRAFANA_TOKEN\"\n\n[providers.example-prometheus]\nkind = \"prometheus\"\nendpoint = \"http://prometheus.example.com:8248\"\nhttp_proxy = \"http://proxy.example.com:8080\"\nhttps_proxy = \"http://proxy.example.com:8443\"\n\n[providers.state-s3]\nkind = \"s3\"\nbucket = \"example-gdbt-state\"\n\n[state]\nprovider = \"state-s3\"\n\n[concurrency]\nthreads = 16\n\n```\n\n- `providers`: provider definitions:\n  - `kind`: provider kind, one of `grafana`, `prometheus` (for evaluations), `s3`, `consul`, `file` (for state storage)\n  - *other provider-specific parameters*\n- `state`: state storage preferences\n  - `provider`: name of provider used for state storage (*at the moment only S3 is supported*)\n- `concurrency`: parallelism preferences\n  - `threads`: how many threads to run for HTTP requests to APIs (*Note: you may experience heavy API rate limiting if you set this value too high, so try to find a sweet spot considering your resource limitations*)\n\nYou can use environment variables inside this configuration as `\"$VARIABLE_NAME\"`. Note: these should be enclosed in quotes.\n\n### Resource definitions\n\nThere are 2 kinds of resources: `dashboard` and `folder`, each of these corresponding to relevant Grafana entities.\n\nPath to the resource definition relative to configuration root (without `.yaml` extension) is designated as the resource identifier. When resource definition produces multiple resources (e.g. when using `loop`), the loop item value is appended to resource identifier with a colon symbol (`example/resource:foo`, `example/resource:bar`).\n\nExample `dashboard` resource with multiple notification channels per service:\n\n```yaml\nkind: dashboard\nprovider: example-grafana\nfolder: example/foo/folder\nevaluations:\n  example-services:\n    kind: prometheus\n    source: example-prometheus\n    metric: \"sum(cpu_user_usage) by (service)[30m]\"\n    label: service\nloop: evaluations.example-services\nlookups:\n  service_notification_channel:\n    service1:\n      - victorops-team1\n      - slack-team1\n    service2:\n      - victorops-team1\n      - mail-all\n    service3:\n      - slack-team2\n    DEFAULT:\n      - mail-all\nmodel: |\n  {\n    \"panels\": [\n      {\n        \"alert\": {\n          \"name\": \"CPU usage high in {{ loop.item }} service\",\n          \"notifications\": [\n            {%- for notification_channel in lookups.service_notification_channel[loop.item] | default(lookups.service_notification_channel.DEFAULT) %}\n            {\n              \"uid\": \"{$ notification_channel -$}\"\n            }{% if not loop.last %},{% endif %}{% endfor %}\n          ]\n        },\n        \"targets\": [\n          {\n            \"expr\": \"avg by (service)(cpu_user_usage{service='{{ loop.item }}'})\",\n          }\n        ]\n      }\n    ],\n    \"tags\": [\"example\", \"cpu\", \"{{ loop.item }}\"],\n    \"title\": \"System CPU usage ({{ loop.item }})\"\n  }\n```\n\nExample `dashboard` resource with one notification channel per service:\n\n```yaml\nkind: dashboard\nprovider: example-grafana\nfolder: example/foo/folder\nevaluations:\n  example-services:\n    kind: prometheus\n    source: example-prometheus\n    metric: \"sum(cpu_user_usage) by (service)[30m]\"\n    label: service\nloop: evaluations.example-services\nlookups:\n  service_notification_channel:\n    service1: victorops-team1\n    service2: victorops-team1\n    service3: slack-team2\n    DEFAULT: mail-all\nmodel: |\n  {\n    \"panels\": [\n      {\n        \"alert\": {\n          \"name\": \"CPU usage high in {{ loop.item }} service\",\n          \"notifications\": [\n            {\n              \"uid\": \"{$ lookups.service_notification_channel[loop.item] | default(lookups.service_notification_channel.DEFAULT) $}\"\n            }\n          ]\n        },\n        \"targets\": [\n          {\n            \"expr\": \"avg by (service)(cpu_user_usage{service='{{ loop.item }}'})\",\n          }\n        ]\n      }\n    ],\n    \"tags\": [\"example\", \"cpu\", \"{{ loop.item }}\"],\n    \"title\": \"System CPU usage ({{ loop.item }})\"\n  }\n```\n\n*Note: `model` in the above example was stripped and only relevant fields were left. Please refer to Grafana documentation for valid resource model JSON format.\n\nExample `folder` resource:\n\n```yaml\nkind: folder\nprovider: example-grafana\nmodel: |\n  {\n    \"title\": \"Example Folder\"\n  }\n```\n\n- `kind`: either of `folder`, `dashboard`\n- `provider`: name of Grafana provider this resource will be applied to\n- `folder` *(only for `dashboard` kind)*: resource identifier of folder the dashboard will be created in\n- `evaluations` *(optional)*: dynamic lookups:\n  - `kind`: evaluation kind, only `prometheus` is supported at the moment\n  - `source`: provider name to run the evaluation against\n  - `metric`: metric to evaluate\n  - `label`: name of label to extract from received metric set\n- `lookups` *(optional)*: static lookups, a simple key-value\n- `loop` *(optional)*: loop against specified variable, will generate a resource for each item in provided variable\n- `model`: Jinja2 template of Grafana resource model JSON\n\nSee [Jinja2 documentation](https://jinja.palletsprojects.com/en/2.11.x/templates/) for more info about templates.\n\n#### Caveats\n\nGrafana forbids creating resources with identical titles. Because of this, be extra careful when using `loop`, ensure that you include `{{ loop.item }}` as a part of `title` — otherwise you will get unexpected cryptic errors from Grafana.\n\n### CLI\n\n```text\ngdbt [command] [parameters] [options]\n```\n\nUse `--help` for information on specific command. The synopsis for each command shows its parameters and their usage.\n\n#### Commands\n\n- `validate`: Validate syntax:\n  - `-s` / `--scope`: Scope (default: current working directory).\n- `plan`: Generates an execution plan for GDBT:\n  - `-u` / `--update`: Update evaluation locks.\n- `apply`: Build or change Grafana resources according to the configuration in the current scope:\n  - `-s` / `--scope`: Scope (default: current working directory);\n  - `-u` / `--update`: Update evaluation locks;\n  - `-y` / `--auto-approve`: Do not ask for confirmation.\n- `destroy`: Remove all defined resources within the current scope:\n  - `-s` / `--scope`: Scope (default: current working directory);\n  - `-u` / `--update`: Update evaluation locks;\n  - `-y` / `--auto-approve`: Do not ask for confirmation.\n- `version`: Print GDBT version.\n\n## Development\n\nBefore starting, please read [Contributing guidelines](https://github.com/zerodayyy/gdbt/blob/main/.github/CONTRIBUTING.md).\n\n*Note:* This repo uses *main* as a default branch. Make sure you don't use *master* accidentally.\n\n### How does it work?\n\nHere's a flow of GDBT code:\n\n1. Query GitHub for new GDBT releases. If a valid release with a latter version is found, display a message, otherwise skip to the next step.\n2. Read evaluation cache from lock files. If lock file hash doesn't match, or `-u` flag was provided, query Prometheus (VictoriaMetrics) and write the new evaluation result to the lock file.\n3. If `loop` option is provided, assign a *resource* for each loop item. Otherwise, a single resource is assigned.\n4. For every resource, query Grafana and fetch JSON model of a dashboard (or a folder).\n5. Calculate the difference between the configured and actual state of resources, and make it into a plan.\n6. If the command is `apply` — apply the plan by querying Grafana and sending JSON models of the resources\n\n### Source code structure\n\nAll source code can be found under `gdbt` directory:\n\n- **`code`** — configuration and templates parsing\n- **`dynamic`** — implementation of *lookup* and *evaluation* concepts\n- **`errors`** — error handling\n- **`provider`** — provider-specific code which implements provider interface\n- **`resource`** — implementation of Grafana Resource object\n- **`state`** — state and plan calculation related code\n- **`cli.py`** — main program, definition of CLI commands\n\n### Standards\n\nGDBT code shall follow OOP patterns. You can learn more [here](https://realpython.com/python3-object-oriented-programming/). Code style shall be [Black](https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html). Code shall be formatted using Black formatter, [isort](https://pycqa.github.io/isort/) and linted with [flake8](https://flake8.pycqa.org/en/latest/#).\nAll dependencies shall be managed using [Poetry](https://python-poetry.org/docs).\nGDBT releases shall strictly follow [Semantic Versioning](https://semver.org) scheme.\n\n### Prerequisites\n\nTo work on this project you need:\n\n- Python 3.8+ (using [pyenv](https://github.com/pyenv/pyenv#installation) is heavily recommended)\n- [Poetry](https://python-poetry.org/docs/#installation)\n- IDE with [Black](https://github.com/psf/black#installation-and-usage) formatter, [flake8](https://flake8.pycqa.org/en/latest/#installation) linter and [isort](https://pycqa.github.io/isort/#installing-isort) tool installed\n\n### Using Poetry\n\nThis project uses Poetry as a dependency management tool. It has a lot of advantages before plain pip, for example:\n\n- automatic virtual env management\n- better dependency management\n- build system\n- integration with test frameworks\n\nHere are some example actions you should know:\n\n```bash\n# Activate the virtual environment and get a shell inside\npoetry shell\n\n# Install the app with all dependencies\npoetry install\n\n# Add a new dependency (identical to pip install x when not using Poetry)\npoetry add x\n\n# Remove a dependency\npoetry remove x\n\n# Bump package version (level is one of patch, minor, major)\npoetry version level\n\n# Run a command in the virtual environment\npoetry run x\n\n# Update dependencies\npoetry update\n\n# Build package wheel\npoetry build -f wheel\n```\n\nAll dependencies should be added using Poetry: `poetry add x`. Please try to reuse existing dependencies to avoid bloating the package; you can find the list of these in `pyproject.toml` or by running `poetry show`.\n\nPlease specify any additional dependencies in module docstring.\n\n#### Documentation\n\nThis tool uses Python docstrings for documentation purposes. Those docstrings should follow [Google's docstrings style guide](https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html). You should use docstrings module documentation, reference, TODOs etc.\n\n### Building\n\nThis package is distributed as a [wheel](https://realpython.com/python-wheels/). This simplifies installation and dependency management on target systems.\n\nNormally you should use stable CI-built wheels, available on Releases page. In case you need a development wheel for testing, you can always build one yourself:\n\n```bash\npoetry build -f wheel\n```\n\nYou can find the built wheel in *dist* directory. *Note:* wheel file name contains package metadata, so do not rename the file, otherwise you might not be able to install it!\n\n### Releases\n\n**GDBT** follows [semantic versioning](https://semver.org) guidelines. Version numbers don't include *v* prefix *unless* it is a tag name (i.e., tags look like `v1.2.3`, everything else — `1.2.3`).\n\nAll changes are kept track of in the changelog, which can be found in *CHANGELOG.md* file. This file follows *[keep-a-changelog](https://keepachangelog.com/en/1.0.0/)* format. Please make yourself familiar with it before contributing.\n\nGenerally, you should test your changes before creating a release. After that, create a *release candidate* pre-release, using the instruction below. Version number should be `1.2.3-rc.1` — an upcoming release version number with RC suffix. After extensively testing the release candidate, you can proceed to creating a release.\n\n#### Release process\n\n0. Checkout *main* branch.\n1. Run `poetry version minor` (or `major` or `patch`, depending on severity of changes in the release). This will bump project version in `pyproject.toml`.\n2. Change `[Unreleased]` H2 header in *CHANGELOG.md* to the new release version (e.g., `[1.2.3]`).\n3. Add current date in ISO format (`YYYY-DD-MM`) after the header (e.g., `[1.2.3] - 2011-12-13`).\n4. Add new `[Unreleased]` H2 header above all version headers.\n5. Add compare link at the bottom of *CHANGELOG.md* as follows:\n`[1.2.3]: https://github.com/zerodayyy/gdbt/compare/v1.2.2...v1.2.3` right below `[unreleased]` link (replace `1.2.3` with the new release version, `1.2.2` with the previous release version).\n6. Change version in `[unreleased]` link at the bottom of *CHANGELOG.md* to the new release version (e.g., `[unreleased]: https://github.com/zerodayyy/gdbt/compare/v1.2.3...HEAD`).\n7. Commit the changes to *main* branch. Commit message should be `Release v1.2.3`.\n8. Create a release tag: `git tag v1.2.3`. This should be a *lightweight* tag, not an annotated one.\n9. Push the changes and tag to GitHub: `git push && git push --tags`.\n\nIf you find the above instructions unclear, take a look at previous releases or contact project maintainers.\n\n### CI/CD\n\nThis repo uses GitHub Actions as CI/CD tool. Pipeline config can be found in *.github/workflows/ci-release.yaml* file.\n\nAs of now, the only pipeline is *Release*: it builds the wheel and creates a release in GitHub. It is triggered on tags that start with *v* prefix.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "gdbt",
+    "package_url": "https://pypi.org/project/gdbt/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/gdbt/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/gdbt/2.2.1/",
+    "requires_dist": [
+      "rich (>=10.2.1,<11.0.0)",
+      "Jinja2 (>=2.11.2,<3.0.0)",
+      "attrs (>=20.3.0,<21.0.0)",
+      "backoff (>=1.10.0,<2.0.0)",
+      "class-registry (>=2.1.2,<3.0.0)",
+      "click (>=7.1.2,<8.0.0)",
+      "deserialize (>=1.8.0,<2.0.0)",
+      "dictdiffer (>=0.8.1,<0.9.0)",
+      "dpath (>=2.0.1,<3.0.0)",
+      "envtoml (>=0.1.2,<0.2.0)",
+      "flatten-dict (>=0.3.0,<0.4.0)",
+      "grafana-api (>=1.0.3,<2.0.0)",
+      "halo (>=0.0.31,<0.0.32)",
+      "jsonpath-ng (>=1.5.2,<2.0.0)",
+      "python-configuration[toml,yaml] (>=0.8.1,<0.9.0)",
+      "python-consul2 (>=0.1.5,<0.2.0)",
+      "requests (>=2.25.0,<3.0.0)",
+      "s3path (>=0.2.205,<0.3.0)",
+      "semver (>=2.13.0,<3.0.0)"
+    ],
+    "requires_python": ">=3.9,<4.0",
+    "summary": "Use Infrastructure as Code to provision and manage Grafana Dashboards from Templates",
+    "version": "2.2.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11315116,
+  "releases": {
+    "2.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5d80d8af0f5dbce27a3564ac9fb44e13a7a10900216d03d39d3cc56bffa1f3c",
+          "md5": "888727f3220de50f879f2382e35f55c8",
+          "sha256": "e2da4ab706d37f85ccfe450cf827e6b2c8a5490733c9430b7cb1ddf7ff9970e7"
+        },
+        "downloads": -1,
+        "filename": "gdbt-2.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "888727f3220de50f879f2382e35f55c8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9,<4.0",
+        "size": 27271,
+        "upload_time": "2021-08-30T16:32:35",
+        "upload_time_iso_8601": "2021-08-30T16:32:35.314899Z",
+        "url": "https://files.pythonhosted.org/packages/e5/d8/0d8af0f5dbce27a3564ac9fb44e13a7a10900216d03d39d3cc56bffa1f3c/gdbt-2.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e5d80d8af0f5dbce27a3564ac9fb44e13a7a10900216d03d39d3cc56bffa1f3c",
+        "md5": "888727f3220de50f879f2382e35f55c8",
+        "sha256": "e2da4ab706d37f85ccfe450cf827e6b2c8a5490733c9430b7cb1ddf7ff9970e7"
+      },
+      "downloads": -1,
+      "filename": "gdbt-2.2.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "888727f3220de50f879f2382e35f55c8",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9,<4.0",
+      "size": 27271,
+      "upload_time": "2021-08-30T16:32:35",
+      "upload_time_iso_8601": "2021-08-30T16:32:35.314899Z",
+      "url": "https://files.pythonhosted.org/packages/e5/d8/0d8af0f5dbce27a3564ac9fb44e13a7a10900216d03d39d3cc56bffa1f3c/gdbt-2.2.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

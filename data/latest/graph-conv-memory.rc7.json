@@ -1,0 +1,402 @@
+{
+  "info": {
+    "author": "Steven Morad",
+    "author_email": "stevenmorad@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Graph Convolutional Memory using Topological Priors\n\n## Description\nGraph convolutional memory (GCM) is graph-structured memory that may be applied to reinforcement learning to solve POMDPs, replacing LSTMs or attention mechanisms. GCM allows you to embed your domain knowledge in the form of connections in a graph. See the [full paper](https://arxiv.org/pdf/2106.14117.pdf) for further details. This repo contains the GCM library implementation for use in your projects. To replicate the experiments from the paper, please see [this repository instead](https://github.com/smorad/graph-conv-memory-paper).\n\nIf you use GCM, please cite the paper!\n```\n@article{morad2021graph,\n  title={Graph Convolutional Memory using Topological Priors},\n  author={Morad, Steven D and Liwicki, Stephan and Kortvelesy, Ryan and Mecca, Roberto and Prorok, Amanda},\n  journal={arXiv preprint arXiv:2106.14117},\n  year={2021}\n}\n```\n\n\n## Installation\nGCM is installed using `pip`. The dependencies must be installed manually, as they target your specific architecture (with or without CUDA).\n\n### Conda install\nFirst install `torch >= 1.8.0` and `torch-geometric` dependencies, then `gcm`:\n```\nconda install torch\nconda install pytorch-geometric -c rusty1s -c conda-forge\npip install graph-conv-memory\n```\n\n### Pip install\nPlease follow the [torch-geometric install guide](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html), then\n```\npip install graph-conv-memory\n```\n\n\n## Quickstart\nBelow is a quick example of how to use GCM in a basic RL problem:\n\n```python\nimport torch\nimport torch_geometric\nfrom gcm.gcm import DenseGCM\nfrom gcm.edge_selectors.temporal import TemporalBackedge\n\n\n# graph_size denotes the maximum number of observations in the graph, after which\n# the oldest observations will be overwritten with newer observations. Reduce this number to\n# reduce memory usage.\ngraph_size = 128\n\n# Define the GNN used in GCM. The following is the one used in the paper\n# Make sure you define the first layer to match your observation space\nclass GNN(torch.nn.Module):\n    \"\"\"A simple two-layer graph neural network\"\"\"\n    def __init__(self, obs_size, hidden_size=32):\n        super().__init__()\n        self.gc0 = torch_geometric.nn.DenseGraphConv(obs_size, hidden_size)\n        self.gc1 = torch_geometric.nn.DenseGraphConv(hidden_size, hidden_size)\n        self.act = torch.nn.Tanh()\n\n    def forward(self, x, adj, weights, B, N):\n        x = self.act(self.gc0(x, adj))\n        return self.act(self.gc1(x, adj))\n\n# Build GNN that GCM uses internally\nobs_size = 8\ngnn = GNN(obs_size)\n# Create the GCM using our GNN and edge selection criteria. TemporalBackedge([1]) will link observation o_t to o_{t-1}.\n# See `gcm.edge_selectors` for different kinds of priors suitable for your specific problem. Do not be afraid to implement your own!\ngcm = DenseGCM(gnn, edge_selectors=TemporalBackedge([1]), graph_size=graph_size)\n\n# If the hidden state m_t is None, GCM will initialize one for you\n# only do this at the beginning, as GCM must track and update the hidden\n# state to function correctly\n#\n# You can inspect m_t, as it is just a graph of observations\n# the first element is the node feature matrix and the second is the adjacency matrix\nm_t = None\n\nfor t in train_timestep:\n   # Obs at timestep t should be a tensor of shape (batch_size, obs_size)\n   # obs = my_env.step()\n   belief, m_t = gcm(obs, m_t)\n   # GCM provides a belief state -- a combination of all past observational data relevant to the problem\n   # What you likely want to do is put this state through actor and critic networks to obtain\n   # action and value estimates\n   action_logits = logits_nn(belief)\n   state_value = vf_nn(belief)\n```\n\nWe provide a few edge selectors, which we briefly detail here:\n```python\ngcm.edge_selectors.temporal.TemporalBackedge\n# Connections to the past. Give it [1,2,4] to connect each\n# observation t to t-1, t-2, and t-4.\n\ngcm.edge_selectors.dense.DenseEdge\n# Connections to all past observations\n# observation t is connected to t-1, t-2, ... 0\n\ngcm.edge_selectors.distance.EuclideanEdge\n# Connections to observations within some max_distance\n# e.g. if l2_norm(o_t, o_k) < max_distance, create an edge\n\ngcm.edge_selectors.distance.CosineEdge\n# Like euclidean edge, but using cosine similarity instead\n\ngcm.edge_selectors.distance.SpatialEdge\n# Euclidean distance, but only compares slices from the observation\n# this is useful if you have an 'x' and 'y' dimension in your observation\n# and only want to connect nearby entries\n#\n# You can also implement the identity priors using this by setting\n# max_distance to something like 1e-6\n\ngcm.edge_selectors.learned.LearnedEdge\n# Learn an edge function from the data\n# Will randomly sample edges and train thru gradient descent\n# call the constructor with the output size of your GNN\n```\n\n## Ray Quickstart (WIP)\nWe provide a ray rllib wrapper around GCM, see the example below for how to use it\n\n```python\nimport unittest\nimport torch\nimport torch_geometric\nimport ray\nfrom ray import tune\n\nfrom gcm.ray_gcm import RayDenseGCM\nfrom gcm.edge_selectors.temporal import TemporalBackedge\n\nclass GNN(torch.nn.Module):\n    \"\"\"A simple two-layer graph neural network\"\"\"\n    def __init__(self, obs_size, hidden_size=32):\n        super().__init__()\n        self.gc0 = torch_geometric.nn.DenseGraphConv(obs_size, hidden_size)\n        self.gc1 = torch_geometric.nn.DenseGraphConv(hidden_size, hidden_size)\n        self.act = torch.nn.Tanh()\n\n    def forward(self, x, adj, weights, B, N):\n        x = self.act(self.gc0(x, adj))\n        return self.act(self.gc1(x, adj))\n\n\nray.init(\n    local_mode=True,\n    object_store_memory=3e10,\n)\ninput_size = 16 \nhidden_size = 32\ncfg = {\n    \"framework\": \"torch\",\n    \"num_gpus\": 0,\n    \"env\": \"CartPole-v0\",\n    \"num_workers\": 0,\n    \"model\": {\n        \"custom_model\": RayDenseGCM,\n        \"custom_model_config\": {\n            \"graph_size\": 20,\n             # GCM Ray wrapper will automatically convert observation\n             # to gnn_input_size using a linear layer\n            \"gnn_input_size\": input_size,\n            \"gnn_output_size\": hidden_size,\n            \"gnn\": GNN(input_size),\n            \"edge_selectors\": TemporalBackedge([1]),\n            \"edge_weights\": False,\n        }\n    }\n}\ntune.run(\n    \"A2C\",\n    config=cfg,\n    stop={\"info/num_steps_trained\": 100}\n)\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/smorad/graph-conv-memory",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "graph-conv-memory",
+    "package_url": "https://pypi.org/project/graph-conv-memory/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/graph-conv-memory/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/smorad/graph-conv-memory/issues",
+      "Homepage": "https://github.com/smorad/graph-conv-memory"
+    },
+    "release_url": "https://pypi.org/project/graph-conv-memory/0.0.7/",
+    "requires_dist": [
+      "torch",
+      "torch-geometric (>=1.7.0)",
+      "sparsemax",
+      "torchtyping"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Graph convolutional memory for reinforcement learning",
+    "version": "0.0.7",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12156111,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1f8e7cbef516145aac19a496d68dccffc5b7fdf3f37d9a87e7b6c8086b3a8a6",
+          "md5": "c09e36dbd7396fddf646bf24ceeeb58b",
+          "sha256": "cc75bd75b3d7c928e5d1a2d602ce8ad0c00912a03b0d4b2330a13501fcf9ad92"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c09e36dbd7396fddf646bf24ceeeb58b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 10526,
+        "upload_time": "2021-06-28T19:01:37",
+        "upload_time_iso_8601": "2021-06-28T19:01:37.186051Z",
+        "url": "https://files.pythonhosted.org/packages/e1/f8/e7cbef516145aac19a496d68dccffc5b7fdf3f37d9a87e7b6c8086b3a8a6/graph_conv_memory-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "73cb5200a78b21e245c1cfae82e5ed7120eb6ed30227fd4cb5aeefb41d44ba6b",
+          "md5": "f519cdb2268c3cf5a16df499eb4544f8",
+          "sha256": "be5828b940d9b66f99d9e35c3c033a3582a1f00a9130d439a7a55029ea3fd66b"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f519cdb2268c3cf5a16df499eb4544f8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 9160,
+        "upload_time": "2021-06-28T19:01:38",
+        "upload_time_iso_8601": "2021-06-28T19:01:38.728427Z",
+        "url": "https://files.pythonhosted.org/packages/73/cb/5200a78b21e245c1cfae82e5ed7120eb6ed30227fd4cb5aeefb41d44ba6b/graph-conv-memory-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f7dcd59e7c9f15f4e079cd7dc63dcb8546725c192a7e28e0fe5f4bd9e5c0686e",
+          "md5": "d4fae6290dfd9a3ddee49d688192ace5",
+          "sha256": "b418924083be763530123a5c09b5f226ffd3ceda2cee7636e46a15180ce1c7e0"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d4fae6290dfd9a3ddee49d688192ace5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 10854,
+        "upload_time": "2021-07-06T12:46:07",
+        "upload_time_iso_8601": "2021-07-06T12:46:07.331218Z",
+        "url": "https://files.pythonhosted.org/packages/f7/dc/d59e7c9f15f4e079cd7dc63dcb8546725c192a7e28e0fe5f4bd9e5c0686e/graph_conv_memory-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "14ed1d9a4ad3f61970f7a6459ca8bf7a9a680a5ae55183e7219a4402ad5be64c",
+          "md5": "2331efea3a1ec9088cd90f8557c2a551",
+          "sha256": "2be93654779e2158586d346af4792aa0f081ee3e4b7f444de206a96dfc93b699"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2331efea3a1ec9088cd90f8557c2a551",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 10555,
+        "upload_time": "2021-07-06T12:46:08",
+        "upload_time_iso_8601": "2021-07-06T12:46:08.306784Z",
+        "url": "https://files.pythonhosted.org/packages/14/ed/1d9a4ad3f61970f7a6459ca8bf7a9a680a5ae55183e7219a4402ad5be64c/graph-conv-memory-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c348e5d305a8135cd3a40e0960416e3d027fb2abb383097f0d0e5ea4b82e0f73",
+          "md5": "d4c9c77396a8c3ddd2dda8cde1591522",
+          "sha256": "e28d894f79ce930b278cf22625e89afab02a379a76d658d58be5666bb6e8bf88"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d4c9c77396a8c3ddd2dda8cde1591522",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 10883,
+        "upload_time": "2021-07-11T17:47:43",
+        "upload_time_iso_8601": "2021-07-11T17:47:43.894329Z",
+        "url": "https://files.pythonhosted.org/packages/c3/48/e5d305a8135cd3a40e0960416e3d027fb2abb383097f0d0e5ea4b82e0f73/graph_conv_memory-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "884f4c453f659600758b8c25cc587fa48cc35fc0c78e2289f1d00077936bf1d7",
+          "md5": "475e49cc1562a97deb941bc574539add",
+          "sha256": "a9269ff253fd23b70d551d45fa5ce9e59956ccfd32cc4cd7e1251b9680a7192c"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "475e49cc1562a97deb941bc574539add",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 10584,
+        "upload_time": "2021-07-11T17:47:45",
+        "upload_time_iso_8601": "2021-07-11T17:47:45.064605Z",
+        "url": "https://files.pythonhosted.org/packages/88/4f/4c453f659600758b8c25cc587fa48cc35fc0c78e2289f1d00077936bf1d7/graph-conv-memory-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "beae362a135fb6359449ec0586d2f8a1941fc502773825aaf3d783a7649583f3",
+          "md5": "522356c25fa8a13fc3327f0658e595a1",
+          "sha256": "52c79aae9063d452c0827a09dab34b4746f9b351da90a30117d1ef379978c373"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "522356c25fa8a13fc3327f0658e595a1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12330,
+        "upload_time": "2021-08-11T18:52:09",
+        "upload_time_iso_8601": "2021-08-11T18:52:09.290205Z",
+        "url": "https://files.pythonhosted.org/packages/be/ae/362a135fb6359449ec0586d2f8a1941fc502773825aaf3d783a7649583f3/graph_conv_memory-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2de28f410febf19b273c880fe47d99306daca9b51f9e3f9cc91d4f06c19678fa",
+          "md5": "115e048679205e73bb06dd0e8c46052d",
+          "sha256": "ae219c610fca2faeb68088ae1076c15d8f296dfa0e075215c403421701f2ef3f"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "115e048679205e73bb06dd0e8c46052d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 11624,
+        "upload_time": "2021-08-11T18:52:10",
+        "upload_time_iso_8601": "2021-08-11T18:52:10.770264Z",
+        "url": "https://files.pythonhosted.org/packages/2d/e2/8f410febf19b273c880fe47d99306daca9b51f9e3f9cc91d4f06c19678fa/graph-conv-memory-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "363e9d971e163c3c6d56d512b894e3d55df2462caa626a7a807a1ccaf21d3b14",
+          "md5": "7a8e9aa51d3a620cd04eb1f0da50e334",
+          "sha256": "6e451699ea83a0464fc9e6470d898bb23b32b5c7c1a741f876efde0e3ca3b65a"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7a8e9aa51d3a620cd04eb1f0da50e334",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 12831,
+        "upload_time": "2021-09-06T13:30:31",
+        "upload_time_iso_8601": "2021-09-06T13:30:31.778788Z",
+        "url": "https://files.pythonhosted.org/packages/36/3e/9d971e163c3c6d56d512b894e3d55df2462caa626a7a807a1ccaf21d3b14/graph_conv_memory-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ecf362ac3a23c1b0a304af0dd8a33138d0c074acc319b21c4b23ca4deae5965f",
+          "md5": "81e355315cffa334b21f5bf67ec9d34a",
+          "sha256": "0d7e620ad62b7b37718c78409ad73354b26721de0e245c596012b3addae783b2"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81e355315cffa334b21f5bf67ec9d34a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 12533,
+        "upload_time": "2021-09-06T13:30:32",
+        "upload_time_iso_8601": "2021-09-06T13:30:32.689389Z",
+        "url": "https://files.pythonhosted.org/packages/ec/f3/62ac3a23c1b0a304af0dd8a33138d0c074acc319b21c4b23ca4deae5965f/graph-conv-memory-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b2d280c4ada3df77f001370c5d277773b3476d971c615c43dd5d2e300f68bea",
+          "md5": "429cd88dc3474ab2bb4c9e40abd5a145",
+          "sha256": "31cd8a34cbcf3dc8b9078c7f01d8de835eb89d76d2e1acac14eb0dd9b3ec26eb"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "429cd88dc3474ab2bb4c9e40abd5a145",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 17020,
+        "upload_time": "2021-10-01T20:22:29",
+        "upload_time_iso_8601": "2021-10-01T20:22:29.383681Z",
+        "url": "https://files.pythonhosted.org/packages/9b/2d/280c4ada3df77f001370c5d277773b3476d971c615c43dd5d2e300f68bea/graph_conv_memory-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d276345a0182fd9ce0a06442ae765d9c70d2985b8f313b54ab8c325e0ef90bc",
+          "md5": "6a27ef2caa65d964f378429ce1e644b0",
+          "sha256": "8b003b866e635a598b7e64e53692c1f2ebb8ee0204bf1b11e85c1f21717dbfd5"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6a27ef2caa65d964f378429ce1e644b0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 16350,
+        "upload_time": "2021-10-01T20:22:31",
+        "upload_time_iso_8601": "2021-10-01T20:22:31.244303Z",
+        "url": "https://files.pythonhosted.org/packages/0d/27/6345a0182fd9ce0a06442ae765d9c70d2985b8f313b54ab8c325e0ef90bc/graph-conv-memory-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5066c8f2369a403a067dad94fc3a17240892aa4b3b21d4abafb02efe07d42612",
+          "md5": "3bbbd45a46dcf0d1253b82ded201e545",
+          "sha256": "4956098cd6c82a78902b28e8afed7766c93d1fcc4fb60bbdbec02763126fc552"
+        },
+        "downloads": -1,
+        "filename": "graph_conv_memory-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3bbbd45a46dcf0d1253b82ded201e545",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 24502,
+        "upload_time": "2021-11-29T16:43:43",
+        "upload_time_iso_8601": "2021-11-29T16:43:43.552525Z",
+        "url": "https://files.pythonhosted.org/packages/50/66/c8f2369a403a067dad94fc3a17240892aa4b3b21d4abafb02efe07d42612/graph_conv_memory-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6283fb8fd24716eb027774b58faf857577c2d68159e1686e602d125c46470c3c",
+          "md5": "1695447cb1af3f45c26ccec36664a9bc",
+          "sha256": "5fe0cc1a56666aebea1fe2c870de558ac53bc5f960fe07580cc17db85b22a113"
+        },
+        "downloads": -1,
+        "filename": "graph-conv-memory-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1695447cb1af3f45c26ccec36664a9bc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 20597,
+        "upload_time": "2021-11-29T16:43:45",
+        "upload_time_iso_8601": "2021-11-29T16:43:45.114602Z",
+        "url": "https://files.pythonhosted.org/packages/62/83/fb8fd24716eb027774b58faf857577c2d68159e1686e602d125c46470c3c/graph-conv-memory-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5066c8f2369a403a067dad94fc3a17240892aa4b3b21d4abafb02efe07d42612",
+        "md5": "3bbbd45a46dcf0d1253b82ded201e545",
+        "sha256": "4956098cd6c82a78902b28e8afed7766c93d1fcc4fb60bbdbec02763126fc552"
+      },
+      "downloads": -1,
+      "filename": "graph_conv_memory-0.0.7-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "3bbbd45a46dcf0d1253b82ded201e545",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 24502,
+      "upload_time": "2021-11-29T16:43:43",
+      "upload_time_iso_8601": "2021-11-29T16:43:43.552525Z",
+      "url": "https://files.pythonhosted.org/packages/50/66/c8f2369a403a067dad94fc3a17240892aa4b3b21d4abafb02efe07d42612/graph_conv_memory-0.0.7-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6283fb8fd24716eb027774b58faf857577c2d68159e1686e602d125c46470c3c",
+        "md5": "1695447cb1af3f45c26ccec36664a9bc",
+        "sha256": "5fe0cc1a56666aebea1fe2c870de558ac53bc5f960fe07580cc17db85b22a113"
+      },
+      "downloads": -1,
+      "filename": "graph-conv-memory-0.0.7.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1695447cb1af3f45c26ccec36664a9bc",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 20597,
+      "upload_time": "2021-11-29T16:43:45",
+      "upload_time_iso_8601": "2021-11-29T16:43:45.114602Z",
+      "url": "https://files.pythonhosted.org/packages/62/83/fb8fd24716eb027774b58faf857577c2d68159e1686e602d125c46470c3c/graph-conv-memory-0.0.7.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

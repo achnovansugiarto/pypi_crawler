@@ -1,0 +1,218 @@
+{
+  "info": {
+    "author": "Marc Gurevitx",
+    "author_email": "marcgurevitx@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# goodenough\n\nA small Python lib that helps one to pick items from their collections / storages.\n\n```bash\npip install goodenough\n```\n\nor\n\n```bash\npip install goodenough[web]  # if you want a simple aiohttp-based web server\n```\n\nIt's designed for tasks where you need a random item that is also not complete garbage like selecting the next song from a songs database to play on the radio.\n\nTo use this lib you should tell it how to get the sample of items (`get_items`) and how to sort them from good to bad (`rules`).\n\nOptionaly, you can also reflect on how the items got sorted and which item has won (`review_items`, `review_result`).\n\n## Callbacks\n\nAll callbacks should be async in case you want to do I/O stuff (like talking to a storage).\n\nEvery callback's first argument should be `request` -- an opaque data passed to `.pick()` or `.async_pick()` (in case of a web server started by `.serve()`, the `request` is JSON-deserialized POST body, see below).\n\n### `get_items`\n\nHere we define `get_items` callback that selects random documents from Mongo (but it can be any data source of your choice):\n\n```python\nfrom motor.motor_asyncio import AsyncIOMotorClient\nfrom goodenough import GoodEnough\n\nasync def get_items(request):\n    client = AsyncIOMotorClient()\n    collection = client.test.things  # assumed test.things is prepopulated\n    pipeline = [{\"$sample\": {\"size\": request[\"size\"]}}]\n    cursor = collection.aggregate(pipeline)\n    return await cursor.to_list(None)  # we return list, but any iterable should do\n\ng = GoodEnough(get_items)\nprint(g.pick(request={\"size\": 1}))  # should print a random document from test.things\n```\n\nIn `request` we pass `\"size\"` equals to 1 to select one random document.\n\nWe could pass a greater size value, but `.pick()` and `.async_pick()` only return one result, so in this example it wouldn't be useful.\n\nHowever, if we define one or more `rules` functions, it will make sense to select a bigger sample and then choose the \"best\" item.\n\n### `rules`\n\nEach rule function receives `request` and an `item` and is expected to return a `float` between `0.` and `1.`, where `0.` means the item is \"the worst\" and `1.` means the item is \"the best\".\n\nHere we extend our previous example and write a rule that gives greater chance to documents whose `\"foo\"` field is closer to `request[\"foo\"]`.\n\n```python\n\n#...\n\nasync def rule_foo(request, item):\n    if item[\"foo\"] == request[\"foo\"]:\n        return 1.\n    else:\n        return 1 / abs(item[\"foo\"] - request[\"foo\"])\n\ng = GoodEnough(\n    get_items,\n    rules=[ rule_foo ],\n)\nprint(g.pick(request={\"size\": 5, \"foo\": 15}))\n```\nYou can supply many rules, in which case the resulting score of an item will be a product of scores returned from the `rules` functions.\n\n`goodenough` also supports rules *weights*. See tests.\n\nIf a rule functions returns `0.`, the item is then never returned by `.pick()`.\n\nIf each item in a sample gains score `0.`, the `None` is returned, or if you supply `default=` parameter to `.pick()`, that is returned.\n\n### `review_items`\n\nThe `review_items` callback (if is defined) is invoked after all rules have applied and the items have got sorted from the \"best\" to the \"worst\" in terms of their scores.\n\nOne use case of this is to communicate information back to the database, like for example saving last resulting scores.\n\nIts second argument `scored_items` is a list of named pairs `[... (item=item, score=score) ...]` sorted from the heighest score to the lowest, implying that the picked item is going to be the first in the list.\n\nThe `is_successful` flag tells the callback whether the first item is going to be returned (`is_successful=True`) or the default value will be returned (`is_successful=False`).\n\nHere we extend our example to increment a `\"pickedCount\"` value in Mongo for the picked item:\n\n```python\n\n#...\n\nasync def review_items(request, scored_items, is_successful):\n    if is_successful:\n        picked = scored_items[0]  # `picked` is a named pair (item=..., score=...)\n        client = AsyncIOMotorClient()\n        collection = client.test.things\n        await collection.update_one(\n            {\"_id\": picked.item[\"_id\"]},\n            {\"$inc\": {\"pickedCount\": 1}},\n        )\n\ng = GoodEnough(\n    get_items,\n    review_items=review_items,\n    rules=[ rule_foo ],\n)\nprint(g.pick(request={\"size\": 5, \"foo\": 15}))\n```\n\n### `review_result`\n\nAnother optional callback is `review_result` that receives the picked item which it can modify before the item will get returned from `.*pick()`.\n\nThis callback **must** return and the returned value **must** be a `GoodEnoughResult` object, see below.\n\nEven if you're not going to modify the result in this callback, you have to explicitly write `return GoodEnoughResult(result)`.\n\nHere we extend the previous example by writing a callback that will insert current datetime to the item before returning it from `.pick()`.\n\n```python\nimport datetime\nfrom goodenough import GoodEnough, GoodEnoughResult\n\n# ...\n\nasync def review_result(request, result, is_successful):\n    if is_successful:\n        result[\"dtPicked\"] = datetime.datetime.now(datetime.timezone.utc)\n    return GoodEnoughResult(result)\n\ng = GoodEnough(\n    get_items,\n    review_items=review_items,\n    review_result=review_result,\n    rules=[ rule_foo ],\n)\nprint(g.pick(request={\"size\": 5, \"foo\": 15}))\n```\n\n## Web server\n\nThis lib has a small web server that returns items in response to `POST /fetch`.\n\nIt requires `aiohttp`, so either `pip install aiohttp` or `pip install goodenough[web]`.\n\nTo start the web server call `.serve()` or `.serve(port=YOUR_PORT)`.\n\nThe default port is `4181` for no comprehensible reason.\n\nThe POST body will be JSON-deserialized and passed to the `.async_pick()` as a `request` parameter.\n\nThe result of `.async_pick()` will be JSON-serialized and sent as the response body.\n\nLet's again update our previous example:\n\n(To avoid JSON errors trying to serialize Mongo's ObjectId and datetime, we will convert them to `str`s in a new version of the `review_result` callback.)\n\n```python\n\n#...\n\nasync def review_result(request, result, is_successful):\n    if is_successful:\n        result[\"dtPicked\"] = str(datetime.datetime.now(datetime.timezone.utc))\n        result[\"_id\"] = str(result[\"_id\"])\n    return GoodEnoughResult(result)\n\n#...\n\ng.serve(port=9000)\n```\n\nAnd here we call it:\n\n```bash\n$ curl -s -XPOST http://localhost:9000/fetch -d'{\"size\": 5, \"foo\": 15}' | jq .\n{\n  \"_id\": \"5fcb503f107390ce97e7d04f\",\n  \"foo\": 16,\n  \"pickedCount\": 9,\n  \"dtPicked\": \"2020-12-05 14:48:46.471336+00:00\"\n}\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/marcgurevitx/goodenough",
+    "keywords": "",
+    "license": "The Unlicense",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "goodenough",
+    "package_url": "https://pypi.org/project/goodenough/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/goodenough/",
+    "project_urls": {
+      "Homepage": "https://github.com/marcgurevitx/goodenough"
+    },
+    "release_url": "https://pypi.org/project/goodenough/0.0.2/",
+    "requires_dist": [
+      "aiohttp[speedups] ; extra == 'web'"
+    ],
+    "requires_python": "",
+    "summary": "Lib to pick the \"best\" item from a random sample",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 8829272,
+  "releases": {
+    "0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39aef4b0b16c71f1a33e6517bc3dd84168d677e77e2be02d201fb7a61f7d067e",
+          "md5": "48f71c7e2913c791c3ea962fadf8e133",
+          "sha256": "0070fa6e0eab51b301d4dace6f3edebd2fe66b0cc8d53b9b52061b6a6fd47a75"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "48f71c7e2913c791c3ea962fadf8e133",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 2685,
+        "upload_time": "2020-12-05T00:19:30",
+        "upload_time_iso_8601": "2020-12-05T00:19:30.298625Z",
+        "url": "https://files.pythonhosted.org/packages/39/ae/f4b0b16c71f1a33e6517bc3dd84168d677e77e2be02d201fb7a61f7d067e/goodenough-0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0267f4f3a8aa8e0fd87648243125a37fb935eda802f8f3f12478ec30cf0228e",
+          "md5": "aab5e9f6551d8b34b0f0a81c274f4c41",
+          "sha256": "bd6fa150a4abdf9d8f59a4577779183847f249b286471750fa47a187eaeb30ce"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aab5e9f6551d8b34b0f0a81c274f4c41",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 2387,
+        "upload_time": "2020-12-05T00:19:31",
+        "upload_time_iso_8601": "2020-12-05T00:19:31.556613Z",
+        "url": "https://files.pythonhosted.org/packages/d0/26/7f4f3a8aa8e0fd87648243125a37fb935eda802f8f3f12478ec30cf0228e/goodenough-0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f4cf7269a857b5ec28ddb4f27bb8514b82e86704878b8a3bb1f8ec5a4888401",
+          "md5": "ccdd24766ab9d51aa4f034f7b2188d27",
+          "sha256": "662a3a74210862c2d2d0da9e1f846ee25df93995cc49c51164e84f0e085dbd6c"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ccdd24766ab9d51aa4f034f7b2188d27",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 5087,
+        "upload_time": "2020-12-05T15:10:59",
+        "upload_time_iso_8601": "2020-12-05T15:10:59.572107Z",
+        "url": "https://files.pythonhosted.org/packages/4f/4c/f7269a857b5ec28ddb4f27bb8514b82e86704878b8a3bb1f8ec5a4888401/goodenough-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "65fae30ccee644359c2a1344f522c226255538798f3c8042639584bddea49ac5",
+          "md5": "342fc000fe52565055baa5f65e9c79b5",
+          "sha256": "49f12dc043a1c816e8ae2b916806f983850b91d328090a45d4068ff008ae8eb0"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "342fc000fe52565055baa5f65e9c79b5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5342,
+        "upload_time": "2020-12-05T15:11:00",
+        "upload_time_iso_8601": "2020-12-05T15:11:00.928817Z",
+        "url": "https://files.pythonhosted.org/packages/65/fa/e30ccee644359c2a1344f522c226255538798f3c8042639584bddea49ac5/goodenough-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8222fad4bdc359d4ab7a81c919ed9602a00d3ee8dd4cfa90d0f1ac562b62e37",
+          "md5": "a58939a4ccb1182dffe47287e17febd5",
+          "sha256": "891d0bf90fa83339c117e59c3dd84470e2192b666006681573391965bde56dc7"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a58939a4ccb1182dffe47287e17febd5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 5232,
+        "upload_time": "2020-12-05T18:26:33",
+        "upload_time_iso_8601": "2020-12-05T18:26:33.731860Z",
+        "url": "https://files.pythonhosted.org/packages/a8/22/2fad4bdc359d4ab7a81c919ed9602a00d3ee8dd4cfa90d0f1ac562b62e37/goodenough-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c47b4575a6d16c7a1cbff7648054a1ddfc8a4e3fb5f0c2531a7ea9e76a04951",
+          "md5": "726b2b8f0be1e4b1883e4246543cd0f5",
+          "sha256": "13acdd6637d462a3ca804cc81db8f2d3f3dfd7be48ec373dac99938f51a8430f"
+        },
+        "downloads": -1,
+        "filename": "goodenough-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "726b2b8f0be1e4b1883e4246543cd0f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 5558,
+        "upload_time": "2020-12-05T18:26:34",
+        "upload_time_iso_8601": "2020-12-05T18:26:34.861733Z",
+        "url": "https://files.pythonhosted.org/packages/7c/47/b4575a6d16c7a1cbff7648054a1ddfc8a4e3fb5f0c2531a7ea9e76a04951/goodenough-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a8222fad4bdc359d4ab7a81c919ed9602a00d3ee8dd4cfa90d0f1ac562b62e37",
+        "md5": "a58939a4ccb1182dffe47287e17febd5",
+        "sha256": "891d0bf90fa83339c117e59c3dd84470e2192b666006681573391965bde56dc7"
+      },
+      "downloads": -1,
+      "filename": "goodenough-0.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a58939a4ccb1182dffe47287e17febd5",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 5232,
+      "upload_time": "2020-12-05T18:26:33",
+      "upload_time_iso_8601": "2020-12-05T18:26:33.731860Z",
+      "url": "https://files.pythonhosted.org/packages/a8/22/2fad4bdc359d4ab7a81c919ed9602a00d3ee8dd4cfa90d0f1ac562b62e37/goodenough-0.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7c47b4575a6d16c7a1cbff7648054a1ddfc8a4e3fb5f0c2531a7ea9e76a04951",
+        "md5": "726b2b8f0be1e4b1883e4246543cd0f5",
+        "sha256": "13acdd6637d462a3ca804cc81db8f2d3f3dfd7be48ec373dac99938f51a8430f"
+      },
+      "downloads": -1,
+      "filename": "goodenough-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "726b2b8f0be1e4b1883e4246543cd0f5",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 5558,
+      "upload_time": "2020-12-05T18:26:34",
+      "upload_time_iso_8601": "2020-12-05T18:26:34.861733Z",
+      "url": "https://files.pythonhosted.org/packages/7c/47/b4575a6d16c7a1cbff7648054a1ddfc8a4e3fb5f0c2531a7ea9e76a04951/goodenough-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

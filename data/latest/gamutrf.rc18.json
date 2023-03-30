@@ -1,0 +1,902 @@
+{
+  "info": {
+    "author": "cglewis",
+    "author_email": "clewis@iqt.org",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# gamutRF\n\nAn SDR orchestrated scanner and collector.\n\ngamutRF is a system enabling a compact network of one or more modest machines (such as Pi4s), each with their own USB SDR (such as an Ettus\nB200mini or a BladeRF XA9), to operate collectively as a configurable wideband scanner and I/Q sample recorder.\n\nA gamutRF \"orchestrator\" machine can scan 0.1GHz to 6GHz in 30 seconds to identify signals, and then command potentially many gamutRF \"workers\" to make I/Q sample recordings for later analysis.\n\ngamutRF provides tools to work with I/Q sample recordings, and to also record GPS location/compass metadata for the system itself. gamutRF typically runs on networks of Raspberry Pi4s, but can also run on x86 machines, and is based on gnuradio.\n\nSee also [instructions on how to build a gamutRF system](BUILD.md).\n\n## Scanner theory of operation\n\ngamutRF's scanner function is split across two Docker containers which are both run on the orchestrator. The `gamutrf` (scanner) container connects to the SDR and sweeps over a configured frequency range in 30s, while sampling at 8.192Msps (all default values which can be changed).\n\nThe samples are sent to a [streaming FFT gnuradio block](https://github.com/iqtlabs/gr-iqtlabs) which emits 2048 FFT points which are served over ZMQ to the `sigfinder` container (see below). The FFT block needs to know when the SDR has been retuned to a new frequency, so it uses a gnuradio timestamp and frequency tag provided by the gnuradio UHD driver upon retuning. This tag functionality has been added to the Soapy driver in a gnuradio fork which is part of gamutRF, so that other SDRs may be used as scanners.\n\nThe `sigfinder` container consumes these FFT points from ZMQ, does some noise processing (correcting FFT points to be in frequency order, computing mean power over 10kHz, and then a rolling mean over 1MHz) and then submits them to [scipy.signals.find_peaks](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.find_peaks.html).\n\nIf workers have been provisioned, the orchestrator will then command the workers to make an approximately 10 second I/Q recording at approximately 20Msps of each signal. Each signal peak is assigned a 20MHz bin, which means that if a signal is repeatedly detected with some frequency variation, the assigned recording bin will be constant, and if multiple signals are detected within 20MHz they can be collected simultaneously. A worker by default records at a higher sample rate than the bin size, so that 20MHz signal margins can be recorded.\n\nAs there will almost certainly be more signals than workers available, the orchestrator will prioritize signals that it least often observed over a configurable number of scanner cycles. It is possible to configure this to `off` so that the recording choice will be random. It is also possible to configure the workers to tell the orchestrator to exclude that worker from certain frequency ranges (if for example the worker SDR cannot handle some part of the frequency spectrum scanned).\n\n## Operating gamutRF\n\nSee the [build doc](BUILD.md)\n\n### SDR/scanner/sigfinder command line options\n\nWhile there are other options, these options primarily influence gamutRF's scanner functionality.\n\n#### scanner\n\n| Option | Description |\n| -- | -- |\n| --freq-start and --freq-end | Start and end of frequency range to scan in Hz (also used by sigfinger) |\n| --igain | SDR input gain in dB |\n| --samp-rate | Number of samples/sec |\n| --sweep-sec | Time to sweep frequency range in seconds |\n| --nfft | Number of FFT points |\n\n##### sigfinder\n\n| Option | Description |\n| -- | -- |\n| --width | Minimum width of a peak to be detected in 0.01MHz increments (passed to scipy find_peaks()) |\n| --prominence | Minimum prominence of a peak to be detected (passed to scipy find_peaks()) |\n| --threshold | Minimum threshold in dB of a peak to be detected (passed to scipy find_peaks()) |\n| --bin_width | Bin width in MHz |\n| --history | Number of scanner cycles over which to prioritize recording of least often observed peaks |\n| --record_bw_msps | Number of samples per second in units of 1024^2 (generally larger than bin size to record signal margins) |\n| --record_secs | Length of time to record I/Q samples in seconds |\n| --fftlog | Log raw output of CSV to this file, which will be rotated every --rotatesecs |\n| --fftgraph | Graph the most recent FFT signal and peaks to this PNG file (will keep the last --nfftgraph versions) |\n\n### Manually initiating worker actions\n\nThe orchestrator has a web interface on port 80. You can use this to command a worker to start an I/Q sample recording or start a RSSI stream.\n\n## Working with worker I/Q recordings\n\nWorkers make recordings that are compressed with zstandard, and are typically in complex number, int16 format, and include the center frequency and sample rate that the recording was made with. gamutRF tools can generally work with such files directly, but other tools require the recordings to be converted (see below).\n\n### Generating a spectrogram of a recording\n\ngamutRF provides a tool to convert a recording or directory of recordings into a spectrogram. For example, to convert all I/Q recordings in /tmp:\n\n```docker run -ti -v /tmp:/tmp iqtlabs/gamutrf gamutrf-specgram /tmp```\n\nUse the ```--help``` option to change how the spectogram is generated (for example, to change the sample rate).\n\n### Translating recordings to \"gnuradio\" format\n\nMost SDR tools by convention take an uncompressed raw binary file as input, of [gnuradio type complex](https://blog.sdr.hu/grblocks/types.html). The user must explicitly specify to most SDR tools what sample rate the file was made at to correctly process it. gamutRF provides a tool that converts a gamutRF I/Q recording (which may be compressed) to an uncompressed binary file. For example:\n\n```\ndocker run -v /tmp:/tmp -ti iqtlabs/gamutrf gamutrf-samples2raw /tmp/gamutrf_recording_ettus_directional_gain70_1234_100000000Hz_20971520sps.s16.zst\n```\n\n### Reviewing a recording interactively in gqrx\n\n[gqrx](https://gqrx.dk/) is a multiplatform open source tool that allows some basic SDR operations like visualizing or audio demodulating an I/Q sample recording (see the [github releases page](https://github.com/gqrx-sdr/gqrx/releases), for a MacOS .dmg file). To use gqrx with a gamutRF recording, first translate the recording to gnuradio format (see above). Then open gqrx.\n\n* Select ```Complex Sampled (I/Q) File```\n* Set ```Input rate``` to be the same as the gamutRF sample rate (e.g. from the recording file name,\n```gamutrf_recording_ettus_directional_gain70_1234_100000000Hz_20971520sps.raw```, set ```Input rate``` to 20971520, and also edit ```rate=``` in ```Device string``` to be 20971520)\n* Set ``Bandwidth`` to 0\n* Edit ```Device string``` to set the ```file=``` to be the path to the recording.\n* Set ```Decimation``` to None.\n* Finally select ```OK``` and then ```play``` from the gqrx interface to watch the recording play.\n\n### Reducing recording sample rate\n\nYou may want to reduce the sample rate of a recording or re-center it with respect to frequency (e.g. to use another demodulator tool that doesn't support a high sample rate). gamutRF provides the ```freqxlator``` tool to do this.\n\n* Translate your gamutRF recording to gnuradio format (see above).\n* Use ```freqxlator``` to create a new recording at a lower sample rate, potentially with a different center frequency.\n\nFor example, to reduce a recording made with gamutRF's default sample rate to 1/10th the rate while adjusting the center frequency down by 1MHz, use:\n\n```docker run -ti iqtlabs/gamutrf gamutrf-freqxlator --samp-rate 20971520 --center -1e6 --dec 10 gamutrf_recording_gain70_1234_100000000Hz_20971520sps.raw gamutrf_recording_gain70_1234_100000000Hz_2097152sps.raw```\n\n### Demodulating AM/FM audio from a recording\n\ngamutRF provides a tool to demodulate AM/FM audio from a recording as an example use case.\n\n* Use the ```freqxlator``` tool to make a new recording at no more than 1Msps and has the frequency to be demodulated centered.\n* Use the ```airspyfm``` tool to demodulate audio to a WAV file.\n\nFor example, to decode an FM recording which must be at the center frequency of a recording:\n\n```docker run -v /tmp:/tmp -ti iqtlabs/gamutrf-airspyfm -m fm -t filesource -c filename=/tmp/gamutrf_recording_gain70_1234_100000000Hz_2097152sps.raw,raw,format=FLOAT,srate=2097152 -F /tmp/out.wav```\n\nRun:\n\n```docker run -ti iqtlabs/gamutrf-airspyfm -h```\n\nTo view other options.\n\n## Scanner testing\n\nCurrently, the scanner ```gain``` and sigfinder ```threshold``` must be set manually for the general RF environment (e.g. noisy/many signals versus quiet/few signals).\nTo establish the correct values and to confirm the scanner is working, initiate a scan over the 2.2-2.6GHz range. As the 2.4GHz spectrum is very busy with legacy WiFi\nand BlueTooth, the probability of seeing signals is high. If in an environment without BlueTooth or WiFi, an alternative is the FM broadcast band (88MHz to 108MHz).\n\nTo begin, commence scanning with just the scanner and sigfinder containers:\n\n```\n$ VOL_PREFIX=/tmp FREQ_START=2.2e9 FREQ_END=2.6e9 docker compose -f orchestrator.yml up gamutrf sigfinder\n```\n\nWatch for ```/tmp/fft.png``` to appear, which should contain strong signals similar to this example:\n\n![2.4G example](fft24test.png)\n\nIf no or only small peaks appear which are not marked as peaks, increase ```gain``` (e.g., from 40 to 45) until peaks are detected.\n\nIf no peaks appear still, check antenna cabling, or choose a different scan range where signals are expected in your environment.\n\nIf peaks appear but are consistently not marked, decrease ```theshold``` (e.g. -25 to -35). If too many peaks are detected (noise detected as peaks), raise ```threshold.```\n\n## Troubleshooting\n\n#### Containers won't start using Ettus SDRs\n\nYou may see ```[ERROR] [USB] USB open failed: insufficient permissions``` on initial startup with Ettus SDRs. These devices download firmware and switch USB identities when first powered up. Restart the affected container to work around this.\n\n#### \"O\"s or warnings about overflows in SDR containers\n\n* Ensure your hardware can support the I/Q sample rate you have configured (gamutRF has been tested on Pi4 at 20Msps, which is the default recording rate). Also ensure your recording medium (e.g. flash drive, USB hard disk) is not timing out or blocking.\n* If using a Pi4, make sure you are using active cooling and an adequate power supply (no CPU throttling), and you are using a \"blue\" USB3 port.\n\n#### Scanner repeatedly logs \"mean tuning step is greater than --samp-rate/2\"\n\n* ```--sweep-sec``` may be too low (fast), or ```--samp-rate``` may be too low, causing non-overlapping FFT windows between retuning points.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "Apache-2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "gamutrf",
+    "package_url": "https://pypi.org/project/gamutrf/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/gamutrf/",
+    "project_urls": {
+      "homepage": "https://github.com/IQTLabs/gamutRF"
+    },
+    "release_url": "https://pypi.org/project/gamutrf/0.5.13/",
+    "requires_dist": [
+      "bjoern (==3.2.2)",
+      "falcon (==3.1.1)",
+      "falcon-cors (==1.1.7)",
+      "gpsd-py3 (==0.3.0)",
+      "httpx (==0.23.3)",
+      "Jinja2 (==3.1.2)",
+      "matplotlib (==3.7.1)",
+      "numpy (==1.24.2)",
+      "paho-mqtt (==1.6.1)",
+      "pandas (==1.5.3)",
+      "prometheus_client (==0.16.0)",
+      "requests (==2.28.2)",
+      "RPi.GPIO (==0.7.1)",
+      "schedule (==1.1.0)",
+      "scipy (==1.10.1)",
+      "sigmf (==1.1.0)",
+      "zstandard (==0.20.0)",
+      "pycairo (>=1.21.0,<2.0.0)",
+      "cairocffi (>=1.3.0,<2.0.0)"
+    ],
+    "requires_python": ">=3.8,<3.11",
+    "summary": "An orchestrated SDR scanner",
+    "version": "0.5.13",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17393170,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f204b2d59f15fa2c29b7e560164cfeff4e26f359f9914761c1716e34e9420708",
+          "md5": "cba2b1f300038b85b89a1e32b1a16fe4",
+          "sha256": "64961760f6579f7d54d32c2832fe30aedb27804287a58a9e2ebed485a0cf697f"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cba2b1f300038b85b89a1e32b1a16fe4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.6",
+        "size": 17291,
+        "upload_time": "2021-11-04T16:21:13",
+        "upload_time_iso_8601": "2021-11-04T16:21:13.463713Z",
+        "url": "https://files.pythonhosted.org/packages/f2/04/b2d59f15fa2c29b7e560164cfeff4e26f359f9914761c1716e34e9420708/gamutrf-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf1b139812d42adb655dfb23efd8f34a27d501871bbafa483f53b937bfd15b1b",
+          "md5": "a5f9893eaa8cae6ae2ccaf7f0df27ed9",
+          "sha256": "d3c631adbcc6816fae68dd3c0b7926cebe01f766dbd1898df2427e7c2d891c6f"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a5f9893eaa8cae6ae2ccaf7f0df27ed9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7808113,
+        "upload_time": "2021-11-04T16:21:15",
+        "upload_time_iso_8601": "2021-11-04T16:21:15.035433Z",
+        "url": "https://files.pythonhosted.org/packages/cf/1b/139812d42adb655dfb23efd8f34a27d501871bbafa483f53b937bfd15b1b/gamutrf-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5450cf863d3e98bbb1545e3c86734a15e5028894edd82f91e537363accc11b20",
+          "md5": "8d4b39aef8174dbb926af6e45e8bbb23",
+          "sha256": "9ac49ccc91da2ab65c7e66ef754d4426c8cf21492fd1b28a2c97520b5d916058"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8d4b39aef8174dbb926af6e45e8bbb23",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.6",
+        "size": 28319,
+        "upload_time": "2022-04-25T21:36:26",
+        "upload_time_iso_8601": "2022-04-25T21:36:26.749119Z",
+        "url": "https://files.pythonhosted.org/packages/54/50/cf863d3e98bbb1545e3c86734a15e5028894edd82f91e537363accc11b20/gamutrf-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "611b5e3df2e43b8e75ad45c89f5260fac8d5d2c3bd4e90cbcac753ea7ad1d897",
+          "md5": "707e860a8b374a2302729d2b65183390",
+          "sha256": "c919e2d11a2ab5a10e70c7f3cab9b5073590107bc37a522893d3b8c2d240294b"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "707e860a8b374a2302729d2b65183390",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7822867,
+        "upload_time": "2022-04-25T21:36:28",
+        "upload_time_iso_8601": "2022-04-25T21:36:28.848886Z",
+        "url": "https://files.pythonhosted.org/packages/61/1b/5e3df2e43b8e75ad45c89f5260fac8d5d2c3bd4e90cbcac753ea7ad1d897/gamutrf-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8804be8a13df02b8571c26c0a24961f4cc62b919fb28fc929e8669a28ba5f7f0",
+          "md5": "ba3618687cf290c4e02bc5abfaf406e3",
+          "sha256": "d35fcbbe5a58e1aba4aa5d13dacd810a359d6702650394b3a20523460da87496"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.3.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ba3618687cf290c4e02bc5abfaf406e3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.6",
+        "size": 35286,
+        "upload_time": "2022-06-13T21:27:45",
+        "upload_time_iso_8601": "2022-06-13T21:27:45.771331Z",
+        "url": "https://files.pythonhosted.org/packages/88/04/be8a13df02b8571c26c0a24961f4cc62b919fb28fc929e8669a28ba5f7f0/gamutrf-0.3.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "78ed4ea80e57df9e1f7c2b39b2c1c1794ff3b6d86a2fac3a56f2aedb7de9d63e",
+          "md5": "19a22367497855d2638f09e3e8270cef",
+          "sha256": "851dc474eba01c426ec0606f804961b72612429c24ae015e09f665de0b034b62"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "19a22367497855d2638f09e3e8270cef",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7833832,
+        "upload_time": "2022-06-13T21:27:47",
+        "upload_time_iso_8601": "2022-06-13T21:27:47.690758Z",
+        "url": "https://files.pythonhosted.org/packages/78/ed/4ea80e57df9e1f7c2b39b2c1c1794ff3b6d86a2fac3a56f2aedb7de9d63e/gamutrf-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d77aa4e880154fa37ceb61b11b46d792ef522722dc88a61dd79ae16d969e8ea4",
+          "md5": "871b6ecb3ad0102b454fd136b9ab19d2",
+          "sha256": "eb8c83c1f878edfd1033a25fb8a672bb7b64905dcc758af3ca7db225872e20cd"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.4.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "871b6ecb3ad0102b454fd136b9ab19d2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": ">=3.6",
+        "size": 35149,
+        "upload_time": "2022-06-29T01:52:02",
+        "upload_time_iso_8601": "2022-06-29T01:52:02.909965Z",
+        "url": "https://files.pythonhosted.org/packages/d7/7a/a4e880154fa37ceb61b11b46d792ef522722dc88a61dd79ae16d969e8ea4/gamutrf-0.4.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "91d1cc1521ed5eee6b563a12e506d2e68344783c28eacd78a3dc8223c7eb4c12",
+          "md5": "5fab76ab4f46d0ef3371da3f0edd1072",
+          "sha256": "5dddaef8216edbc912d3a1adf13832cd03e593f8e74a04aa7e2e34c7904e9b09"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5fab76ab4f46d0ef3371da3f0edd1072",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 7871555,
+        "upload_time": "2022-06-29T01:52:04",
+        "upload_time_iso_8601": "2022-06-29T01:52:04.448645Z",
+        "url": "https://files.pythonhosted.org/packages/91/d1/cc1521ed5eee6b563a12e506d2e68344783c28eacd78a3dc8223c7eb4c12/gamutrf-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0ec9fccec73dc93d51499e3b57010a090149dd127607b1e86a3e02c0cd6e55d6",
+          "md5": "53571477d7d8042dc37ea48b1fee34f3",
+          "sha256": "72d52a17b013fd244faa1866528fd5289a477b2d532d374003f4d933bf51aa0f"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "53571477d7d8042dc37ea48b1fee34f3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41139,
+        "upload_time": "2022-07-30T01:52:45",
+        "upload_time_iso_8601": "2022-07-30T01:52:45.210491Z",
+        "url": "https://files.pythonhosted.org/packages/0e/c9/fccec73dc93d51499e3b57010a090149dd127607b1e86a3e02c0cd6e55d6/gamutrf-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "070733848906f4ab92805a1315c3d6270a8312fa269fb557387a1bb8a5e2f161",
+          "md5": "8e3028df2f8c71e1c59f5d5b359801b7",
+          "sha256": "22e25783fb273518a05df3e54549cb9d2c891d550e238475d6ac5403f02eec3e"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8e3028df2f8c71e1c59f5d5b359801b7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 38072,
+        "upload_time": "2022-07-30T01:52:46",
+        "upload_time_iso_8601": "2022-07-30T01:52:46.524893Z",
+        "url": "https://files.pythonhosted.org/packages/07/07/33848906f4ab92805a1315c3d6270a8312fa269fb557387a1bb8a5e2f161/gamutrf-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d8ec6cac63f89d745ceea1e6f574e4fbceabd37fdafe78eacf7463352186190",
+          "md5": "b8e9648d8ae5cac5a44217ad9d7e3442",
+          "sha256": "0185dbe55fe5d28ce87ca6fc822b2673d3e04cdb51260a53e41036f739db538e"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b8e9648d8ae5cac5a44217ad9d7e3442",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41237,
+        "upload_time": "2022-08-11T21:56:35",
+        "upload_time_iso_8601": "2022-08-11T21:56:35.399106Z",
+        "url": "https://files.pythonhosted.org/packages/7d/8e/c6cac63f89d745ceea1e6f574e4fbceabd37fdafe78eacf7463352186190/gamutrf-0.5.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "48eafa4e3a4e8437f81e8b0cc2d6dacfeed235e356a252a27c1ac0cc9deba7b4",
+          "md5": "fc6f646fdbacfe429e1c05bec304a5c9",
+          "sha256": "8cfd43d6fdf5b0aa0b42af0797dba6f3198518f0e746f694bbd150b2b5ece74e"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fc6f646fdbacfe429e1c05bec304a5c9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 38183,
+        "upload_time": "2022-08-11T21:56:36",
+        "upload_time_iso_8601": "2022-08-11T21:56:36.559259Z",
+        "url": "https://files.pythonhosted.org/packages/48/ea/fa4e3a4e8437f81e8b0cc2d6dacfeed235e356a252a27c1ac0cc9deba7b4/gamutrf-0.5.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "088877ec18d03a03ee492c7518c90952bcbaa2adf1349ccbf5dd302ece497438",
+          "md5": "bc484d2951e0dd9b496f500edfc2d5b5",
+          "sha256": "391094fedcd1f7a7d232cf7ffcf0feab68f675cd3ff536a07594e3245f08905a"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc484d2951e0dd9b496f500edfc2d5b5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43818,
+        "upload_time": "2023-01-29T13:41:42",
+        "upload_time_iso_8601": "2023-01-29T13:41:42.824079Z",
+        "url": "https://files.pythonhosted.org/packages/08/88/77ec18d03a03ee492c7518c90952bcbaa2adf1349ccbf5dd302ece497438/gamutrf-0.5.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b5722c297220f7cfa0d8f5c333d427769999fb8a7769667b0b936354e624017",
+          "md5": "816b26d68dd5cec1f54cf94cd85b7fa4",
+          "sha256": "ba82926a667ee6745dd7b5aa58149cafb399102eec4334c6e1e7efbfe3d54346"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "816b26d68dd5cec1f54cf94cd85b7fa4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41398,
+        "upload_time": "2023-01-29T13:41:44",
+        "upload_time_iso_8601": "2023-01-29T13:41:44.457971Z",
+        "url": "https://files.pythonhosted.org/packages/4b/57/22c297220f7cfa0d8f5c333d427769999fb8a7769667b0b936354e624017/gamutrf-0.5.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38f2ddd2059a14f17c3e2dfea0819d6ddffeba206b7b4ff2c6b7d38d55b6f551",
+          "md5": "137a6a2f062f3179186a1250469c9635",
+          "sha256": "5ba74cd65136ceddec048439a00dddf8c8d5d31396390cb2dc9f434a04f7bf96"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "137a6a2f062f3179186a1250469c9635",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 44169,
+        "upload_time": "2023-02-16T22:41:57",
+        "upload_time_iso_8601": "2023-02-16T22:41:57.027629Z",
+        "url": "https://files.pythonhosted.org/packages/38/f2/ddd2059a14f17c3e2dfea0819d6ddffeba206b7b4ff2c6b7d38d55b6f551/gamutrf-0.5.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9c2c5f8160449b0cb5e1eb8a2a942465b6f0b336e0c6c543ee32895290f7dbc7",
+          "md5": "198775aa8b0cd42f5c00b9acb281ed4f",
+          "sha256": "1549e2ccb0586d89fdf13cd969deaa1e7e3b04bf673ff92a7699f5c90e62f178"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "198775aa8b0cd42f5c00b9acb281ed4f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41639,
+        "upload_time": "2023-02-16T22:41:58",
+        "upload_time_iso_8601": "2023-02-16T22:41:58.648192Z",
+        "url": "https://files.pythonhosted.org/packages/9c/2c/5f8160449b0cb5e1eb8a2a942465b6f0b336e0c6c543ee32895290f7dbc7/gamutrf-0.5.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09754970c85f2444f2ddc9d7774d82f602365735b7d0dd11410a79b47ba4023d",
+          "md5": "9106bc0453bc93f2faa17c9cedbb893d",
+          "sha256": "97f688ead9934e6aa1ac103c2a8bc46d211c5318c59c973585c94740d461de38"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9106bc0453bc93f2faa17c9cedbb893d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 44428,
+        "upload_time": "2023-03-02T04:34:27",
+        "upload_time_iso_8601": "2023-03-02T04:34:27.127728Z",
+        "url": "https://files.pythonhosted.org/packages/09/75/4970c85f2444f2ddc9d7774d82f602365735b7d0dd11410a79b47ba4023d/gamutrf-0.5.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e0a70351f8a9de1d0a40b103cbb6934b7500fca68de82f1fe195b972578d82de",
+          "md5": "78ad46c52e48f0abdb0ea468605fda45",
+          "sha256": "2f1a6ba356aec4f1e20a97e2f951f5dfd3c293fa3475b9fda84bfb71fe426f87"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "78ad46c52e48f0abdb0ea468605fda45",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 40892,
+        "upload_time": "2023-03-02T04:34:28",
+        "upload_time_iso_8601": "2023-03-02T04:34:28.922695Z",
+        "url": "https://files.pythonhosted.org/packages/e0/a7/0351f8a9de1d0a40b103cbb6934b7500fca68de82f1fe195b972578d82de/gamutrf-0.5.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b45ff7017fb5f550fba3378d612b9cc5f952c6584ee4f3689e148f7a113186b",
+          "md5": "e0792c87bbb3c6edaa4fe3d4703999e3",
+          "sha256": "c9fc2f0c251571680b1fe4240fb1ab25e3284edd5061e0da165418e1f6b485b9"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0792c87bbb3c6edaa4fe3d4703999e3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 45306,
+        "upload_time": "2023-03-22T03:34:38",
+        "upload_time_iso_8601": "2023-03-22T03:34:38.258365Z",
+        "url": "https://files.pythonhosted.org/packages/2b/45/ff7017fb5f550fba3378d612b9cc5f952c6584ee4f3689e148f7a113186b/gamutrf-0.5.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b977be67b82b8208ca6029f0f6320162004576674f82583baddb9e8be6cb47cc",
+          "md5": "809dcc83962a0548a8b524cf348020f7",
+          "sha256": "fec4d6bba77562b8d15ce8ad6367de226c057113b947cf51c131ba8f2c30501f"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "809dcc83962a0548a8b524cf348020f7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41793,
+        "upload_time": "2023-03-22T03:34:39",
+        "upload_time_iso_8601": "2023-03-22T03:34:39.882072Z",
+        "url": "https://files.pythonhosted.org/packages/b9/77/be67b82b8208ca6029f0f6320162004576674f82583baddb9e8be6cb47cc/gamutrf-0.5.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46ead5100e8801a4073c8e220cf642b4d7039ba5b43265a9d5c4726533a29c97",
+          "md5": "332f0e0db87adc3f3b024c1d5bd4c061",
+          "sha256": "ef96fa98fd1de5fc42d58afa5142e9aff5a0b52412696fdf896aeddbf2ebd686"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "332f0e0db87adc3f3b024c1d5bd4c061",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 42420,
+        "upload_time": "2022-09-29T02:25:47",
+        "upload_time_iso_8601": "2022-09-29T02:25:47.723751Z",
+        "url": "https://files.pythonhosted.org/packages/46/ea/d5100e8801a4073c8e220cf642b4d7039ba5b43265a9d5c4726533a29c97/gamutrf-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef427f0a93683900f41cd8846ecf83507552e626aaf258e964ad72b43ec411c7",
+          "md5": "986391a9d6ec4504095e66a53914a582",
+          "sha256": "1abfe9d019181745bb83ed2b5bc93eb5be9ec9bbf4c3947b55289b55c1295da9"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "986391a9d6ec4504095e66a53914a582",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 39932,
+        "upload_time": "2022-09-29T02:25:49",
+        "upload_time_iso_8601": "2022-09-29T02:25:49.058044Z",
+        "url": "https://files.pythonhosted.org/packages/ef/42/7f0a93683900f41cd8846ecf83507552e626aaf258e964ad72b43ec411c7/gamutrf-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d660b10255f8754983080df0866909a0e29a8ad4ce6abed04a53874270014718",
+          "md5": "291857dc1cfd05561c259e8d0c4291eb",
+          "sha256": "498ef196381535a074923dcc579114ad969b82536e726ce3eb9d6d6e37c8d626"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "291857dc1cfd05561c259e8d0c4291eb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 42808,
+        "upload_time": "2022-10-12T21:54:09",
+        "upload_time_iso_8601": "2022-10-12T21:54:09.354572Z",
+        "url": "https://files.pythonhosted.org/packages/d6/60/b10255f8754983080df0866909a0e29a8ad4ce6abed04a53874270014718/gamutrf-0.5.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87d4564e7423129fee5f993efd7735b5764a05f154a0b2cbe2171ea6813596dd",
+          "md5": "c287fa44202eade1c428d166be2a8da0",
+          "sha256": "a82e0066732886bb3a2468add44dd928a59bd85292e5999fe799fc1612031184"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c287fa44202eade1c428d166be2a8da0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 40321,
+        "upload_time": "2022-10-12T21:54:10",
+        "upload_time_iso_8601": "2022-10-12T21:54:10.834203Z",
+        "url": "https://files.pythonhosted.org/packages/87/d4/564e7423129fee5f993efd7735b5764a05f154a0b2cbe2171ea6813596dd/gamutrf-0.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d3c176a10e8492d5b6ba20819995dea686977c5db016b927677bcab42f1a965d",
+          "md5": "0687db0e18948ef5b54b0fab13342f35",
+          "sha256": "433268c43c811480d0bd95c5ca768ad8d7313c308880d5fabe4f77a5f2cd3825"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0687db0e18948ef5b54b0fab13342f35",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43301,
+        "upload_time": "2022-10-20T04:38:08",
+        "upload_time_iso_8601": "2022-10-20T04:38:08.220793Z",
+        "url": "https://files.pythonhosted.org/packages/d3/c1/76a10e8492d5b6ba20819995dea686977c5db016b927677bcab42f1a965d/gamutrf-0.5.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5de29ebad8d29df1b0d5d0a5c34f54960ef32eaddeef4e73616a5fb3b7c269c7",
+          "md5": "a803b1d6fd9fda022bf9f9588aea3d49",
+          "sha256": "3e0b6345a6c04062e7dd6e487a75f2aff7d00f962a9180c497f9961b5e232986"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a803b1d6fd9fda022bf9f9588aea3d49",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 40824,
+        "upload_time": "2022-10-20T04:38:09",
+        "upload_time_iso_8601": "2022-10-20T04:38:09.898871Z",
+        "url": "https://files.pythonhosted.org/packages/5d/e2/9ebad8d29df1b0d5d0a5c34f54960ef32eaddeef4e73616a5fb3b7c269c7/gamutrf-0.5.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "150e6b85cee35134e55971a3fe3e6cff74a7a3d580895ffc72d1ce39bb2d162d",
+          "md5": "7540a7830bc0882a3defd93b8f71c106",
+          "sha256": "f5bc49e369de1c2d6a8f41c6f0a671fcfcabd2990f373ea81dceb044132e959b"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7540a7830bc0882a3defd93b8f71c106",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43306,
+        "upload_time": "2022-10-24T22:20:13",
+        "upload_time_iso_8601": "2022-10-24T22:20:13.531991Z",
+        "url": "https://files.pythonhosted.org/packages/15/0e/6b85cee35134e55971a3fe3e6cff74a7a3d580895ffc72d1ce39bb2d162d/gamutrf-0.5.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a43aebf0c2e263848757ed5e0c3a00a723094297f5c657613f52e8c64926393e",
+          "md5": "fbafbcc77c9e4ae5d98300ffd39c96ad",
+          "sha256": "92fdda8451b8357bccb020e76ee663ce9c1138d9f02c6d5ee6817380c0c6022a"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fbafbcc77c9e4ae5d98300ffd39c96ad",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 40845,
+        "upload_time": "2022-10-24T22:20:14",
+        "upload_time_iso_8601": "2022-10-24T22:20:14.830718Z",
+        "url": "https://files.pythonhosted.org/packages/a4/3a/ebf0c2e263848757ed5e0c3a00a723094297f5c657613f52e8c64926393e/gamutrf-0.5.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3657f5702236c4a4d16d49561f9fe5c04fc62f380c6ff97fb7f959074f126b33",
+          "md5": "4a8d25f0bc34b62a7c22b344ff1897e9",
+          "sha256": "0fc44202ade0beae647e53405bf04a9d67d6b5d8ba94ed5fd6c6565d3ad4b4d1"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4a8d25f0bc34b62a7c22b344ff1897e9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 44808,
+        "upload_time": "2022-11-02T06:05:59",
+        "upload_time_iso_8601": "2022-11-02T06:05:59.032509Z",
+        "url": "https://files.pythonhosted.org/packages/36/57/f5702236c4a4d16d49561f9fe5c04fc62f380c6ff97fb7f959074f126b33/gamutrf-0.5.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "08beae3f3d8dfa577c9cd7f6b3952bcc9aedca62fe888862f9e2d49fc064f18b",
+          "md5": "6262fed86338c3f465e42af8deebc4d4",
+          "sha256": "addf5a806b70c338034e2b8a8ca7817ad42e1fa6045d4458841215e048833161"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6262fed86338c3f465e42af8deebc4d4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 42556,
+        "upload_time": "2022-11-02T06:06:00",
+        "upload_time_iso_8601": "2022-11-02T06:06:00.462754Z",
+        "url": "https://files.pythonhosted.org/packages/08/be/ae3f3d8dfa577c9cd7f6b3952bcc9aedca62fe888862f9e2d49fc064f18b/gamutrf-0.5.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0e5d38cc63911f0f134b4cf0de92897394f3283c4defb1f77c1be2799c6dab0",
+          "md5": "2a993d48d85f4f5d6e7cf2c885008261",
+          "sha256": "7565cd10710c9c1a421ba257b306c3f2aa8de2d426e59e332a2d32041e3beffb"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2a993d48d85f4f5d6e7cf2c885008261",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43655,
+        "upload_time": "2023-01-10T21:14:59",
+        "upload_time_iso_8601": "2023-01-10T21:14:59.569979Z",
+        "url": "https://files.pythonhosted.org/packages/f0/e5/d38cc63911f0f134b4cf0de92897394f3283c4defb1f77c1be2799c6dab0/gamutrf-0.5.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e636f35beffd9ed1239b38104028e30bfd60cd7b98256e8e54be792a7d32991",
+          "md5": "f7e4b82be44b855f0536f8ebe32adcbb",
+          "sha256": "63159261f7fa747fe8129307de6f19fef59346efc2e9f4d2a91b8cd91cead685"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f7e4b82be44b855f0536f8ebe32adcbb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41228,
+        "upload_time": "2023-01-10T21:15:01",
+        "upload_time_iso_8601": "2023-01-10T21:15:01.106435Z",
+        "url": "https://files.pythonhosted.org/packages/8e/63/6f35beffd9ed1239b38104028e30bfd60cd7b98256e8e54be792a7d32991/gamutrf-0.5.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b82a63523e5b6b35a11c8225a7b4e783fabd04feb9d9c94da469079caeee478",
+          "md5": "9f79ad5c8f2b871f22ffcdc40c7f8280",
+          "sha256": "4b12d56f78cf1a1f6947cb5c7d54af38d56af2809503856fd0a53ed4c80b56b7"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9f79ad5c8f2b871f22ffcdc40c7f8280",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43655,
+        "upload_time": "2023-01-11T04:17:50",
+        "upload_time_iso_8601": "2023-01-11T04:17:50.215550Z",
+        "url": "https://files.pythonhosted.org/packages/2b/82/a63523e5b6b35a11c8225a7b4e783fabd04feb9d9c94da469079caeee478/gamutrf-0.5.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "217d806e05511e24064aa0fe8abc69c0c146641c564035693160b0d56874dbe0",
+          "md5": "b1aec24af97efef5724bdc5a1e476d05",
+          "sha256": "785f1bdbf12abcebe0181443456151cda8a73486149a85261e36bccdcfc9556f"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b1aec24af97efef5724bdc5a1e476d05",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41233,
+        "upload_time": "2023-01-11T04:17:51",
+        "upload_time_iso_8601": "2023-01-11T04:17:51.551636Z",
+        "url": "https://files.pythonhosted.org/packages/21/7d/806e05511e24064aa0fe8abc69c0c146641c564035693160b0d56874dbe0/gamutrf-0.5.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e5545d9e0d146a14c997a83e284719d778831623c27d6d505928c47ec2081b8b",
+          "md5": "b850d649b8d54b6639c4654734036107",
+          "sha256": "ef2c29baffb30f1bb836c935e19d41b788f0238bf86c2971679fa94407d5d051"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b850d649b8d54b6639c4654734036107",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<3.11",
+        "size": 43806,
+        "upload_time": "2023-01-29T01:59:58",
+        "upload_time_iso_8601": "2023-01-29T01:59:58.960711Z",
+        "url": "https://files.pythonhosted.org/packages/e5/54/5d9e0d146a14c997a83e284719d778831623c27d6d505928c47ec2081b8b/gamutrf-0.5.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "73bba18b75e158f2ea2f358ccd22af9203cc884390e1795b5e6d07b974052d61",
+          "md5": "b6928b7e1f947ecbcafc807b8cdca5c8",
+          "sha256": "1865960d50ec3aecf162da0f6a1d9c60bd41f599bfeb00f5c9d1333d83bcc915"
+        },
+        "downloads": -1,
+        "filename": "gamutrf-0.5.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b6928b7e1f947ecbcafc807b8cdca5c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<3.11",
+        "size": 41396,
+        "upload_time": "2023-01-29T02:00:00",
+        "upload_time_iso_8601": "2023-01-29T02:00:00.622182Z",
+        "url": "https://files.pythonhosted.org/packages/73/bb/a18b75e158f2ea2f358ccd22af9203cc884390e1795b5e6d07b974052d61/gamutrf-0.5.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2b45ff7017fb5f550fba3378d612b9cc5f952c6584ee4f3689e148f7a113186b",
+        "md5": "e0792c87bbb3c6edaa4fe3d4703999e3",
+        "sha256": "c9fc2f0c251571680b1fe4240fb1ab25e3284edd5061e0da165418e1f6b485b9"
+      },
+      "downloads": -1,
+      "filename": "gamutrf-0.5.13-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "e0792c87bbb3c6edaa4fe3d4703999e3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<3.11",
+      "size": 45306,
+      "upload_time": "2023-03-22T03:34:38",
+      "upload_time_iso_8601": "2023-03-22T03:34:38.258365Z",
+      "url": "https://files.pythonhosted.org/packages/2b/45/ff7017fb5f550fba3378d612b9cc5f952c6584ee4f3689e148f7a113186b/gamutrf-0.5.13-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b977be67b82b8208ca6029f0f6320162004576674f82583baddb9e8be6cb47cc",
+        "md5": "809dcc83962a0548a8b524cf348020f7",
+        "sha256": "fec4d6bba77562b8d15ce8ad6367de226c057113b947cf51c131ba8f2c30501f"
+      },
+      "downloads": -1,
+      "filename": "gamutrf-0.5.13.tar.gz",
+      "has_sig": false,
+      "md5_digest": "809dcc83962a0548a8b524cf348020f7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<3.11",
+      "size": 41793,
+      "upload_time": "2023-03-22T03:34:39",
+      "upload_time_iso_8601": "2023-03-22T03:34:39.882072Z",
+      "url": "https://files.pythonhosted.org/packages/b9/77/be67b82b8208ca6029f0f6320162004576674f82583baddb9e8be6cb47cc/gamutrf-0.5.13.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
