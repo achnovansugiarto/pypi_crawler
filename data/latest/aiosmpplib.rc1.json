@@ -1,0 +1,98 @@
+{
+  "info": {
+    "author": "Nikša Baldun",
+    "author_email": "niksa.baldun@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3.7",
+      "Topic :: Internet :: WWW/HTTP",
+      "Topic :: Security",
+      "Topic :: Software Development :: Build Tools",
+      "Topic :: System :: Installation/Setup",
+      "Topic :: System :: Networking",
+      "Topic :: System :: Systems Administration",
+      "Topic :: Utilities"
+    ],
+    "description": "aiosmpplib\n==========\nAn asynchronous SMPP library for use with asyncio.\n\nInspired by `naz`_ library by Komu Wairagu. Initial intention was to add missing functionality\nto existing library. But in the end, the code has been almost completely rewritten and released\nas a separate library.\n\n    SMPP is a protocol designed for the transfer of short message data between External Short\n    Messaging Entities(ESMEs), Routing Entities(REs) and Short Message Service Center(SMSC).\n    - `Wikipedia <https://en.wikipedia.org/wiki/Short_Message_Peer-to-Peer>`_\n\nCurrently, only partial ESME functionality is implemented, and only SMPP version 3.4 is supported.\n\nFull documentation is not available at this time.\n\n.. _naz: https://github.com/komuw/naz\n\nInstallation\n------------\n.. code-block:: shell\n\n    pip install aiosmpplib\n\n\nRequirements\n------------\nPython 3.7+ is required. Currently, aiosmpplib does not have any third-party dependencies,\nbut it optionally uses `orjson`_ library for JSON serialization and logging.\n\n.. _orjson: https://github.com/ijl/orjson\n\n\nQuick start\n-----------\n\n.. code-block:: python\n\n    import asyncio\n    from aiosmpplib import ESME, PhoneNumber, SubmitSm\n    from aiosmpplib.log import DEBUG\n\n    async def main():\n        # Create ESME instance.\n        esme = ESME(\n            smsc_host='127.0.0.1',\n            smsc_port=2775,\n            system_id='test',\n            password='test',\n            log_level=DEBUG,\n        )\n\n        # Queue messages to send.\n        for i in range(0, 5):\n            msg = SubmitSm(\n                short_message=f'Test message {i}',\n                source=PhoneNumber('254722111111'),\n                destination=PhoneNumber('254722999999'),\n                log_id=f'id-{i}',\n            )\n            await esme.broker.enqueue(msg)\n\n        # Start ESME. It will run until stopped, automatically reconnecting if necessary.\n        # If you want to test connection beforehand, await esme.connect() first.\n        # It will raise an exception if connection is not successfull -\n        # typically SmppError, or one of transport errors (OSError, TimeoutError, socket.error etc).\n        asyncio.create_task(esme.start())\n        # Give it some time to send messages.\n        await asyncio.sleep(20)\n        # Stop ESME.\n        await esme.stop()\n\n    if __name__ == \"__main__\":\n        loop = asyncio.get_event_loop()\n        loop.run_until_complete(main())\n        loop.close()\n\n\nQuick user guide\n----------------\nYour application interacts with ESME via three interfaces: broker, correlator and hook.\n\n* Broker is a FIFO queue in which your application puts messages. ESME retrieves messages\n  from the broker and sends them to SMSC. Any type of SMPP message can be queued, but it really\n  only makes sense for **SubmitSm** (outgoing SMS). Subclass **AbstractBroker** in order to put and\n  get messages from persistent storage. The library provides ``json_encode`` and ``json_decode``\n  convenience methods which can be used to convert messages to/from JSON. Again, while any message\n  can be serialized, it probably only makes sense for **SubmitSm**, and possibly **DeliverSm**.\n* Correlator is an interface that does two types of correlation:\n\n  * Outgoing SMPP requests are correlated with received responses.\n  * Outgoing SMS messages (SubmitSm) are correlated with delivery receipts (DeliverSm).\n\n  Delivery receipts may be received days after original message is sent, so this type of\n  correlation should be persisted. Subclass **SimpleCorrelator** and override ``put_delivery`` and\n  ``get_delivery`` methods. If you want to implement more efficient request/response correlation,\n  subclass **AbstractCorrelator** and also override ``get`` and ``put`` methods.\n* Hook is an interface with three async methods:\n\n  * ``sending``: Called before sending any message to SMSC.\n  * ``received``: Called after receiving any message from SMSC.\n  * ``send_error``: Called if error occured while sending a SubmitSm.\n\n  Subclass **AbstractHook** and implement all three methods. The latter two are essential for\n  reliable message tracking.\n\nIncoming message flow\n_____________________\nReceiving messages is straightforward. The ``received`` hook will be called. If the\n``smpp_message`` parameter is of type **DeliverSm** and its ``is_receipt`` method returns ``False``,\nit is an incoming SMS. Store it as appropriate.\n\nOutgoing message flow\n_____________________\nSending messages is a lot more involved.\n\n1. Create a **SubmitSm** message with unique ``log_id`` and optionally ``extra_data`` parameters.\n   Any message related to this message will have the same ``log_id`` and ``extra_data``,\n   provided that correlator did its job.\n2. Enqueue the message in broker.\n3. If message could not be sent, ``send_error`` hook will be called. Original message is available\n   in ``smpp_message`` parameter. The ``error`` parameter contains exception that occured.\n\n   * ValueError indicates that the message couldn't be encoded to PDU (probably invalid parameters).\n   * Transport errors (OSError and its descendants) indicate a network problem.\n   * TimeoutError indicates that the response from SMSC was not received within timeout.\n     Timeout duration depends on correlator implementation.\n\n   Whichever error occured, the message will not be re-sent automatically.\n   User application must implement retry mechanism, if required.\n4. If the SMSC does respond, check the response in ``received`` hook.\n   The ``smpp_message`` parameter will be either:\n\n   * **SubmitSmResp** - If ``command_status`` member is anything other than\n     ``SmppCommandStatus.ESME_ROK``, the request has been rejected by SMSC.\n   * **GenericNack** - The request was not understood by SMSC, probably due to network error.\n\n   Again, if the message was rejected, it will not be re-sent automatically.\n5. If the request was accepted, a delivery receipt should arrive after some time.\n   In ``received`` hook, look for **DeliverSm** message whose ``is_receipt`` method\n   returns ``True``. Then use ``parse_receipt`` method to get a dictionary with parsed data.\n   Receipt structure is SMSC-specific, but it usually has the following items:\n   \n   .. code-block:: python\n\n       {\n           'id': str # Message ID allocated by the SMSC when submitted.\n           'sub': int # Number of short messages originally submitted.\n           'dlvrd': int # Number of short messages delivered.\n           'submit date': datetime # The time and date at which the message was submitted.\n           'done date': datetime # The time and date at which the message reached its final state.\n           'stat': str # The final status of the message.\n           'err': str # Network specific error code or an SMSC error code.\n           'text': str # The first 20 characters of the short message.\n       }\n   \n   The ``stat`` parameter should have one the following values:\n\n   * ``DELIVRD`` - Message is delivered to destination.\n   * ``EXPIRED`` - Message validity period has expired.\n   * ``DELETED`` - Message has been deleted.\n   * ``UNDELIV`` - Message is undeliverable.\n   * ``ACCEPTD`` - Message is in accepted state.\n   * ``UNKNOWN`` - Message is in invalid state.\n   * ``REJECTD`` - Message is in a rejected state.\n\n   For more details, check `SMPP specification <https://smpp.org/SMPP_v3_4_Issue1_2.pdf>`_.\n\nExample hook implementation:\n____________________________\n\n.. code-block:: python\n\n    from aiosmpplib import AbstractHook, SmppCommandStatus\n    from aiosmpplib import DeliverSm, SubmitSm, SubmitSmResp, GenericNack, SmppMessage, Trackable\n\n    class MyHook(AbstractHook):\n        async def _save_result(self, msg: str, smpp_message: Trackable) -> None:\n            log_id: str = smpp_message.log_id\n            extra_data: str = smpp_message.extra_data\n            # Save data to database\n\n        async def sending(self, smpp_message: SmppMessage, pdu: bytes, client_id: str) -> None:\n            pass # Or trace log\n\n        async def received(self, smpp_message: Optional[SmppMessage], pdu: bytes,\n                           client_id: str) -> None:\n            if isinstance(smpp_message, GenericNack):\n                await self._save_result('Sending failed', smpp_message)\n                # Requeue if desired\n            if isinstance(smpp_message, SubmitSmResp):\n                if smpp_message.command_status == SmppCommandStatus.ESME_ROK:\n                    await self._save_result('Message sent', smpp_message)\n                else:\n                    await self._save_result('Sending failed', smpp_message)\n                    # Requeue if desired\n            elif isinstance(smpp_message, DeliverSm):\n                if smpp_message.is_receipt():\n                    # This is a delivery receipt\n                    receipt: Dict[str, Any] = smpp_message.parse_receipt()\n                    final_status: str = receipt.get('stat', '')\n                    if final_status == 'DELIVRD':\n                        msg: str = 'Delivered to handset'\n                    elif final_status == 'EXPIRED':\n                        msg: str = 'Message expired'\n                    elif final_status == 'DELETED':\n                        msg: str = 'Message deleted by SC'\n                    elif final_status == 'UNDELIV':\n                        msg: str = 'Message undeliverable'\n                    elif final_status == 'ACCEPTD':\n                        msg: str = 'Message accepted'\n                    elif final_status == 'REJECTD':\n                        msg: str = 'Message rejected'\n                    else:\n                        msg: str = 'Unknown status'\n                    await self._save_result(msg, smpp_message)\n                else:\n                    pass\n                    # This is an incoming SMS\n                    # Process and save to database\n\n        async def send_error(self, smpp_message: SmppMessage, error: Exception, client_id: str) -> None:\n            if isinstance(smpp_message, SubmitSm):\n                await self._save_result('Sending failed', smpp_message)\n                # Requeue if desired\n\n\nBug Reporting\n-------------\nBug reports and feature requests are welcome via `Github issues`_.\n\n.. _Github issues: https://github.com/niksabaldun/aiosmpplib/issues\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/niksabaldun/aiosmpplib",
+    "keywords": "aiosmpplib,smpp,smpp-client,smpp-protocol,smpp-library,esme,smsc",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "aiosmpplib",
+    "package_url": "https://pypi.org/project/aiosmpplib/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/aiosmpplib/",
+    "project_urls": {
+      "Homepage": "https://github.com/niksabaldun/aiosmpplib"
+    },
+    "release_url": "https://pypi.org/project/aiosmpplib/0.6.3/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Python asyncio SMPP client library.",
+    "version": "0.6.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15898521,
+  "releases": {
+    "0.6.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5cc3dbae2f08116154ba0fefac2fac11e863a86c127069ce4def8ec70eaaed0",
+          "md5": "3001d304caa3f4b4faabfbd237848bdb",
+          "sha256": "1f1a8e9c6bfe4c35563a030004942bf73404bc58750bb3297ef12f99d8e420b9"
+        },
+        "downloads": -1,
+        "filename": "aiosmpplib-0.6.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3001d304caa3f4b4faabfbd237848bdb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 51107,
+        "upload_time": "2022-11-26T17:19:58",
+        "upload_time_iso_8601": "2022-11-26T17:19:58.948581Z",
+        "url": "https://files.pythonhosted.org/packages/b5/cc/3dbae2f08116154ba0fefac2fac11e863a86c127069ce4def8ec70eaaed0/aiosmpplib-0.6.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b5cc3dbae2f08116154ba0fefac2fac11e863a86c127069ce4def8ec70eaaed0",
+        "md5": "3001d304caa3f4b4faabfbd237848bdb",
+        "sha256": "1f1a8e9c6bfe4c35563a030004942bf73404bc58750bb3297ef12f99d8e420b9"
+      },
+      "downloads": -1,
+      "filename": "aiosmpplib-0.6.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "3001d304caa3f4b4faabfbd237848bdb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 51107,
+      "upload_time": "2022-11-26T17:19:58",
+      "upload_time_iso_8601": "2022-11-26T17:19:58.948581Z",
+      "url": "https://files.pythonhosted.org/packages/b5/cc/3dbae2f08116154ba0fefac2fac11e863a86c127069ce4def8ec70eaaed0/aiosmpplib-0.6.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

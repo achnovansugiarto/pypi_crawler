@@ -1,0 +1,134 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "Ash Berlin-Taylor <ash_github@firemirror.com>, Ian Buss <ian.buss@astronomer.io>, Kaxil Niak <kaxil@astronomer.io>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Framework :: Apache Airflow",
+      "Framework :: Apache Airflow :: Provider"
+    ],
+    "description": "<p align=\"center\">\n  <a href=\"https://www.airflow.apache.org\">\n    <img alt=\"Airflow\" src=\"https://cwiki.apache.org/confluence/download/attachments/145723561/airflow_transparent.png?api=v2\" width=\"60\" />\n  </a>\n</p>\n<h1 align=\"center\">\n  Apache Airflow virtual envs made easy\n</h1>\n<h3 align=\"center\">\n  Making it easy to run tasks in isolated python virtual environments (venv) in Dockerfiles.\n  Maintained with ❤️ by Astronomer.\n</h3>\n\nLet's say you want to be able to run an Airflow task against Snowflake's Snowpark -- which requires Python 3.8.\n\nWith the addition of the ExternalPythonOperator in Airflow 2.4 this is possible, but managing the build process to get clean, quick Docker builds can take a lot of plumbing.\n\nThis repo provides a nice packaged solution to it, that plays nicely with Docker image caching.\n\n## Synopsis\n\n### Create a requirements.txt file\n\nFor example, `snowpark-requirements.txt`\n\n```\nsnowflake-snowpark-python[pandas]\n\n# To get credentials out of a connection we need these in the venv too sadly\napache-airflow\npsycopg2-binary\napache-airflow-providers-snowflake\n```\n\n### Use our custom Docker build frontend\n\n```Dockerfile\n# syntax=quay.io/astronomer/airflow-extensions:v1\n\nFROM quay.io/astronomer/astro-runtime:7.2.0-base\n\nPYENV 3.8 snowpark snowpark-requirements.txt\n```\n\nNote: That first `# syntax=` comment is important, don't leave it out!\n\nRead more about the [new `PYENV` instruction](#pyenv-docker-instruction)\n\n### Use it in a DAG\n\n```python\nfrom __future__ import annotations\n\nimport sys\n\nfrom airflow import DAG\nfrom airflow.decorators import task\nfrom airflow.utils.timezone import datetime\n\nwith DAG(\n    dag_id=\"astro_snowpark\",\n    schedule=None,\n    start_date=datetime(2022, 1, 1),\n    catchup=False,\n    tags=[\"example\"],\n) as dag:\n\n    @task\n    def print_python():\n        print(f\"My python version is {sys.version}\")\n\n    @task.venv(\"snowpark\")\n    def snowpark_task():\n        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook\n        from snowflake.snowpark import Session\n\n        print(f\"My python version is {sys.version}\")\n\n        hook = SnowflakeHook(\"snowflake_default\")\n        conn_params = hook._get_conn_params()\n        session = Session.builder.configs(conn_params).create()\n        tables = session.sql(\"show tables\").collect()\n        print(tables)\n\n        df_table = session.table(\"sample_product_data\")\n        print(df_table.show())\n        return df_table.to_pandas()\n\n    @task\n    def analyze(df):\n        print(f\"My python version is {sys.version}\")\n        print(df.head(2))\n\n    print_python() >> analyze(snowpark_task())\n```\n\n## Requirements\n\nThis needs Apache Airflow 2.4+ for the [ExternalPythonOperator] to work.\n\n## Requirements for building Docker images\n\nThis needs the [buildkit](https://docs.docker.com/build/buildkit/) backend for Docker.\n\nIt is enabled by default for Docker Desktop users; Linux users will need to enable it:\n\nTo set the BuildKit environment variable when running the docker build command, run:\n\n```bash\nDOCKER_BUILDKIT=1 docker build .\n```\n\nTo enable docker BuildKit by default, set daemon configuration in /etc/docker/daemon.json feature to true and restart the daemon. If the daemon.json file doesn’t exist, create new file called daemon.json and then add the following to the file.\n\n```json\n{\n  \"features\": {\n    \"buildkit\" : true\n  }\n}\n```\n\nAnd restart the Docker daemon.\n\nThe syntax extension also currently expects to find a `packages.txt` and `requirements.txt` in the Docker context directory (these can be empty by default).\n\n## Reference\n\n### `PYENV` Docker instruction\n\nThe `PYENV` command adds a Python Virtual Environment, running on the specified Python version to the docker image, and optionally install packages from a requirements.txt\n\nIt has the following syntax:\n\n```Dockerfile\nPYENV <python-version> <venv-name> [<reqs-file>]\n```\n\nThe requirements file is optional, so one can install a bare Python environment with something like:\n\n```Dockerfile\nPYENV 3.10 venv1\n```\n\n### `@task.venv` decorator\n\nTODO! Write the decorator, then fill out docs!\n\n## In This Repo\n\n### [`buildkit/`](buildkit/)\n\nThis contains the cusotm  Docker BuildKit frontend (see this [blog]( https://www.docker.com/blog/compiling-containers-dockerfiles-llvm-and-buildkit/) for details) adds a new custom command `PYENV` that can be used inside Dockerfiles to install new Python versions and virtual environments with custom dependencies.\n\n### [`provider/`](provider/)\n\nThis contains an Apache Airflow provider that providers the `@task.venv` decorator.\n\n## The Gory Details\n\n**a.k.a. How do I do this all manually?**\n\nThe `# syntax` line tells buildkit to user our Build frontend to process the Dockerfile into instructions.\n\nThe example Dockerfile above gets converted into roughly following instructions\n\n```Dockerfile\nUSER root\nCOPY --link --from=python:3.8-slim /usr/local/bin/*3.8* /usr/local/bin/\nCOPY --link --from=python:3.8-slim /usr/local/include/python3.8* /usr/local/include/python3.8\nCOPY --link --from=python:3.8-slim /usr/local/lib/pkgconfig/*3.8* /usr/local/lib/pkgconfig/\nCOPY --link --from=python:3.8-slim /usr/local/lib/*3.8*.so* /usr/local/lib/\nCOPY --link --from=python:3.8-slim /usr/local/lib/python3.8 /usr/local/lib/python3.8\nRUN /sbin/ldconfig /usr/local/lib\nRUN ln -s /usr/local/include/python3.8 /usr/local/include/python3.8m\n\nUSER astro\nRUN mkdir -p /home/astro/.venv/snowpark\nCOPY reqs/venv1.txt /home/astro/.venv/snowpark/requirements.txt\nRUN /usr/local/bin/python3.8 -m venv --system-site-packages /home/astro/.venv/snowpark\nENV ASTRO_PYENV_snowpark /home/astro/.venv/snowpark/bin/python\nRUN --mount=type=cache,target=/home/astro/.cache/pip /home/astro/.venv/snowpark/bin/pip --cache-dir=/home/astro/.cache/pip install -r /home/astro/.venv/snowpark/requirements.txt\n```\n\nThe final part of this puzzle from the Airflow operator is to look up the path to `python` in the created venv using the `ASTRO_PYENV_*` environment variable:\n\n```python\n@task.external_python(python=os.environ[\"ASTRO_PYENV_snowpark\"])\ndef snowpark_task():\n    ...\n```\n\n[ExternalPythonOperator]: https://airflow.apache.org/docs/apache-airflow/stable/howto/operator/python.html#externalpythonoperator\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "Apache License 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "astro-provider-venv",
+    "package_url": "https://pypi.org/project/astro-provider-venv/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/astro-provider-venv/",
+    "project_urls": {
+      "Source": "https://github.com/astronomer/astro-provider-venv"
+    },
+    "release_url": "https://pypi.org/project/astro-provider-venv/1.0.0a3/",
+    "requires_dist": [
+      "apache-airflow (>=2.4)",
+      "pytest (>=7.0) ; extra == 'tests'"
+    ],
+    "requires_python": "~=3.7",
+    "summary": "Easily create and use Python Virtualenvs in Apache Airflow",
+    "version": "1.0.0a3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17494800,
+  "releases": {
+    "1.0.0a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b0e97e78b0abec4d8884b755dfe7f870082f2a18332c065b68ca58f567e3994",
+          "md5": "add7208fdd82ba0e48d8e13e9e4fb474",
+          "sha256": "c04b199ca57bfade28816d3181973b75c09b2229cde23e936f875b26c9888445"
+        },
+        "downloads": -1,
+        "filename": "astro_provider_venv-1.0.0a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "add7208fdd82ba0e48d8e13e9e4fb474",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": "~=3.7",
+        "size": 9915,
+        "upload_time": "2023-03-29T09:54:27",
+        "upload_time_iso_8601": "2023-03-29T09:54:27.668228Z",
+        "url": "https://files.pythonhosted.org/packages/7b/0e/97e78b0abec4d8884b755dfe7f870082f2a18332c065b68ca58f567e3994/astro_provider_venv-1.0.0a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a8adce7c2e09c12202c6840cf58faa2abd3a7f16c409a4d530389077182046bc",
+          "md5": "ada5a86caf74657ff74018d644e84aed",
+          "sha256": "2677313e987815c9a072d28fa23679ba296db5d2db51cfb26b4aafb5e8cd08ea"
+        },
+        "downloads": -1,
+        "filename": "astro-provider-venv-1.0.0a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ada5a86caf74657ff74018d644e84aed",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": "~=3.7",
+        "size": 10319,
+        "upload_time": "2023-03-29T09:54:34",
+        "upload_time_iso_8601": "2023-03-29T09:54:34.356330Z",
+        "url": "https://files.pythonhosted.org/packages/a8/ad/ce7c2e09c12202c6840cf58faa2abd3a7f16c409a4d530389077182046bc/astro-provider-venv-1.0.0a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7b0e97e78b0abec4d8884b755dfe7f870082f2a18332c065b68ca58f567e3994",
+        "md5": "add7208fdd82ba0e48d8e13e9e4fb474",
+        "sha256": "c04b199ca57bfade28816d3181973b75c09b2229cde23e936f875b26c9888445"
+      },
+      "downloads": -1,
+      "filename": "astro_provider_venv-1.0.0a3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "add7208fdd82ba0e48d8e13e9e4fb474",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": "~=3.7",
+      "size": 9915,
+      "upload_time": "2023-03-29T09:54:27",
+      "upload_time_iso_8601": "2023-03-29T09:54:27.668228Z",
+      "url": "https://files.pythonhosted.org/packages/7b/0e/97e78b0abec4d8884b755dfe7f870082f2a18332c065b68ca58f567e3994/astro_provider_venv-1.0.0a3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a8adce7c2e09c12202c6840cf58faa2abd3a7f16c409a4d530389077182046bc",
+        "md5": "ada5a86caf74657ff74018d644e84aed",
+        "sha256": "2677313e987815c9a072d28fa23679ba296db5d2db51cfb26b4aafb5e8cd08ea"
+      },
+      "downloads": -1,
+      "filename": "astro-provider-venv-1.0.0a3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "ada5a86caf74657ff74018d644e84aed",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": "~=3.7",
+      "size": 10319,
+      "upload_time": "2023-03-29T09:54:34",
+      "upload_time_iso_8601": "2023-03-29T09:54:34.356330Z",
+      "url": "https://files.pythonhosted.org/packages/a8/ad/ce7c2e09c12202c6840cf58faa2abd3a7f16c409a4d530389077182046bc/astro-provider-venv-1.0.0a3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

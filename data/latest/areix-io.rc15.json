@@ -1,0 +1,420 @@
+{
+  "info": {
+    "author": "Areix",
+    "author_email": "hellohk@areix-ai.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 2 - Pre-Alpha",
+      "Environment :: Console",
+      "Intended Audience :: Developers",
+      "Intended Audience :: Financial and Insurance Industry",
+      "Intended Audience :: Information Technology",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Office/Business :: Financial :: Investment",
+      "Topic :: Software Development :: Build Tools"
+    ],
+    "description": "# Areix IO (Alpha Test)\n\n[Documentation](http://alphagen.areix-ai.com/doc)\n\n## Installation\nCreate a virtual environment \n```\nvirtualenv venv --python=python3\n```\nActivate the virtual environment \n```python\n# Macbook / Linus\nsource venv/bin/activate \n\n# Windows\nvenv/Scripts/activate\n```\nDeactivate\n```\ndeactivate\n```\nInstall Areix-IO package\n```\npip install areix_io\n```\n\n\n## Usage\nDefine your strategy class:\n```python\n\nfrom areix_io import (\n    create_report_folder, Side,\n    Strategy, BinanceSpotDataFeed, BackTest, \n    BackTestBroker, CommissionScheme\n)\n\nfrom sklearn.neighbors import KNeighborsClassifier\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.metrics import accuracy_score, f1_score\nimport pandas as pd\nimport numpy as np\n\nPRED_DAYS = 2 \nPCT_CHANGE = 0.004\n\"\"\"\nData pre processing step\n\"\"\"\ndef bollinger_band(data, n_lookback, n_std):\n    hlc3 = (data['high'] + data['low'] + data['close']) / 3\n    mean, std = hlc3.rolling(n_lookback).mean(), hlc3.rolling(n_lookback).std()\n    upper = mean + n_std*std\n    lower = mean - n_std*std\n    return upper, lower\n\ndef update_df(df):\n    upper, lower = bollinger_band(df, 20, 2)\n\n    df['ma10'] = df.close.rolling(10).mean()\n    df['ma20'] = df.close.rolling(20).mean()\n    df['ma50'] = df.close.rolling(50).mean()\n    df['ma100'] = df.close.rolling(100).mean()\n\n    df['x_ma10'] = (df.close - df.ma10) / df.close\n    df['x_ma20'] = (df.close - df.ma20) / df.close\n    df['x_ma50'] = (df.close - df.ma50) / df.close\n    df['x_ma100'] = (df.close - df.ma100) / df.close\n\n    df['x_delta_10'] = (df.ma10 - df.ma20) / df.close\n    df['x_delta_20'] = (df.ma20 - df.ma50) / df.close\n    df['x_delta_50'] = (df.ma50 - df.ma100) / df.close\n\n    df['x_mom'] = df.close.pct_change(periods=2)\n    df['x_bb_upper'] = (upper - df.close) / df.close\n    df['x_bb_lower'] = (lower - df.close) / df.close\n    df['x_bb_width'] = (upper - lower) / df.close\n\n    # df = df.dropna().astype(float)\n    return df\n\ndef get_X(data):\n    return data.filter(like='x_').values\n\ndef get_y(data):\n    y = data.close.pct_change(PRED_DAYS).shift(-PRED_DAYS)  # Returns after roughly two days\n    y[y.between(-PCT_CHANGE, PCT_CHANGE)] = 0             # Devalue returns smaller than 0.4%\n    y[y > 0] = 1\n    y[y < 0] = -1\n    return y\n\ndef get_clean_Xy(df):\n    X = get_X(df)\n    y = get_y(df).values\n    isnan = np.isnan(y)\n    X = X[~isnan]\n    y = y[~isnan]\n    return X, y\n\nclass MLStrategy(Strategy):\n    num_pre_train = 300\n\n    def initialize(self):\n        \"\"\"\n        Model training step\n        \"\"\"\n        self.info('initialize')\n        self.code = list(self.ctx.feed.keys())[0]\n        df = self.ctx.feed[self.code].data\n        self.ctx.feed[self.code].data = update_df(df)\n\n        self.y = get_y(df[self.num_pre_train-1:])\n        self.y_true = self.y.values\n\n        self.clf = KNeighborsClassifier(7)\n        \n        df = df.dropna()\n        X, y = get_clean_Xy(df[:self.num_pre_train])\n        self.clf.fit(X, y)\n\n        self.y_pred = []\n    \n    def before_trade(self, order):\n        return True\n\n    def on_order_ok(self, order):\n        self.my_quantity = self.ctx.get_quantity(order['code'])\n        self.info(\n            f\"{order['side'].name} order [number {order['id']}] ({order['order_type'].name}) executed [quantity {order['quantity']}] {order['code']} [price ${order['price']:2f}] [Cost ${order['gross_amount']:2f}] [Commission: ${order['commission']}] [Available Cash: ${self.available_cash}] [Position: #{self.ctx.get_quantity(order['code'])}] [Gross P&L: ${order['pnl']}] [Net P&L: ${order['pnl_net']}]\"\n        )\n\n        if not order['is_open']:\n            self.info(f\"Trade closed, pnl: {order['pnl']}========\")\n\n    def on_market_start(self):\n        # self.info('on_market_start')\n        pass\n\n    def on_market_close(self):\n        # self.info('on_market_close')\n        pass\n\n    def on_order_timeout(self, order):\n        self.info(f'on_order_timeout. Order: {order}')\n        pass\n\n    def finish(self):\n        self.info('finish')\n\n    def on_bar(self, tick):\n        \"\"\"\n        Model scoring and decisioning step\n        \"\"\"\n        bar_data = self.ctx.bar_data[self.code]\n        \n        X = get_X(bar_data)\n        if bar_data.x_ma100 != bar_data.x_ma100:\n            return\n        forecast = self.clf.predict([X])[0]\n        self.y_pred.append(forecast)\n\n        open, high, low, close = bar_data.open, bar_data.high, bar_data.low, bar_data.close\n\n        upper, lower = close * (1 + np.r_[1, -1]*PCT_CHANGE)\n\n        if forecast == 1 and not self.ctx.get_quantity(self.code):\n            o1 = self.order_amount(code=self.code,amount=self.available_cash,side=Side.BUY)\n            self.info(f\"BUY order [number {o1['id']}] created, [quantity {o1['quantity']}] [price {o1['price']}] [balance: {self.available_cash}]\")\n            \n            osl = self.sell(code=self.code,quantity=o1['quantity'], price=lower, stop_price=lower)\n            self.info(f\"STOPLOSS order [number {osl['id']}] created, [quantity {osl['quantity']}] [price {osl['price']}] [balance: {self.available_cash}]\")\n            \n        elif forecast == -1 and self.ctx.get_quantity(self.code):\n            o2 = self.close(code=self.code, price=upper)\n            self.info(f\"SELL order [number {o2['id']}] created, [quantity {o2['quantity']}] [price {o2['price']}] [balance: {self.available_cash}]\")\n\n```\n\nRun your strategy:\n```python\n\nif __name__ == '__main__':\n\n    base = create_report_folder()\n\n    start_date = '2021-01-01'\n    end_date = '2021-07-01'\n    interval = '4h'\n\n    code = 'XRP/USDT'\n    benchmark_code = 'BTC/USDT'\n\n    cs = CommissionScheme(\n        commission_rate=0.001, \n        min_commission=None, \n        is_contract = False\n    )\n    broker = BackTestBroker(\n        commission_scheme=cs,\n        trade_at='close', \n        # trade_at='open', \n        cash=1000, \n        short_cash=False, \n        slippage=0.0)\n    \n    btc = BinanceSpotDataFeed(\n        symbol=benchmark_code,\n        start_date=start_date, \n        end_date=end_date,  \n        interval=interval, \n        min_volume = 0.00001,\n        order_ascending=True, \n        store_path=base\n    )\n    datefeed = BinanceSpotDataFeed(\n        symbol=code,\n        start_date=start_date, \n        end_date=end_date,  \n        interval=interval, \n        min_volume = 0.0001,\n        order_ascending=True, \n        store_path=base\n    )\n\n    mytest = BackTest(\n        [ datefeed ], \n        MLStrategy, \n        benchmark=btc, \n        store_path=base,\n        broker=broker\n    )\n\n    mytest.start()\n\n\n```\n\nRetrieve statistic results:\n```python\n    prefix = ''\n    stats = mytest.ctx.statistic.stats(pprint=True, annualization=252, risk_free=0.0442)\n    stats['model_name'] = 'Simple KNN Signal Generation Strategy'\n    stats['algorithm'] = ['KNN', 'Simple Moving Average', 'Bollinger Band']\n    print(stats)\n    mytest.contest_output(is_plot=True)\n```\nResult:\n```\nstart                                                2021-01-01 00:00:00+08:00\nend                                                  2021-07-01 00:00:00+08:00\nduration                                                     181 days 00:00:00\ntrading_pairs                                                        [XRPUSDT]\nbenchmark                                                              BTCUSDT\nbeginning_balance                                                         1000\nending_balance                                                     6374.787763\ntotal_net_profit                                                   5374.787763\ngross_profit                                                       9919.319576\ngross_loss                                                        -4544.531813\nprofit_factor                                                         2.182693\nreturn_on_initial_capital                                             5.374788\nannualized_return                                                     0.536384\ntotal_return                                                          5.374788\nmax_return                                                            5.401244\nmin_return                                                           -0.004806\nnumber_trades                                                              630\nnumber_winning_trades                                                      317\nnumber_losing_trades                                                       220\navg_daily_trades                                                      6.899160\navg_weekly_trades                                                    32.840000\navg_monthly_trades                                                  136.833333\nwin_ratio                                                             0.503175\nloss_ratio                                                            0.349206\nwin_days                                                                    64\nloss_days                                                                   18\nmax_win_in_day                                                      701.189561\nmax_loss_in_day                                                     -51.928662\nmax_consecutive_win_days                                                    22\nmax_consecutive_loss_days                                                    2\navg_profit_per_trade                                                 13.209755\ntrading_period                                         0 years 6 months 0 days\navg_daily_pnl($)                                                      4.949160\navg_daily_pnl                                                         0.001784\navg_weekly_pnl($)                                                   206.722606\navg_weekly_pnl                                                        0.080719\navg_monthly_pnl($)                                                  868.835518\navg_monthly_pnl                                                       0.398852\navg_quarterly_pnl($)                                               1532.511026\navg_quarterly_pnl                                                     0.463027\navg_annualy_pnl($)                                                         NaN\navg_annualy_pnl                                                            NaN\nsharpe_ratio                                                          2.022460\nsortino_ratio                                                         6.971285\nannualized_volatility                                                 0.200512\nomega_ratio                                                           0.011848\ndownside_risk                                                         0.064485\ninformation_ratio                                                     0.058498\nbeta                                                                  0.105311\nalpha                                                                -0.999939\ncalmar_ratio                                                          5.527284\ntail_ratio                                                            9.548038\nmax_drawdown                                                          0.097043\nmax_drawdown_period          (2021-06-21 04:00:00+08:00, 2021-06-28 08:00:0...\nmax_drawdown_duration                                          7 days 04:00:00\nsqn                                                                   5.283288\nmodel_name                               Simple KNN Signal Generation Strategy\nalgorithm                         [KNN, Simple Moving Average, Bollinger Band]\n\n```",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://alphagen.areix-ai.com",
+    "keywords": "areix,areix_io,alpha_gen,alphagen,wealthx,algo,algorithmic,backtest,backtesting,bitcoin,crypto,bokeh,bonds,candle,candlestick,cboe,chart,cme,commodities,crash,currency,drawdown,equity,etf,ethereum,exchange,finance,financial,forecast,forex,fund,futures,fx,gold,historical,indicator,invest,investing,investment,macd,market,money,ohlc,ohlcv,order,price,profit,quant,quantitative,rsi,pnl,stocks,strategy,ticker,trader,trading,tradingview,usd,binance",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "Areix-IO",
+    "package_url": "https://pypi.org/project/Areix-IO/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/Areix-IO/",
+    "project_urls": {
+      "Documentation": "https://alphagen.areix-ai.com/doc",
+      "Homepage": "https://alphagen.areix-ai.com"
+    },
+    "release_url": "https://pypi.org/project/Areix-IO/0.1.20/",
+    "requires_dist": null,
+    "requires_python": ">=3.8.0",
+    "summary": "Areix IO Backtesting Framework",
+    "version": "0.1.20",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11888553,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b5109eca8bf8919b52334486524827953ab45b39281522b9c2ef81f608034eb1",
+          "md5": "539eadf4ab2c4a085057425006a19ccb",
+          "sha256": "4ba5ebac7b67ebaa9eb1d36089212f1defef43dda28bb0d7694520e24afc89f0"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "539eadf4ab2c4a085057425006a19ccb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1377482,
+        "upload_time": "2021-01-28T10:26:39",
+        "upload_time_iso_8601": "2021-01-28T10:26:39.554851Z",
+        "url": "https://files.pythonhosted.org/packages/b5/10/9eca8bf8919b52334486524827953ab45b39281522b9c2ef81f608034eb1/Areix_IO-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b49b03c35a2f026b9de8a7cd6bb50664790dd3572062fbc07ed70c8dbb733f95",
+          "md5": "3b635e17c822f4e95be99aa7883f4151",
+          "sha256": "a5c7219a776f531eba240f1359c1d1c4f5a8d475569504493f4880b2701cb191"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b635e17c822f4e95be99aa7883f4151",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1414577,
+        "upload_time": "2021-02-06T13:18:32",
+        "upload_time_iso_8601": "2021-02-06T13:18:32.220531Z",
+        "url": "https://files.pythonhosted.org/packages/b4/9b/03c35a2f026b9de8a7cd6bb50664790dd3572062fbc07ed70c8dbb733f95/Areix_IO-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6af6839e5538fbe92626b9eeb33d61ab8e819108384c85820e22893ab7e38359",
+          "md5": "35354d7002ed3bc8ce503fc826b1c523",
+          "sha256": "9438b13fcce588b6479679af43739d6275636e948830df29d3efc121dbb65f6d"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "35354d7002ed3bc8ce503fc826b1c523",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1459938,
+        "upload_time": "2021-03-11T18:19:59",
+        "upload_time_iso_8601": "2021-03-11T18:19:59.928587Z",
+        "url": "https://files.pythonhosted.org/packages/6a/f6/839e5538fbe92626b9eeb33d61ab8e819108384c85820e22893ab7e38359/Areix_IO-0.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e688b23924208effd222138a460ada2d65ecb70ed41b1727efd83b56d4ef759d",
+          "md5": "1c60e398d1939f18691701ae98ded7f1",
+          "sha256": "6ed27540e7f1f7dc256bee0929a275edfe807a05a6b03d64070f16d873c37bfe"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1c60e398d1939f18691701ae98ded7f1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1452600,
+        "upload_time": "2021-03-15T14:44:19",
+        "upload_time_iso_8601": "2021-03-15T14:44:19.506677Z",
+        "url": "https://files.pythonhosted.org/packages/e6/88/b23924208effd222138a460ada2d65ecb70ed41b1727efd83b56d4ef759d/Areix_IO-0.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bf996b972439740faddc309f46c2507d3b8fb321e425622856568e1e0020bccd",
+          "md5": "f0c7440c695b2974eca1becc5fad0f5b",
+          "sha256": "771f5f6a4fe1565f8a2c316621ef301f34f566f17680cadc635a0f4e60bbb8e1"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f0c7440c695b2974eca1becc5fad0f5b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1470912,
+        "upload_time": "2021-03-30T15:04:11",
+        "upload_time_iso_8601": "2021-03-30T15:04:11.808487Z",
+        "url": "https://files.pythonhosted.org/packages/bf/99/6b972439740faddc309f46c2507d3b8fb321e425622856568e1e0020bccd/Areix_IO-0.1.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c86d8049c377ab7d1de3acd05d1d51a179b2f1d4442763a1b65cce04615d2fb0",
+          "md5": "f98eacad01082000284d74d85c58039c",
+          "sha256": "189e0081c356b60306d65e559f6c0b71f56068018b3462488291cb2942e7fea1"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f98eacad01082000284d74d85c58039c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1466916,
+        "upload_time": "2021-03-31T16:52:20",
+        "upload_time_iso_8601": "2021-03-31T16:52:20.859590Z",
+        "url": "https://files.pythonhosted.org/packages/c8/6d/8049c377ab7d1de3acd05d1d51a179b2f1d4442763a1b65cce04615d2fb0/Areix_IO-0.1.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "942a6e46cb134086fd84437456a07959d5afb339727cb362aa13e03d52423dfb",
+          "md5": "3fe670c6aadf842e9454fffc92cf947f",
+          "sha256": "53d81167a3ea77260560194014890585438eb59e2c6a48bc4e7da591a88881d9"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3fe670c6aadf842e9454fffc92cf947f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1500428,
+        "upload_time": "2021-07-14T09:45:55",
+        "upload_time_iso_8601": "2021-07-14T09:45:55.958783Z",
+        "url": "https://files.pythonhosted.org/packages/94/2a/6e46cb134086fd84437456a07959d5afb339727cb362aa13e03d52423dfb/Areix_IO-0.1.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1dafac74b11c7d487d2c40c74a5f0550939b68518507534963bebde9abdccdff",
+          "md5": "3cfdcbddf670e21775251ff50d39e172",
+          "sha256": "667416faca3bb26fb1ba8f897bb72ef70df14dcf7f93f6b069667bda0ebffc31"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3cfdcbddf670e21775251ff50d39e172",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1499398,
+        "upload_time": "2021-08-17T02:47:02",
+        "upload_time_iso_8601": "2021-08-17T02:47:02.393021Z",
+        "url": "https://files.pythonhosted.org/packages/1d/af/ac74b11c7d487d2c40c74a5f0550939b68518507534963bebde9abdccdff/Areix_IO-0.1.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6b540f152196998b711718b42a5adb87715873e3b2a0eff1fe748af689ec9758",
+          "md5": "45d4f73e10b6d0e43d7ec96b6b296a7a",
+          "sha256": "7771eefdf0c431861499700a619e2b0049f705282a0b1f861fb266ea180482f9"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "45d4f73e10b6d0e43d7ec96b6b296a7a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 1556593,
+        "upload_time": "2021-09-12T14:19:45",
+        "upload_time_iso_8601": "2021-09-12T14:19:45.258003Z",
+        "url": "https://files.pythonhosted.org/packages/6b/54/0f152196998b711718b42a5adb87715873e3b2a0eff1fe748af689ec9758/Areix_IO-0.1.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ca23f662a99898f5ea8beec04e3a610b46206a2b75dd8c0eb461cfca37e2972",
+          "md5": "4bf5835858c08857814abd4b69f55503",
+          "sha256": "b07c730595de56d351446d899287236183115109e31bbf7f02296b1845225db7"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4bf5835858c08857814abd4b69f55503",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 661684,
+        "upload_time": "2021-10-30T12:18:43",
+        "upload_time_iso_8601": "2021-10-30T12:18:43.568184Z",
+        "url": "https://files.pythonhosted.org/packages/7c/a2/3f662a99898f5ea8beec04e3a610b46206a2b75dd8c0eb461cfca37e2972/Areix_IO-0.1.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db76409e63d66eccf880bd67af2f00a808fe6a7dd3c662626abc2e629a2950f5",
+          "md5": "90d911214fc337d51aa0802cf663a432",
+          "sha256": "06be94eed690c99a6f9568a43675269c89d8deb301af7c512f3c777fbf07e719"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.19.tar.gz",
+        "has_sig": false,
+        "md5_digest": "90d911214fc337d51aa0802cf663a432",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 624282,
+        "upload_time": "2021-10-31T15:24:06",
+        "upload_time_iso_8601": "2021-10-31T15:24:06.611451Z",
+        "url": "https://files.pythonhosted.org/packages/db/76/409e63d66eccf880bd67af2f00a808fe6a7dd3c662626abc2e629a2950f5/Areix_IO-0.1.19.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.20": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d37a8f75004f5495965db077cc963c730d2f58c7c5d4047c1ab64ddc6b24231",
+          "md5": "733a042995527b9fe1be3ffe9dbfbf48",
+          "sha256": "2b27b246596a434b03e11aa3ae2fead5c8392c0d64988e7ad0d526531c1cf037"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.20.tar.gz",
+        "has_sig": false,
+        "md5_digest": "733a042995527b9fe1be3ffe9dbfbf48",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8.0",
+        "size": 640623,
+        "upload_time": "2021-11-01T04:10:42",
+        "upload_time_iso_8601": "2021-11-01T04:10:42.104127Z",
+        "url": "https://files.pythonhosted.org/packages/7d/37/a8f75004f5495965db077cc963c730d2f58c7c5d4047c1ab64ddc6b24231/Areix_IO-0.1.20.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0505f803a597c660179e26d4f845c8905c55e8a14726a2b6bfecf9a0268589d9",
+          "md5": "bf3a5264a73f9dfc11644b0fe175a978",
+          "sha256": "c65c1feaa50f92471715641e6cb2f6ded86f74870476d4b0fbbebb9c4c592d3c"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bf3a5264a73f9dfc11644b0fe175a978",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1415174,
+        "upload_time": "2021-02-08T04:25:51",
+        "upload_time_iso_8601": "2021-02-08T04:25:51.288562Z",
+        "url": "https://files.pythonhosted.org/packages/05/05/f803a597c660179e26d4f845c8905c55e8a14726a2b6bfecf9a0268589d9/Areix_IO-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "914431852975432062ec522fa594d2320020ff74aebd54b7a6ee8395789444ff",
+          "md5": "88530f9c7d9951eb45184f16e96e0e1d",
+          "sha256": "11d6fecae12082357d00a8f03e46dcaf83dc6bf65aaa919627ba2fec469a38dd"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "88530f9c7d9951eb45184f16e96e0e1d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1458424,
+        "upload_time": "2021-02-21T18:15:25",
+        "upload_time_iso_8601": "2021-02-21T18:15:25.772723Z",
+        "url": "https://files.pythonhosted.org/packages/91/44/31852975432062ec522fa594d2320020ff74aebd54b7a6ee8395789444ff/Areix_IO-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09b6daaa6980625c633b6811a144bc2a7cc5bb7734852c3b5b2075cd88f74fc7",
+          "md5": "9cd6188b466818f4c6327e62fc99afc9",
+          "sha256": "bbb7cc496a039f8d912ed132b9fbec57cb545d992f8f743ef0aae12b6b9e3b37"
+        },
+        "downloads": -1,
+        "filename": "Areix_IO-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9cd6188b466818f4c6327e62fc99afc9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7.0",
+        "size": 1454007,
+        "upload_time": "2021-03-02T13:45:02",
+        "upload_time_iso_8601": "2021-03-02T13:45:02.611304Z",
+        "url": "https://files.pythonhosted.org/packages/09/b6/daaa6980625c633b6811a144bc2a7cc5bb7734852c3b5b2075cd88f74fc7/Areix_IO-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7d37a8f75004f5495965db077cc963c730d2f58c7c5d4047c1ab64ddc6b24231",
+        "md5": "733a042995527b9fe1be3ffe9dbfbf48",
+        "sha256": "2b27b246596a434b03e11aa3ae2fead5c8392c0d64988e7ad0d526531c1cf037"
+      },
+      "downloads": -1,
+      "filename": "Areix_IO-0.1.20.tar.gz",
+      "has_sig": false,
+      "md5_digest": "733a042995527b9fe1be3ffe9dbfbf48",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8.0",
+      "size": 640623,
+      "upload_time": "2021-11-01T04:10:42",
+      "upload_time_iso_8601": "2021-11-01T04:10:42.104127Z",
+      "url": "https://files.pythonhosted.org/packages/7d/37/a8f75004f5495965db077cc963c730d2f58c7c5d4047c1ab64ddc6b24231/Areix_IO-0.1.20.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

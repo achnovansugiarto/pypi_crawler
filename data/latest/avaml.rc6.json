@@ -1,0 +1,357 @@
+{
+  "info": {
+    "author": "Aron Widforss",
+    "author_email": "arwi@nve.no",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# avaml - helper functions for Avalanche machine learning\n\nThis package contains functions used to prepare data from\nthe Norwegian Avalanche Forecasting Service to facilitate\nmachine learning.\n\n## Installation\n\nTo install using `pip`:\n```\npip install avaml\n```\n\n## Example program\n\n### Searching for data\n\nHere is a short example program using the package to prepare data\nfor training a RandomForestClassifier:\n\n```python\nimport sys\n\nfrom regobslib import SnowRegion\nimport avaml\nimport datetime as dt\nimport pandas as pd\nfrom sklearn import metrics\nfrom sklearn.ensemble import RandomForestClassifier\n\nDAYS_IN_TIMELINE = 4\nSTART_DATE = dt.date(2017, 11, 1)\nSTOP_DATE = dt.date(2021, 7, 1)\nTRAINING_REGIONS = [\n    SnowRegion.VEST_FINNMARK,\n    SnowRegion.NORD_TROMS,\n    SnowRegion.LYNGEN,\n    SnowRegion.SOR_TROMS,\n    SnowRegion.INDRE_TROMS,\n    SnowRegion.LOFOTEN_OG_VESTERALEN,\n    SnowRegion.SVARTISEN,\n    SnowRegion.HELGELAND,\n    SnowRegion.TROLLHEIMEN,\n    SnowRegion.ROMSDAL,\n    SnowRegion.SUNNMORE,\n    SnowRegion.INDRE_FJORDANE,\n    SnowRegion.JOTUNHEIMEN,\n    SnowRegion.HALLINGDAL,\n    SnowRegion.INDRE_SOGN,\n    SnowRegion.VOSS,\n    SnowRegion.HEIANE,\n]\nVALIDATION_REGIONS = [\n    SnowRegion.TROMSO,\n    SnowRegion.SALTEN,\n    SnowRegion.VEST_TELEMARK,\n]\nTEST_REGIONS = [\n    SnowRegion.FINNMARKSKYSTEN,\n    SnowRegion.OFOTEN,\n    SnowRegion.HARDANGER,\n]\nREGIONS = sorted(TRAINING_REGIONS + VALIDATION_REGIONS + TEST_REGIONS)\n\n# fetch_and_prepare_aps_varsom() does a number of things:\n# * See if a call with the same parameters have been called earlier.\n#   If so, load prepared csv's from disk.\n# * If there is no prepared data on disk, see if there are raw\n#   data instead.\n# * If no previously downloaded data is found, download data from\n#   APS and Varsom.\n# * Save the data as csv's to the 'cache_dir'\n# * Prepare the data:\n#   * It transforms the Varsom DataFrame to contain the same index\n#     as the APS DataFrame, replicating the forecast for every\n#     elevation level. It then removes avalanche problems that\n#     does not exist at the row's elevation level and remove the\n#     elevation data from the avalanche problems. All rows that\n#     does not contain complete APS data is removed.\n#   * Creates a timeline out of the APS DataFrame. This means that\n#     the APS data is concatenated onto a shifted version of itself,\n#     making each APS row contain several days worth of data.\n#     This will make some rows incomplete. They will be removed.\naps, varsom = avaml.prepare.fetch_and_prepare_aps_varsom(START_DATE,\n                                                         STOP_DATE,\n                                                         DAYS_IN_TIMELINE,\n                                                         REGIONS,\n                                                         print_to=sys.stdout,  # Print progression to terminal\n                                                         cache_dir=\".\",  # Use current dir for csv-files\n                                                         read_cache=True,\n                                                         write_cache=True)\n\nprint(\"Training and predicting problems\")\n# split_avalanche_problems() takes the Varsom Dataframe and splits it into\n# several DataFrames, containing information about one avalanche problem each.\n# If a problem row contains some values, but also some NaNs, it is invalid and\n# is removed from both Varsom and APS.\n#\n# A 3-tuple is returned, (problems_X: Dict, problems_Y: Dict, problems: List).\n# * problems_X is a dict with the problem as key and a DataFrame with indata as value\n# * problems_Y is a dict with the problem as key and a DataFrame with labels as value\n# * problems is a list of avalanche problem names\nproblems_X, problems_Y, problems = avaml.prepare.split_avalanche_problems(aps, varsom)\nf1_dict = {}\nfor problem in problems:\n    X = problems_X[problem]\n    Y = problems_Y[problem]\n\n    # Splitting data into TRAINING and VALIDATION sets\n    training_index = Y.index.isin(TRAINING_REGIONS, level=\"region\")\n    validation_index = Y.index.isin(VALIDATION_REGIONS, level=\"region\")\n    training_X = X.loc[training_index]\n    training_Y = Y.loc[training_index].any(axis=1)\n    validation_X = X.loc[validation_index]\n    validation_Y = Y.loc[validation_index].any(axis=1)\n\n    # Training and validating\n    classifier = RandomForestClassifier(n_estimators=10)\n    classifier.fit(training_X.values, training_Y)\n    prediction = pd.Series(classifier.predict(validation_X.values), index=validation_X.index)\n\n    # Calculating and storing scores to dict\n    elevation_prediction = prediction\n    elevation_ground_truth = validation_Y\n    problem_prediction = elevation_prediction.unstack().any(axis=1)\n    problem_ground_truth = elevation_ground_truth.unstack().any(axis=1)\n    training_elevation_ground_truth = training_Y\n    training_problem_ground_truth = training_elevation_ground_truth.unstack().any(axis=1)\n    elevation_f1 = metrics.f1_score(elevation_ground_truth, elevation_prediction)\n    problem_f1 = metrics.f1_score(problem_ground_truth, problem_prediction)\n    f1_dict[problem] = {\n        (\"f1\", \"per_elevation\"): elevation_f1,\n        (\"f1\", \"per_forecast\"): problem_f1,\n        (\"training_n_true\", \"per_elevation\"):\n            f\"{training_elevation_ground_truth.sum()}/{len(training_elevation_ground_truth)}\",\n        (\"training_n_true\", \"per_forecast\"):\n            f\"{training_problem_ground_truth.sum()}/{len(training_problem_ground_truth)}\",\n        (\"validation_n_true\", \"per_elevation\"):\n            f\"{elevation_ground_truth.sum()}/{len(elevation_ground_truth)}\",\n        (\"validation_n_true\", \"per_forecast\"):\n            f\"{problem_ground_truth.sum()}/{len(problem_ground_truth)}\",\n    }\n\nwith pd.option_context('display.max_rows', None,\n                       'display.max_columns', None,\n                       'display.expand_frame_repr', False):\n    print(pd.DataFrame(f1_dict).T)\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/NVE/avaml",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "avaml",
+    "package_url": "https://pypi.org/project/avaml/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/avaml/",
+    "project_urls": {
+      "Homepage": "https://github.com/NVE/avaml"
+    },
+    "release_url": "https://pypi.org/project/avaml/0.0.6/",
+    "requires_dist": [
+      "pandas",
+      "numpy",
+      "regobslib (>=0.2.4)",
+      "setuptools"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Facilitating machine learning in the Norwegian Avalanche Forecasting Service",
+    "version": "0.0.6",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12925296,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "82ddee451ccd668193f0fb5710fbf6a72195c0ea9877255a6c0a6cf07a01b147",
+          "md5": "cc8077f1ea06b9f68cd0a888501db000",
+          "sha256": "2ffbf1b066c6a98feeb3313a4d5e26f06dda3600b9be859c829d118d1269a958"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cc8077f1ea06b9f68cd0a888501db000",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 5997,
+        "upload_time": "2022-02-17T15:06:18",
+        "upload_time_iso_8601": "2022-02-17T15:06:18.444443Z",
+        "url": "https://files.pythonhosted.org/packages/82/dd/ee451ccd668193f0fb5710fbf6a72195c0ea9877255a6c0a6cf07a01b147/avaml-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7205145225129d65ac8c97888652a6354fd819516c8ed0c15bbc81874b5fe468",
+          "md5": "dce424d636e680d91ac1445f6a65ab7b",
+          "sha256": "6328b9b67b3c9ec955afed7e2034281f0fe574d09dfcd7aa6cc4dd362e8bbec1"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dce424d636e680d91ac1445f6a65ab7b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5820,
+        "upload_time": "2022-02-17T15:06:20",
+        "upload_time_iso_8601": "2022-02-17T15:06:20.363007Z",
+        "url": "https://files.pythonhosted.org/packages/72/05/145225129d65ac8c97888652a6354fd819516c8ed0c15bbc81874b5fe468/avaml-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c24909a03445c5d6a37a41ec5474ba4e65d57271f1cb93afa81c090a7abb1dbb",
+          "md5": "62a9068fab58af08906e2dfc4a73797e",
+          "sha256": "d42a6b5ceb70a9d12a1fbd3ad64cabe22dc3f5a09a204c57061faa639d4c3a95"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "62a9068fab58af08906e2dfc4a73797e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 6006,
+        "upload_time": "2022-02-17T15:13:39",
+        "upload_time_iso_8601": "2022-02-17T15:13:39.644136Z",
+        "url": "https://files.pythonhosted.org/packages/c2/49/09a03445c5d6a37a41ec5474ba4e65d57271f1cb93afa81c090a7abb1dbb/avaml-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b64a1a86c49c7ec5a8f8679e666ca4cefbe86c47a9322b464b1314dc6307c5a3",
+          "md5": "e98db156bb7a51e1310475b2cf7556ca",
+          "sha256": "612a4ef2bc20c56dfac47ca4e735655158641b0a33e8667c98c2ffb326a5d82b"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e98db156bb7a51e1310475b2cf7556ca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5823,
+        "upload_time": "2022-02-17T15:13:42",
+        "upload_time_iso_8601": "2022-02-17T15:13:42.177503Z",
+        "url": "https://files.pythonhosted.org/packages/b6/4a/1a86c49c7ec5a8f8679e666ca4cefbe86c47a9322b464b1314dc6307c5a3/avaml-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "41a5f940e64d9c30b2bc1fe9be341bdd7b7e09eb25adc455dfd34a702cf4548f",
+          "md5": "335e3603d959ac554170449b5014097b",
+          "sha256": "ebfbc031ba984459130eb69acaee0d5c3e784ae98ae036740dcebbed991e7a2e"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "335e3603d959ac554170449b5014097b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 6027,
+        "upload_time": "2022-02-17T15:35:49",
+        "upload_time_iso_8601": "2022-02-17T15:35:49.077101Z",
+        "url": "https://files.pythonhosted.org/packages/41/a5/f940e64d9c30b2bc1fe9be341bdd7b7e09eb25adc455dfd34a702cf4548f/avaml-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c3efad2d03bc208d9a09767cf3152929ea749e2b85a688aa2f8346425cc0d15",
+          "md5": "8d151450ae84a1d61ff40ef35e7fd505",
+          "sha256": "fe2e50607aa976bccddd09bfaa1c8c91d2374338feab86033591d5e1af8278b8"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8d151450ae84a1d61ff40ef35e7fd505",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5856,
+        "upload_time": "2022-02-17T15:35:50",
+        "upload_time_iso_8601": "2022-02-17T15:35:50.552885Z",
+        "url": "https://files.pythonhosted.org/packages/2c/3e/fad2d03bc208d9a09767cf3152929ea749e2b85a688aa2f8346425cc0d15/avaml-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11d31b73d27ed9a34045af528438a2589f890bab30e332a343c0282765fa7502",
+          "md5": "a057bf24e7d1aadabab43eb0aa0d161f",
+          "sha256": "59d028b419f80bffc449dce81d6a426fda0e3eb123a762a1c2a8194a829ad96e"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a057bf24e7d1aadabab43eb0aa0d161f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 6058,
+        "upload_time": "2022-02-17T18:08:44",
+        "upload_time_iso_8601": "2022-02-17T18:08:44.557316Z",
+        "url": "https://files.pythonhosted.org/packages/11/d3/1b73d27ed9a34045af528438a2589f890bab30e332a343c0282765fa7502/avaml-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3ec0f02ac37491d5cf884204974c320a07d3a82d70ae06e6d8284580f16d3361",
+          "md5": "b41ff21e5776816d08c567059a14a499",
+          "sha256": "d674695a9e576181747cc04dd1a8ebcb3092e61ee3bbe8152411b0f94eee9697"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b41ff21e5776816d08c567059a14a499",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5888,
+        "upload_time": "2022-02-17T18:08:48",
+        "upload_time_iso_8601": "2022-02-17T18:08:48.441304Z",
+        "url": "https://files.pythonhosted.org/packages/3e/c0/f02ac37491d5cf884204974c320a07d3a82d70ae06e6d8284580f16d3361/avaml-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "89bde3e77de89b17e196479af5ea88cf99b79d35081f79624739389a85981185",
+          "md5": "bfc608c01984e1b11c97f4d78a3517fd",
+          "sha256": "ae2ab69a3dcd53af165beb2dc1e0405e24dbfa414ac9c308d40df6ccb0816b68"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bfc608c01984e1b11c97f4d78a3517fd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 6037,
+        "upload_time": "2022-02-17T18:08:46",
+        "upload_time_iso_8601": "2022-02-17T18:08:46.259880Z",
+        "url": "https://files.pythonhosted.org/packages/89/bd/e3e77de89b17e196479af5ea88cf99b79d35081f79624739389a85981185/avaml-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "675d1a2fb0be89c04ee3855c3958592aa4339e68634d2a79d9bb45aadd3d282e",
+          "md5": "0030fc1c24db4fc469e7dd8e80d196a8",
+          "sha256": "0750c57215f95ed133d3777cdc26ec810007a50bbd9eb45b54c4fdad01b690c9"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0030fc1c24db4fc469e7dd8e80d196a8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5853,
+        "upload_time": "2022-02-17T18:08:50",
+        "upload_time_iso_8601": "2022-02-17T18:08:50.035587Z",
+        "url": "https://files.pythonhosted.org/packages/67/5d/1a2fb0be89c04ee3855c3958592aa4339e68634d2a79d9bb45aadd3d282e/avaml-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a89908fbae45a97ff6ea71f8bccca0b3bea0a675d0070443d64c6acc2e93e3ea",
+          "md5": "23802d3e18920f18063fa916f2fa998a",
+          "sha256": "df2ae1d269147704c5208e5f74bbb75062939be9ede0116b40c4ce83f0c2ca94"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "23802d3e18920f18063fa916f2fa998a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 6024,
+        "upload_time": "2022-02-17T19:39:23",
+        "upload_time_iso_8601": "2022-02-17T19:39:23.795223Z",
+        "url": "https://files.pythonhosted.org/packages/a8/99/08fbae45a97ff6ea71f8bccca0b3bea0a675d0070443d64c6acc2e93e3ea/avaml-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2ae871532685210c00eb60e9f09b12c3324f3c4b1c77b6ae3ea01b9c377b6e2b",
+          "md5": "824ba4aa04af91b32652953d6b2a6251",
+          "sha256": "75473fd4f1aad92c6aea9aed989f10f9be05e7271d481c200722435619fbe291"
+        },
+        "downloads": -1,
+        "filename": "avaml-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "824ba4aa04af91b32652953d6b2a6251",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 5859,
+        "upload_time": "2022-02-17T19:39:25",
+        "upload_time_iso_8601": "2022-02-17T19:39:25.394537Z",
+        "url": "https://files.pythonhosted.org/packages/2a/e8/71532685210c00eb60e9f09b12c3324f3c4b1c77b6ae3ea01b9c377b6e2b/avaml-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a89908fbae45a97ff6ea71f8bccca0b3bea0a675d0070443d64c6acc2e93e3ea",
+        "md5": "23802d3e18920f18063fa916f2fa998a",
+        "sha256": "df2ae1d269147704c5208e5f74bbb75062939be9ede0116b40c4ce83f0c2ca94"
+      },
+      "downloads": -1,
+      "filename": "avaml-0.0.6-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "23802d3e18920f18063fa916f2fa998a",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 6024,
+      "upload_time": "2022-02-17T19:39:23",
+      "upload_time_iso_8601": "2022-02-17T19:39:23.795223Z",
+      "url": "https://files.pythonhosted.org/packages/a8/99/08fbae45a97ff6ea71f8bccca0b3bea0a675d0070443d64c6acc2e93e3ea/avaml-0.0.6-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2ae871532685210c00eb60e9f09b12c3324f3c4b1c77b6ae3ea01b9c377b6e2b",
+        "md5": "824ba4aa04af91b32652953d6b2a6251",
+        "sha256": "75473fd4f1aad92c6aea9aed989f10f9be05e7271d481c200722435619fbe291"
+      },
+      "downloads": -1,
+      "filename": "avaml-0.0.6.tar.gz",
+      "has_sig": false,
+      "md5_digest": "824ba4aa04af91b32652953d6b2a6251",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 5859,
+      "upload_time": "2022-02-17T19:39:25",
+      "upload_time_iso_8601": "2022-02-17T19:39:25.394537Z",
+      "url": "https://files.pythonhosted.org/packages/2a/e8/71532685210c00eb60e9f09b12c3324f3c4b1c77b6ae3ea01b9c377b6e2b/avaml-0.0.6.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

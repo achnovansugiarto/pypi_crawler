@@ -1,0 +1,144 @@
+{
+  "info": {
+    "author": "CommitThis",
+    "author_email": "gdavey@committhis.co.uk",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Framework :: Pytest",
+      "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries :: Python Modules",
+      "Topic :: Software Development :: Testing",
+      "Topic :: System :: Networking"
+    ],
+    "description": "# Asynchronous Packet Testing\n\nThis library aims to allow the creation of simple assertions and tests to be\nrun against packets that _may_ be received _in the future_. It's original\nintent was to provide a black box testing framework for the P4.org Behavioural\nModel, with no dependencies on any special P4 libraries, but I think it has some\nutility outside of this context.\n\n## Running\n\nBecause scapy is _usually_ required to be run as root (or at least with network\ncapture capabilities) the tests must also be run as root.\n\n### Example Script\n\nIf installing into a virtual environment, running the example would involve:\n\n    python3 -m venv .venv\n    source .venv/bin/activate\n    pip install .\n    sudo .venv/bin/python ./example.py\n\n> A safer alternative may be to create the virtual environment with\n> copies of the python binaries from the host (rather than symlinks, as is the\n> default behaviour), and then setting capabilities on them using `setcap`.\n\n\n### Unit Tests\n\nThe unit tests require the use of a `dummy` interface. To that end, a script\nhas been fashioned which, using `poetry`:\n\n* Installs and sources the virtual environment;\n* Installs the packet test library;\n* Using `sudo`, inserts the `dummy` kernel module and creates an interface;\n* Using `sudo`, and preserving the poetry environment, runs the tests;\n* Using `sudo`, removes the `dummy` interface and exits.\n\n\n## A Simple Example\n\nThe following example creates a test for observing a single packet on the `lo`\n(loopback) interface. \n\n```python\nimport pytest\n\nfrom scapy.all import Ether, Dot1Q, TCP, IP, sendp\n\nfrom async_packet_test.context import make_pytest_context\nfrom async_packet_test.predicates import saw_vlan_tag\n\niface = 'lo'\ncontext = make_pytest_context()\ntest_packet = Ether() / Dot1Q(vlan=102) / IP() / TCP()\n\ndef test_saw_vlan_102(context):\n    result = context.expect(iface, saw_vlan_tag(102))\n    sendp(test_packet, iface=iface)\n    assert result\n\n# You could use the `did_not_see_vlan_tag` predicate, however, this demonstrates\n# a negated assertion. It also demonstrates the usage of a timeout. Otherwise\n# the test would be sat waiting for a packet it will never see (until the\n# default timeout is reached)\ndef test_did_not_see_vlan_103(context):\n    result = context.expect(iface, saw_vlan_tag(103), timeout=0.5)\n    sendp(test_packet, iface=iface)\n    assert not result\n```\n\n## `pytest`\n\nThe test context file includes a `pytest` fixture, yielding a `TestContext`.\nTherefore, the test context and predicates can be used to write unit tests.\n\nThe unit tests in `test/test_async_packet_test.py` should be fairly easy to grok.\n\n\n## Test Predicates\n\nThe core purpose of this repository is testing switch functionality, which\ninvolve the use of predicates which are applied against future packets,\nI suppose asynchronously.\n\nPredicates have been named to read naturally in English (even if it isn't my\nstrong suit) and read well in the context of the test. Even though they are\ntechnically classes, in spite of `PEP` , they are written in the underscore\nstyle. This is because they are used in a context where they could be perceived\nas functions, and that lower case anything is easier to read and above all, in\nmy opinion (outside testing an outcome), unit tests should be comprehensible.\n[[ citation needed ]]\n\nBecause they are testing something that _may_ happen in the future, they cannot\nbe evaluated immediately, and therefore their use may not be as obvious as other\ntesting frameworks.\n\nAs an example, we might want to test if a specific port saw a packet with a\nparticular MAC address.\n\n    def test_saw_mac_address(context):\n        dst_mac = 'ab:ab:ab:ab:ab:ab'\n        iface = 'veth0'\n        future = context.expect(iface, saw_dst_mac(dst_mac))\n        assert(future.result() == True)\n\nIt may be obvious, but what this is saying that we want to test that at some\npoint in the future that `veth0` will see the supplied MAC adress. The `future`\nfrom the `expect` call represents the outcome of the test. Consequently, when\nretrieving the result, this call will block until the test completes.\n\n\n### Writing Predicates\n\nThis is relatively easy. The predicates are objects that test incoming packets,\nand are able to carry state from one evaluation from the next. The base test is\nas follows:\n\n    class async_packet_test:\n        def on_packet(self, pkt):\n            pass\n\n        def stop_condition(self, pkt) -> bool:\n            pass\n\n        def on_finish(self, timed_out) -> bool:\n            pass\n\n- `on_packet` receives avery packet. It is there for updating state.\n- `stop_condition` is the to notify the test manager that the test has\n  completed\n\n- `on_finish` reports the result back to the manager, and ultimately the\n  future given back to the user.\n\nCarrying on with our previous example `saw_dst_mac` , the predicate is\nconstructed as follows:\n\n    class saw_src_mac(async_packet_test):\n        def __init__(self, mac):\n            self._mac = mac\n\n        def stop_condition(self, pkt):\n            return pkt.haslayer(Ether) and pkt[Ether].src == self._mac\n\n        def on_finish(self, timed_out):\n            return not timed_out\n\nThis is straightforward as no state is needed between packets; we only need to\ntest each individual packet for the supplied MAC address. As soon as that MAC is\nseen, the test will terminate and `on_finish` will be called. Ultimately, the\nonly thing that needs to be returned is whether the test timed out, if it didn't\ntime out, the stop condition will never have returned `True` .\n\n> `on_finish` could have been written by default to test whether or not it timed\n> out however I wasn't sure whether that was reasonable behaviour or not.\n\nAnother simple example is testing the count of packets received.\n\n> This may be difficult to guarantee as ports may receive packets for things\n> like SSDP, multicast DNS, or any number of packets that may be sent to a port\n> by the OS as a part of it's normal operation\n\n    class packet_count_was(async_packet_test):\n        def __init__(self, count):\n            self._expected_count = count\n            self._received_count = 0\n\n        def on_packet(self, pkt):\n            self._received_count += 1\n\n        def on_finish(self, timed_out):\n            return self._received_count == self._expected_count\n\nAs each packet is received, a counter will be incremented. At the end of the\ntime out period, the count will be compared with the expected result.\n\n> The stop condition cannot be used for this purpose as it is called before the\n> more general `on_packet` function.\n\nIt is important to note differences in between behaviour. This test expects a\nspecific number of packets, if the total count is off, it will return False.\nHowever, it could equally be written so that it terminates as soon as the number\nof packets are counted, that is to say, we care about the minimum number of\npackets received, and not the total. This could be written as follows:\n\n    class min_packet_count_was(async_packet_test):\n        def __init__(self, count):\n            self._expected_count = count\n            self._received_count = 0\n\n        def stop_condition(self, pkt):\n            self._received_count += 1\n            if self._received_count == self._expected_count:\n                return True\n            return False\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://committhis.github.io/async-packet-test/",
+    "keywords": "",
+    "license": "GPL-2.0-only",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "async-packet-test",
+    "package_url": "https://pypi.org/project/async-packet-test/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/async-packet-test/",
+    "project_urls": {
+      "Documentation": "https://committhis.github.io/async-packet-test/",
+      "Homepage": "https://committhis.github.io/async-packet-test/",
+      "Repository": "https://github.com/CommitThis/async-packet-test"
+    },
+    "release_url": "https://pypi.org/project/async-packet-test/1.0.0/",
+    "requires_dist": [
+      "scapy (>=2.4,<3.0)"
+    ],
+    "requires_python": ">=3.6,<4.0",
+    "summary": "Human readable tests for future expected packets.",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12782063,
+  "releases": {
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "516b2721ba3f8e29086236895ca90b251d6827012499e9ff9430a74217e44cb2",
+          "md5": "7b1163c3729f1c70655b135836f60be1",
+          "sha256": "a2392880e68234918dcd53fd53d55f5cf308c2f53d2475d328f395d0ef7a2f81"
+        },
+        "downloads": -1,
+        "filename": "async_packet_test-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7b1163c3729f1c70655b135836f60be1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 14597,
+        "upload_time": "2022-02-03T23:43:50",
+        "upload_time_iso_8601": "2022-02-03T23:43:50.755668Z",
+        "url": "https://files.pythonhosted.org/packages/51/6b/2721ba3f8e29086236895ca90b251d6827012499e9ff9430a74217e44cb2/async_packet_test-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0aaa0f1ee16a100f87df9ae23b85b18fc15efb00010b164e7bc48d8f55220470",
+          "md5": "b9f34fc811dab872d9ae4bfadb23553b",
+          "sha256": "58504f6f8bb0f2213e0a488d77786df0bea260bb0f8a3ee360e6d783f63742aa"
+        },
+        "downloads": -1,
+        "filename": "async-packet-test-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b9f34fc811dab872d9ae4bfadb23553b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 16287,
+        "upload_time": "2022-02-03T23:43:49",
+        "upload_time_iso_8601": "2022-02-03T23:43:49.444715Z",
+        "url": "https://files.pythonhosted.org/packages/0a/aa/0f1ee16a100f87df9ae23b85b18fc15efb00010b164e7bc48d8f55220470/async-packet-test-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "516b2721ba3f8e29086236895ca90b251d6827012499e9ff9430a74217e44cb2",
+        "md5": "7b1163c3729f1c70655b135836f60be1",
+        "sha256": "a2392880e68234918dcd53fd53d55f5cf308c2f53d2475d328f395d0ef7a2f81"
+      },
+      "downloads": -1,
+      "filename": "async_packet_test-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7b1163c3729f1c70655b135836f60be1",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6,<4.0",
+      "size": 14597,
+      "upload_time": "2022-02-03T23:43:50",
+      "upload_time_iso_8601": "2022-02-03T23:43:50.755668Z",
+      "url": "https://files.pythonhosted.org/packages/51/6b/2721ba3f8e29086236895ca90b251d6827012499e9ff9430a74217e44cb2/async_packet_test-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0aaa0f1ee16a100f87df9ae23b85b18fc15efb00010b164e7bc48d8f55220470",
+        "md5": "b9f34fc811dab872d9ae4bfadb23553b",
+        "sha256": "58504f6f8bb0f2213e0a488d77786df0bea260bb0f8a3ee360e6d783f63742aa"
+      },
+      "downloads": -1,
+      "filename": "async-packet-test-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b9f34fc811dab872d9ae4bfadb23553b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6,<4.0",
+      "size": 16287,
+      "upload_time": "2022-02-03T23:43:49",
+      "upload_time_iso_8601": "2022-02-03T23:43:49.444715Z",
+      "url": "https://files.pythonhosted.org/packages/0a/aa/0f1ee16a100f87df9ae23b85b18fc15efb00010b164e7bc48d8f55220470/async-packet-test-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

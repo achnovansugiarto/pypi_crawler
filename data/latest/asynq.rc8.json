@@ -1,0 +1,1560 @@
+{
+  "info": {
+    "author": "Quora, Inc.",
+    "author_email": "asynq@quora.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": ".. image:: http://i.imgur.com/jCPNyOa.png\n\n``asynq`` is a library for asynchronous programming in Python with a focus on batching requests to\nexternal services. It also provides seamless interoperability with synchronous code, support for\nasynchronous context managers, and tools to make writing and testing asynchronous code easier.\n``asynq`` was developed at Quora and is a core component of Quora's architecture. See the original blog\npost `here <https://www.quora.com/q/quoraengineering/Asynchronous-Programming-in-Python>`_.\n\nThe most important use case for ``asynq`` is batching. For many storage services (e.g., memcache,\nredis) it is far faster to make a single request that fetches many keys at once than to make\nmany requests that each fetch a single key. The ``asynq`` framework makes it easy to write code\nthat takes advantage of batching without radical changes in code structure from code that does not\nuse batching.\n\nFor example, synchronous code to retrieve the names of the authors of a list of Quora answers may\nlook like this:\n\n.. code-block:: python\n\n    def all_author_names(aids):\n        uids = [author_of_answer(aid) for aid in aids]\n        names = [name_of_user(uid) for uid in uids]\n        return names\n\nHere, each call to ``author_of_answer`` and ``name_of_user`` would result in a memcache request.\nConverted to use ``asynq``, this code would look like:\n\n.. code-block:: python\n\n    @asynq()\n    def all_author_names(aids):\n        uids = yield [author_of_answer.asynq(aid) for aid in aids]\n        names = yield [name_of_user.asynq(uid) for uid in uids]\n        return names\n\nAll ``author_of_answer`` calls will be combined into a single memcache request, as will all of the\n``name_of_user`` calls.\n\nFutures\n-------\n\nFutures are the basic building blocks of ``asynq``'s programming model. The scheduler keeps track\nof futures and attempts to schedule them in an efficient way. ``asynq`` uses its own hierarchy of\nFuture classes, rooted in ``asynq.FutureBase``. Futures have a ``.value()`` method that computes\ntheir value if necessary and then returns it.\n\nThe following are the most important Future classes used in ``asynq``:\n\n- ``AsyncTask``, a Future representing the execution of an asynchronous function (see below).\n  Normally created by calling ``.asynq()`` on an asynchronous function.\n- ``ConstFuture``, a Future whose value is known at creation time. This is useful when you need\n  to pass a Future somewhere, but no computation is actually needed.\n- ``BatchBase`` and ``BatchItemBase``, the building blocks for doing batching. See below for\n  details.\n\n\nDecorators and asynchronous functions\n-------------------------------------\n\n``asynq``'s asynchronous functions are implemented as Python generator functions. Every time an\nasynchronous functions yields one or more Futures, it cedes control the asynq scheduler, which will\nresolve the futures that were yielded and continue running the function after the futures have been\ncomputed.\n\nThe framework requires usage of the ``@asynq()`` decorator on all asynchronous functions. This\ndecorator wraps the generator function so that it can be called like a normal, synchronous function.\nIt also creates a ``.asynq`` attribute on the function that allows calling the function\nasynchronously. Calling this attribute will return an ``AsyncTask`` object corresponding to the\nfunction.\n\nYou can call an asynchronous function synchronously like this:\n\n.. code-block:: python\n\n    result = async_fn(a, b)\n\nand asynchronously like this:\n\n.. code-block:: python\n\n    result = yield async_fn.asynq(a, b)\n\nCalling ``async_fn.asynq(a, b).value()`` has the same result as ``async_fn(a, b)``.\n\nThe decorator has a ``pure=True`` option that disables the ``.asynq`` attribute and instead makes\nthe function itself asynchronous, so that calling it returns an ``AsyncTask``. We recommend to use\nthis option only in special cases like decorators for asynchronous functions.\n\n``asynq`` also provides an ``@async_proxy()`` decorator for functions that return a Future\ndirectly. Functions decorated with ``@async_proxy()`` look like ``@asynq()`` functions externally.\nAn example use case is a function that takes either an asynchronous or a synchronous function,\nand calls it accordingly:\n\n.. code-block:: python\n\n    @async_proxy()\n    def async_call(fn, *args, **kwargs):\n        if is_async_fn(fn):\n            # Returns an AsyncTask\n            return fn.asynq(*args, **kwargs)\n        return ConstFuture(fn(*args, **kwargs))\n\nBatching\n--------\n\nBatching is at the core of what makes ``asynq`` useful. To implement batching, you need to subclass\n``asynq.BatchItemBase`` and ``asynq.BatchBase``. The first represents a single entry in a batch\n(e.g., a single memcache key to fetch) and the second is responsible for executing the batch when\nthe scheduler requests it.\n\nBatch items usually do not require much logic beyond registering themselves with the currently\nactive batch in ``__init__``. Batches need to override the ``_try_switch_active_batch`` method,\nwhich changes the batch that is currently active, and the ``_flush`` method that executes it.\nThis method should call ``.set_value()`` on all the items in the batch.\n\nAn example implementation of batching for memcache is in the ``asynq/examples/batching.py`` file.\nThe framework also provides a ``DebugBatchItem`` for testing.\n\nMost users of ``asynq`` should not need to implement batches frequently. At Quora, we use\nthousands of asynchronous functions, but only five ``BatchBase`` subclasses.\n\nContexts\n--------\n\n``asynq`` provides support for Python context managers that are automatically activated and\ndeactivated when a particular task is scheduled. This feature is necessary because the scheduler\ncan schedule tasks in arbitrary order. For example, consider the following code:\n\n.. code-block:: python\n\n    @asynq()\n    def show_warning():\n        yield do_something_that_creates_a_warning.asynq()\n\n    @asynq()\n    def suppress_warning():\n        with warnings.catch_warnings():\n            yield show_warning.asynq()\n\n    @asynq()\n    def caller():\n        yield show_warning.asynq(), suppress_warning.asynq()\n\nThis code should show only one warning, because only the second call to ``show_warning`` is within\na ``catch_warnings()`` context, but depending on how the scheduler happens to execute these\nfunctions, the code that shows the warning may also be executed while ``catch_warnings()`` is\nactive.\n\nTo remedy this problem, you should use an ``AsyncContext``, which will be automatically paused when\nthe task that created it is no longer active and resumed when it becomes active again. An\n``asynq``-compatible version of ``catch_warnings`` would look something like this:\n\n.. code-block:: python\n\n    class catch_warnings(asynq.AsyncContext):\n        def pause(self):\n            stop_catching_warnings()\n\n        def resume(self):\n            start_catching_warnings()\n\nDebugging\n---------\n\nBecause the ``asynq`` scheduler is invoked every time an asynchronous function is called, and it\ncan invoke arbitrary other active futures, normal Python stack traces become useless in a\nsufficiently complicated application built on ``asynq``. To make debugging easier, the framework\nprovides the ability to generate a custom ``asynq`` stack trace, which shows how each active\nasynchronous function was invoked.\n\nThe ``asynq.debug.dump_asynq_stack()`` method can be used to print this stack, similar to\n``traceback.print_stack()``. The framework also registers a hook to print out the ``asynq`` stack\nwhen an exception happens.\n\nTools\n-----\n\n``asynq`` provides a number of additional tools to make it easier to write asynchronous code. Some\nof these are in the ``asynq.tools`` module. These tools include:\n\n- ``asynq.async_call`` calls a function asynchronously only if it is asynchronous. This can be\n  useful when calling an overridden method that is asynchronous on some child classes but not on others.\n- ``asynq.tools.call_with_context`` calls an asynchronous function within the provided context\n  manager. This is helpful in cases where you need to yield multiple tasks at once, but only one\n  needs to be within the context.\n- ``asynq.tools.afilter`` and ``asynq.tools.asorted`` are equivalents of the standard ``filter``\n  and ``sorted`` functions that take asynchronous functions as their filter and compare functions.\n- ``asynq.tools.acached_per_instance`` caches an asynchronous instance method.\n- ``asynq.tools.deduplicate`` prevents multiple simultaneous calls to the same asynchronous\n  function.\n- The ``asynq.mock`` module is an enhancement to the standard ``mock`` module that makes it\n  painless to mock asynchronous functions. Without this module, mocking any asynchronous function\n  will often also require mocking its ``.asynq`` attribute. We recommend using ``asynq.mock.patch``\n  for all mocking in projects that use ``asynq``.\n- The ``asynq.generator`` module provides an experimental implementation of asynchronous\n  generators, which can produce a sequence of values while also using ``asynq``'s batching support.\n\nCompatibility\n-------------\n\n``asynq`` runs on Python 3.6 and newer.\n\nPrevious versions of ``asynq`` used the name ``async`` for the ``@asynq()`` decorator and the\n``.asynq`` attribute. Because ``async`` is a keyword in recent versions of Python 3, we now use\nthe spelling ``asynq`` in both places. ``asynq`` version 1.3.0 drops support for the old spelling.\n\nContributors\n------------\n\n`Alex Yakunin <https://github.com/alexyakunin>`_, `Jelle Zijlstra <https://github.com/JelleZijlstra>`_, `Manan Nayak <https://github.com/manannayak>`_, `Martin Michelsen <https://github.com/fuzziqersoftware>`_, `Shrey Banga <https://github.com/banga>`_, `Suren Nihalani <https://github.com/snihalani>`_, `Suchir Balaji <https://github.com/suchir>`_ and\nother engineers at Quora.\n\n\n",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/quora/asynq",
+    "keywords": "quora asynq common utility",
+    "license": "Apache Software License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "asynq",
+    "package_url": "https://pypi.org/project/asynq/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/asynq/",
+    "project_urls": {
+      "Homepage": "https://github.com/quora/asynq"
+    },
+    "release_url": "https://pypi.org/project/asynq/1.4.0/",
+    "requires_dist": [
+      "Cython (>=0.27.1)",
+      "qcore",
+      "pygments"
+    ],
+    "requires_python": "",
+    "summary": "Quora's asynq library",
+    "version": "1.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10723905,
+  "releases": {
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98840de28a45fabca2bf78254792295626aacec91fff8158ab9ecc78cd1066c5",
+          "md5": "9312ea1ee12f2216cab14d20d063115e",
+          "sha256": "dff05350ff64926cc53e9e441345f436d6919403c4e28dc695f505559ce5223d"
+        },
+        "downloads": -1,
+        "filename": "asynq-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9312ea1ee12f2216cab14d20d063115e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 537734,
+        "upload_time": "2016-09-19T19:24:23",
+        "upload_time_iso_8601": "2016-09-19T19:24:23.050546Z",
+        "url": "https://files.pythonhosted.org/packages/98/84/0de28a45fabca2bf78254792295626aacec91fff8158ab9ecc78cd1066c5/asynq-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bdddf34d2e08b42c2f105ba28a1ecbb991a472191d84a6f173949c55728dbcff",
+          "md5": "570440a73afd2ba218f3154078861301",
+          "sha256": "7b160f066f1c1e82a0ce0d5348547571d93744e81b34ace1d23c26391e063dde"
+        },
+        "downloads": -1,
+        "filename": "asynq-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "570440a73afd2ba218f3154078861301",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 540420,
+        "upload_time": "2017-01-11T00:39:35",
+        "upload_time_iso_8601": "2017-01-11T00:39:35.891165Z",
+        "url": "https://files.pythonhosted.org/packages/bd/dd/f34d2e08b42c2f105ba28a1ecbb991a472191d84a6f173949c55728dbcff/asynq-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6d7f15ded822841452cee812bc781b62c2c711fdcae07870408b5f533cbae288",
+          "md5": "3b3ff28b984cb75ad92eb7827f0b6444",
+          "sha256": "46c0b47b8c9c0152f6f3fe207143a77bbacbe53a0d4d32949f03bdeb14e34c06"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3b3ff28b984cb75ad92eb7827f0b6444",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 480258,
+        "upload_time": "2017-07-07T19:44:08",
+        "upload_time_iso_8601": "2017-07-07T19:44:08.558968Z",
+        "url": "https://files.pythonhosted.org/packages/6d/7f/15ded822841452cee812bc781b62c2c711fdcae07870408b5f533cbae288/asynq-1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac6ad60ac003808f639f2dd347f3c72835737016e827591074e25f24f961a015",
+          "md5": "0733c0505ebcfcaa6b2539fcc0e03f37",
+          "sha256": "8d29cb53e138524c932eca768f8c62af31b98639667fb336fa37692126e744de"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0733c0505ebcfcaa6b2539fcc0e03f37",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 45626,
+        "upload_time": "2017-12-13T19:08:42",
+        "upload_time_iso_8601": "2017-12-13T19:08:42.014849Z",
+        "url": "https://files.pythonhosted.org/packages/ac/6a/d60ac003808f639f2dd347f3c72835737016e827591074e25f24f961a015/asynq-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "18678af1fc0947de38a634098b4bdd7bfe05dee8d47068e2a8cc9be0945c214a",
+          "md5": "ae8b1988792eb447ddab4a2ec0c26ed3",
+          "sha256": "086bcee0d5837bf57e44e86d0e001d9d579fd8b849d2dca9ca51a42e313a3c03"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "ae8b1988792eb447ddab4a2ec0c26ed3",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp27",
+        "requires_python": null,
+        "size": 1939548,
+        "upload_time": "2018-08-09T23:47:14",
+        "upload_time_iso_8601": "2018-08-09T23:47:14.268436Z",
+        "url": "https://files.pythonhosted.org/packages/18/67/8af1fc0947de38a634098b4bdd7bfe05dee8d47068e2a8cc9be0945c214a/asynq-1.1.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37b61b4eef0ec9e27a9fbf64649e20cd7ed9c09256127e1b6feca865f1e4e094",
+          "md5": "b557af611cb5b8dddf122574efe030ec",
+          "sha256": "ef86a236bab37ebafc3c3abd85d3eb9bb67dfbc05c7d9fd94b7ad65164849385"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0-cp34-cp34m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "b557af611cb5b8dddf122574efe030ec",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp34",
+        "requires_python": null,
+        "size": 2130905,
+        "upload_time": "2018-08-09T23:46:54",
+        "upload_time_iso_8601": "2018-08-09T23:46:54.393837Z",
+        "url": "https://files.pythonhosted.org/packages/37/b6/1b4eef0ec9e27a9fbf64649e20cd7ed9c09256127e1b6feca865f1e4e094/asynq-1.1.0-cp34-cp34m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "450bfb446e41674db1f19f96785f6a0c2840266a707fbff48be01001c162effb",
+          "md5": "540fa7a48adea6566ec5880b4a373dba",
+          "sha256": "f10b3d8f7f8cfe909648141e7dfa6d52424108af85760e3f48cc562b5ba0f385"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "540fa7a48adea6566ec5880b4a373dba",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp35",
+        "requires_python": null,
+        "size": 2079735,
+        "upload_time": "2018-08-09T23:46:41",
+        "upload_time_iso_8601": "2018-08-09T23:46:41.364193Z",
+        "url": "https://files.pythonhosted.org/packages/45/0b/fb446e41674db1f19f96785f6a0c2840266a707fbff48be01001c162effb/asynq-1.1.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "536a032d1ee9f98693df9dd8519220485cc4ab5a26d658bcea5592caf814ab96",
+          "md5": "234b09c285a263500d9ef0b96a56dfc5",
+          "sha256": "896740d5aada503dbfc89e7d4aef575bb5a6770dab7c20b3fcaaa45dbcc8b7b4"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "234b09c285a263500d9ef0b96a56dfc5",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 2170518,
+        "upload_time": "2018-08-09T23:46:24",
+        "upload_time_iso_8601": "2018-08-09T23:46:24.576753Z",
+        "url": "https://files.pythonhosted.org/packages/53/6a/032d1ee9f98693df9dd8519220485cc4ab5a26d658bcea5592caf814ab96/asynq-1.1.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22e17fc9d5639a0b13edb414e33b07016bdf166f5d331132007d7689b1476092",
+          "md5": "13c1a6a814d5e5758f671d9c58b9d9d7",
+          "sha256": "a6be12eb3a8d29e46f198967b17f98db1218ad6615bbc1ddb816628dcddaef16"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "13c1a6a814d5e5758f671d9c58b9d9d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 2145642,
+        "upload_time": "2018-08-09T23:52:27",
+        "upload_time_iso_8601": "2018-08-09T23:52:27.288534Z",
+        "url": "https://files.pythonhosted.org/packages/22/e1/7fc9d5639a0b13edb414e33b07016bdf166f5d331132007d7689b1476092/asynq-1.1.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "abd346472eaafeb4367a45331e750c8ff960d03b660d772ca6303ff6d0666be6",
+          "md5": "05ecc88016b3e6966905fe5bcaefe02a",
+          "sha256": "bf5fc302f56ea9ff55736240a1f361f559dc79f3b5984493b739034ec86c934b"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05ecc88016b3e6966905fe5bcaefe02a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 49929,
+        "upload_time": "2018-08-09T23:52:29",
+        "upload_time_iso_8601": "2018-08-09T23:52:29.251388Z",
+        "url": "https://files.pythonhosted.org/packages/ab/d3/46472eaafeb4367a45331e750c8ff960d03b660d772ca6303ff6d0666be6/asynq-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a11c3e883ad031049da585677afa52ac452abc9bd23853659513b5c5e5d0dfd",
+          "md5": "888e20e9bd584ae67a61dfb9c778644b",
+          "sha256": "05b85974dfa9c40317873fd32d51de7311ed51703f475fb44e8bde5ffc4fa89b"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.2.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "888e20e9bd584ae67a61dfb9c778644b",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp27",
+        "requires_python": null,
+        "size": 1981697,
+        "upload_time": "2020-05-02T01:28:02",
+        "upload_time_iso_8601": "2020-05-02T01:28:02.097434Z",
+        "url": "https://files.pythonhosted.org/packages/2a/11/c3e883ad031049da585677afa52ac452abc9bd23853659513b5c5e5d0dfd/asynq-1.2.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d06d6a93532d88b6c26e7534bfba763ccf5650c37f9ad2e0a71a4f433580a84d",
+          "md5": "ebc314bd80566af059fc4ae1d930c0ce",
+          "sha256": "40e2b3710c5815357a166a5ac4a0bfa4ca0fc47465bdb1c0c6c566b11080240e"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.2.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "ebc314bd80566af059fc4ae1d930c0ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp35",
+        "requires_python": null,
+        "size": 2125000,
+        "upload_time": "2020-05-02T01:30:27",
+        "upload_time_iso_8601": "2020-05-02T01:30:27.765536Z",
+        "url": "https://files.pythonhosted.org/packages/d0/6d/6a93532d88b6c26e7534bfba763ccf5650c37f9ad2e0a71a4f433580a84d/asynq-1.2.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "05755aa281c10b53cd3d7aecbab7f7d14c397c2697089e35e41cfe0bd0ef2f90",
+          "md5": "93675fafeba244475a4f21fa91f670c5",
+          "sha256": "b0ab4236c82e9d2ed9515247d8c630c9e32cd0946d140f44d7139db2476473ef"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.2.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "93675fafeba244475a4f21fa91f670c5",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 2217636,
+        "upload_time": "2020-05-02T01:30:44",
+        "upload_time_iso_8601": "2020-05-02T01:30:44.210524Z",
+        "url": "https://files.pythonhosted.org/packages/05/75/5aa281c10b53cd3d7aecbab7f7d14c397c2697089e35e41cfe0bd0ef2f90/asynq-1.2.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "252bcbcc051eeedaf9ca2a487a60e7ba045ea2a1f538fb4a20501918760bbc3f",
+          "md5": "73a47d13e58e3ea20c5c4722b55abd0c",
+          "sha256": "7d397054cfb43040d096823dd9b6ba03718479e0de2199b008687e809d59ddd3"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.2.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "73a47d13e58e3ea20c5c4722b55abd0c",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 2190905,
+        "upload_time": "2020-05-02T01:30:42",
+        "upload_time_iso_8601": "2020-05-02T01:30:42.480153Z",
+        "url": "https://files.pythonhosted.org/packages/25/2b/cbcc051eeedaf9ca2a487a60e7ba045ea2a1f538fb4a20501918760bbc3f/asynq-1.2.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a9131fc5cbb4c8db278ec460732faec56b8595c852f95543576ac11141b9eb43",
+          "md5": "9faf11ee7b245cb9ddb1c1369f94cb4c",
+          "sha256": "aafe8dce7902cefc09f76a223f305397bd32c97fffb6e380a4de661bc6e18ddc"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9faf11ee7b245cb9ddb1c1369f94cb4c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 57479,
+        "upload_time": "2020-05-02T01:30:44",
+        "upload_time_iso_8601": "2020-05-02T01:30:44.014785Z",
+        "url": "https://files.pythonhosted.org/packages/a9/13/1fc5cbb4c8db278ec460732faec56b8595c852f95543576ac11141b9eb43/asynq-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc4d23878eda8e7c2917b58336dad01452af9bacd342001fe155f816dc3a43c3",
+          "md5": "c4400fd370eac1ba9be708a8e8068e5a",
+          "sha256": "10c29ba25c5bf878567c675e8122f12df09bd5e62f8eb743d52894a14f1fea00"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "c4400fd370eac1ba9be708a8e8068e5a",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp27",
+        "requires_python": null,
+        "size": 1880544,
+        "upload_time": "2020-05-29T04:02:40",
+        "upload_time_iso_8601": "2020-05-29T04:02:40.912896Z",
+        "url": "https://files.pythonhosted.org/packages/cc/4d/23878eda8e7c2917b58336dad01452af9bacd342001fe155f816dc3a43c3/asynq-1.3.0-cp27-cp27m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d61c118aaf98edd9fac33b2735cc9819b2ebf3caf130624a5cdf645f2662bc2c",
+          "md5": "e669aad0519ff35bd5cc534317c6607a",
+          "sha256": "da576e12a0fcdc336ef0cd193b91982467e8184d845a437238e19bdd6ee0b65b"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "e669aad0519ff35bd5cc534317c6607a",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp35",
+        "requires_python": null,
+        "size": 2082863,
+        "upload_time": "2020-05-29T04:02:28",
+        "upload_time_iso_8601": "2020-05-29T04:02:28.270930Z",
+        "url": "https://files.pythonhosted.org/packages/d6/1c/118aaf98edd9fac33b2735cc9819b2ebf3caf130624a5cdf645f2662bc2c/asynq-1.3.0-cp35-cp35m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a9ebf0a90daa118622b7e667224f8c6a41f96b3a555a386b39d27760b03f0bac",
+          "md5": "f48ad5ef4c481fb4db9458553325f8ad",
+          "sha256": "aab93cd0f906b8fee7fb44caaf0e97515da202cb69275a77b7cbf1e1ce8730a4"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "f48ad5ef4c481fb4db9458553325f8ad",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 2170765,
+        "upload_time": "2020-05-29T04:02:31",
+        "upload_time_iso_8601": "2020-05-29T04:02:31.300891Z",
+        "url": "https://files.pythonhosted.org/packages/a9/eb/f0a90daa118622b7e667224f8c6a41f96b3a555a386b39d27760b03f0bac/asynq-1.3.0-cp36-cp36m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33e49bfa9513d8613285967861263cd5a4288bba4f3f77f0743ff32417a563f7",
+          "md5": "1c2f82baba96e4762b7497022a81ce08",
+          "sha256": "6e5d394ad61ff96d7fe249310522c3793601c17bb8ce3b3de48d1a8ddf2f1357"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "1c2f82baba96e4762b7497022a81ce08",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 2159478,
+        "upload_time": "2020-05-29T04:02:53",
+        "upload_time_iso_8601": "2020-05-29T04:02:53.401170Z",
+        "url": "https://files.pythonhosted.org/packages/33/e4/9bfa9513d8613285967861263cd5a4288bba4f3f77f0743ff32417a563f7/asynq-1.3.0-cp37-cp37m-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b4a6b6bd4cfb38f4432e005d9ec0f829f2622a4cd340408625e9a71efdf0f1f",
+          "md5": "dddbc56f50f2ccc5b731f8092e5579c1",
+          "sha256": "fdb8d114359b41c7e72eb112097d9954b8c43fe20f6190b4d1d228a967d013d6"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0-cp38-cp38-manylinux1_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "dddbc56f50f2ccc5b731f8092e5579c1",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 2301476,
+        "upload_time": "2020-05-29T04:03:54",
+        "upload_time_iso_8601": "2020-05-29T04:03:54.308937Z",
+        "url": "https://files.pythonhosted.org/packages/1b/4a/6b6bd4cfb38f4432e005d9ec0f829f2622a4cd340408625e9a71efdf0f1f/asynq-1.3.0-cp38-cp38-manylinux1_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9093f8ec60d95236a290d607f987c592e7574c3b46fdafaee466674bb3c060e5",
+          "md5": "b2231e74497d30b91d40080d194beaf6",
+          "sha256": "7029242587969bf9202bc90b90b6409592badb2a018a0461daea6a9f252fcc71"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b2231e74497d30b91d40080d194beaf6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 57618,
+        "upload_time": "2020-05-29T04:02:55",
+        "upload_time_iso_8601": "2020-05-29T04:02:55.144132Z",
+        "url": "https://files.pythonhosted.org/packages/90/93/f8ec60d95236a290d607f987c592e7574c3b46fdafaee466674bb3c060e5/asynq-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4d0b17246c8b718534934237693c126188d5adcba87a1913f80fa3eb8f820b7",
+          "md5": "d9762427e30ae290321b85b7b1aa8c60",
+          "sha256": "51c931f93213c2039034aa65d847b63cb433659095841d4a08c5acb3b591e7a0"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp36-cp36m-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "d9762427e30ae290321b85b7b1aa8c60",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 612884,
+        "upload_time": "2021-06-23T19:05:02",
+        "upload_time_iso_8601": "2021-06-23T19:05:02.183210Z",
+        "url": "https://files.pythonhosted.org/packages/d4/d0/b17246c8b718534934237693c126188d5adcba87a1913f80fa3eb8f820b7/asynq-1.4.0-cp36-cp36m-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b43f453db818846c40ec13711a9e10f98f5b0a670e00634dc0c979d741dbfc5f",
+          "md5": "da6838ad809c845f8b842f44e91c2284",
+          "sha256": "c83dc8d4b8aeb3d02880cfd055c1025da344623328a78d5015c07132f2598e5f"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp36-cp36m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "has_sig": false,
+        "md5_digest": "da6838ad809c845f8b842f44e91c2284",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 2313474,
+        "upload_time": "2021-06-23T19:05:07",
+        "upload_time_iso_8601": "2021-06-23T19:05:07.351492Z",
+        "url": "https://files.pythonhosted.org/packages/b4/3f/453db818846c40ec13711a9e10f98f5b0a670e00634dc0c979d741dbfc5f/asynq-1.4.0-cp36-cp36m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dc7671c2fbe68ef4d1fca047493d1e8a5307c72b1499d874c042a9ccf9a76b88",
+          "md5": "0946d460179417a50170bb993a0786b1",
+          "sha256": "93d8d70706feeb24d82c13d846374510829598f044458ae9a1600b1adacd6ce1"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp36-cp36m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "0946d460179417a50170bb993a0786b1",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 2433027,
+        "upload_time": "2021-06-23T19:05:12",
+        "upload_time_iso_8601": "2021-06-23T19:05:12.926456Z",
+        "url": "https://files.pythonhosted.org/packages/dc/76/71c2fbe68ef4d1fca047493d1e8a5307c72b1499d874c042a9ccf9a76b88/asynq-1.4.0-cp36-cp36m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "577582b43842254276e374bf76394c30c042eaf5c8c4f9d50fd1973086b93810",
+          "md5": "9d36136e71b48f5f3d013645b3b0ae3a",
+          "sha256": "033afdf11cfeb710944d8194b1b72c137918fcfb9ca564b015f7f80e7d447e49"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp36-cp36m-win32.whl",
+        "has_sig": false,
+        "md5_digest": "9d36136e71b48f5f3d013645b3b0ae3a",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 481302,
+        "upload_time": "2021-06-23T19:05:16",
+        "upload_time_iso_8601": "2021-06-23T19:05:16.185955Z",
+        "url": "https://files.pythonhosted.org/packages/57/75/82b43842254276e374bf76394c30c042eaf5c8c4f9d50fd1973086b93810/asynq-1.4.0-cp36-cp36m-win32.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2520fa93073d9e8ae26a17565e441f2e2eeea257678f74f8c7e09ac431a0ef2a",
+          "md5": "330b8d24fc39b892eb61095deef80d66",
+          "sha256": "faa3a2445edecacf28bb857d6415d55a25ba70ff957a54b1908b6522addb2afd"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp36-cp36m-win_amd64.whl",
+        "has_sig": false,
+        "md5_digest": "330b8d24fc39b892eb61095deef80d66",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp36",
+        "requires_python": null,
+        "size": 548495,
+        "upload_time": "2021-06-23T19:05:19",
+        "upload_time_iso_8601": "2021-06-23T19:05:19.014056Z",
+        "url": "https://files.pythonhosted.org/packages/25/20/fa93073d9e8ae26a17565e441f2e2eeea257678f74f8c7e09ac431a0ef2a/asynq-1.4.0-cp36-cp36m-win_amd64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "080ba714738e58f29f0b8bd156aac2559893a2e9349bdaf53a38a2b7ba458624",
+          "md5": "2ea00d25fb68fa29a8a11573ab817848",
+          "sha256": "02889e0fe8b868ece6afd334df4d92d1cf304c4010b7fd5b225e5e8f7106aa2e"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "2ea00d25fb68fa29a8a11573ab817848",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 595846,
+        "upload_time": "2021-06-23T19:05:21",
+        "upload_time_iso_8601": "2021-06-23T19:05:21.126373Z",
+        "url": "https://files.pythonhosted.org/packages/08/0b/a714738e58f29f0b8bd156aac2559893a2e9349bdaf53a38a2b7ba458624/asynq-1.4.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "73afa29920e172871ba4153cf3f52f7c32d49953e8575d20d2abe38126ed9339",
+          "md5": "e524a7ebc99d010226ddeb7b94db58ea",
+          "sha256": "8bc86af59179d1cb3cf9fc83b88342c03620f4190cc3dfff96b62ec41f919627"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp37-cp37m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "has_sig": false,
+        "md5_digest": "e524a7ebc99d010226ddeb7b94db58ea",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 2313013,
+        "upload_time": "2021-06-23T19:05:25",
+        "upload_time_iso_8601": "2021-06-23T19:05:25.829077Z",
+        "url": "https://files.pythonhosted.org/packages/73/af/a29920e172871ba4153cf3f52f7c32d49953e8575d20d2abe38126ed9339/asynq-1.4.0-cp37-cp37m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "446befbce3228ceb1b016f77607b8115c87169a886d108c38cec86eae4e24e09",
+          "md5": "0137d2a87e66804ae87f9a1095f39129",
+          "sha256": "59924f2d639af65ff86db72af5543b6ebb03f7bd255c63bbae351a922f0569a2"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "0137d2a87e66804ae87f9a1095f39129",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 2431197,
+        "upload_time": "2021-06-23T19:05:30",
+        "upload_time_iso_8601": "2021-06-23T19:05:30.755458Z",
+        "url": "https://files.pythonhosted.org/packages/44/6b/efbce3228ceb1b016f77607b8115c87169a886d108c38cec86eae4e24e09/asynq-1.4.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c2f36d6db7225b4c45174ceae85c234d639061949d10085ef19e96180f4398df",
+          "md5": "3af1ff86c1f5ccb3365458841dac01c2",
+          "sha256": "10c19973cd586a593dd43cf3ca3ba92dfd3e235370ddef56a3ad83ad3c2fb1d0"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp37-cp37m-win32.whl",
+        "has_sig": false,
+        "md5_digest": "3af1ff86c1f5ccb3365458841dac01c2",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 481018,
+        "upload_time": "2021-06-23T19:05:33",
+        "upload_time_iso_8601": "2021-06-23T19:05:33.394983Z",
+        "url": "https://files.pythonhosted.org/packages/c2/f3/6d6db7225b4c45174ceae85c234d639061949d10085ef19e96180f4398df/asynq-1.4.0-cp37-cp37m-win32.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8319cd91b24175728cd376abdc49fc3c851fb3a7e2aec2a7336c26da32d13f0f",
+          "md5": "04ea1ee4c0388ce09d4d96ebce7fde10",
+          "sha256": "2ac59480e83ff8ab68e69c2d317bba2d4554d09c08e14717d78292dae4462d38"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp37-cp37m-win_amd64.whl",
+        "has_sig": false,
+        "md5_digest": "04ea1ee4c0388ce09d4d96ebce7fde10",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp37",
+        "requires_python": null,
+        "size": 548570,
+        "upload_time": "2021-06-23T19:05:35",
+        "upload_time_iso_8601": "2021-06-23T19:05:35.994342Z",
+        "url": "https://files.pythonhosted.org/packages/83/19/cd91b24175728cd376abdc49fc3c851fb3a7e2aec2a7336c26da32d13f0f/asynq-1.4.0-cp37-cp37m-win_amd64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "354bfa8f28c450ca7cd2367b0c6c8047c2df281f28b7c59e51a65fdd3eb10e4e",
+          "md5": "c5324345288f1da9b114a2528afa2898",
+          "sha256": "5a8fa581c31eeab35a2820ab667f8237a4f6d999e731f38cfd113f81b93646cd"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp38-cp38-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "c5324345288f1da9b114a2528afa2898",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 608922,
+        "upload_time": "2021-06-23T19:05:38",
+        "upload_time_iso_8601": "2021-06-23T19:05:38.039566Z",
+        "url": "https://files.pythonhosted.org/packages/35/4b/fa8f28c450ca7cd2367b0c6c8047c2df281f28b7c59e51a65fdd3eb10e4e/asynq-1.4.0-cp38-cp38-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "912bfbea586004af81dc5628716555912fab810f01f862dd32f208e15aa5c51f",
+          "md5": "b278eb73f700d3d6ba88f4b2a3277ab2",
+          "sha256": "9e412847f72dcbd2301bf38c89f9c2c0fb07b5b846728e6f81c9fc206de9fbe9"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp38-cp38-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "has_sig": false,
+        "md5_digest": "b278eb73f700d3d6ba88f4b2a3277ab2",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 2814534,
+        "upload_time": "2021-06-23T19:05:43",
+        "upload_time_iso_8601": "2021-06-23T19:05:43.327546Z",
+        "url": "https://files.pythonhosted.org/packages/91/2b/fbea586004af81dc5628716555912fab810f01f862dd32f208e15aa5c51f/asynq-1.4.0-cp38-cp38-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2af9c22583e07c7e22000fbda7c9642b65fe609189735c23d210e59c85187c98",
+          "md5": "81b2c5f230250feff179ee01d18d75e3",
+          "sha256": "c17f6064b6ee36df6dd96328fdb76373709a505dcf05e147b1c59c3331fa00c9"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "81b2c5f230250feff179ee01d18d75e3",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 2956538,
+        "upload_time": "2021-06-23T19:05:48",
+        "upload_time_iso_8601": "2021-06-23T19:05:48.967996Z",
+        "url": "https://files.pythonhosted.org/packages/2a/f9/c22583e07c7e22000fbda7c9642b65fe609189735c23d210e59c85187c98/asynq-1.4.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4160083ea114705b28953738e48c1ad41ef76c467d3b75391ddffe0e93da609c",
+          "md5": "e3ab511d9a1ab7eb078338867f66d849",
+          "sha256": "7e77377b6eba8f6917418245ab4e4f7d8d7e20c94683dc1b01c95f8047f63573"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp38-cp38-win32.whl",
+        "has_sig": false,
+        "md5_digest": "e3ab511d9a1ab7eb078338867f66d849",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 491330,
+        "upload_time": "2021-06-23T19:05:51",
+        "upload_time_iso_8601": "2021-06-23T19:05:51.537680Z",
+        "url": "https://files.pythonhosted.org/packages/41/60/083ea114705b28953738e48c1ad41ef76c467d3b75391ddffe0e93da609c/asynq-1.4.0-cp38-cp38-win32.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "83eb1e7e0348fc820c234a460efddb1ce03e827606af20ed24db5fc3a2bc61ca",
+          "md5": "75e139e6682b47501462f415c034ef6a",
+          "sha256": "bca28af669b13a120cd190165ec4f8e8f7435d60b9232537dfd4d4140fef7b85"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp38-cp38-win_amd64.whl",
+        "has_sig": false,
+        "md5_digest": "75e139e6682b47501462f415c034ef6a",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp38",
+        "requires_python": null,
+        "size": 564195,
+        "upload_time": "2021-06-23T19:05:53",
+        "upload_time_iso_8601": "2021-06-23T19:05:53.630791Z",
+        "url": "https://files.pythonhosted.org/packages/83/eb/1e7e0348fc820c234a460efddb1ce03e827606af20ed24db5fc3a2bc61ca/asynq-1.4.0-cp38-cp38-win_amd64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a5565f63948d8172ef64027cfc02a4a6a8741cb8cf68437421aa4586901d0011",
+          "md5": "85e8fc406073c9bed39b12318db2f3ff",
+          "sha256": "19cba678f4ca3f0f9440c9c3cfe86e6624a55d112ff32a9f1ff64b4281bf066e"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp39-cp39-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "85e8fc406073c9bed39b12318db2f3ff",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 619798,
+        "upload_time": "2021-06-23T19:05:56",
+        "upload_time_iso_8601": "2021-06-23T19:05:56.277182Z",
+        "url": "https://files.pythonhosted.org/packages/a5/56/5f63948d8172ef64027cfc02a4a6a8741cb8cf68437421aa4586901d0011/asynq-1.4.0-cp39-cp39-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf9e6a1191ac2893d390527c1ff660c0218bbb9d2e8467868e9416bc7aae2a49",
+          "md5": "02322072ea1126d20c89371eb1b98c21",
+          "sha256": "e7bed6079b7e074eaf38cbc0ea99462eb34973234a1aee84f0c55dd4b13c9ad9"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp39-cp39-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "has_sig": false,
+        "md5_digest": "02322072ea1126d20c89371eb1b98c21",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 2609196,
+        "upload_time": "2021-06-23T19:06:01",
+        "upload_time_iso_8601": "2021-06-23T19:06:01.490785Z",
+        "url": "https://files.pythonhosted.org/packages/cf/9e/6a1191ac2893d390527c1ff660c0218bbb9d2e8467868e9416bc7aae2a49/asynq-1.4.0-cp39-cp39-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb9f8cd993c27d2bf5a2689444c583294879a02a27f60ac654b8dca361b1d10a",
+          "md5": "1cb415c334679e596161a22d7394f1c3",
+          "sha256": "3930404839baa5664460d751aa63d49e6b2744d97a0b39e1b9ba33c9c9be8cd0"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "1cb415c334679e596161a22d7394f1c3",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 2744568,
+        "upload_time": "2021-06-23T19:06:06",
+        "upload_time_iso_8601": "2021-06-23T19:06:06.980920Z",
+        "url": "https://files.pythonhosted.org/packages/bb/9f/8cd993c27d2bf5a2689444c583294879a02a27f60ac654b8dca361b1d10a/asynq-1.4.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0f517f3fe7ce3698e0d23b6ce5fb911684e603a3e9bb73b38415faaaaf761509",
+          "md5": "935cd6e6a286eafcd33194a57a58d9aa",
+          "sha256": "b6090225b6b9786267de52426d3eb0aa5ac7b95336c40db791c933314fcb11aa"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp39-cp39-win32.whl",
+        "has_sig": false,
+        "md5_digest": "935cd6e6a286eafcd33194a57a58d9aa",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 490901,
+        "upload_time": "2021-06-23T19:06:08",
+        "upload_time_iso_8601": "2021-06-23T19:06:08.958535Z",
+        "url": "https://files.pythonhosted.org/packages/0f/51/7f3fe7ce3698e0d23b6ce5fb911684e603a3e9bb73b38415faaaaf761509/asynq-1.4.0-cp39-cp39-win32.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "08b1bfd66a1d7d1432b9a7ca720200bc5749e3822749efabfc1aca6cb11f027e",
+          "md5": "cdb0a6c6e500d8aaaa0b33b74f4fec1e",
+          "sha256": "f67acdd64b8114cb6117a9cb8c66223b7a4e0c79fa4e93edba0f2f70267ed0d0"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-cp39-cp39-win_amd64.whl",
+        "has_sig": false,
+        "md5_digest": "cdb0a6c6e500d8aaaa0b33b74f4fec1e",
+        "packagetype": "bdist_wheel",
+        "python_version": "cp39",
+        "requires_python": null,
+        "size": 564413,
+        "upload_time": "2021-06-23T19:06:11",
+        "upload_time_iso_8601": "2021-06-23T19:06:11.100014Z",
+        "url": "https://files.pythonhosted.org/packages/08/b1/bfd66a1d7d1432b9a7ca720200bc5749e3822749efabfc1aca6cb11f027e/asynq-1.4.0-cp39-cp39-win_amd64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "31cd96f0f298ea65ea5829739d220fd738fe4b16585d1d3ee80697bae8609cb2",
+          "md5": "171ba7eb5b6fb2e3314bbfb6546e075f",
+          "sha256": "f4dfc831e9e432706392c2dc52bf2c6ceda71d90cd6a63d13ac36b2d4ac80ed0"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-pp37-pypy37_pp73-macosx_10_9_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "171ba7eb5b6fb2e3314bbfb6546e075f",
+        "packagetype": "bdist_wheel",
+        "python_version": "pp37",
+        "requires_python": null,
+        "size": 454396,
+        "upload_time": "2021-06-23T19:06:12",
+        "upload_time_iso_8601": "2021-06-23T19:06:12.988535Z",
+        "url": "https://files.pythonhosted.org/packages/31/cd/96f0f298ea65ea5829739d220fd738fe4b16585d1d3ee80697bae8609cb2/asynq-1.4.0-pp37-pypy37_pp73-macosx_10_9_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20f917e1811d1dae54e46f24327ff8949325a67a31378ede709193c918a44a47",
+          "md5": "bb1d86b434dd91f4289ef97ce509434b",
+          "sha256": "d7208dcf124c4585797163e1b8d5d05d287ba608fab997ad6fba4cf2acbcc6f8"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "has_sig": false,
+        "md5_digest": "bb1d86b434dd91f4289ef97ce509434b",
+        "packagetype": "bdist_wheel",
+        "python_version": "pp37",
+        "requires_python": null,
+        "size": 555083,
+        "upload_time": "2021-06-23T19:06:14",
+        "upload_time_iso_8601": "2021-06-23T19:06:14.938820Z",
+        "url": "https://files.pythonhosted.org/packages/20/f9/17e1811d1dae54e46f24327ff8949325a67a31378ede709193c918a44a47/asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef4aff20320e89fcdd99c0c3395bbc8613811946a58f35e74b46b9dee5845610",
+          "md5": "f170eecf3a050e4160a257fc2e4ae620",
+          "sha256": "024f817440fa4a84eba36656a9aca0fde5bdee4a8601e22bf786015ceefef8ad"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "has_sig": false,
+        "md5_digest": "f170eecf3a050e4160a257fc2e4ae620",
+        "packagetype": "bdist_wheel",
+        "python_version": "pp37",
+        "requires_python": null,
+        "size": 552867,
+        "upload_time": "2021-06-23T19:06:16",
+        "upload_time_iso_8601": "2021-06-23T19:06:16.934790Z",
+        "url": "https://files.pythonhosted.org/packages/ef/4a/ff20320e89fcdd99c0c3395bbc8613811946a58f35e74b46b9dee5845610/asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8621be418013eab59f088aa986249d20a412f95f66289e68718818c8a6306a7f",
+          "md5": "d23718a4ec3677547423ccde6e66b291",
+          "sha256": "5de0ba9104ed8f7c25d1854c9fe3ae33abd35abeaf86fac1c13b5031792eea4b"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0-pp37-pypy37_pp73-win_amd64.whl",
+        "has_sig": false,
+        "md5_digest": "d23718a4ec3677547423ccde6e66b291",
+        "packagetype": "bdist_wheel",
+        "python_version": "pp37",
+        "requires_python": null,
+        "size": 483692,
+        "upload_time": "2021-06-23T19:06:18",
+        "upload_time_iso_8601": "2021-06-23T19:06:18.875227Z",
+        "url": "https://files.pythonhosted.org/packages/86/21/be418013eab59f088aa986249d20a412f95f66289e68718818c8a6306a7f/asynq-1.4.0-pp37-pypy37_pp73-win_amd64.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c408e43ae80f2cee1d2639549c3e4a4c194a566903012780259a5a92d02598e7",
+          "md5": "9ca2e86ffca2b903b2e9d88b2c4d684c",
+          "sha256": "0601fbd278dd40bd605b6947f2e177b272fdec910944a4e394ce7dff94ac6952"
+        },
+        "downloads": -1,
+        "filename": "asynq-1.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9ca2e86ffca2b903b2e9d88b2c4d684c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 62425,
+        "upload_time": "2021-06-23T19:06:20",
+        "upload_time_iso_8601": "2021-06-23T19:06:20.765242Z",
+        "url": "https://files.pythonhosted.org/packages/c4/08/e43ae80f2cee1d2639549c3e4a4c194a566903012780259a5a92d02598e7/asynq-1.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d4d0b17246c8b718534934237693c126188d5adcba87a1913f80fa3eb8f820b7",
+        "md5": "d9762427e30ae290321b85b7b1aa8c60",
+        "sha256": "51c931f93213c2039034aa65d847b63cb433659095841d4a08c5acb3b591e7a0"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp36-cp36m-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "d9762427e30ae290321b85b7b1aa8c60",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp36",
+      "requires_python": null,
+      "size": 612884,
+      "upload_time": "2021-06-23T19:05:02",
+      "upload_time_iso_8601": "2021-06-23T19:05:02.183210Z",
+      "url": "https://files.pythonhosted.org/packages/d4/d0/b17246c8b718534934237693c126188d5adcba87a1913f80fa3eb8f820b7/asynq-1.4.0-cp36-cp36m-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b43f453db818846c40ec13711a9e10f98f5b0a670e00634dc0c979d741dbfc5f",
+        "md5": "da6838ad809c845f8b842f44e91c2284",
+        "sha256": "c83dc8d4b8aeb3d02880cfd055c1025da344623328a78d5015c07132f2598e5f"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp36-cp36m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "has_sig": false,
+      "md5_digest": "da6838ad809c845f8b842f44e91c2284",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp36",
+      "requires_python": null,
+      "size": 2313474,
+      "upload_time": "2021-06-23T19:05:07",
+      "upload_time_iso_8601": "2021-06-23T19:05:07.351492Z",
+      "url": "https://files.pythonhosted.org/packages/b4/3f/453db818846c40ec13711a9e10f98f5b0a670e00634dc0c979d741dbfc5f/asynq-1.4.0-cp36-cp36m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "dc7671c2fbe68ef4d1fca047493d1e8a5307c72b1499d874c042a9ccf9a76b88",
+        "md5": "0946d460179417a50170bb993a0786b1",
+        "sha256": "93d8d70706feeb24d82c13d846374510829598f044458ae9a1600b1adacd6ce1"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp36-cp36m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "0946d460179417a50170bb993a0786b1",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp36",
+      "requires_python": null,
+      "size": 2433027,
+      "upload_time": "2021-06-23T19:05:12",
+      "upload_time_iso_8601": "2021-06-23T19:05:12.926456Z",
+      "url": "https://files.pythonhosted.org/packages/dc/76/71c2fbe68ef4d1fca047493d1e8a5307c72b1499d874c042a9ccf9a76b88/asynq-1.4.0-cp36-cp36m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "577582b43842254276e374bf76394c30c042eaf5c8c4f9d50fd1973086b93810",
+        "md5": "9d36136e71b48f5f3d013645b3b0ae3a",
+        "sha256": "033afdf11cfeb710944d8194b1b72c137918fcfb9ca564b015f7f80e7d447e49"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp36-cp36m-win32.whl",
+      "has_sig": false,
+      "md5_digest": "9d36136e71b48f5f3d013645b3b0ae3a",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp36",
+      "requires_python": null,
+      "size": 481302,
+      "upload_time": "2021-06-23T19:05:16",
+      "upload_time_iso_8601": "2021-06-23T19:05:16.185955Z",
+      "url": "https://files.pythonhosted.org/packages/57/75/82b43842254276e374bf76394c30c042eaf5c8c4f9d50fd1973086b93810/asynq-1.4.0-cp36-cp36m-win32.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2520fa93073d9e8ae26a17565e441f2e2eeea257678f74f8c7e09ac431a0ef2a",
+        "md5": "330b8d24fc39b892eb61095deef80d66",
+        "sha256": "faa3a2445edecacf28bb857d6415d55a25ba70ff957a54b1908b6522addb2afd"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp36-cp36m-win_amd64.whl",
+      "has_sig": false,
+      "md5_digest": "330b8d24fc39b892eb61095deef80d66",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp36",
+      "requires_python": null,
+      "size": 548495,
+      "upload_time": "2021-06-23T19:05:19",
+      "upload_time_iso_8601": "2021-06-23T19:05:19.014056Z",
+      "url": "https://files.pythonhosted.org/packages/25/20/fa93073d9e8ae26a17565e441f2e2eeea257678f74f8c7e09ac431a0ef2a/asynq-1.4.0-cp36-cp36m-win_amd64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "080ba714738e58f29f0b8bd156aac2559893a2e9349bdaf53a38a2b7ba458624",
+        "md5": "2ea00d25fb68fa29a8a11573ab817848",
+        "sha256": "02889e0fe8b868ece6afd334df4d92d1cf304c4010b7fd5b225e5e8f7106aa2e"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "2ea00d25fb68fa29a8a11573ab817848",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 595846,
+      "upload_time": "2021-06-23T19:05:21",
+      "upload_time_iso_8601": "2021-06-23T19:05:21.126373Z",
+      "url": "https://files.pythonhosted.org/packages/08/0b/a714738e58f29f0b8bd156aac2559893a2e9349bdaf53a38a2b7ba458624/asynq-1.4.0-cp37-cp37m-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "73afa29920e172871ba4153cf3f52f7c32d49953e8575d20d2abe38126ed9339",
+        "md5": "e524a7ebc99d010226ddeb7b94db58ea",
+        "sha256": "8bc86af59179d1cb3cf9fc83b88342c03620f4190cc3dfff96b62ec41f919627"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp37-cp37m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "has_sig": false,
+      "md5_digest": "e524a7ebc99d010226ddeb7b94db58ea",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 2313013,
+      "upload_time": "2021-06-23T19:05:25",
+      "upload_time_iso_8601": "2021-06-23T19:05:25.829077Z",
+      "url": "https://files.pythonhosted.org/packages/73/af/a29920e172871ba4153cf3f52f7c32d49953e8575d20d2abe38126ed9339/asynq-1.4.0-cp37-cp37m-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "446befbce3228ceb1b016f77607b8115c87169a886d108c38cec86eae4e24e09",
+        "md5": "0137d2a87e66804ae87f9a1095f39129",
+        "sha256": "59924f2d639af65ff86db72af5543b6ebb03f7bd255c63bbae351a922f0569a2"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "0137d2a87e66804ae87f9a1095f39129",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 2431197,
+      "upload_time": "2021-06-23T19:05:30",
+      "upload_time_iso_8601": "2021-06-23T19:05:30.755458Z",
+      "url": "https://files.pythonhosted.org/packages/44/6b/efbce3228ceb1b016f77607b8115c87169a886d108c38cec86eae4e24e09/asynq-1.4.0-cp37-cp37m-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c2f36d6db7225b4c45174ceae85c234d639061949d10085ef19e96180f4398df",
+        "md5": "3af1ff86c1f5ccb3365458841dac01c2",
+        "sha256": "10c19973cd586a593dd43cf3ca3ba92dfd3e235370ddef56a3ad83ad3c2fb1d0"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp37-cp37m-win32.whl",
+      "has_sig": false,
+      "md5_digest": "3af1ff86c1f5ccb3365458841dac01c2",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 481018,
+      "upload_time": "2021-06-23T19:05:33",
+      "upload_time_iso_8601": "2021-06-23T19:05:33.394983Z",
+      "url": "https://files.pythonhosted.org/packages/c2/f3/6d6db7225b4c45174ceae85c234d639061949d10085ef19e96180f4398df/asynq-1.4.0-cp37-cp37m-win32.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8319cd91b24175728cd376abdc49fc3c851fb3a7e2aec2a7336c26da32d13f0f",
+        "md5": "04ea1ee4c0388ce09d4d96ebce7fde10",
+        "sha256": "2ac59480e83ff8ab68e69c2d317bba2d4554d09c08e14717d78292dae4462d38"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp37-cp37m-win_amd64.whl",
+      "has_sig": false,
+      "md5_digest": "04ea1ee4c0388ce09d4d96ebce7fde10",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp37",
+      "requires_python": null,
+      "size": 548570,
+      "upload_time": "2021-06-23T19:05:35",
+      "upload_time_iso_8601": "2021-06-23T19:05:35.994342Z",
+      "url": "https://files.pythonhosted.org/packages/83/19/cd91b24175728cd376abdc49fc3c851fb3a7e2aec2a7336c26da32d13f0f/asynq-1.4.0-cp37-cp37m-win_amd64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "354bfa8f28c450ca7cd2367b0c6c8047c2df281f28b7c59e51a65fdd3eb10e4e",
+        "md5": "c5324345288f1da9b114a2528afa2898",
+        "sha256": "5a8fa581c31eeab35a2820ab667f8237a4f6d999e731f38cfd113f81b93646cd"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp38-cp38-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "c5324345288f1da9b114a2528afa2898",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 608922,
+      "upload_time": "2021-06-23T19:05:38",
+      "upload_time_iso_8601": "2021-06-23T19:05:38.039566Z",
+      "url": "https://files.pythonhosted.org/packages/35/4b/fa8f28c450ca7cd2367b0c6c8047c2df281f28b7c59e51a65fdd3eb10e4e/asynq-1.4.0-cp38-cp38-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "912bfbea586004af81dc5628716555912fab810f01f862dd32f208e15aa5c51f",
+        "md5": "b278eb73f700d3d6ba88f4b2a3277ab2",
+        "sha256": "9e412847f72dcbd2301bf38c89f9c2c0fb07b5b846728e6f81c9fc206de9fbe9"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp38-cp38-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "has_sig": false,
+      "md5_digest": "b278eb73f700d3d6ba88f4b2a3277ab2",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 2814534,
+      "upload_time": "2021-06-23T19:05:43",
+      "upload_time_iso_8601": "2021-06-23T19:05:43.327546Z",
+      "url": "https://files.pythonhosted.org/packages/91/2b/fbea586004af81dc5628716555912fab810f01f862dd32f208e15aa5c51f/asynq-1.4.0-cp38-cp38-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2af9c22583e07c7e22000fbda7c9642b65fe609189735c23d210e59c85187c98",
+        "md5": "81b2c5f230250feff179ee01d18d75e3",
+        "sha256": "c17f6064b6ee36df6dd96328fdb76373709a505dcf05e147b1c59c3331fa00c9"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "81b2c5f230250feff179ee01d18d75e3",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 2956538,
+      "upload_time": "2021-06-23T19:05:48",
+      "upload_time_iso_8601": "2021-06-23T19:05:48.967996Z",
+      "url": "https://files.pythonhosted.org/packages/2a/f9/c22583e07c7e22000fbda7c9642b65fe609189735c23d210e59c85187c98/asynq-1.4.0-cp38-cp38-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4160083ea114705b28953738e48c1ad41ef76c467d3b75391ddffe0e93da609c",
+        "md5": "e3ab511d9a1ab7eb078338867f66d849",
+        "sha256": "7e77377b6eba8f6917418245ab4e4f7d8d7e20c94683dc1b01c95f8047f63573"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp38-cp38-win32.whl",
+      "has_sig": false,
+      "md5_digest": "e3ab511d9a1ab7eb078338867f66d849",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 491330,
+      "upload_time": "2021-06-23T19:05:51",
+      "upload_time_iso_8601": "2021-06-23T19:05:51.537680Z",
+      "url": "https://files.pythonhosted.org/packages/41/60/083ea114705b28953738e48c1ad41ef76c467d3b75391ddffe0e93da609c/asynq-1.4.0-cp38-cp38-win32.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "83eb1e7e0348fc820c234a460efddb1ce03e827606af20ed24db5fc3a2bc61ca",
+        "md5": "75e139e6682b47501462f415c034ef6a",
+        "sha256": "bca28af669b13a120cd190165ec4f8e8f7435d60b9232537dfd4d4140fef7b85"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp38-cp38-win_amd64.whl",
+      "has_sig": false,
+      "md5_digest": "75e139e6682b47501462f415c034ef6a",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp38",
+      "requires_python": null,
+      "size": 564195,
+      "upload_time": "2021-06-23T19:05:53",
+      "upload_time_iso_8601": "2021-06-23T19:05:53.630791Z",
+      "url": "https://files.pythonhosted.org/packages/83/eb/1e7e0348fc820c234a460efddb1ce03e827606af20ed24db5fc3a2bc61ca/asynq-1.4.0-cp38-cp38-win_amd64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a5565f63948d8172ef64027cfc02a4a6a8741cb8cf68437421aa4586901d0011",
+        "md5": "85e8fc406073c9bed39b12318db2f3ff",
+        "sha256": "19cba678f4ca3f0f9440c9c3cfe86e6624a55d112ff32a9f1ff64b4281bf066e"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp39-cp39-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "85e8fc406073c9bed39b12318db2f3ff",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 619798,
+      "upload_time": "2021-06-23T19:05:56",
+      "upload_time_iso_8601": "2021-06-23T19:05:56.277182Z",
+      "url": "https://files.pythonhosted.org/packages/a5/56/5f63948d8172ef64027cfc02a4a6a8741cb8cf68437421aa4586901d0011/asynq-1.4.0-cp39-cp39-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "cf9e6a1191ac2893d390527c1ff660c0218bbb9d2e8467868e9416bc7aae2a49",
+        "md5": "02322072ea1126d20c89371eb1b98c21",
+        "sha256": "e7bed6079b7e074eaf38cbc0ea99462eb34973234a1aee84f0c55dd4b13c9ad9"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp39-cp39-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "has_sig": false,
+      "md5_digest": "02322072ea1126d20c89371eb1b98c21",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 2609196,
+      "upload_time": "2021-06-23T19:06:01",
+      "upload_time_iso_8601": "2021-06-23T19:06:01.490785Z",
+      "url": "https://files.pythonhosted.org/packages/cf/9e/6a1191ac2893d390527c1ff660c0218bbb9d2e8467868e9416bc7aae2a49/asynq-1.4.0-cp39-cp39-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bb9f8cd993c27d2bf5a2689444c583294879a02a27f60ac654b8dca361b1d10a",
+        "md5": "1cb415c334679e596161a22d7394f1c3",
+        "sha256": "3930404839baa5664460d751aa63d49e6b2744d97a0b39e1b9ba33c9c9be8cd0"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "1cb415c334679e596161a22d7394f1c3",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 2744568,
+      "upload_time": "2021-06-23T19:06:06",
+      "upload_time_iso_8601": "2021-06-23T19:06:06.980920Z",
+      "url": "https://files.pythonhosted.org/packages/bb/9f/8cd993c27d2bf5a2689444c583294879a02a27f60ac654b8dca361b1d10a/asynq-1.4.0-cp39-cp39-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0f517f3fe7ce3698e0d23b6ce5fb911684e603a3e9bb73b38415faaaaf761509",
+        "md5": "935cd6e6a286eafcd33194a57a58d9aa",
+        "sha256": "b6090225b6b9786267de52426d3eb0aa5ac7b95336c40db791c933314fcb11aa"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp39-cp39-win32.whl",
+      "has_sig": false,
+      "md5_digest": "935cd6e6a286eafcd33194a57a58d9aa",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 490901,
+      "upload_time": "2021-06-23T19:06:08",
+      "upload_time_iso_8601": "2021-06-23T19:06:08.958535Z",
+      "url": "https://files.pythonhosted.org/packages/0f/51/7f3fe7ce3698e0d23b6ce5fb911684e603a3e9bb73b38415faaaaf761509/asynq-1.4.0-cp39-cp39-win32.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "08b1bfd66a1d7d1432b9a7ca720200bc5749e3822749efabfc1aca6cb11f027e",
+        "md5": "cdb0a6c6e500d8aaaa0b33b74f4fec1e",
+        "sha256": "f67acdd64b8114cb6117a9cb8c66223b7a4e0c79fa4e93edba0f2f70267ed0d0"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-cp39-cp39-win_amd64.whl",
+      "has_sig": false,
+      "md5_digest": "cdb0a6c6e500d8aaaa0b33b74f4fec1e",
+      "packagetype": "bdist_wheel",
+      "python_version": "cp39",
+      "requires_python": null,
+      "size": 564413,
+      "upload_time": "2021-06-23T19:06:11",
+      "upload_time_iso_8601": "2021-06-23T19:06:11.100014Z",
+      "url": "https://files.pythonhosted.org/packages/08/b1/bfd66a1d7d1432b9a7ca720200bc5749e3822749efabfc1aca6cb11f027e/asynq-1.4.0-cp39-cp39-win_amd64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "31cd96f0f298ea65ea5829739d220fd738fe4b16585d1d3ee80697bae8609cb2",
+        "md5": "171ba7eb5b6fb2e3314bbfb6546e075f",
+        "sha256": "f4dfc831e9e432706392c2dc52bf2c6ceda71d90cd6a63d13ac36b2d4ac80ed0"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-pp37-pypy37_pp73-macosx_10_9_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "171ba7eb5b6fb2e3314bbfb6546e075f",
+      "packagetype": "bdist_wheel",
+      "python_version": "pp37",
+      "requires_python": null,
+      "size": 454396,
+      "upload_time": "2021-06-23T19:06:12",
+      "upload_time_iso_8601": "2021-06-23T19:06:12.988535Z",
+      "url": "https://files.pythonhosted.org/packages/31/cd/96f0f298ea65ea5829739d220fd738fe4b16585d1d3ee80697bae8609cb2/asynq-1.4.0-pp37-pypy37_pp73-macosx_10_9_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "20f917e1811d1dae54e46f24327ff8949325a67a31378ede709193c918a44a47",
+        "md5": "bb1d86b434dd91f4289ef97ce509434b",
+        "sha256": "d7208dcf124c4585797163e1b8d5d05d287ba608fab997ad6fba4cf2acbcc6f8"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "has_sig": false,
+      "md5_digest": "bb1d86b434dd91f4289ef97ce509434b",
+      "packagetype": "bdist_wheel",
+      "python_version": "pp37",
+      "requires_python": null,
+      "size": 555083,
+      "upload_time": "2021-06-23T19:06:14",
+      "upload_time_iso_8601": "2021-06-23T19:06:14.938820Z",
+      "url": "https://files.pythonhosted.org/packages/20/f9/17e1811d1dae54e46f24327ff8949325a67a31378ede709193c918a44a47/asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_i686.manylinux1_i686.manylinux_2_12_i686.manylinux2010_i686.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ef4aff20320e89fcdd99c0c3395bbc8613811946a58f35e74b46b9dee5845610",
+        "md5": "f170eecf3a050e4160a257fc2e4ae620",
+        "sha256": "024f817440fa4a84eba36656a9aca0fde5bdee4a8601e22bf786015ceefef8ad"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "has_sig": false,
+      "md5_digest": "f170eecf3a050e4160a257fc2e4ae620",
+      "packagetype": "bdist_wheel",
+      "python_version": "pp37",
+      "requires_python": null,
+      "size": 552867,
+      "upload_time": "2021-06-23T19:06:16",
+      "upload_time_iso_8601": "2021-06-23T19:06:16.934790Z",
+      "url": "https://files.pythonhosted.org/packages/ef/4a/ff20320e89fcdd99c0c3395bbc8613811946a58f35e74b46b9dee5845610/asynq-1.4.0-pp37-pypy37_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8621be418013eab59f088aa986249d20a412f95f66289e68718818c8a6306a7f",
+        "md5": "d23718a4ec3677547423ccde6e66b291",
+        "sha256": "5de0ba9104ed8f7c25d1854c9fe3ae33abd35abeaf86fac1c13b5031792eea4b"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0-pp37-pypy37_pp73-win_amd64.whl",
+      "has_sig": false,
+      "md5_digest": "d23718a4ec3677547423ccde6e66b291",
+      "packagetype": "bdist_wheel",
+      "python_version": "pp37",
+      "requires_python": null,
+      "size": 483692,
+      "upload_time": "2021-06-23T19:06:18",
+      "upload_time_iso_8601": "2021-06-23T19:06:18.875227Z",
+      "url": "https://files.pythonhosted.org/packages/86/21/be418013eab59f088aa986249d20a412f95f66289e68718818c8a6306a7f/asynq-1.4.0-pp37-pypy37_pp73-win_amd64.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c408e43ae80f2cee1d2639549c3e4a4c194a566903012780259a5a92d02598e7",
+        "md5": "9ca2e86ffca2b903b2e9d88b2c4d684c",
+        "sha256": "0601fbd278dd40bd605b6947f2e177b272fdec910944a4e394ce7dff94ac6952"
+      },
+      "downloads": -1,
+      "filename": "asynq-1.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9ca2e86ffca2b903b2e9d88b2c4d684c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 62425,
+      "upload_time": "2021-06-23T19:06:20",
+      "upload_time_iso_8601": "2021-06-23T19:06:20.765242Z",
+      "url": "https://files.pythonhosted.org/packages/c4/08/e43ae80f2cee1d2639549c3e4a4c194a566903012780259a5a92d02598e7/asynq-1.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

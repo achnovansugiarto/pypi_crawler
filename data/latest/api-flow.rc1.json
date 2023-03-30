@@ -1,0 +1,134 @@
+{
+  "info": {
+    "author": "Rob Thomas",
+    "author_email": "pypi@sharedsecret.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# api-flow\nThis utility allows the user to define, in YAML, “flows” composed of “steps,” each of which performs a single API \nrequest, and execute them. Steps can extract values from their responses and expose them for\nconsumption by later steps and the user.\n\nIntended use cases include automated QA of API processes and automation of workflows across multiple\nendpoints and services, in a lightweight form that can run in restricted environments.\n\n## Moving Parts\n### Context\nFlows and steps are derived from the `Context` class. It exposes data using either object \n(`context.my_data_item`) or dict (`context['my_data_item']`) notation, and provides support for \nreferring attributes requests up to a `parent` context. For example, the `parent` of a Step is \nthe Flow that executes it.\n```mermaid\nclassDiagram\n  class Context\n  Context : GLOBALS -- a class-level store available to all instances\n  Context : parent -- an optional upstream context\n  Context : <all other data attributes are dynamic>\n  Context : as_dict()\n```\nThe resolution order for context attributes is as follows:\n- The instance's own native attributes\n- Environment variables\n- Items in the `GLOBALS` store\n- The context's `parent` (if any)\n- (`dict` access methods exposed to provide dict-like behavior)\n\nSetting an attribute on a context sets the native value, so that will take precedence\non future requests.\n\nIn order to preserve nested object notation for access, dict values are transparently (and\nrecursively) \"upgraded\" to a class representation. You can \"downgrade\" these back to `dict`\n(for instance if you need to serialize a value) using the `as_dict` method.\n\n### Steps\nThe basic unit of work is the `Step` class. It represents a single API call. You will typically not \ninstantiate one directly, but you will deal with them as parts of a Flow.\n```mermaid\nclassDiagram\n  class Context\n  class Step\n  Step : step_name -- the supplied name\n  Step : step_definition -- specification of the step, loaded from YAML\n  Step : step_description -- a descriptive string supplied in the definition\n  Step : step_method -- an HTTP method supplied in the definition, defaults to GET\n  Step : step_request -- a Request object that encapsulates the entire API transaction.\n  Step : step_retry_config -- a struct describing retry behavior on failure\n  Step : --------- Accessors ----------\n  Step : step_body -- template-interpolated request body from the step_definition\n  Step : step_headers -- template-interpolated request headers from the step_definition\n  Step : step_url -- template-interpolated request URL from the step_definition\n  Step : execute() bool\n  Context <|-- Step\n```\n\nStep definitions are embedded in the YAML defining a flow, and are structured like this:\n```yaml\ndescription: My Cool Step\nmethod: POST\nurl: http://{? my_site_url ?}/do/the/thing\nheaders:\n  X-Additional-Headers: to append to (or override) the default request headers\nbody: (see below)\nwait_for_success: (see below)\noutputs:\n  my_output_var: (a jsonpath expression -- see below)\n```\n\nNote the `{? my_site_url ?}` in the `url` field. This is a substitution point for a variable\nextracted from context. Most likely in this example there would be a `my_site_url` key\ndefined in a profile file.\n\n#### The body field\nThe `body` field can be a string, or it can be, e.g., `template:my_cool_flow_body.json` to load\na template file, or it can be structured YAML. If you use structured YAML, this content will be\nreformatted as JSON to form the request body. If you intend to send a non-JSON body, you _must_ use\na template file.\n\n#### Retry configuration\nThe `wait_for_success` field defines the `step_retry_config` for the step. The retry configuration\nhas two fields:\n- `attempt`: total number of times to try a request when failures are encountered\n- `delay`: seconds to pause in between request attempts. If provided this applies to every attempt,\n_including the first one_.\n\nYou can specify both of these directly under a `wait_for_success` dict key. Alternately, simply\nusing `wait_for_success: true` in your definition will supply a default config (three attempts\nwith five-second delay). Omitting the `wait_for_success` field results in a no-retry configuration\n(one attempt, zero delay).\n\n> **Caution:** a zero delay with a positive retry will spam retries of failing requests as fast as it can.\n\n#### Step outputs\nThe `outputs` of the step are defined as a map of variable names to [JSONPath](https://jsonpath.com/)\nexpressions, which are applied to the body of a JSON response to extract the value. These\nvariables are assigned to the Step for later access, so that `my_cool_step.my_output_var` refers\nto the value extracted from the response body.\n\n#### Running the step\nThe `execute()` method runs the step (including all retries if applicable) and returns `True` if the\nfinal request attempt succeeded. To reiterate, you typically will not call this directly. The `execute`\nmethod on Flow objects calls `execute` on each Step.\n\n### Flows\nFlows are what you actually execute. They are loaded from YAML files and define a set of Steps to\nexecute in sequence. Flows can also optionally declare a set of other prerequisite flows that supply\nstep outputs the current flow depends on. The prerequisite mechanism is a way to split out and reuse\ncommon sub-flows required in multiple different flows, for example, logging in and getting a session ID.\n```mermaid\nclassDiagram\n  class Flow\n  Flow : flow_name -- the simple name of the flow\n  Flow : flow_definition -- the loaded YAML flow specification\n  Flow : flow_description -- an optional descriptive string, defaults to flow_name\n  Flow : flow_dependencies -- list[str] simple names of other flows to load and execute first\n  Flow : flow_steps -- references the `steps` member of the flow_definition\n  Flow : flow_store -- an internally managed global reference to all loaded flows\n  Flow : flow_dependencies_succeeded -- bool|None have dependencies run and did they all succeed?\n  Flow : flow_steps_succeeded -- bool|None have steps run and did they all succeed?\n  Flow : succeeded -- bool has the flow executed successfully?\n  Flow :  --------- Accessors ----------\n  Flow : current_flow -- reference to the currently executing flow\n  Flow : previous_flow -- reference to the last executed flow\n  Flow : current_step -- reference to the currently executing step\n  Flow : previous_step -- reference to the last executed step\n  Flow : execute() bool\n  class Context\n  class Step\n  Context <|-- Flow\n  Context <|-- Step\n  Flow <-- Step : parent\n  Flow o-- Step : 1..*\n```\n\nThe constructor for a `Flow` looks like this:\n```python\ndef __init__(flow_name, profile=None, profiles=None, parent=None, **kwargs):\n```\nAt least the `flow_name` is required, which specifies which YAML specification to load.\nProfiles, which can be specified in single or plural form as shown above, are names referencing\n\"profile\" YAML files, which supply initial context variables. The `parent` keyword arg is used \nwhen constructing prerequisite flows. You typically will not pass it directly. Any additional\n`kwargs` supplied in construction are added to the context after profiles are loaded.\n\nThe YAML for a flow is specified like so:\n```yaml\ndescription: My Cool Flow\ndepends_on:\n  - prerequisite_flow\n  - another_prerequisite_flow\n  - ...\nsteps:\n  my_cool_step: (see step definition above) \n  ...\n```\nStep items are assigned to their containing Flow using the simple name, so that in the example\nabove, after the Flow is executed, `my_cool_flow.my_cool_step` will refer to that Step object.\n\nCalling `execute` on the flow first runs all prerequisites defined by the `depends_on` field in order,\nthen assuming those all succeed, runs the steps in the `steps` field in order. The flow succeeds if\nall dependencies and steps succeed.\n\n## Extracting Results and Populating Templates\nAs seen above, steps are accessible via their flows, and outputs are available via their steps,\nso if you construct and execute a flow (`flow = Flow('my_cool_flow')`, `flow.execute()`) then you\nwill be able to access step attributes as `value = flow.my_cool_flow.my_cool_step.my_output_var`.\nThis provides a straightforward way to use the flow object for automated testing of API responses.\n\nPrerequisite flows also inherit from the main flow that depends upon them, allowing them to access \nprofiles and other data.\n\nThis is the same syntax you will use in template tags, except you will omit the `flow` root.\nIn rendering a template substitution, the context is always the current step, which inherits values\nfrom the current flow, and then from the profiles, so that every step gets access to the full state\nof the request process. In templates for `my_second_step`, you can use `{? my_first_step.an_output ?}`\nto use values from previous steps in the flow.\n\nFor convenience, api-flow also globally tracks `current_flow`, `previous_flow`, `current_step` and\n`previous_step`, all of which are available to use in template substitutions.\n\nAny prerequisite flows (specified by `depends_on`) are also available by name on the flow, so they can\nbe accessed using `{? prerequisite_flow.prereq_step.output_value ?}`.\n\n## Configuration\n`api-flow` pulls configuration from files in from a few data directories.  The default structure for data paths is:\n```text\n./\n    flows/\n    functions/\n    profiles/\n    templates/\n```\nThe default base data path is the current directory, with defined subdirectories underneath. The values for each of\nthese can be changed by setting values on the `Config` object or setting environment variables.\n\n### Data Path\nThe data path is a common root directory in which all other directories are located by default. The data path is\nirrelevant if all other paths are set explicitly.  It defaults to the current directory, but can be changed using\n`Config.data_path` or the `DATA_PATH` environment variable.\n\n### Flow Path\nFlow files contain the definition of your flows. They are found in the \"flows\" directory, and have the following YAML\nstructure:\n\n- `depends_on`: (optional) A list of strings describing other flows that must be run, in order, to populate the context\nfor this flow to execute.\n- `description`: (optional) A human-readable string describing the flow. If omitted, the flow name is used to describe\nthe flow.\n- `steps`: An ordered dictionary of steps for the flow.  Steps can contain the following values:\n   - `description`: (optional) A human-readable description of the step. If omitted, the step name is used instead.\n   - `wait_for_success`: (optional) If defined, retry support is enabled for this step.  You can just use `true` here\nto use a default configuration (3 attempts, 5 seconds between attempts), or you may set the values directly using a\ndict value:\n       - `attempt`: (optional, default 3) A maximum number of times a request will be attempted.\n       - `delay`: (optional, default 5) A number of seconds to pause.  If specified every attempt (including the first\none) will be preceded by a sleep for the requested time.\n   - `url`: (required, template) The URL to request\n   - `method`: (optional, default GET) The HTTP request method to use.\n   - `headers`: (optional, template) A dict of key/value pairs sent as request headers. This will be combined with a\nset of default headers.\n   - `body`: (optional, template) The body to be sent with a POST/PUT/PATCH etc request.  This can be defined in YAML \nformat but will be translated to JSON in the request.\n   - `output`: A dictionary of variables that should be extracted from the response data.  Each key is a variable name, \nand the value is a `jsonpath` expression describing where that value can be found in the response JSON. After\nretrieval, the values are attached as variables to the Step object so that they can be consumed by later steps.\n\nValues marked with the \"template\" tag will have values substituted in from the current context before rendering, so that\nyou can inject variables, including outputs from previous steps, into their values.\n\nThe flow path defaults to `<data_path>/flows` but can be overridden using `Config.flow_path` or the `FLOW_PATH`\nenvironment variable.\n\n### Function Path\nThe api-flow template mechanism provides support for extremely simple functions, and renders their output as the\ntemplate substitution.  Two built-in functions are currently provided:\n\n- `random(maxval)` produces a stringified random number in the range [0-maxval).  The string is fixed-width and\nzero-padded to the digit width of maxval-1.\n- `uuid()` produces a random UUID in v4 format.\n\nUsers may also supply their own functions in the `functions` directory. To be usable, you must have an `__init__.py` file\nin the functions directory to make it visible as a module. The available functions (whether defined here or not) must\nbe exposed in the `__init__` file as well. If an unrecognized function is encountered in a template, this is where\napi-flow will try to find it.\n\nFunctions are of the form:\n```python\ndef my_custom_function(context, <...other args>):\n    <implementation here>\n    return \"some-stringable-value\"\n```\n\nFunctions must be extremely basic. Their arguments (if any) must be expressible as JSON primitives, and their return\nvalues must be convertible to `str`. Keyword args are not supported. It is also not possible to perform any nested\ntemplate substitution when calling a function. This last limitation is mitigated somewhat by the fact that the \ncurrent context is passed as the first parameter of the function.\n\nThe function path defaults to `<data_path>/functions` but can be overridden using `Config.function_path` or the\n`FUNCTION_PATH` environment variable.\n\n### Profile Path\nProfiles are a base set of variables exposed to your scripts. You can use them to set up static data your flow needs.\nProfiles are defined in YAML files, which _must_ be dictionary-shaped at the root. \n\nYou may provide profiles when constructing a `Flow` object or using the `execute` convenience command. Multiple profiles \ncan be combined in a single flow run, and subdirectories are supported for organization.  When specifying profiles,\nomit the `.yaml` extension.\n\n#### Example:\n```text\nflow = execute('my_flow', profiles=['environment/stable', 'variant/green'])\n```\nThis will load, e.g., `environment/stable.yaml` from the profiles directory and merge the values it contains into a\ncommon context. Values in profiles specified later in the list take precedence over earlier ones, and if a single\nprofile is specified in the `profile=` option, that will take the highest precedence.\n\nThe profile path defaults to `<data_path>/profiles` but can be overridden using `Config.profile_path` or the \n`PROFILE_PATH` environment variable.\n\n### Template Path\nTemplates are text files (of any sort) that can contain markup for substitution, (e.g., `My variable is {? my_var ?}`).\nThis directory contains a collection of body (or other) templates in JSON format.  It defaults to\n`{DATA_PATH}/templates` but can be overridden by the `TEMPLATES_PATH` environment variable.  You can reference a\ntemplate file in flow configuration by using the value `template:template_filename` in the flow YAML.  So you can define\na flow step where the body is a template:\n\n```yaml\nmy_step:\n  url: http://my-endpoint\n  method: POST\n  body: template:my-step-body.json\n```\n\nWhen the step is executed, `my-step-body.json` will be read in from the templates directory and substitutions will be\nperformed on any `{? substitution_tags ?}` inside. The result will be returned as\nthe `body` value.\n\n## Running Flows\nIt is possible to construct an instance of the `Flow` class exported from api-flow directly, but it is easier to use\nthe `execute` convenience function:\n\n```python\nfrom api_flow import execute\n\nflow = execute('my_cool_flow', profile='my_environment')\n```\n\nThe arguments to `execute` are the same as those to the Flow constructor. This example will load and \nrun `my_cool_flow` with the `my_environment` profile and return the constructed `Flow` object, which \nyou can then use to extract the outputs for further use.\n\nDuring the run, request and response data will be output to the console for diagnostic purposes.\n\n## Running From CLI\nThe package includes a command-line module, which you can run using `python -m api_flow`.\nThis will be useful for executing automated API processes when you are not testing the\nresults. The same configuration options are available in the CLI as using `execute`.\n\nRun `python -m api_flow -h` for details.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/rothomas/api_flow.git",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "api-flow",
+    "package_url": "https://pypi.org/project/api-flow/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/api-flow/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/rothomas/api_flow/issues",
+      "Homepage": "https://github.com/rothomas/api_flow.git"
+    },
+    "release_url": "https://pypi.org/project/api-flow/0.5.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "A utility for running flows of chained API calls",
+    "version": "0.5.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13049194,
+  "releases": {
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a06bd6a3cfdd8c5c603c8e7f6d35f36d413bdafae7e8340187f3f4c87a71bc85",
+          "md5": "20bea182d342d607fee7bded8a9e19cf",
+          "sha256": "ca00144bdf34d97c7132c39637f7c2b630794ba6be75861c69ddd58115cbb3d7"
+        },
+        "downloads": -1,
+        "filename": "api_flow-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "20bea182d342d607fee7bded8a9e19cf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 22523,
+        "upload_time": "2022-03-01T19:57:31",
+        "upload_time_iso_8601": "2022-03-01T19:57:31.478659Z",
+        "url": "https://files.pythonhosted.org/packages/a0/6b/d6a3cfdd8c5c603c8e7f6d35f36d413bdafae7e8340187f3f4c87a71bc85/api_flow-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f059fd16adc3a7bc426bcd2ae8701da024494c16203d3a611f4dfdc385226e05",
+          "md5": "001d604f5a10a4c940e6ed462e6cf659",
+          "sha256": "71befe1a254b4587728d9ba995ae43acf822712c3bb0c496131662c572aee9b2"
+        },
+        "downloads": -1,
+        "filename": "api-flow-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "001d604f5a10a4c940e6ed462e6cf659",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25456,
+        "upload_time": "2022-03-01T19:57:33",
+        "upload_time_iso_8601": "2022-03-01T19:57:33.375568Z",
+        "url": "https://files.pythonhosted.org/packages/f0/59/fd16adc3a7bc426bcd2ae8701da024494c16203d3a611f4dfdc385226e05/api-flow-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a06bd6a3cfdd8c5c603c8e7f6d35f36d413bdafae7e8340187f3f4c87a71bc85",
+        "md5": "20bea182d342d607fee7bded8a9e19cf",
+        "sha256": "ca00144bdf34d97c7132c39637f7c2b630794ba6be75861c69ddd58115cbb3d7"
+      },
+      "downloads": -1,
+      "filename": "api_flow-0.5.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "20bea182d342d607fee7bded8a9e19cf",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 22523,
+      "upload_time": "2022-03-01T19:57:31",
+      "upload_time_iso_8601": "2022-03-01T19:57:31.478659Z",
+      "url": "https://files.pythonhosted.org/packages/a0/6b/d6a3cfdd8c5c603c8e7f6d35f36d413bdafae7e8340187f3f4c87a71bc85/api_flow-0.5.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f059fd16adc3a7bc426bcd2ae8701da024494c16203d3a611f4dfdc385226e05",
+        "md5": "001d604f5a10a4c940e6ed462e6cf659",
+        "sha256": "71befe1a254b4587728d9ba995ae43acf822712c3bb0c496131662c572aee9b2"
+      },
+      "downloads": -1,
+      "filename": "api-flow-0.5.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "001d604f5a10a4c940e6ed462e6cf659",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 25456,
+      "upload_time": "2022-03-01T19:57:33",
+      "upload_time_iso_8601": "2022-03-01T19:57:33.375568Z",
+      "url": "https://files.pythonhosted.org/packages/f0/59/fd16adc3a7bc426bcd2ae8701da024494c16203d3a611f4dfdc385226e05/api-flow-0.5.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

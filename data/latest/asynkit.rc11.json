@@ -1,0 +1,582 @@
+{
+  "info": {
+    "author": "Kristján Valur Jónsson",
+    "author_email": "sweskman@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Framework :: AsyncIO",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# asynkit: a toolkit for coroutines\n\n[![CI](https://github.com/kristjanvalur/py-asynkit/actions/workflows/ci.yml/badge.svg)](https://github.com/kristjanvalur/py-asynkit/actions/workflows/ci.yml)\n\nThis module provides some handy tools for those wishing to have better control over the\nway Python's `asyncio` module does things.\n\n- Helper tools for controlling coroutine execution, such as `CoroStart` and `Monitor`\n- Utility classes such as `GeneratorObject`\n- Coroutine helpers such as `coro_iter()`\n- `asyncio` event-loop extensions\n- _eager_ execution of Tasks\n- Limited support for `anyio` and `trio`.\n\n# Installation\n\n```bash\n$ pip install asynkit\n```\n\n# Coroutine Tools\n\n## `eager()` - lower latency IO\n\nDid you ever wish that your _coroutines_ started right away, and only returned control to\nthe caller once they become blocked?  Like the way the `async` and `await` keywords work in the __C#__ language?\n\nNow they can. Just decorate or convert them with `acynkit.eager`:\n\n```python\n@asynkit.eager\nasync def get_slow_remote_data():\n    result = await execute_remote_request()\n    return result.important_data\n\nasync def my_complex_thing():\n    # kick off the request as soon as possible\n    future = get_slow_remote_data()\n    # The remote execution may now already be in flight. Do some work taking time\n    intermediate_result = await some_local_computation()\n    # wait for the result of the request\n    return compute_result(intermediate_result, await future)\n```\n\nBy decorating your function with `eager`, the coroutine will start executing __right away__ and\ncontrol will return to the calling function as soon as it _suspends_, _returns_, or _raises_\nan exception. In case it is suspended, a _Task_ is created and returned, ready to resume\nexecution from that point.\n\nNotice how, in either case, control is returned __directly__ back to the\ncalling function, maintaining synchronous execution. In effect, conventional code\ncalling order is maintained as much as possible. We call this _depth-first-execution_.\n\nThis allows you to prepare and dispatch long running operations __as soon as possible__ while\nstill being able to asynchronously wait for the result.\n\n`asynckit.eager` can also be used directly on the returned coroutine:\n```python\nlog = []\nasync def test():\n    log.append(1)\n    await asyncio.sleep(0.2) # some long IO\n    log.append(2)\n\nasync def caller(convert):\n    del log[:]\n    log.append(\"a\")\n    future = convert(test())\n    log.append(\"b\")\n    await asyncio.sleep(0.1) # some other IO\n    log.append(\"c\")\n    await future\n\n# do nothing\nasyncio.run(caller(lambda c:c))\nassert log == [\"a\", \"b\", \"c\", 1, 2]\n\n# Create a Task\nasyncio.run(caller(asyncio.create_task))\nassert log == [\"a\", \"b\", 1, \"c\", 2]\n\n# eager\nasyncio.run(caller(asynkit.eager))\nassert log == [\"a\", 1, \"b\", \"c\", 2]\n```\n\n`eager()` is actually a convenience function, invoking either `coro_eager()` or `func_eager()` (see below) depending on context.\nDecorating your function makes sense if you __always__ intend\nTo _await_ its result at some later point. Otherwise, just apply it at the point\nof invocation in each such case. \n\n## `coro_eager()`, `func_eager()`\n\n`coro_eager()` is the magic coroutine wrapper providing the __eager__ behaviour:\n\n1. It copies the current _context_\n1. It initializes a `CoroStart()` object for the coroutine, starting it in the copied context.\n2. If it subsequently is `done()` It returns `CoroStart.as_future()`, ortherwise\n   it creates and returns a `Task` (using `asyncio.create_task` by default.)\n\nThe result is an _awaitable_ which can be either directly awaited or passed\nto `asyncio.gather()`. The coroutine is executed in its own copy of the current context,\njust as would happen if it were directly turned into a `Task`.\n\n`func_eager()` is a decorator which automatically applies `coro_eager()` to the coroutine returned by an async function.\n\n## `CoroStart`\n\nThis class manages the state of a partially run coroutine and is what what powers the `coro_eager()` function. \nWhen initialized, it will _start_ the coroutine, running it until it either suspends, returns, or raises\nan exception.\n\nSimilarly to a `Future`, it has these methods:\n\n- `done()` - returns `True` if the coroutine finished without blocking. In this case, the following two methods may be called to get the result.\n- `result()` - Returns the _return value_ of the coroutine or **raises** any _exception_ that it produced.\n- `exception()` - Returns any _exception_ raised, or `None` otherwise.\n\n But more importly it has these:\n\n- `as_coroutine()` - Returns an coroutine encapsulating the original coroutine's _continuation_.\n  If it has already finished, awaiting this coroutine is the same as calling `result()`, otherwise it continues the original coroutine's execution.\n- `as_future()` - If `done()`, returns a `Future` holding its result, otherwise, a `RuntimeError`\n  is raised. This is suitable for using with\n  `asyncio.gather()` to avoid wrapping the result of an already completed coroutine into a `Task`.\n- `as_awaitable()` - If `done()`, returns `as_future()`, else returns `as_coroutine()`.\n  This is a convenience method for use with functions such as `asyncio.gather()`. \n\nCoroStart can be provided with a `contextvars.Context` object, in which case the coroutine will be run using that\ncontext.\n\n## Context helper\n\n`coro_await()` is a helper function to await a coroutine, optionally with a `contextvars.Context`\nobject to activate:\n\n```python\nvar1 = contextvars.ContextVar(\"myvar\")\n\nasync def my_method():\n    var1.set(\"foo\")\n    \nasync def main():\n    context=contextvars.copy_context()\n    var1.set(\"bar\")\n    await asynkit.coro_await(my_method(), context=context)\n    # the coroutine didn't modify _our_ context\n    assert var1.get() == \"bar\"\n    # ... but it did modify the copied context\n    assert context.get(var1) == \"foo\"\n```\n\nThis is similar to `contextvars.Context.run()` but works for async functions.  This function is\nimplemented using `CoroStart`\n\n## `coro_iter` - helper for `__await__` methods\n\nThis helper function returns an `Generator` for a coroutine.  This is useful, if one\nwants to make an object _awaitable_ via the `__await__` method, which must only\nreturn `Iterator` objects.\n\n```python\nclass Awaitable:\n    def __init__(self, cofunc):\n        self.cofunc = cofunc\n    def __await__(self):\n        return asynkit.coro_iter(self.cofunc())\n\nasync def main():\n    async def sleeper():\n        await asyncio.sleep(1)\n    a = Awaitable(sleeper)\n    await a  # sleep once\n    await a  # sleep again\n\nasyncio.run(main())\n```\nUnlike a regular _coroutine_ (the result of calling a _coroutine function_), an object with an `__await__` method can potentially be awaited multiple times.\n\n## `Monitor`\n\nA `Monitor` object can be used to await a coroutine, while listening for _out of band_ messages\nfrom the coroutine.  As the coroutine sends messages, it is suspended, until the caller resumes\nawaiting for it.\n\n```python\nasync def coro(monitor):\n    await monitor.oob(\"hello\")\n    await asyncio.sleep(0)\n    await monitor.oob(\"dolly\")\n    return \"done\"\n\nasync def runner():\n    m = Monitor()\n    c = coro(m)\n    while True:\n        try:\n            print(await m.aawait(c))\n        except OOBData as oob:\n            print(oob.data)\n```\n\nwhich will result in the output\n\n```\nhello\ndolly\ndone\n```\n\nThe caller can also pass in _data_ to the coroutine via the `Monitor.aawait(coro, data=None)` method and\nit will become the _return value_ of the `Monitor.oob()` call in the coroutine.\n`Monitor.athrow()` can be used to raise an exception inside the coroutine.\nNeither data nor an exception can be sent the first time the coroutine is awaited, \nonly as a response to a previous `OOBData` exception.\n\nIf no data is to be sent (the common case), an _awaitable_ object can be generated to simplify\nthe syntax:\n\n```python\nm = Monitor()\na = m.awaitable(coro(m))\nwhile True:\n    try:\n        return await a\n    except OOBData as oob:\n        handle_oob(oob.data)\n```\nThe returned awaitable is a `MonitorAwaitable` instance, and it can also be created\ndirectly:\n\n```python\na = MonitorAwaitable(m, coro(m))\n```\n\nA `Monitor` can be used when a coroutine wants to suspend itself, maybe waiting for some extenal\ncondition, without resorting to the relatively heavy mechanism of creating, managing and synchronizing\n`Task` objects.  This can be useful if the coroutine needs to maintain state.\n\nConsider the following scenario. A _parser_ wants to read a line from a buffer, but fails, signalling\nthis to the monitor:\n\n```python\n    async def readline(m, buffer):\n        l = buffer.readline()\n        while not l.endswith(\"\\n\"):\n            await m.oob(None)  # ask for more data in the buffer\n            l += buffer.readline()\n        return l\n\n    async def manager(buffer, io):\n        m = Monitor()\n        a = m.awaitable(readline(m, buffer))\n        while True:\n            try:\n                return await a\n            except OOBData:\n                try:\n                    buffer.fill(await io.read())\n                except Exception as exc:\n                    await m.athrow(c, exc)\n```\n\nIn this example, `readline()` is trivial, but if it were a complicated parser with hierarchical\ninvocation structure, then this pattern allows the decoupling of IO and the parsing of buffered data, maintaining the state of the parser while _the caller_ fills up the buffer.\n\n## `GeneratorObject`\n\nA `GeneratorObject` builds on top of the `Monitor` to create an `AsyncGenerator`.  It is in many ways\nsimilar to an _asynchronous generator_ constructed using the _generator function_ syntax.\nBut wheras those return values using the `yield` _keyword_,\na GeneratorObject has an `ayield()` _method_, which means that data can be sent to the generator\nby anyone, and not just by using `yield`, which makes composing such generators much simpler.\n\nThe `GeneratorObject` leverages the `Monitor.oob()` method to deliver the _ayielded_ data to whomever is iterating over it:\n\n```python\nasync def generator(gen_obj):\n    # yield directly to the generator\n    await gen_obj.ayield(1):\n    # have someone else yield to it\n    async def helper():\n        await gen_obj.ayield(2)\n    await asyncio.create_task(helper())\n\nasync def runner():\n    gen_obj = GeneratorObject()\n    values = [val async for val in gen_obj(generator(gen_obj))]\n    assert values == [1, 2]\n```\n\nThe `GeneratorObject`, when called, returns a `GeneratorObjectIterator` which behaves in\nthe same way as an `AsyncGenerator` object.  It can be iterated over and supports the\n`asend()`, `athrow()` and `aclose()` methods.\n\nA `GeneratorObject` is a flexible way to asynchronously generate results without\nresorting to `Task` and `Queue` objects.\n\n\n# Event loop tools\n\nAlso provided is a mixin for the built-in event loop implementations in python, providing some primitives for advanced\nscheduling of tasks.\n\n## `SchedulingMixin` mixin class\n\nThis class adds some handy scheduling functions to the event loop. They primarily\nwork with the _ready queue_, a queue of callbacks representing tasks ready\nto be executed.\n\n- `ready_len(self)` - returns the length of the ready queue\n- `ready_pop(self, pos=-1)` - pops an entry off the queue\n- `ready_insert(self, pos, element)` - inserts a previously popped element into the queue\n- `ready_rotate(self, n)` - rotates the queue\n- `call_insert(self, pos, ...)` - schedules a callback at position `pos` in the queue\n\n## Concrete event loop classes\n\nConcrete subclasses of Python's built-in event loop classes are provided.\n\n- `SchedulingSelectorEventLoop` is a subclass of `asyncio.SelectorEventLoop` with the `SchedulingMixin`\n- `SchedulingProactorEventLoop` is a subclass of `asyncio.ProactorEventLoop` with the `SchedulingMixin` on those platforms that support it.\n\n## Event Loop Policy\n\nA policy class is provided to automatically create the appropriate event loops.\n\n- `SchedulingEventLoopPolicy` is a subclass of `asyncio.DefaultEventLoopPolicy` which instantiates either of the above event loop classes as appropriate.\n\nUse this either directly:\n\n```python\nasyncio.set_event_loop_policy(asynkit.SchedulingEventLoopPolicy())\nasyncio.run(myprogram())\n```\n\nor with a context manager:\n\n```python\nwith asynkit.event_loop_policy():\n    asyncio.run(myprogram())\n```\n\n## Scheduling functions\n\nA couple of functions are provided making use of these scheduling features.\nThey require a `SchedulingMixin` event loop to be current.\n\n### `sleep_insert(pos)`\n\nSimilar to `asyncio.sleep()` but sleeps only for `pos` places in the runnable queue.\nWhereas `asyncio.sleep(0)` will place the executing task at the end of the queue, which is\nappropriate for fair scheduling, in some advanced cases you want to wake up sooner than that, perhaps\nafter a specific task.\n\n### `task_reinsert(task, pos)`\n\nTakes a _runnable_ task (for example just created with `asyncio.create_task()` or similar) and\nreinserts it at a given position in the queue. \nSimilarly as for `sleep_insert()`, this can be useful to achieve\ncertain scheduling goals.\n\n### `task_switch(task, *, insert_pos=None)`\n\nImmediately moves the given task to the head of the ready queue and switches to it, assuming it is runnable.\nIf `insert_pos is not None`, the current task will be\nput to sleep at that position, using `sleep_insert()`. Otherwise the current task is put at the end\nof the ready queue.  If `insert_pos == 1` the current task will be inserted directly after the target\ntask, making it the next to be run.  If `insert_pos == 0`, the current task will execute _before_ the target.\n\n### `task_is_blocked(task)`\n\nReturns True if the task is waiting for some awaitable, such as a Future or another Task, and is thus not\non the ready queue.\n\n### `task_is_runnable(task)`\n\nRoughly the opposite of `task_is_blocked()`, returns True if the task is neither `done()` nor __blocked__ and\nawaits execution.\n\n### `create_task_descend(coro)`\n\nImplements depth-first task scheduling.\n\nSimilar to `asyncio.create_task()` this creates a task but starts it running right away, and positions the caller to be woken\nup right after it blocks. The effect is similar to using `asynkit.eager()` but\nit achieves its goals solely by modifying the runnable queue. A `Task` is always\ncreated, unlike `eager`, which only creates a task if the target blocks.\n\n## Runnable task helpers\n\nA few functions are added to help working with tasks.\nThey require a `SchedulingMixin` event loop to be current.\n\nThe following identity applies:\n```python\nasyncio.all_tasks(loop) = asynkit.runnable_tasks(loop) | asynkit.blocked_tasks(loop) | {asyncio.current_task(loop)}\n```\n\n### `runnable_tasks(loop=None)`\n\nReturns a set of the tasks that are currently runnable in the given loop\n\n### `blocked_tasks(loop=None)`\n\nReturns a set of the tasks that are currently blocked on some future in the given loop.\n\n# Coroutine helpers\n\nA couple of functions are provided to introspect the state of coroutine objects. They\nwork on both regular __async__ coroutines, __classic__ coroutines (using `yield from`) and\n__async generators__.\n\n- `coro_is_new(coro)` -\n  Returns true if the object has just been created and hasn't started executing yet\n\n- `coro_is_suspended(coro)` - Returns true if the object is in a suspended state.\n\n- `coro_is_done(coro)` - Returns true if the object has finished executing, e.g. by returning or raising an exception.\n\n- `coro_get_frame(coro)` - Returns the current frame object of the coroutine, if it has one, or `None`.\n\n# `anyio` support\n\nThe library has been tested to work with the `anyio`.  However, not everything is supported on the `trio` backend.\nCurrently only the `asyncio` backend can be assumed to work reliably.\n\nWhen using the asyncio backend, the module `asynkit.experimental.anyio` can be used, to provide \"eager\"-like\nbehaviour to task creation.  It will return an `EagerTaskGroup` context manager:\n\n```python\nfrom asynkit.experimental.anyio import create_eager_task_group\nfrom anyio import run, sleep\n\nasync def func(task_status):\n    print(\"hello\")\n    task_status->started(\"world\")\n    await sleep(0.01)\n    print(\"goodbye\")\n\nasync def main():\n\n    async with create_eager_task_group() as tg:\n        start = tg.start(func)\n        print(\"fine\")\n        print(await start)\n    print (\"world\")\n\nrun(main, backend=\"asyncio\")\n```\n\nThis will result in the following output:\n\n```\nhello\nfine\nworld\ngoodbye\nworld\n```\n\nThe first part of the function `func` is run even before calling `await` on the result from `EagerTaskGroup.start()`\n\nSimilarly, `EagerTaskGroup.start_soon()` will run the provided coroutine up to its first blocking point before\nreturning.\n\n## `trio` limitations\n\n`trio` differs significantly from `asyncio` and therefore enjoys only limited support.\n\n- The event loop is completely different and proprietary and so the event loop extensions don't work\n  for `trio`.\n\n- `CoroStart` when used with `Task` objects, such as by using `EagerTaskGroup`,\n  does not work reliably with `trio`.\n  This is because the syncronization primitives\n  are not based on `Future` objects but rather perform `Task`-based actions both before going to sleep\n  and upon waking up.  If a `CoroStart` initially blocks on a primitive such as `Event.wait()` or\n  `sleep(x)` it will be surprised and throw an error when it wakes up on in a different\n  `Task` than when it was in when it fell asleep.\n\n`CoroStart` works by intercepting a `Future` being passed up via the `await` protocol to \nthe event loop to perform the task scheduling.  If any part of the task scheduling has happened\nbefore this, and the _continuation_ happens on a different `Task` then things may break\nin various ways.   For `asyncio`, the event loop never sees the `Future` object until\n`as_coroutine()` has been called and awaited, and so if this happens in a new task, all is good.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/kristjanvalur/py-asynkit",
+    "keywords": "asyncio,eventloop",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "asynkit",
+    "package_url": "https://pypi.org/project/asynkit/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/asynkit/",
+    "project_urls": {
+      "Homepage": "https://github.com/kristjanvalur/py-asynkit",
+      "Repository": "https://github.com/kristjanvalur/py-asynkit"
+    },
+    "release_url": "https://pypi.org/project/asynkit/0.7.0/",
+    "requires_dist": [
+      "typing-extensions (>=4.4.0,<5.0.0)"
+    ],
+    "requires_python": ">=3.7,<4.0",
+    "summary": "Async toolkit for advanced scheduling",
+    "version": "0.7.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17452613,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3d93bb5729db424c14dccf3a8b4412c91750985ee3daf2f765ff44a2c5fa378",
+          "md5": "a04be0efa8034e907c905c17739398b9",
+          "sha256": "9f7644fdc0b3158951a5bd247e25fb8c9d299f380e1ef4ba841e7b930a88ba15"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a04be0efa8034e907c905c17739398b9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5835,
+        "upload_time": "2022-05-18T10:25:41",
+        "upload_time_iso_8601": "2022-05-18T10:25:41.716326Z",
+        "url": "https://files.pythonhosted.org/packages/a3/d9/3bb5729db424c14dccf3a8b4412c91750985ee3daf2f765ff44a2c5fa378/asynkit-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b35fbbf00a65d7557154adf73d3010c9629ef123579084d45c8d02bb0ae76b0",
+          "md5": "799e8274d758eabe4c2ea7090643ea78",
+          "sha256": "cde753b2397db9f3fcd9493d0998fd9907bdb511779a60fc042c6e54cd29c27b"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "799e8274d758eabe4c2ea7090643ea78",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5017,
+        "upload_time": "2022-05-18T10:25:42",
+        "upload_time_iso_8601": "2022-05-18T10:25:42.882416Z",
+        "url": "https://files.pythonhosted.org/packages/0b/35/fbbf00a65d7557154adf73d3010c9629ef123579084d45c8d02bb0ae76b0/asynkit-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e00be3ec11c67224c4ca3e6eec6fed16e93f73ad49dbcdc757aa75b505ae1f3b",
+          "md5": "cef14d0dc81f289670245ec0ad53df9e",
+          "sha256": "ff78e4febcb23fef92fb36fd31b636e2ae26138f067b6982702d53679c4fcadc"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cef14d0dc81f289670245ec0ad53df9e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5998,
+        "upload_time": "2022-05-18T10:41:39",
+        "upload_time_iso_8601": "2022-05-18T10:41:39.560335Z",
+        "url": "https://files.pythonhosted.org/packages/e0/0b/e3ec11c67224c4ca3e6eec6fed16e93f73ad49dbcdc757aa75b505ae1f3b/asynkit-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "31ba876bb9bb0fe04363d6b9470a879eb2437a63acf9afb263904090e19806df",
+          "md5": "763497c3b30c093135fa4d06626a20e7",
+          "sha256": "58a1d7668042273a3f859928eae16c69419138cbc5cdea07fa1d0737ff9ba754"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "763497c3b30c093135fa4d06626a20e7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5384,
+        "upload_time": "2022-05-18T10:41:40",
+        "upload_time_iso_8601": "2022-05-18T10:41:40.840803Z",
+        "url": "https://files.pythonhosted.org/packages/31/ba/876bb9bb0fe04363d6b9470a879eb2437a63acf9afb263904090e19806df/asynkit-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb31a24bb59ad170f0c408472557e21b0764028be42e84ccf3b27a356a44a7d4",
+          "md5": "7a33ff9f2af7e94d819c4b00b749d055",
+          "sha256": "42dd8e926fdea64621fb573f345bc6ad96cf1c56b89aaa8e9cee252cac3647d7"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7a33ff9f2af7e94d819c4b00b749d055",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8584,
+        "upload_time": "2022-05-22T11:38:10",
+        "upload_time_iso_8601": "2022-05-22T11:38:10.439568Z",
+        "url": "https://files.pythonhosted.org/packages/bb/31/a24bb59ad170f0c408472557e21b0764028be42e84ccf3b27a356a44a7d4/asynkit-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "45709b10fb4c10d9be3c4dfaeb9e1d2d7c4f5c132b6c804feb73cab322f62e68",
+          "md5": "1873bfe10ccf3e6f0db04a82caf964a4",
+          "sha256": "fff2b4d8616e26a0b9baca14a19c875751770db53742f36f5bc2f977434877bd"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1873bfe10ccf3e6f0db04a82caf964a4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8697,
+        "upload_time": "2022-05-22T11:38:11",
+        "upload_time_iso_8601": "2022-05-22T11:38:11.901220Z",
+        "url": "https://files.pythonhosted.org/packages/45/70/9b10fb4c10d9be3c4dfaeb9e1d2d7c4f5c132b6c804feb73cab322f62e68/asynkit-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68de723ecaa58f003befeb5106c73930272daf0b1f46c59faf0233ad628efb6b",
+          "md5": "c4128a314aee9a13bcd809eb3dc6e4ce",
+          "sha256": "72e2aa0b505c006d96280be21c8bd5eca73ecb4d74dd687c5204e6a2bbcad259"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c4128a314aee9a13bcd809eb3dc6e4ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9356,
+        "upload_time": "2022-05-26T11:53:00",
+        "upload_time_iso_8601": "2022-05-26T11:53:00.923821Z",
+        "url": "https://files.pythonhosted.org/packages/68/de/723ecaa58f003befeb5106c73930272daf0b1f46c59faf0233ad628efb6b/asynkit-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fc7b33f26a84b380e8431105b6ee5afe2557a20f35d4598370ef5d0de40d87a8",
+          "md5": "09969fd288984451462dfeaa9a188585",
+          "sha256": "30df80f47c987d8266be2107bd3ec9b54f8c1be5a5645cf72db3f8d325bde01c"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "09969fd288984451462dfeaa9a188585",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9585,
+        "upload_time": "2022-05-26T11:53:02",
+        "upload_time_iso_8601": "2022-05-26T11:53:02.689640Z",
+        "url": "https://files.pythonhosted.org/packages/fc/7b/33f26a84b380e8431105b6ee5afe2557a20f35d4598370ef5d0de40d87a8/asynkit-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b04a8256fdcf0deea4ef77bcc11677988e61205d7dc66b138c7778ad1030dae3",
+          "md5": "dacbc117e1e5be512af7aa5c49c1721c",
+          "sha256": "8427e9f3be8c546d556487af27454665bfff01f1318c7ea2d07bea7084743592"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dacbc117e1e5be512af7aa5c49c1721c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9944,
+        "upload_time": "2022-05-30T08:18:06",
+        "upload_time_iso_8601": "2022-05-30T08:18:06.517420Z",
+        "url": "https://files.pythonhosted.org/packages/b0/4a/8256fdcf0deea4ef77bcc11677988e61205d7dc66b138c7778ad1030dae3/asynkit-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "00cfeb52ae635ff4841706ed9decc908cf0ba5dd25ffa794516b0117ddbdc03b",
+          "md5": "4c65026515bc7b02a3cc15619ab823a1",
+          "sha256": "3b353ac7c3273e2bd9d872da6b4ed13f3de6a1bb5078fe8b23af127220f13fd5"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c65026515bc7b02a3cc15619ab823a1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 11991,
+        "upload_time": "2022-05-30T08:18:07",
+        "upload_time_iso_8601": "2022-05-30T08:18:07.960894Z",
+        "url": "https://files.pythonhosted.org/packages/00/cf/eb52ae635ff4841706ed9decc908cf0ba5dd25ffa794516b0117ddbdc03b/asynkit-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f32c8fcd8dd273796230fb94509afbcc79ab90cef9d6027a27fa67f2c2c421bf",
+          "md5": "9780c24d50424b64502de80e6c871016",
+          "sha256": "3e10e50440a51c185fb74b22566043b9c76dd0607a61f7fd088675cfd23fd1f2"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9780c24d50424b64502de80e6c871016",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 10898,
+        "upload_time": "2022-06-14T22:47:10",
+        "upload_time_iso_8601": "2022-06-14T22:47:10.870005Z",
+        "url": "https://files.pythonhosted.org/packages/f3/2c/8fcd8dd273796230fb94509afbcc79ab90cef9d6027a27fa67f2c2c421bf/asynkit-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ea82266ddfc7dcfd1a1523e2b23263cf57f85d8929c19e30d2e4d88e64e1b637",
+          "md5": "2b4622aa25dfb6b57a8732da97a5e773",
+          "sha256": "030d9263f5303295935f41352cea1410957348bdc17a04b0a49fec9c0f4e3588"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2b4622aa25dfb6b57a8732da97a5e773",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 13385,
+        "upload_time": "2022-06-14T22:47:12",
+        "upload_time_iso_8601": "2022-06-14T22:47:12.479617Z",
+        "url": "https://files.pythonhosted.org/packages/ea/82/266ddfc7dcfd1a1523e2b23263cf57f85d8929c19e30d2e4d88e64e1b637/asynkit-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a7babba948836697457d3047606c7420db61cb269e1be74a90a1d75730abafe1",
+          "md5": "e68ddee8bd0cc18d241e15bbf068f815",
+          "sha256": "0eef95a7d9071e6e24b4ecf67074d47b9e272c1c51b977d4c9ad051a8288bfc1"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e68ddee8bd0cc18d241e15bbf068f815",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 11057,
+        "upload_time": "2022-11-07T09:44:28",
+        "upload_time_iso_8601": "2022-11-07T09:44:28.957515Z",
+        "url": "https://files.pythonhosted.org/packages/a7/ba/bba948836697457d3047606c7420db61cb269e1be74a90a1d75730abafe1/asynkit-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "34271afd0fe84faa0705b9d6c1b90d0995390abeff643a98a7c07392a37139a0",
+          "md5": "9038963e56b1802417930b2928cf0b3f",
+          "sha256": "335b3756e56b0a2aff52082327df71793e3aa34fe1171a8e5d7500be49328051"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9038963e56b1802417930b2928cf0b3f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 13423,
+        "upload_time": "2022-11-07T09:44:30",
+        "upload_time_iso_8601": "2022-11-07T09:44:30.719051Z",
+        "url": "https://files.pythonhosted.org/packages/34/27/1afd0fe84faa0705b9d6c1b90d0995390abeff643a98a7c07392a37139a0/asynkit-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3ed66cd3ffa7a31e47c184a05a138e40f2eaa73e38c2031167d300cd8404b24",
+          "md5": "d55b5e8f19e5f5d50d7ae7e9311cd8a9",
+          "sha256": "a8fb179317c98e2ece44b03d74ae797aa74cb22c1ea0890e085a92b95a11b825"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d55b5e8f19e5f5d50d7ae7e9311cd8a9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 11231,
+        "upload_time": "2022-12-09T12:47:31",
+        "upload_time_iso_8601": "2022-12-09T12:47:31.811365Z",
+        "url": "https://files.pythonhosted.org/packages/c3/ed/66cd3ffa7a31e47c184a05a138e40f2eaa73e38c2031167d300cd8404b24/asynkit-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f20b7e49380f6b9dcd72a5bd1b573648c77d193d4a420a01dee7a8475b4bb7b0",
+          "md5": "dd0974986fd3fde48a27b50228843b53",
+          "sha256": "a4f1eefb7c3c38cb980596a20f5484b2d43ab65b9699331afe1b29a70c2d9b25"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dd0974986fd3fde48a27b50228843b53",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 13537,
+        "upload_time": "2022-12-09T12:47:33",
+        "upload_time_iso_8601": "2022-12-09T12:47:33.293183Z",
+        "url": "https://files.pythonhosted.org/packages/f2/0b/7e49380f6b9dcd72a5bd1b573648c77d193d4a420a01dee7a8475b4bb7b0/asynkit-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a1e2a4c5b6740a4ea76fcfbbd86938c421c6411ae9352204737bb535c8d79f62",
+          "md5": "b0e63e6440bdd9a42d03f2a9a4accc41",
+          "sha256": "d0290980364ce1d56c55056a2233e4d3e26d9a6f648278bfb661c5d8ea1dd6bf"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0e63e6440bdd9a42d03f2a9a4accc41",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 12094,
+        "upload_time": "2023-01-11T18:29:58",
+        "upload_time_iso_8601": "2023-01-11T18:29:58.661857Z",
+        "url": "https://files.pythonhosted.org/packages/a1/e2/a4c5b6740a4ea76fcfbbd86938c421c6411ae9352204737bb535c8d79f62/asynkit-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "070798c46f6ef851d8e14abf17c68a679f65ea503120f221d5a721b018bc4170",
+          "md5": "835593eb14d86a22833090412e8d96cd",
+          "sha256": "97b6559c3f5ebb46fecb481464a44090ed537aa47d97c54615da5f281768fe0b"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "835593eb14d86a22833090412e8d96cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 14802,
+        "upload_time": "2023-01-11T18:29:59",
+        "upload_time_iso_8601": "2023-01-11T18:29:59.776192Z",
+        "url": "https://files.pythonhosted.org/packages/07/07/98c46f6ef851d8e14abf17c68a679f65ea503120f221d5a721b018bc4170/asynkit-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04a96303496582ccb994714207bd856133aaef21c3328e2ed0b85673bc57a9d4",
+          "md5": "0c6830241a01aa6dfc2584d4dae51217",
+          "sha256": "3058780860fd8ec0465985667ed5f3750d28ac196d68ce882bfeb7126d45d2ea"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0c6830241a01aa6dfc2584d4dae51217",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 19399,
+        "upload_time": "2023-01-28T19:20:04",
+        "upload_time_iso_8601": "2023-01-28T19:20:04.687033Z",
+        "url": "https://files.pythonhosted.org/packages/04/a9/6303496582ccb994714207bd856133aaef21c3328e2ed0b85673bc57a9d4/asynkit-0.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e95ea449ed026af482988db75e813eccc94732229e997765954b4ba6eb8070c8",
+          "md5": "db85e4f39320957de9f3474fc4015520",
+          "sha256": "88b7aa2d1e5ebeee4d50fa59ee049b0d98011102bd67ff71d95565bef92be83b"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db85e4f39320957de9f3474fc4015520",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 23989,
+        "upload_time": "2023-01-28T19:20:06",
+        "upload_time_iso_8601": "2023-01-28T19:20:06.522301Z",
+        "url": "https://files.pythonhosted.org/packages/e9/5e/a449ed026af482988db75e813eccc94732229e997765954b4ba6eb8070c8/asynkit-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e87cdfbbfda0080445bb32650d74c2a7f2afe60653e387a79d2312a096978d19",
+          "md5": "3bd17f92a9217613f133ffd0f4e96664",
+          "sha256": "140bd34ff865195ebd113ec4578401535e2b3023ca20cd87b014a83b0b3db936"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3bd17f92a9217613f133ffd0f4e96664",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 20678,
+        "upload_time": "2023-03-26T20:21:30",
+        "upload_time_iso_8601": "2023-03-26T20:21:30.014746Z",
+        "url": "https://files.pythonhosted.org/packages/e8/7c/dfbbfda0080445bb32650d74c2a7f2afe60653e387a79d2312a096978d19/asynkit-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a5ed375860d254aa093b9ca2002383e7ecf01a9963cf2b36ddd0ad241095cc8",
+          "md5": "c32163db9bb0b323e8359fc25d1e64d6",
+          "sha256": "d789321975fcd1335f1b1e421ea3ac873150100629bed9579c2fe5012f16f044"
+        },
+        "downloads": -1,
+        "filename": "asynkit-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c32163db9bb0b323e8359fc25d1e64d6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 24090,
+        "upload_time": "2023-03-26T20:21:31",
+        "upload_time_iso_8601": "2023-03-26T20:21:31.288842Z",
+        "url": "https://files.pythonhosted.org/packages/7a/5e/d375860d254aa093b9ca2002383e7ecf01a9963cf2b36ddd0ad241095cc8/asynkit-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e87cdfbbfda0080445bb32650d74c2a7f2afe60653e387a79d2312a096978d19",
+        "md5": "3bd17f92a9217613f133ffd0f4e96664",
+        "sha256": "140bd34ff865195ebd113ec4578401535e2b3023ca20cd87b014a83b0b3db936"
+      },
+      "downloads": -1,
+      "filename": "asynkit-0.7.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "3bd17f92a9217613f133ffd0f4e96664",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7,<4.0",
+      "size": 20678,
+      "upload_time": "2023-03-26T20:21:30",
+      "upload_time_iso_8601": "2023-03-26T20:21:30.014746Z",
+      "url": "https://files.pythonhosted.org/packages/e8/7c/dfbbfda0080445bb32650d74c2a7f2afe60653e387a79d2312a096978d19/asynkit-0.7.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7a5ed375860d254aa093b9ca2002383e7ecf01a9963cf2b36ddd0ad241095cc8",
+        "md5": "c32163db9bb0b323e8359fc25d1e64d6",
+        "sha256": "d789321975fcd1335f1b1e421ea3ac873150100629bed9579c2fe5012f16f044"
+      },
+      "downloads": -1,
+      "filename": "asynkit-0.7.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c32163db9bb0b323e8359fc25d1e64d6",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7,<4.0",
+      "size": 24090,
+      "upload_time": "2023-03-26T20:21:31",
+      "upload_time_iso_8601": "2023-03-26T20:21:31.288842Z",
+      "url": "https://files.pythonhosted.org/packages/7a/5e/d375860d254aa093b9ca2002383e7ecf01a9963cf2b36ddd0ad241095cc8/asynkit-0.7.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -1,0 +1,266 @@
+{
+  "info": {
+    "author": "Sander Schwenk-Nebbe",
+    "author_email": "sandersn@econ.au.dk",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "\r\n# Introduction\r\n\r\nThis package implements the $\\text{oShapley-VI}_p$ (out-of-sample Shapley-based variable importance) and $\\text{PBSV}_p$ (performance-based Shapley value) proposed in the \"The Anatomy of Out-of-Sample Forecasting Accuracy\" paper by Daniel Borup, Philippe Goulet Coulombe, David E. Rapach, Erik Christian Montes Schütte, and Sander Schwenk-Nebbe, which is available to download for free at SSRN: [https://ssrn.com/abstract=4278745](https://ssrn.com/abstract=4278745).\r\n\r\nThe $\\text{PBSV}_p$ is a Shapley-based decomposition that measures the contributions of an individual predictor $p$ in fitted models to the out-of-sample loss.\r\n\r\nThe interpretation of PBSVs is straightforward: if $\\text{PBSV}_p$ is negative (positive), predictor $p$ reduces (increases) the loss and is thus beneficial for (detrimental to) forecasting accuracy in the out-of-sample period. Taking the sum of the individual contributions (including the contribution of the empty set) yields the decomposed loss exactly (due to the efficiency property of Shapley values; see [below example](#the-efficiency-property)).\r\n\r\nPlease cite our paper if you find the package useful:\r\n\r\n    Borup, Daniel and Coulombe, Philippe Goulet and Rapach, David E. and Montes Schütte, Erik Christian and Schwenk-Nebbe, Sander (2022). “The Anatomy of Out-of-Sample Forecasting Accuracy”. Federal Reserve Bank of Atlanta Working Paper 2022-16. https://doi.org/10.29338/wp2022-16.\r\n\r\n\r\n# Quickstart\r\n*If you haven't already, install the package via `pip install anatomy`, preferably in a new environment with Python 3.9.*\r\n\r\nThe anatomy package uses a simple workflow. An `Anatomy` object is initially estimated on your forecasting setup (using your data and your models), is then stored to disk, and can then be loaded at any future time without requiring re-estimation.\r\n\r\nAfter initial estimation, an `Anatomy` can anatomize:\r\n\r\n* forecasts produced by any combination of your models\r\n* your original forecasts\r\n* any loss or gain function applied to your forecasts\r\n* an arbitrary subset of your forecasts\r\n\r\nall of which requires *no additional computational time*.\r\n\r\n## General structure\r\nYou may already have trained your models before you create the `Anatomy`, and the aggregate of all your models at all periods may be too large to fit into your RAM. During estimation, the `Anatomy` will therefore ask you for the specific model and dataset it needs at a given iteration by calling your mapping function:\r\n\r\n    from anatomy import *\r\n    \r\n    def my_map(key: AnatomyModelProvider.PeriodKey) -> \\\r\n            AnatomyModelProvider.PeriodValue:  \r\n        \r\n        train, test, model = ...  # load from somewhere or generate here\r\n        \r\n        return AnatomyModelProvider.PeriodValue(train, test, model)\r\n\r\nYou wrap the mapping function in an `AnatomyModelProvider` alongside information about the forecasting application:\r\n \r\n    my_provider = AnatomyModelProvider(  \r\n        n_periods=..., n_features=..., model_names=[...],\r\n        y_name=..., provider_fn=my_map\r\n    )\r\n\r\nand finally create the `Anatomy`:\r\n\r\n    my_anatomy = Anatomy(provider=my_provider, n_iterations=...).precompute(  \r\n        n_jobs=16, save_path=\"my_anatomy.bin\"\r\n    )\r\n\r\nAfter running the above, the `Anatomy` is estimated and stored in your working directory as `my_anatomy.bin`.\r\n\r\n# Example:\r\n\r\n*For convenience, the examples below are contained in a single Python script available [here](https://github.com/sander-sn/anatomy/blob/main/examples/simple_dgp.py).*\r\n\r\nTo get started, we need a forecasting application. We use a linear DGP to generate our dataset consisting of 500 observations of the three predictors `x_{0,1,2}` and our target `y`:\r\n          \r\n    # set random seed for reproducibility:\r\n    np.random.seed(1338)\r\n    \r\n    xy = pd.DataFrame(np.random.normal(0, 1, (500, 3)), columns=[\"x_0\", \"x_1\", \"x_2\"])\r\n    xy[\"y\"] = xy.sum(axis=1) + np.random.normal(0, 1, 500)\r\n\r\n    # set a unique and monotonically increasing index (default index would suffice):\r\n    xy.index = pd.date_range(\"2021-04-19\", \"2022-08-31\").map(lambda x: x.date())\r\n\r\nFor convenience, the `AnatomySubsets` includes a generator that splits your dataset into training and test sets according to your forecasting scheme. Here, we include 100 periods in our first training set, forecast the target of the next period with no gap between the training set and the forecast, extend our training set by one period, and repeat until we reach the end of our data:\r\n    \r\n    subsets = AnatomySubsets.generate(\r\n        index=xy.index,\r\n        initial_window=100,\r\n        estimation_type=AnatomySubsets.EstimationType.EXPANDING,\r\n        periods=1,\r\n        gap=0\r\n    )\r\n\t\r\nIn this example, we have not yet trained our models. We thus do so directly in our mapping function:\r\n\r\n    def mapper(key: AnatomyModelProvider.PeriodKey) -> \\\r\n            AnatomyModelProvider.PeriodValue:  \r\n  \r\n        train = xy.iloc[subsets.get_train_subset(key.period)]  \r\n        test = xy.iloc[subsets.get_test_subset(key.period)]  \r\n\r\n        if key.model_name == \"ols\":\r\n            model = train_ols(train.drop(\"y\", axis=1), train[\"y\"])  \r\n        elif key.model_name == \"rf\":  \r\n            model = train_rf(train.drop(\"y\", axis=1), train[\"y\"])  \r\n      \r\n        return AnatomyModelProvider.PeriodValue(train, test, model)\r\n\r\nusing `train_ols` and `train_rf`, which train a model and yield its prediction function wrapped in an `AnatomyModel`:\r\n\r\n    from sklearn.ensemble import RandomForestRegressor  \r\n    from sklearn.linear_model import LinearRegression\r\n    \r\n    def train_ols(x_train: pd.DataFrame, y_train: pd.Series) -> AnatomyModel:\r\n        ols_model = LinearRegression().fit(x_train, y_train)  \r\n      \r\n        def pred_fn_ols(xs: np.ndarray) -> np.ndarray:  \r\n            xs_df = pd.DataFrame(xs, columns=x_train.columns)  \r\n            return np.array(ols_model.predict(xs_df)).flatten()  \r\n      \r\n        return AnatomyModel(pred_fn_ols)  \r\n\r\n    def train_rf(x_train: pd.DataFrame, y_train: pd.Series) -> AnatomyModel:\r\n        rf_model = RandomForestRegressor(random_state=1338).fit(x_train, y_train)  \r\n      \r\n        def pred_fn_rf(xs: np.ndarray) -> np.ndarray:  \r\n            xs_df = pd.DataFrame(xs, columns=x_train.columns)  \r\n            return np.array(rf_model.predict(xs_df)).flatten()  \r\n      \r\n        return AnatomyModel(pred_fn_rf)\r\n\r\nWe now have all we need to train the models and estimate the `Anatomy`:\r\n \r\n    provider = AnatomyModelProvider(\r\n        n_periods=subsets.n_periods,\r\n        n_features=xy.shape[1]-1,\r\n        model_names=[\"ols\", \"rf\"],\r\n        y_name=\"y\",\r\n        provider_fn=mapper\r\n    )  \r\n      \r\n    anatomy = Anatomy(provider=provider, n_iterations=10).precompute(  \r\n        n_jobs=16, save_path=\"anatomy.bin\"  \r\n    )\r\n\r\nAt this point, the `Anatomy` is stored as `anatomy.bin` in our working directory. We can load it at any later point using `anatomy = Anatomy.load(\"anatomy.bin\")`.\r\n\r\n# Anatomizing\r\nWe can now use our estimated `Anatomy` to anatomize our forecasts. In this example, we are using two models, `rf` and `ols`, as well as an equal-weighted combination of the two:\r\n\r\n    groups = {\r\n        \"rf\": [\"rf\"],  \r\n        \"ols\": [\"ols\"],\r\n        \"ols+rf\": [\"ols\", \"rf\"]\r\n    }\r\n\r\n## Anatomize the out-of-sample $R^2$ of the forecasts:\r\nTo decompose the out-of-sample $R^2$ of our forecasts produced by the two models and their combination, we use the unconditional forecasts as benchmark and provide a function transforming forecasts into out-of-sample $R^2$ to the `Anatomy`:\r\n      \r\n    prevailing_mean = np.array([  \r\n        xy.iloc[subsets.get_train_subset(period=i)][\"y\"].mean()  \r\n        for i in range(subsets.n_periods)  \r\n    ])  \r\n      \r\n    def transform(y_hat, y):  \r\n        return 1 - np.sum((y - y_hat) ** 2) / np.sum((y - prevailing_mean) ** 2)\r\n\r\n    df = anatomy.explain(\r\n        model_sets=AnatomyModelCombination(groups=groups),\r\n        transformer=AnatomyModelOutputTransformer(transform=transform)\r\n    )\r\n\r\nThis yields the change in out-of-sample $R^2$ attributable to each predictor:\r\n\r\n    >>> df\r\n                                     base_contribution       x_0       x_1       x_2\r\n    rf     2021-07-28 -> 2022-08-31           0.000759  0.257240  0.238458  0.215062\r\n    ols    2021-07-28 -> 2022-08-31           0.000000  0.285329  0.267940  0.249870\r\n    ols+rf 2021-07-28 -> 2022-08-31           0.000383  0.279073  0.259201  0.240548\r\n\r\n### *Interpretation*\r\n\r\nThe Shapley-based decomposition can be understood as a means to fairly allocate a single value (in this case the out-of-sample $R^2$) amongst multiple actors contributiong to it (the predictors in our model). This implies that the individual contributions of the actors and the contribution of the empty set of actors (`base_contribution`) sum up exactly to the original value that was decomposed.\r\n\r\nThe above depicts the individual contributions to the out-of-sample $R^2$, which can be negative, if a given predictor hurts accuracy, or positive, if a given predictor increases accuracy.  In this case, all predictors contribute positively to the out-of-sample $R^2$. In practice, predictors can hurt accuracy by reducing the out-of-sample $R^2$.\r\n\r\n*Note: In this example, we use the prevailing mean (average of the target in the training sets) as benchmark to compute the out-of-sample R². The average forecast of an OLS model coincides with this benchmark, which explains why the `base_contribution` of OLS is exactly zero.*\r\n\r\n## ... the RMSE of the forecasts:\r\n\r\n    def transform(y_hat, y):  \r\n        return np.sqrt(np.mean((y - y_hat) ** 2))\r\n    \r\n    df = anatomy.explain(  \r\n        model_sets=AnatomyModelCombination(groups=groups),  \r\n        transformer=AnatomyModelOutputTransformer(transform=transform)  \r\n    )\r\n\r\nwhich yields the change in root mean squared error attributable to each predictor:\r\n\r\n    >>> df\r\n                                     base_contribution       x_0       x_1       x_2\r\n    rf     2021-07-28 -> 2022-08-31           2.105513 -0.351430 -0.326065 -0.296708\r\n    ols    2021-07-28 -> 2022-08-31           2.106313 -0.414488 -0.386125 -0.371149\r\n    ols+rf 2021-07-28 -> 2022-08-31           2.105910 -0.397903 -0.368193 -0.350080\r\n\r\n### *Interpretation*\r\nWe previously decomposed the out-of-sample $R^2$. In this case, we use the RMSE *loss* function, implying that a predictor with a negative contribution increases forecasting accuracy. Because the RMSE cannot be negative, the `base_contribution`, which is the RMSE of the average forecasts of the models, can only be positive.\r\n\r\nSimilar to the previous case, we find that all predictors contribute positively to forecasting accuracy (by contributing negatively to the RMSE).\r\n   \r\n## ... the MAE:\r\n\r\n    def transform(y_hat, y):  \r\n        return np.mean(np.abs(y - y_hat))\r\n    \r\n    df = anatomy.explain(  \r\n        model_sets=AnatomyModelCombination(groups=groups),  \r\n        transformer=AnatomyModelOutputTransformer(transform=transform)  \r\n    )\r\n\r\nwhich yields the change in mean absolute error attributable to each predictor:\r\n\r\n    >>> df\r\n                                     base_contribution       x_0       x_1       x_2\r\n    rf     2021-07-28 -> 2022-08-31           1.679359 -0.299382 -0.249591 -0.221651\r\n    ols    2021-07-28 -> 2022-08-31           1.679946 -0.345583 -0.300613 -0.288960\r\n    ols+rf 2021-07-28 -> 2022-08-31           1.679652 -0.330303 -0.283129 -0.262270\r\n\r\n### *Interpretation*\r\n\r\nThe interpretation is similar to that of the RMSE.\r\n \r\n## ... the SE:\r\n\r\n    def transform(y_hat, y):  \r\n        return (y - y_hat) ** 2\r\n  \r\n    df = anatomy.explain(\r\n        model_sets=AnatomyModelCombination(groups=groups),\r\n        transformer=AnatomyModelOutputTransformer(transform=transform)\r\n    )\r\n\r\nwhich yields the change in squared error attributable to each predictor for each forecast:\r\n\r\n    >>> df\r\n                       base_contribution       x_0       x_1       x_2\r\n    rf     2021-07-28           0.026485 -0.063311 -0.115985  0.163743\r\n           2021-07-29           0.021582  0.238569 -0.370448  0.694773\r\n           2021-07-30           2.451742 -2.702365  1.660915 -1.407192\r\n    ...                              ...       ...       ...       ...\r\n\r\n*Note: The `transform` function in this case does not aggregate (returns a vector instead of a scalar). The `Anatomy` thus yields one decomposition per forecast, which is also known as a local (as opposed to global) decomposition.*\r\n\r\n### *Interpretation*\r\n\r\nThe previous decompositions have consistently shown that all predictors increase forecasting accuracy when it is gauged over the entire period (2021-07-28 to 2022-08-31). Anatomizing instead each individual forecast reveals that this is not always true, at least not at the local level. We now see that individual predictors are contributing positively to the squared error of some forecasts (thus reducing forecast accuracy).\r\n\r\n## ... the RMSE of the forecasts in a subperiod:\r\n\r\n    subset = pd.date_range(\"2021-07-28\", \"2021-08-06\").map(lambda x: x.date())\r\n    \t    \r\n    def transform(y_hat, y):  \r\n        return np.sqrt(np.mean((y - y_hat) ** 2))  \r\n        \r\n    df = anatomy.explain(  \r\n        model_sets=AnatomyModelCombination(groups=groups),  \r\n        transformer=AnatomyModelOutputTransformer(transform=transform),  \r\n        explanation_subset=subset \r\n    )\r\n\r\nwhich yields the change in root mean squared error in the ten-day period attributable to each predictor:\r\n\r\n```\r\n>>> df\r\n                                 base_contribution       x_0       x_1       x_2\r\nrf     2021-07-28 -> 2021-08-06           1.402950 -0.149847 -0.199615  0.118059\r\nols    2021-07-28 -> 2021-08-06           1.404761 -0.155275 -0.323760  0.317055\r\nols+rf 2021-07-28 -> 2021-08-06           1.403853 -0.169584 -0.275408  0.211672\r\n```\r\n\r\n### _Interpretation_\r\n\r\nIn this short subperiod of ten days, we find that our last predictor contributed positively to the RMSE (and thus negatively to forecasting accuracy).\r\n\r\n\r\n## ... or just the raw forecasts:\r\n\r\n    def transform(y_hat):\r\n        return y_hat\r\n        \r\n    df = anatomy.explain(\r\n        model_sets=AnatomyModelCombination(groups=groups),\r\n        transformer=AnatomyModelOutputTransformer(transform=transform)\r\n    )\r\n\r\nwhich yields the change in the forecast attributable to each predictor:\r\n\r\n    >>> df\r\n                       base_contribution       x_0       x_1       x_2\r\n    rf     2021-07-28           0.070861  0.222932  0.360182 -0.315820\r\n           2021-07-29           0.070354  0.250389 -0.617779  0.984992\r\n           2021-07-30           0.071163 -1.514547  0.839562 -0.835136\r\n    ...                              ...       ...       ...       ...\r\n\r\n### *Interpretation*\r\n\r\nDecomposing the forecasts themselves yields contributions that bear no relation to forecasting accuracy. Hence, a negative or positive contribution means no more than a decrease or increase in the forecast at that period attributable to the given predictor, which may or may not have be good for forecasting accuracy.\r\n\r\n***Hence: beware, a high average absolute contribution does not necessarily translate into a high gain in accuracy. That is precisely why we need to decompose the loss directly, and in consequence, take into account our target and how far away our forecasts were from it.***\r\n\r\nFrom the anatomized raw forecasts, we can compute the  $\\text{oShapley-VI}$ by averaging over the magnitudes of the invididual contributions:\r\n\r\n    >>> df.abs().mean(axis=0)\r\n    base_contribution    0.078436\r\n    x_0                  0.865098\r\n    x_1                  0.787327\r\n    x_2                  0.773340\r\n\r\n## The Efficiency property\r\n\r\n*During estimation, the `Anatomy` checks that the individual attributions of the predictors to the forecasts sum up exactly to the forecasts produced by the models. The estimation would be aborted if efficiency does not hold.*\r\n\r\nDue to the efficiency property of Shapley values, summing the individual contributions yields the decomposed value exactly. We can check that the results that `Anatomy` yields are consistet. We can recover the RMSE from the decomposed RMSE, but we can also recover the RMSE from the decomposed forecasts. Let's make sure that they match.\r\n\r\nWe first anatomize the RMSE:\r\n\r\n    def transform(y_hat, y):  \r\n        return np.sqrt(np.mean((y - y_hat) ** 2))  \r\n      \r\n    df = anatomy.explain(  \r\n        model_sets=AnatomyModelCombination(groups=groups),  \r\n        transformer=AnatomyModelOutputTransformer(transform=transform)  \r\n    )\r\n\r\nThe RMSE (or any other decomposed value) is the sum of the individual attributions, `rmse_a = df.sum(axis=1)`:\r\n\r\n    >>> rmse_a\r\n    rf      2021-07-28 -> 2022-08-31    1.131310\r\n    ols     2021-07-28 -> 2022-08-31    0.934551\r\n    ols+rf  2021-07-28 -> 2022-08-31    0.989733\r\n\r\nWe next decompose the raw forecasts and compute the RMSE from these:\r\n\r\n    def transform(y_hat):  \r\n        return y_hat  \r\n  \r\n    df = anatomy.explain(  \r\n        model_sets=AnatomyModelCombination(groups=groups),  \r\n        transformer=AnatomyModelOutputTransformer(transform=transform)  \r\n    )\r\n\r\nThe forecasts are recovered as the sum of the individual attributions, `y_hat = df.sum(axis=1)`:\r\n\r\n    >>> y_hat\r\n    rf      2021-07-28    0.338154\r\n            2021-07-29    0.687956\r\n            2021-07-30   -1.438958\r\n                               ...   \r\n\r\nFrom the forecasts, we can compute the RMSE:       \r\n      \r\n    y_true = np.hstack([  \r\n        xy.iloc[subsets.get_test_subset(period=i)][\"y\"]\r\n        for i in range(subsets.n_periods)  \r\n    ])  \r\n      \r\n    rmse_b = pd.Series({  \r\n        key: np.sqrt(np.mean((y_true - y_hat.xs(key)) ** 2))   \r\n        for key in groups.keys()  \r\n    })\r\n\r\nwhich yields the same RMSE as the sum of the contributions of the RMSE decomposition:\r\n\r\n    >>> rmse_b\r\n    rf        1.131310\r\n    ols       0.934551\r\n    ols+rf    0.989733\r\n\r\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/sander-sn/anatomy",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "anatomy",
+    "package_url": "https://pypi.org/project/anatomy/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/anatomy/",
+    "project_urls": {
+      "Homepage": "https://github.com/sander-sn/anatomy"
+    },
+    "release_url": "https://pypi.org/project/anatomy/0.1.4/",
+    "requires_dist": [
+      "joblib (>=0.15.0)",
+      "numpy (>=1.18.1)",
+      "pandas (>=1.0.0)"
+    ],
+    "requires_python": ">=3.9",
+    "summary": "Shapley-based decomposition to anatomize the of out-of-sample accuracy of time-series forecasting models",
+    "version": "0.1.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15800756,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3dcd1d02b1cb458bb2a305e38b11d13bea826010d40ead1f8ecd0249d9eb4ca5",
+          "md5": "aec5eb9f4d8f956731416cf8fb7b150f",
+          "sha256": "32f72043bc91dbbe3a2ef4c60120571f58748bed943f528c4a956d8e5ee5de35"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aec5eb9f4d8f956731416cf8fb7b150f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 8116,
+        "upload_time": "2022-09-19T15:48:31",
+        "upload_time_iso_8601": "2022-09-19T15:48:31.729154Z",
+        "url": "https://files.pythonhosted.org/packages/3d/cd/1d02b1cb458bb2a305e38b11d13bea826010d40ead1f8ecd0249d9eb4ca5/anatomy-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d26d2e0e4421153b1402dcdd01ff545a39d7073f7c273cfb37fed707ebcc8d2",
+          "md5": "457b37c185686510c340f4c1381346db",
+          "sha256": "8915430e147a41a7f847664e198a7e42ef66be64b35b1d6ecf33949f70cd67e1"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "457b37c185686510c340f4c1381346db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 15593,
+        "upload_time": "2022-09-27T13:39:59",
+        "upload_time_iso_8601": "2022-09-27T13:39:59.158119Z",
+        "url": "https://files.pythonhosted.org/packages/2d/26/d2e0e4421153b1402dcdd01ff545a39d7073f7c273cfb37fed707ebcc8d2/anatomy-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d610dc9360cba024355e7f1c45843d3056611e759d883a3f2ab82723ebd4f127",
+          "md5": "40228039e2e7aadc700b15ce26c341fd",
+          "sha256": "743804909e5cb581b1e3377222ca59018b69118ad7f717cccbf28cd634acd9f0"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "40228039e2e7aadc700b15ce26c341fd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 14675,
+        "upload_time": "2022-10-05T11:23:12",
+        "upload_time_iso_8601": "2022-10-05T11:23:12.633547Z",
+        "url": "https://files.pythonhosted.org/packages/d6/10/dc9360cba024355e7f1c45843d3056611e759d883a3f2ab82723ebd4f127/anatomy-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69e87530ef137b603dd0468c51dca047f2a397ddc0f6e52ea648776dea422b76",
+          "md5": "9158864c2f0816f02678072fe81e7abb",
+          "sha256": "d00fb800ac71b60772be5cc32edc26f755e70daad0d7d9e1154ee6293f6c1205"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9158864c2f0816f02678072fe81e7abb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 18392,
+        "upload_time": "2022-10-05T11:23:14",
+        "upload_time_iso_8601": "2022-10-05T11:23:14.536713Z",
+        "url": "https://files.pythonhosted.org/packages/69/e8/7530ef137b603dd0468c51dca047f2a397ddc0f6e52ea648776dea422b76/anatomy-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d8a15fecff6775631a0d8c68182e4c3e93a9be1028f4327aaed0c2b64974ec0",
+          "md5": "50ad79e9be37bf240d3a72159fe92f31",
+          "sha256": "457fd224f8af3ff8bc62b03c20d176153751f9e7d7d89c5c907dad2df771e967"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "50ad79e9be37bf240d3a72159fe92f31",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 15346,
+        "upload_time": "2022-11-15T16:06:17",
+        "upload_time_iso_8601": "2022-11-15T16:06:17.734865Z",
+        "url": "https://files.pythonhosted.org/packages/2d/8a/15fecff6775631a0d8c68182e4c3e93a9be1028f4327aaed0c2b64974ec0/anatomy-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8708d305705dc22c31a20dfb11856e89acf66d2e233f526df9b8d6a9c804f9f4",
+          "md5": "05304198899018b6827388d32ba7319c",
+          "sha256": "7e75e818091b3c8e07f0f238daef076e6c6296f22d440217f7015eb9bde6e259"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05304198899018b6827388d32ba7319c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 19731,
+        "upload_time": "2022-11-15T16:06:19",
+        "upload_time_iso_8601": "2022-11-15T16:06:19.493614Z",
+        "url": "https://files.pythonhosted.org/packages/87/08/d305705dc22c31a20dfb11856e89acf66d2e233f526df9b8d6a9c804f9f4/anatomy-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b1ea609347bb1c8001621d9c97cfbccfc2e48de0b331751188a3a5d35fc79a1",
+          "md5": "284d800892d4c573e846d18c5d9b4fdc",
+          "sha256": "9f60344eb664c5db165da7cd82f934c633239b573f5802404d6956dcf8ad1796"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "284d800892d4c573e846d18c5d9b4fdc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.9",
+        "size": 15271,
+        "upload_time": "2022-11-17T12:16:50",
+        "upload_time_iso_8601": "2022-11-17T12:16:50.180041Z",
+        "url": "https://files.pythonhosted.org/packages/4b/1e/a609347bb1c8001621d9c97cfbccfc2e48de0b331751188a3a5d35fc79a1/anatomy-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d5e96f64c60055bcc22b9649cfdd7a1ce42cc1d7546ebf9a83c0bc739b26eabf",
+          "md5": "323c82bcc1c359411a1586e5d8a85464",
+          "sha256": "cb8c25224d5f492a4b3bda20a3bdeba0c3240672d9ab4e78ebcd8b63f8028b9f"
+        },
+        "downloads": -1,
+        "filename": "anatomy-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "323c82bcc1c359411a1586e5d8a85464",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.9",
+        "size": 19518,
+        "upload_time": "2022-11-17T12:16:54",
+        "upload_time_iso_8601": "2022-11-17T12:16:54.180742Z",
+        "url": "https://files.pythonhosted.org/packages/d5/e9/6f64c60055bcc22b9649cfdd7a1ce42cc1d7546ebf9a83c0bc739b26eabf/anatomy-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4b1ea609347bb1c8001621d9c97cfbccfc2e48de0b331751188a3a5d35fc79a1",
+        "md5": "284d800892d4c573e846d18c5d9b4fdc",
+        "sha256": "9f60344eb664c5db165da7cd82f934c633239b573f5802404d6956dcf8ad1796"
+      },
+      "downloads": -1,
+      "filename": "anatomy-0.1.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "284d800892d4c573e846d18c5d9b4fdc",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.9",
+      "size": 15271,
+      "upload_time": "2022-11-17T12:16:50",
+      "upload_time_iso_8601": "2022-11-17T12:16:50.180041Z",
+      "url": "https://files.pythonhosted.org/packages/4b/1e/a609347bb1c8001621d9c97cfbccfc2e48de0b331751188a3a5d35fc79a1/anatomy-0.1.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d5e96f64c60055bcc22b9649cfdd7a1ce42cc1d7546ebf9a83c0bc739b26eabf",
+        "md5": "323c82bcc1c359411a1586e5d8a85464",
+        "sha256": "cb8c25224d5f492a4b3bda20a3bdeba0c3240672d9ab4e78ebcd8b63f8028b9f"
+      },
+      "downloads": -1,
+      "filename": "anatomy-0.1.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "323c82bcc1c359411a1586e5d8a85464",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.9",
+      "size": 19518,
+      "upload_time": "2022-11-17T12:16:54",
+      "upload_time_iso_8601": "2022-11-17T12:16:54.180742Z",
+      "url": "https://files.pythonhosted.org/packages/d5/e9/6f64c60055bcc22b9649cfdd7a1ce42cc1d7546ebf9a83c0bc739b26eabf/anatomy-0.1.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
