@@ -1,0 +1,1458 @@
+{
+  "info": {
+    "author": "Guillermo Perez",
+    "author_email": "bisho@revenuecat.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# meta-memcache-py\nModern, pure python, memcache client with support for new meta commands.\n\n# Usage:\n\n## Install:\n```\npip install meta-memcache\n```\n## Configure a pool:\n```python:\nfrom meta_memcache import (\n    Key,\n    ServerAddress,\n    ShardedCachePool,\n    connection_pool_factory_builder,\n)\n\npool = ShardedCachePool.from_server_addresses(\n    servers=[\n        ServerAddress(host=\"1.1.1.1\", port=11211),\n        ServerAddress(host=\"2.2.2.2\", port=11211),\n        ServerAddress(host=\"3.3.3.3\", port=11211),\n    ],\n    connection_pool_factory_fn=connection_pool_factory_builder(),\n)\n```\n\nThe design is very pluggable. Rather than supporting a lot of features, it\nrelies on dependency injection to configure behavior.\n\nThe `CachePool`s expects a `connection_pool_factory_fn` callback to build the\ninternal connection pool. And the connection pool receives a function to create\na new memcache connection.\n\nWhile this is very flexible, it can be complex to initialize, so there is a\ndefault builder provided to tune the most frequent things:\n```\ndef connection_pool_factory_builder(\n    initial_pool_size: int = 1,\n    max_pool_size: int = 3,\n    mark_down_period_s: float = DEFAULT_MARK_DOWN_PERIOD_S,\n    connection_timeout: float = 1,\n    recv_timeout: float = 1,\n    no_delay: bool = True,\n    read_buffer_size: int = 4096,\n) -> Callable[[ServerAddress], ConnectionPool]:\n```\n* `initial_pool_size`: How many connections open for each host in the pool\n* `max_pool_size`: Maximum number of connections to keep open for each host in\n  the pool. Note that if there are no connections available in the pool, the\n  client will open a new connection always, instead of just blocking waiting\n  for a free connection. If you see too many connection creations in the\n  stats, you might need to increase this setting.\n* `mark_down_period_s`: When a network failure is detected, the destination host\n  is marked down, and requests will fail fast, instead of trying to reconnect\n  causing clients to block. A single client request will be checking if the host\n  is still down every `mark_down_period_s`, while the others fail fast.\n* `connection_timeout`: Timeout to stablish initial connection, ideally should\n  be < 1 s for memcache servers in local network.\n* `recv_timeout`: Timeout of requests. Ideally should be < 1 s for memcache\n  servers in local network.\n* `no_delay`: Wether to configure socket with NO_DELAY. This library tries to\n  send requests as a single write(), so enabling no_delay is a good idea.\n* `read_buffer_size`: This client tries to minimize memory allocation by reading\n  bytes from the socket into a reusable read buffer. If the memcache response\n  size is < `read_buffer_size` no memory allocations happen for the network\n  read. Note: Each connection will have its own read buffer, so you must find a\n  good balance between memory usage and reducing memory allocations. Note: While\n  reading from the socket has zero allocations, the values will be deserialized\n  and those will have the expected memory allocations.\n\nIf you need to customize how the sockets are created (IPv6, add auth, unix\nsockets) you will need to implement your own `connection_pool_factory_builder`\nand override the `socket_factory_fn`.\n\n## Use the pool:\n```python:\ncache_pool.set(key=Key(\"bar\"), value=1, ttl=1000)\n```\n\n## Keys:\n### String or `Key` named tuple\nOn the high-level commands you can use either plain strings as keys\nor the more advanced `Key` object that allows extra features like\ncustom routing and unicode keys.\n\n### Custom routing:\nYou can control the routing of the keys setting a custom `routing_key`:\n```python:\nKey(\"key:1:2\", routing_key=\"key:1\")\n```\nThis is useful if you have several keys related with each other. You can use the\nsame routing key, and they will be placed in the same server. This is handy for\nspeed of retrieval (single request instead of fan-out) and/or consistency (all\nwill be gone or present, since they are stored in the same server). Note this is\nalso risky, if you place all keys of a user in the same server, and the server\ngoes down, the user life will be miserable.\n\n### Unicode keys:\nUnicode keys are supported, the keys will be hashed according to Meta commands\n[binary encoded keys](https://github.com/memcached/memcached/wiki/MetaCommands#binary-encoded-keys)\nspecification.\n\nTo use this, mark the key as unicode:\n```python:\nKey(\"🍺\", unicode=True)\n```\n\n### Large keys:\nLarge keys are also automatically supported and binary encoded as above. But\ndon't use large keys :)\n\n# Design:\nThe code relies on dependency injection to allow to configure a lot of the\naspects of the cache client. For example, instead of supporting a lot of\nfeatures on how to connect, authenticate, etc, a `socket_factory_fn` is required\nand you can customize the socket creation to your needs. We provide some basic\nsane defaults, but you should not have a lot of issues to customize it for your\nneeds.\n\nRegarding cache client features, relies in inheritance to abstract different\nlayers of responsibility, augment the capabilities while abstracting details\nout:\n\n## Low level meta commands:\n\nThe low-level class is\n[BaseCachePool](https://github.com/RevenueCat/meta-memcache-py/blob/main/src/meta_memcache/base/base_cache_pool.py).\nImplements the connection pool handling as well as the memcache protocol,\nfocusing on the new\n[Memcache MetaCommands](https://github.com/memcached/memcached/blob/master/doc/protocol.txt#L79):\nmeta get, meta set, meta delete and meta arithmetic. They implement the full set\nof flags, and features, but are very low level.\n\n```python:\n    def meta_multiget(\n        self,\n        keys: List[Key],\n        flags: Optional[Set[Flag]] = None,\n        int_flags: Optional[Dict[IntFlag, int]] = None,\n        token_flags: Optional[Dict[TokenFlag, bytes]] = None,\n    ) -> Dict[Key, ReadResponse]:\n\n    def meta_get(\n        self,\n        key: Key,\n        flags: Optional[Set[Flag]] = None,\n        int_flags: Optional[Dict[IntFlag, int]] = None,\n        token_flags: Optional[Dict[TokenFlag, bytes]] = None,\n    ) -> ReadResponse:\n\n    def meta_set(\n        self,\n        key: Key,\n        value: Any,\n        ttl: int,\n        flags: Optional[Set[Flag]] = None,\n        int_flags: Optional[Dict[IntFlag, int]] = None,\n        token_flags: Optional[Dict[TokenFlag, bytes]] = None,\n    ) -> WriteResponse:\n\n    def meta_delete(\n        self,\n        key: Key,\n        flags: Optional[Set[Flag]] = None,\n        int_flags: Optional[Dict[IntFlag, int]] = None,\n        token_flags: Optional[Dict[TokenFlag, bytes]] = None,\n    ) -> WriteResponse:\n\n    def meta_arithmetic(\n        self,\n        key: Key,\n        flags: Optional[Set[Flag]] = None,\n        int_flags: Optional[Dict[IntFlag, int]] = None,\n        token_flags: Optional[Dict[TokenFlag, bytes]] = None,\n    ) -> WriteResponse:\n```\n\nYou won't use this api unless you are implementing some custom high-level\ncommand. See below for the usual memcache api.\n\n## High level commands:\n\nThe\n[CachePool](https://github.com/RevenueCat/meta-memcache-py/blob/main/src/meta_memcache/base/cache_pool.py)\naugments the low-level class and implements the more high-level memcache\noperations (get, set, touch, cas...), plus the memcached's\n[new MetaCommands anti-dogpiling techniques](https://github.com/memcached/memcached/wiki/MetaCommands)\nfor high qps caching needs: Atomic Stampeding control, Herd Handling, Early\nRecache, Serve Stale, No Reply, Probabilistic Hot Cache, Hot Key Cache\nInvalidation...\n\n```python:\n    def set(\n        self,\n        key: Union[Key, str],\n        value: Any,\n        ttl: int,\n        no_reply: bool = False,\n        cas_token: Optional[int] = None,\n        stale_policy: Optional[StalePolicy] = None,\n        set_mode: SetMode = SetMode.SET,  # Other are ADD, REPLACE, APPEND...\n    ) -> bool:\n\n    def delete(\n        self,\n        key: Union[Key, str],\n        cas_token: Optional[int] = None,\n        no_reply: bool = False,\n        stale_policy: Optional[StalePolicy] = None,\n    ) -> bool:\n\n    def touch(\n        self,\n        key: Union[Key, str],\n        ttl: int,\n        no_reply: bool = False,\n    ) -> bool:\n\n    def get_or_lease(\n        self,\n        key: Union[Key, str],\n        lease_policy: LeasePolicy,\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n    ) -> Optional[Any]:\n\n    def get_or_lease_cas(\n        self,\n        key: Union[Key, str],\n        lease_policy: LeasePolicy,\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n    ) -> Tuple[Optional[Any], Optional[int]]:\n\n    def get(\n        self,\n        key: Union[Key, str],\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n    ) -> Optional[Any]:\n\n    def multi_get(\n        self,\n        keys: List[Union[Key, str]],\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n    ) -> Dict[Key, Optional[Any]]:\n\n    def get_cas(\n        self,\n        key: Union[Key, str],\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n    ) -> Tuple[Optional[Any], Optional[int]]:\n\n    def get_typed(\n        self,\n        key: Union[Key, str],\n        cls: Type[T],\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n        error_on_type_mismatch: bool = False,\n    ) -> Optional[T]:\n\n    def get_cas_typed(\n        self,\n        key: Union[Key, str],\n        cls: Type[T],\n        touch_ttl: Optional[int] = None,\n        recache_policy: Optional[RecachePolicy] = None,\n        error_on_type_mismatch: bool = False,\n    ) -> Tuple[Optional[T], Optional[int]]:\n\n    def delta(\n        self,\n        key: Union[Key, str],\n        delta: int,\n        refresh_ttl: Optional[int] = None,\n        no_reply: bool = False,\n        cas_token: Optional[int] = None,\n    ) -> bool:\n\n    def delta_initialize(\n        self,\n        key: Union[Key, str],\n        delta: int,\n        initial_value: int,\n        initial_ttl: int,\n        refresh_ttl: Optional[int] = None,\n        no_reply: bool = False,\n        cas_token: Optional[int] = None,\n    ) -> bool:\n\n    def delta_and_get(\n        self,\n        key: Union[Key, str],\n        delta: int,\n        refresh_ttl: Optional[int] = None,\n        cas_token: Optional[int] = None,\n    ) -> Optional[int]:\n\n    def delta_initialize_and_get(\n        self,\n        key: Union[Key, str],\n        delta: int,\n        initial_value: int,\n        initial_ttl: int,\n        refresh_ttl: Optional[int] = None,\n        cas_token: Optional[int] = None,\n    ) -> Optional[int]:\n```\n\n# Anti-dogpiling techniques\nSome commands receive `RecachePolicy`, `StalePolicy` and `LeasePolicy` for the\nadvanced anti-dogpiling control needed in high-qps environments:\n\n```python:\nclass RecachePolicy(NamedTuple):\n    \"\"\"\n    This controls the recache herd control behavior\n    If recache ttl is indicated, when remaining ttl is < given value\n    one of the clients will win, return a miss and will populate the\n    value, while the other clients will loose and continue to use the\n    stale value.\n    \"\"\"\n\n    ttl: int = 30\n\n\nclass LeasePolicy(NamedTuple):\n    \"\"\"\n    This controls the lease or miss herd control behavior\n    If miss lease retries > 0, on misses a lease will be created. The\n    winner will get a Miss and will continue to populate the cache,\n    while the others are BLOCKED! Use with caution! You can define\n    how many times and how often clients will retry to get the\n    value. After the retries are expired, clients will get a Miss\n    if they weren't able to get the value.\n    \"\"\"\n\n    ttl: int = 30\n    miss_retries: int = 3\n    miss_retry_wait: float = 1.0\n    wait_backoff_factor: float = 1.2\n    miss_max_retry_wait: float = 5.0\n\n\nclass StalePolicy(NamedTuple):\n    \"\"\"\n    This controls the stale herd control behavior\n    * Deletions can mark items stale instead of deleting them\n    * Stale items automatically do recache control, one client\n      will get the miss, others will receive the stale value\n      until the winner refreshes the value in the cache.\n    * cas mismatches (due to race / further invalidation) can\n      store the value as stale instead of failing\n    \"\"\"\n\n    mark_stale_on_deletion_ttl: int = 0  # 0 means disabled\n    mark_stale_on_cas_mismatch: bool = False\n``` \n\n### Notes:\n* Recache/Stale policies are typically used together. Make sure all your reads\n  for a given key share the same recache policy to avoid unexpected behaviors.\n* Leases are for a more traditional, more consistent model, where other clients\n  will block instead of getting a stale value.\n\n## Pool level features:\nFinally in\n[`cache_pools.py`](https://github.com/RevenueCat/meta-memcache-py/blob/main/src/meta_memcache/cache_pools.py)\na few classes implement the pool-level semantics:\n* `ShardedCachePool`: implements a consistent hashing cache pool using uhashring's `HashRing`.\n* `ShardedWithGutterCachePool`: implements a sharded cache pool like above, but\n  with a 'gutter pool' (See\n  [Scaling Memcache at Facebook](http://www.cs.utah.edu/~stutsman/cs6963/public/papers/memcached.pdf)),\n  so when a server of the primary pool is down, requests are sent to the\n  'gutter' pool, with TTLs overriden and lowered on the fly, so they provide\n  some level of caching instead of hitting the backend for each request.\n\nThese pools also provide an option to register a callback for write failure events. This might be useful\nif you are serious about cache consistency. If you have transient network issues, some writes might fail,\nand if the server comes back without being restarted or the cache flushed, the data will be stale. The\nevents allows for failed writes to be collected and logged. Affected keys can then be invalidated later\nand eventual cache consistency guaranteed.\n\nIt should be trivial to implement your own cache pool if you need custom\nsharding, shadowing, pools that support live migrations, etc. Feel free to\ncontribute!\n\n## Write failure tracking\nWhen a write failure occures with a `SET` or `DELETE` opperation occures then the `pool.on_write_failure` event\nhandler will be triggered. Consumers subscribing to this handler will receive the key that failed. The\nfollowing is an example on how to subscribe to these events:\n```python:\nfrom meta_memcache import CachePool, Key\n\nclass SomeConsumer(object):\n    def __init__(self, pool: CachePool):\n        self.pool = pool\n        self.pool.on_write_failures += self.on_write_failure_handler\n\n    def call_before_dereferencing(self):\n        self.pool.on_write_failures -= self.on_write_failure_handler\n\n    def on_write_failure_handler(self, key: Key) -> None:\n        # Handle the failures here\n        pass\n        \n```\n\n## Stats:\nThe cache pools offer a `get_counters()` that return information about the state\nof the servers and their connection pools:\n\n```python:\n    def get_counters(self) -> Dict[ServerAddress, PoolCounters]:\n```\n\nThe counters are:\n```python:\nclass PoolCounters(NamedTuple):\n    # Available connections in the pool, ready to use\n    available: int\n    # The # of connections active, currently in use, out of the pool\n    active: int\n    # Current stablished connections (available + active)\n    stablished: int\n    # Total # of connections created. If this keeps growing\n    # might mean the pool size is too small and we are\n    # constantly needing to create new connections:\n    total_created: int\n    # Total # of connection or socket errors\n    total_errors: int\n```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/RevenueCat/meta-memcache-py",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "meta-memcache",
+    "package_url": "https://pypi.org/project/meta-memcache/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/meta-memcache/",
+    "project_urls": {
+      "Homepage": "https://github.com/RevenueCat/meta-memcache-py",
+      "Repository": "https://github.com/RevenueCat/meta-memcache-py"
+    },
+    "release_url": "https://pypi.org/project/meta-memcache/0.9.4/",
+    "requires_dist": [
+      "uhashring (>=2.1,<3.0)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "Modern, pure python, memcache client with support for new meta commands.",
+    "version": "0.9.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15940087,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b4d110f0cf1bd015f460437b3c259bba0a3c2bcd0243e22f87fccced707044f",
+          "md5": "fe89c7d4196a96368c78cd79415d8fcd",
+          "sha256": "3d02724ecc6f3e81e642bb427f7fcb6e497019e2863d1dbe7225d62bd9cbf167"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fe89c7d4196a96368c78cd79415d8fcd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18376,
+        "upload_time": "2021-12-29T03:09:34",
+        "upload_time_iso_8601": "2021-12-29T03:09:34.692877Z",
+        "url": "https://files.pythonhosted.org/packages/9b/4d/110f0cf1bd015f460437b3c259bba0a3c2bcd0243e22f87fccced707044f/meta_memcache-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4c34341bde4d010f723f397de543672b316a3a11f1e34d933b7b976b5505494d",
+          "md5": "04e4a2f482028b6d0880c4a9300b3b54",
+          "sha256": "7ad805ab54f5100243b2a531afe7e006ab51bfe3513d30456d21cc17f7b826d4"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "04e4a2f482028b6d0880c4a9300b3b54",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14255,
+        "upload_time": "2021-12-29T03:09:32",
+        "upload_time_iso_8601": "2021-12-29T03:09:32.829569Z",
+        "url": "https://files.pythonhosted.org/packages/4c/34/341bde4d010f723f397de543672b316a3a11f1e34d933b7b976b5505494d/meta-memcache-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e2adae85958cb6596decfdd67945654ac8c63461c1603488aa456a6785b8b6ec",
+          "md5": "2d78687a0bb60d2c9f124d2b3c52964c",
+          "sha256": "093081b98357d896852ddabd3291a334f64056e01a0a3b03b26d162a3f15ba1f"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2d78687a0bb60d2c9f124d2b3c52964c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21999,
+        "upload_time": "2022-01-10T18:34:49",
+        "upload_time_iso_8601": "2022-01-10T18:34:49.730154Z",
+        "url": "https://files.pythonhosted.org/packages/e2/ad/ae85958cb6596decfdd67945654ac8c63461c1603488aa456a6785b8b6ec/meta_memcache-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bba926455e35b93f75e8141c372c8217d7ae8196ac69eb9cf326a3279feba773",
+          "md5": "5a2ef0079843ab0c93c6cf8be93d2a1d",
+          "sha256": "d1053a337afe7b6f1cdcf0435444f6a420387d472010a6a145d96f0ba6f9422b"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5a2ef0079843ab0c93c6cf8be93d2a1d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 21258,
+        "upload_time": "2022-01-10T18:34:48",
+        "upload_time_iso_8601": "2022-01-10T18:34:48.522998Z",
+        "url": "https://files.pythonhosted.org/packages/bb/a9/26455e35b93f75e8141c372c8217d7ae8196ac69eb9cf326a3279feba773/meta-memcache-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c3f4b66d827e749d9fa686385fd4a037e3772f06caf7accb9b2a024550bbca9d",
+          "md5": "b399fd44dbdd2f9178038a9cb543e4f4",
+          "sha256": "55ad2e17f03118506c33fffd37cb6bdcf31c752603b26394638c5cfddc8d19b6"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b399fd44dbdd2f9178038a9cb543e4f4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 23219,
+        "upload_time": "2022-01-11T17:31:11",
+        "upload_time_iso_8601": "2022-01-11T17:31:11.275698Z",
+        "url": "https://files.pythonhosted.org/packages/c3/f4/b66d827e749d9fa686385fd4a037e3772f06caf7accb9b2a024550bbca9d/meta_memcache-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b141dcdfaa454df4b55c7f078ed5165df552bcb39b4aa2370a0afe0b1d118e3c",
+          "md5": "beb4fa37ff219a8e6c5e39c2300e10dc",
+          "sha256": "e9d1c50504075db6f8529cfc452b5d1818225beabdf11bfa634e6908b17a0561"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "beb4fa37ff219a8e6c5e39c2300e10dc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 23513,
+        "upload_time": "2022-01-11T17:31:08",
+        "upload_time_iso_8601": "2022-01-11T17:31:08.881100Z",
+        "url": "https://files.pythonhosted.org/packages/b1/41/dcdfaa454df4b55c7f078ed5165df552bcb39b4aa2370a0afe0b1d118e3c/meta-memcache-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "efeae61f1bbd2fc9bbe09db121c708fa970a213bb586c493e583f9394249fe68",
+          "md5": "3f5afc64559ec9283c2e2083b4c770f5",
+          "sha256": "538a213221428eac014873cfd45fc700916885b28a39d6aa47ea384b2d7c4bb0"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3f5afc64559ec9283c2e2083b4c770f5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 23827,
+        "upload_time": "2022-01-14T17:22:40",
+        "upload_time_iso_8601": "2022-01-14T17:22:40.512614Z",
+        "url": "https://files.pythonhosted.org/packages/ef/ea/e61f1bbd2fc9bbe09db121c708fa970a213bb586c493e583f9394249fe68/meta_memcache-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb1f03125f3864115f7ad13a6c1bdafee67b627af5222d88867c1257a2da4e46",
+          "md5": "d28031799f2acd62a975a84d05c317e9",
+          "sha256": "de329dacb6df55750248acd073ab90232916ccaed1985a561e590ea035a3bf39"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d28031799f2acd62a975a84d05c317e9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24330,
+        "upload_time": "2022-01-14T17:22:38",
+        "upload_time_iso_8601": "2022-01-14T17:22:38.832131Z",
+        "url": "https://files.pythonhosted.org/packages/eb/1f/03125f3864115f7ad13a6c1bdafee67b627af5222d88867c1257a2da4e46/meta-memcache-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01f27831f5b874f542c1d4e73b3b7d654e2a42fcb135f112a6cf0f09d3b7a0a6",
+          "md5": "1e857fcb80a26e45b8a1628de27d5c5e",
+          "sha256": "125afb640bc65b551a2d293835c10828952f5e944f219376e61840110c43ec78"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1e857fcb80a26e45b8a1628de27d5c5e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24056,
+        "upload_time": "2022-01-21T06:25:14",
+        "upload_time_iso_8601": "2022-01-21T06:25:14.780911Z",
+        "url": "https://files.pythonhosted.org/packages/01/f2/7831f5b874f542c1d4e73b3b7d654e2a42fcb135f112a6cf0f09d3b7a0a6/meta_memcache-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e926a19b49883b95ca7c20f0799131df4962937852a65d24005a7bda89ce299",
+          "md5": "0cfd512abdb47c86c4dfa96063e08d60",
+          "sha256": "a79a90ebaad8bfdfb0423c9b915f15da212712bd2ae49f09faa5ee921a423255"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0cfd512abdb47c86c4dfa96063e08d60",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24517,
+        "upload_time": "2022-01-21T06:25:13",
+        "upload_time_iso_8601": "2022-01-21T06:25:13.313920Z",
+        "url": "https://files.pythonhosted.org/packages/9e/92/6a19b49883b95ca7c20f0799131df4962937852a65d24005a7bda89ce299/meta-memcache-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02c9400f8115eb3810694439bfb0acf91aea50ff5711b6e6f9a30760645ceadc",
+          "md5": "687b44ba71d4e7e54f229c698f396e3c",
+          "sha256": "23949b4459a162ae6a8a51ba7417e5fed44f37047c7e8be91cd3724fc4893884"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "687b44ba71d4e7e54f229c698f396e3c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24063,
+        "upload_time": "2022-01-21T16:39:56",
+        "upload_time_iso_8601": "2022-01-21T16:39:56.691649Z",
+        "url": "https://files.pythonhosted.org/packages/02/c9/400f8115eb3810694439bfb0acf91aea50ff5711b6e6f9a30760645ceadc/meta_memcache-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "418d9556adbe158c143168551e3a90fbf85bc68a30db00d4301f9354303bbe49",
+          "md5": "8e6c8bdcb90d8030e07319e338a4ac21",
+          "sha256": "b413eb881af28f9ff62cd594aad0cc46a6f70f48e615098c9330f247b70539a1"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8e6c8bdcb90d8030e07319e338a4ac21",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24533,
+        "upload_time": "2022-01-21T16:39:55",
+        "upload_time_iso_8601": "2022-01-21T16:39:55.258075Z",
+        "url": "https://files.pythonhosted.org/packages/41/8d/9556adbe158c143168551e3a90fbf85bc68a30db00d4301f9354303bbe49/meta-memcache-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a43a34587ec7b86bd2f7ed496ffdff63408a626434d898ce2c6d5f19dbe9c126",
+          "md5": "0f17f1dd7e45f374ce17ce489d9489b6",
+          "sha256": "53dde4404e89115b31e2cdade5423109e9ff1e61b27c857ceb97b9f3fe2640cd"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0f17f1dd7e45f374ce17ce489d9489b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 24796,
+        "upload_time": "2022-02-14T22:20:20",
+        "upload_time_iso_8601": "2022-02-14T22:20:20.116753Z",
+        "url": "https://files.pythonhosted.org/packages/a4/3a/34587ec7b86bd2f7ed496ffdff63408a626434d898ce2c6d5f19dbe9c126/meta_memcache-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3379b6ec744c7ebc5813b57c1b0573a45944765f0d695a9c1d4e97bff2ca9691",
+          "md5": "d0a43b4b9ad54b5162e2103707d4be49",
+          "sha256": "e92edeefeeb899094217603263631e3947e455745ea9342f9d2ef42347184fa6"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d0a43b4b9ad54b5162e2103707d4be49",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25112,
+        "upload_time": "2022-02-14T22:20:18",
+        "upload_time_iso_8601": "2022-02-14T22:20:18.619286Z",
+        "url": "https://files.pythonhosted.org/packages/33/79/b6ec744c7ebc5813b57c1b0573a45944765f0d695a9c1d4e97bff2ca9691/meta-memcache-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "253baa5e43d5c911a1657209d003cf15e2e0e4d2709e2e0999961ac73a0c5367",
+          "md5": "a6aeefcff9405a1b000fdb0381b58ecd",
+          "sha256": "081d4681204f80b508c2325e8bb409cb911ee78b01a758f815756facbc2173da"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a6aeefcff9405a1b000fdb0381b58ecd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25087,
+        "upload_time": "2022-03-04T06:59:39",
+        "upload_time_iso_8601": "2022-03-04T06:59:39.785458Z",
+        "url": "https://files.pythonhosted.org/packages/25/3b/aa5e43d5c911a1657209d003cf15e2e0e4d2709e2e0999961ac73a0c5367/meta_memcache-0.5.1a0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "abb7a9a1d40de3ebc4f55e6109eebd7c83cf6c2139511f8a5f2465b910cbecfc",
+          "md5": "c98818cabd48d3bdf72656f3430cc0f3",
+          "sha256": "2d22956ae10766ab7cd84cc6f77a5a5617b7fbc112400ecf6cf0f3ea95f74860"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c98818cabd48d3bdf72656f3430cc0f3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25381,
+        "upload_time": "2022-03-04T06:59:37",
+        "upload_time_iso_8601": "2022-03-04T06:59:37.477561Z",
+        "url": "https://files.pythonhosted.org/packages/ab/b7/a9a1d40de3ebc4f55e6109eebd7c83cf6c2139511f8a5f2465b910cbecfc/meta-memcache-0.5.1a0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12b2e59a1afa49a2899b6dbc18f45c3246a961c1c31eba51425bf183eacd31ed",
+          "md5": "1d58a5c3428a8a46d9fa6a5c79d0753f",
+          "sha256": "8ea8b954a2119b5eeb985e8296e971a7b90dcfbd2ff67f0a21a56addb4a5c4fb"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1d58a5c3428a8a46d9fa6a5c79d0753f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25437,
+        "upload_time": "2022-03-05T02:51:19",
+        "upload_time_iso_8601": "2022-03-05T02:51:19.907913Z",
+        "url": "https://files.pythonhosted.org/packages/12/b2/e59a1afa49a2899b6dbc18f45c3246a961c1c31eba51425bf183eacd31ed/meta_memcache-0.5.1a1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0261790e2b1198d053105b49fb0f6b54b9904c9303dce031974861951e735bce",
+          "md5": "45e44e9d1a6393315e5f05a678234579",
+          "sha256": "e07e088a6cecef88714f0cd81184939dc2442252d9291a82c23c113882e7f34c"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "45e44e9d1a6393315e5f05a678234579",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25710,
+        "upload_time": "2022-03-05T02:51:18",
+        "upload_time_iso_8601": "2022-03-05T02:51:18.517636Z",
+        "url": "https://files.pythonhosted.org/packages/02/61/790e2b1198d053105b49fb0f6b54b9904c9303dce031974861951e735bce/meta-memcache-0.5.1a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0932858a4071d31288dcd7b64a0860bf8dbc224e605c493d42f33946a47886a",
+          "md5": "737ff847292b479eb1a2e134d1e563b0",
+          "sha256": "361eace6f4cedb026514e9786ff530214b0a5cac344ba7388d621824e6bc225f"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "737ff847292b479eb1a2e134d1e563b0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25428,
+        "upload_time": "2022-03-05T06:25:41",
+        "upload_time_iso_8601": "2022-03-05T06:25:41.505335Z",
+        "url": "https://files.pythonhosted.org/packages/d0/93/2858a4071d31288dcd7b64a0860bf8dbc224e605c493d42f33946a47886a/meta_memcache-0.5.1a2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "24fef1a88c3bbfbbfc55e36e739aa81298228f569bf38f4a1b02125e19deb7bf",
+          "md5": "4df1bca7d1f89d3179a4d5087991420a",
+          "sha256": "2db8da44eb0dccaa22a86ed25d491f118f5f47ff00c0768c9cffca49fc475167"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4df1bca7d1f89d3179a4d5087991420a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25696,
+        "upload_time": "2022-03-05T06:25:39",
+        "upload_time_iso_8601": "2022-03-05T06:25:39.506349Z",
+        "url": "https://files.pythonhosted.org/packages/24/fe/f1a88c3bbfbbfc55e36e739aa81298228f569bf38f4a1b02125e19deb7bf/meta-memcache-0.5.1a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7ad5d2f668bfae85af4770c9ee8e251b8f04ec0e5c5991727bf97231433f6d6",
+          "md5": "a562c8ded297a7ad73ccd6f2f6d98b6a",
+          "sha256": "e96a1282df539c6c4f2eebba0aabb61c44673dfbfbffb4a6734ee1434723e316"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a562c8ded297a7ad73ccd6f2f6d98b6a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25427,
+        "upload_time": "2022-03-05T06:39:57",
+        "upload_time_iso_8601": "2022-03-05T06:39:57.106239Z",
+        "url": "https://files.pythonhosted.org/packages/e7/ad/5d2f668bfae85af4770c9ee8e251b8f04ec0e5c5991727bf97231433f6d6/meta_memcache-0.5.1a3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a91b8ba50846063c5837425e644c74d035ee0462828576e1ce6cd8de8b84b28d",
+          "md5": "fcdcea08d9d491063c3bce855048bb31",
+          "sha256": "c9d4e5170a330fbafc06516e7d7efa15bd7697f63e74f9cfc605237f89fb3fbe"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fcdcea08d9d491063c3bce855048bb31",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25697,
+        "upload_time": "2022-03-05T06:39:55",
+        "upload_time_iso_8601": "2022-03-05T06:39:55.680238Z",
+        "url": "https://files.pythonhosted.org/packages/a9/1b/8ba50846063c5837425e644c74d035ee0462828576e1ce6cd8de8b84b28d/meta-memcache-0.5.1a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "783df8963d9ef04e0616be231856284902687979872cef3c0f11aa0cd89bb766",
+          "md5": "16fd37c1f8e963bd1542cd1ffd5b0102",
+          "sha256": "a22814ae9168aceb238a9e3f216891bf35ace6de7c0a647203f6389c3dc46eaf"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "16fd37c1f8e963bd1542cd1ffd5b0102",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25521,
+        "upload_time": "2022-03-07T23:43:44",
+        "upload_time_iso_8601": "2022-03-07T23:43:44.824141Z",
+        "url": "https://files.pythonhosted.org/packages/78/3d/f8963d9ef04e0616be231856284902687979872cef3c0f11aa0cd89bb766/meta_memcache-0.5.1a4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50fa62fea973e9ac3a2591f3213bcc2ce3bbffc8823f99515925b9fef1290a25",
+          "md5": "f50312bdeda5164715be4108b485a7d0",
+          "sha256": "4681bf2620de11dc90f0e7766e519c50467247e8683bcb8ee0f1616cd068e3a1"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f50312bdeda5164715be4108b485a7d0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25784,
+        "upload_time": "2022-03-07T23:43:42",
+        "upload_time_iso_8601": "2022-03-07T23:43:42.978954Z",
+        "url": "https://files.pythonhosted.org/packages/50/fa/62fea973e9ac3a2591f3213bcc2ce3bbffc8823f99515925b9fef1290a25/meta-memcache-0.5.1a4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "78c71ff66ac0d7318b2001f16cc78291c00edf3b24c27e285b5dd0c5ee466368",
+          "md5": "0c96b36b3be96390fbc73d04fc76b770",
+          "sha256": "24bc99c30c42452b9f47f883a3289804c68f43ee7cb6fa31735c672ce83eee54"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0c96b36b3be96390fbc73d04fc76b770",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25551,
+        "upload_time": "2022-03-08T17:44:13",
+        "upload_time_iso_8601": "2022-03-08T17:44:13.246846Z",
+        "url": "https://files.pythonhosted.org/packages/78/c7/1ff66ac0d7318b2001f16cc78291c00edf3b24c27e285b5dd0c5ee466368/meta_memcache-0.5.1a5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50a1090f332237592be22f286d603a140259de493be24d9bfa6a7642e51a2cf8",
+          "md5": "aa9f196e4e99cd0fcd0e57c6c63dcccd",
+          "sha256": "539e10b11a0ffe92401dca3dcd07b29060823502e9e533cf38c84e2ebfe542b4"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aa9f196e4e99cd0fcd0e57c6c63dcccd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25808,
+        "upload_time": "2022-03-08T17:44:11",
+        "upload_time_iso_8601": "2022-03-08T17:44:11.151284Z",
+        "url": "https://files.pythonhosted.org/packages/50/a1/090f332237592be22f286d603a140259de493be24d9bfa6a7642e51a2cf8/meta-memcache-0.5.1a5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.1a6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1f035531b81e6c760dc78264ac38f8ff38ecd6cf38826f468713f299425ea4f",
+          "md5": "144f6dcec8388e26c71965f7e2f6afe8",
+          "sha256": "f2e9613eaf6d070199955032461dab5e9863ced6154ca09cfe337d4251201e27"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.5.1a6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "144f6dcec8388e26c71965f7e2f6afe8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25616,
+        "upload_time": "2022-03-08T19:42:41",
+        "upload_time_iso_8601": "2022-03-08T19:42:41.977099Z",
+        "url": "https://files.pythonhosted.org/packages/e1/f0/35531b81e6c760dc78264ac38f8ff38ecd6cf38826f468713f299425ea4f/meta_memcache-0.5.1a6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b2275937bc33c779c78b8712e3d854fc4ab53bea2510a1fc910e3a532cf0807f",
+          "md5": "8630bcdb5bca7816603b70ace79fea58",
+          "sha256": "37b31f5873de62d5f4d2343e2c5e1c7666198c0fa1ffb52ee0f91260a5761f61"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.5.1a6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8630bcdb5bca7816603b70ace79fea58",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25888,
+        "upload_time": "2022-03-08T19:42:40",
+        "upload_time_iso_8601": "2022-03-08T19:42:40.832399Z",
+        "url": "https://files.pythonhosted.org/packages/b2/27/5937bc33c779c78b8712e3d854fc4ab53bea2510a1fc910e3a532cf0807f/meta-memcache-0.5.1a6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd67677c50b9c925ef4fc8e999e13fd5567d52f447e138bd7ef33aa6180cd29c",
+          "md5": "1b31645445da5c91f2cf531b55af3109",
+          "sha256": "a34be2d99d5ffee31faa7488abcafa65416919a9c9acc23224091006dc65e42f"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b31645445da5c91f2cf531b55af3109",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 36010,
+        "upload_time": "2022-03-09T16:29:29",
+        "upload_time_iso_8601": "2022-03-09T16:29:29.858164Z",
+        "url": "https://files.pythonhosted.org/packages/dd/67/677c50b9c925ef4fc8e999e13fd5567d52f447e138bd7ef33aa6180cd29c/meta_memcache-0.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d1ae1fe3ae7e2312f2d74dd6f84bf9904f9f8f133a878198defc2494f599e66",
+          "md5": "8a7d5743910ee34b8bf68bc03460b96e",
+          "sha256": "4d161f650922b6889e5c473188129772467a06579487633c91522f4aeb7ec823"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8a7d5743910ee34b8bf68bc03460b96e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 27228,
+        "upload_time": "2022-03-09T16:29:28",
+        "upload_time_iso_8601": "2022-03-09T16:29:28.640988Z",
+        "url": "https://files.pythonhosted.org/packages/2d/1a/e1fe3ae7e2312f2d74dd6f84bf9904f9f8f133a878198defc2494f599e66/meta-memcache-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "058237e06b635e9f21ab2f30a26c9b1ab92a376516887ed86878982ba4b38802",
+          "md5": "779bb2eb615c17bbff5849b8fbe3bc16",
+          "sha256": "47fd4b799caa663673cde4ac0a680bc18f7de9f88aa0de1a3605fcea844edd97"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "779bb2eb615c17bbff5849b8fbe3bc16",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29840,
+        "upload_time": "2022-03-16T17:48:40",
+        "upload_time_iso_8601": "2022-03-16T17:48:40.746477Z",
+        "url": "https://files.pythonhosted.org/packages/05/82/37e06b635e9f21ab2f30a26c9b1ab92a376516887ed86878982ba4b38802/meta_memcache-0.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe015fcb01e22c6f3f64052674a3dca4bc7e3e8b7b92c785e2f25c81b9f47ca1",
+          "md5": "3628a9fea67c4683d59d192e52c80c63",
+          "sha256": "0eb8d1209a3289519b23e0f342902c2754dd6913edc64638bf38609643f251cb"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3628a9fea67c4683d59d192e52c80c63",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29958,
+        "upload_time": "2022-03-16T17:48:38",
+        "upload_time_iso_8601": "2022-03-16T17:48:38.726736Z",
+        "url": "https://files.pythonhosted.org/packages/fe/01/5fcb01e22c6f3f64052674a3dca4bc7e3e8b7b92c785e2f25c81b9f47ca1/meta-memcache-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8d147ea4f152463077f8793f6a86e9751973ff8fe58a2842a1cfa799dfd4762b",
+          "md5": "6036fb05c4f28b8a94467ca49688d003",
+          "sha256": "12fcbbfb98fa93ae67a5d86c664692d4ce03a4e5ffeb573d3466d2cef3f7d415"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.8.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6036fb05c4f28b8a94467ca49688d003",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29851,
+        "upload_time": "2022-04-26T20:51:31",
+        "upload_time_iso_8601": "2022-04-26T20:51:31.397201Z",
+        "url": "https://files.pythonhosted.org/packages/8d/14/7ea4f152463077f8793f6a86e9751973ff8fe58a2842a1cfa799dfd4762b/meta_memcache-0.8.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "00c7d8eb517cb7084970c544a554f5e751fa30e0ae1c8a965b937eb491784e8f",
+          "md5": "1818ba6da0998e2893cc8a9c124a43a9",
+          "sha256": "fd66d5f91832269aeb955188f9364332ce58b8cb38690ed93c74e67349a30c51"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1818ba6da0998e2893cc8a9c124a43a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30010,
+        "upload_time": "2022-04-26T20:51:29",
+        "upload_time_iso_8601": "2022-04-26T20:51:29.770923Z",
+        "url": "https://files.pythonhosted.org/packages/00/c7/d8eb517cb7084970c544a554f5e751fa30e0ae1c8a965b937eb491784e8f/meta-memcache-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6052c0bdc8aae1e9344a7a02d3401d40a5992188786abe903838f6363b8d46a4",
+          "md5": "98ead57d26490b8eaf4832d77696f151",
+          "sha256": "8a1b55e0e130622023fb9d3a6a6325d7fb7c79e52ca5fb2567fb5a2e200633db"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.8.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "98ead57d26490b8eaf4832d77696f151",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29879,
+        "upload_time": "2022-05-10T16:41:33",
+        "upload_time_iso_8601": "2022-05-10T16:41:33.128552Z",
+        "url": "https://files.pythonhosted.org/packages/60/52/c0bdc8aae1e9344a7a02d3401d40a5992188786abe903838f6363b8d46a4/meta_memcache-0.8.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "88b9d461421b8405a72274a7084e6a1ab679c88954ac6c80dc8dcd0ba166b11c",
+          "md5": "912a873a32549f10299723d6e04eb9a9",
+          "sha256": "db34f4988e152cf601fd22fccbaca1ee57c9dd72c6c626410c6ed8685d67d4b6"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.8.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "912a873a32549f10299723d6e04eb9a9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30035,
+        "upload_time": "2022-05-10T16:41:31",
+        "upload_time_iso_8601": "2022-05-10T16:41:31.538341Z",
+        "url": "https://files.pythonhosted.org/packages/88/b9/d461421b8405a72274a7084e6a1ab679c88954ac6c80dc8dcd0ba166b11c/meta-memcache-0.8.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e18c64dc34b1b4fa2346b3bd4fc90bf8253f3a59795a6b12beb62d7baed69c3",
+          "md5": "ea17b2451c99d79586b40acbe490eab5",
+          "sha256": "a857a4397c5e0aefd41fddabf9ea20f02ee0e66086473b0f45f20103dea9b971"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.8.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ea17b2451c99d79586b40acbe490eab5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 29892,
+        "upload_time": "2022-05-12T18:26:58",
+        "upload_time_iso_8601": "2022-05-12T18:26:58.521028Z",
+        "url": "https://files.pythonhosted.org/packages/3e/18/c64dc34b1b4fa2346b3bd4fc90bf8253f3a59795a6b12beb62d7baed69c3/meta_memcache-0.8.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4fb7a0ed650a41cb2a5c5cfe42834e4d6fd7bc30b3ecbeb9e187ef2b8332baf3",
+          "md5": "5e0093de46a5bc3ffd23db5878cf5f11",
+          "sha256": "f2b82a3db395c0b069923286025f44f87160db5f4f1a0fb5bfbde1336540751b"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.8.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5e0093de46a5bc3ffd23db5878cf5f11",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30040,
+        "upload_time": "2022-05-12T18:26:57",
+        "upload_time_iso_8601": "2022-05-12T18:26:57.150767Z",
+        "url": "https://files.pythonhosted.org/packages/4f/b7/a0ed650a41cb2a5c5cfe42834e4d6fd7bc30b3ecbeb9e187ef2b8332baf3/meta-memcache-0.8.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a01beb59e5bea79ad4f99d7489cb5ea6d730c41e22cd20e2d77e816194401027",
+          "md5": "bc18bb4737c04d343679d591a4c82732",
+          "sha256": "a57f73c7b50f6d6725fa9410a5a3e220e11dcc32fcdd29a9e4060e81f141a4c6"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc18bb4737c04d343679d591a4c82732",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30333,
+        "upload_time": "2022-06-02T21:25:01",
+        "upload_time_iso_8601": "2022-06-02T21:25:01.103812Z",
+        "url": "https://files.pythonhosted.org/packages/a0/1b/eb59e5bea79ad4f99d7489cb5ea6d730c41e22cd20e2d77e816194401027/meta_memcache-0.9.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46157e2599e48240147ed742e8742b7decda7c4b4c646a84e73e8fec33f30555",
+          "md5": "033ef39debde0745c24dad5b3068f4dc",
+          "sha256": "0c7692b6799d26a4337a589ac8e2cc4578005bd1fe743548cfe2c5ac0fa2a8bb"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "033ef39debde0745c24dad5b3068f4dc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30657,
+        "upload_time": "2022-06-02T21:24:59",
+        "upload_time_iso_8601": "2022-06-02T21:24:59.234333Z",
+        "url": "https://files.pythonhosted.org/packages/46/15/7e2599e48240147ed742e8742b7decda7c4b4c646a84e73e8fec33f30555/meta-memcache-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0.dev33": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7463d6a57d9305dbf85cbf9f2fc4f51040cf515bb7ad0cac62ddd707100ff38f",
+          "md5": "77c88074d60e3a0713a97ae09b68a9fb",
+          "sha256": "cb4f336d25cae20d0adad21532a330e7e40462eb50720cabed83619d38ee3120"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.0.dev33-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "77c88074d60e3a0713a97ae09b68a9fb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25557,
+        "upload_time": "2022-06-03T16:54:44",
+        "upload_time_iso_8601": "2022-06-03T16:54:44.354263Z",
+        "url": "https://files.pythonhosted.org/packages/74/63/d6a57d9305dbf85cbf9f2fc4f51040cf515bb7ad0cac62ddd707100ff38f/meta_memcache-0.9.0.dev33-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f7015a714ba9eb5285e2a16d6842812034d9e701b136897fccd6bbe37fa14921",
+          "md5": "0245ce0bccff7e91295790d8053cb537",
+          "sha256": "1b9c5367f902638346b849a23a992644ffd78902c6295d67735390a30c282505"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.0.dev33.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0245ce0bccff7e91295790d8053cb537",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26083,
+        "upload_time": "2022-06-03T16:54:45",
+        "upload_time_iso_8601": "2022-06-03T16:54:45.747688Z",
+        "url": "https://files.pythonhosted.org/packages/f7/01/5a714ba9eb5285e2a16d6842812034d9e701b136897fccd6bbe37fa14921/meta-memcache-0.9.0.dev33.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "92bb665a7c33c34207abeca03239f31ff275efde31a046ae21f4c559496bf5bc",
+          "md5": "e78af6ffaaef510009ae32d1b344f362",
+          "sha256": "25d602a50b46bea2f308da20f3b4f3816019567279b0a238f6f65eeeb185e6a9"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e78af6ffaaef510009ae32d1b344f362",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25516,
+        "upload_time": "2022-06-03T17:32:43",
+        "upload_time_iso_8601": "2022-06-03T17:32:43.108926Z",
+        "url": "https://files.pythonhosted.org/packages/92/bb/665a7c33c34207abeca03239f31ff275efde31a046ae21f4c559496bf5bc/meta_memcache-0.9.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a78e6f68fe76ff93f91bb75c12b1c63fab2fd412afb28b0611bc5bc61eefd3b",
+          "md5": "75c28b9410593823b764bdb73484bb83",
+          "sha256": "d93acccb7a94dc662abb8dba6071aaea9f73619aed470830e60d3d5744bd1c35"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "75c28b9410593823b764bdb73484bb83",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26068,
+        "upload_time": "2022-06-03T17:32:44",
+        "upload_time_iso_8601": "2022-06-03T17:32:44.174491Z",
+        "url": "https://files.pythonhosted.org/packages/6a/78/e6f68fe76ff93f91bb75c12b1c63fab2fd412afb28b0611bc5bc61eefd3b/meta-memcache-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1.dev0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f05d45e536832e4b913a241418c4da7b7bf983c097d7e0fc1e8ca7c345ebffa3",
+          "md5": "5f81d3ccd79c5d8514e99f7d06e693ed",
+          "sha256": "cc855413dc89500ebbcb5a22cb278f7d2613b78fd6e10cbd9b1ff4663b4649c2"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.1.dev0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5f81d3ccd79c5d8514e99f7d06e693ed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25567,
+        "upload_time": "2022-06-03T17:08:38",
+        "upload_time_iso_8601": "2022-06-03T17:08:38.602978Z",
+        "url": "https://files.pythonhosted.org/packages/f0/5d/45e536832e4b913a241418c4da7b7bf983c097d7e0fc1e8ca7c345ebffa3/meta_memcache-0.9.1.dev0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3251dd08f4986fb3e40b4ce60b67fd911f4872178decc2fbab52f4655229370e",
+          "md5": "2f259cf3eee6523326bbacc54f6041e4",
+          "sha256": "b5adc09cd38ef5ec6b4c627466336e16b2525fad73ea042b246c57d3876d3e1a"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.1.dev0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f259cf3eee6523326bbacc54f6041e4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26108,
+        "upload_time": "2022-06-03T17:08:39",
+        "upload_time_iso_8601": "2022-06-03T17:08:39.806984Z",
+        "url": "https://files.pythonhosted.org/packages/32/51/dd08f4986fb3e40b4ce60b67fd911f4872178decc2fbab52f4655229370e/meta-memcache-0.9.1.dev0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0d0935ac10cd36a568a4cfd4bb4deb1a624450b4a160b1d1bef6602558a069ba",
+          "md5": "7271ae7d8c9a1a299099a8ac4c514411",
+          "sha256": "9d698766bb9fda10bc02ac7298d6051efb61bc961b0cadd3a11dc41c2bb26ced"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.1.dev1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7271ae7d8c9a1a299099a8ac4c514411",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25565,
+        "upload_time": "2022-06-03T17:24:22",
+        "upload_time_iso_8601": "2022-06-03T17:24:22.795413Z",
+        "url": "https://files.pythonhosted.org/packages/0d/09/35ac10cd36a568a4cfd4bb4deb1a624450b4a160b1d1bef6602558a069ba/meta_memcache-0.9.1.dev1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3243a0e15e9c082f34136752391a7fa340e1956bbc8fcde05fcac189b768e391",
+          "md5": "ebc51d723c1d8b47f24b0a1cb646e09a",
+          "sha256": "701790ab52250507c375fe49acb8e919d98df3a31bbc05f3dd99c1bc97c9dac9"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.1.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ebc51d723c1d8b47f24b0a1cb646e09a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26106,
+        "upload_time": "2022-06-03T17:24:23",
+        "upload_time_iso_8601": "2022-06-03T17:24:23.895000Z",
+        "url": "https://files.pythonhosted.org/packages/32/43/a0e15e9c082f34136752391a7fa340e1956bbc8fcde05fcac189b768e391/meta-memcache-0.9.1.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "38600c9e17f458fe529fdb10efd29827064cc637c58abf8481a8a5ded28c01fa",
+          "md5": "5610378a36433ce0a7bf81f895dc3f11",
+          "sha256": "ba6570d38e8359b84ee2ecda224c77569533a3558357002ce7b3dba7501b76e8"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5610378a36433ce0a7bf81f895dc3f11",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25508,
+        "upload_time": "2022-06-03T20:47:19",
+        "upload_time_iso_8601": "2022-06-03T20:47:19.734417Z",
+        "url": "https://files.pythonhosted.org/packages/38/60/0c9e17f458fe529fdb10efd29827064cc637c58abf8481a8a5ded28c01fa/meta_memcache-0.9.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f046a156a96d1eb02ace59b6bc8eb6a436fd6e729e64e788743723963f69b0cf",
+          "md5": "5f33d9e9777611c73899c5de2a888d0b",
+          "sha256": "67e01d0c1058846f336138f3ad1c10df4d868393348a5b18aeebd92ca9b33b2a"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5f33d9e9777611c73899c5de2a888d0b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26060,
+        "upload_time": "2022-06-03T20:47:21",
+        "upload_time_iso_8601": "2022-06-03T20:47:21.058770Z",
+        "url": "https://files.pythonhosted.org/packages/f0/46/a156a96d1eb02ace59b6bc8eb6a436fd6e729e64e788743723963f69b0cf/meta-memcache-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "926880e83325dd965c87d1245a71d8f563e197e01ba02fb604443481f58d5c35",
+          "md5": "de4519b30753d72be4d8d6e64c4966f1",
+          "sha256": "983463565f569f4d5a5a2adb4991a4b3318981f1a0a2c57153bbbef5e21cd321"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.2.dev1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "de4519b30753d72be4d8d6e64c4966f1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25568,
+        "upload_time": "2022-06-03T17:44:47",
+        "upload_time_iso_8601": "2022-06-03T17:44:47.449816Z",
+        "url": "https://files.pythonhosted.org/packages/92/68/80e83325dd965c87d1245a71d8f563e197e01ba02fb604443481f58d5c35/meta_memcache-0.9.2.dev1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a844e880e82f6482569cd6d505f8b0059e71946f389f0770c1b9190da25b1d7",
+          "md5": "dd56a35ac1e816614fb1f5541e7bcc18",
+          "sha256": "9851335ac13f722c9d318858b3c2f7e391b2eb5989493e33e01241325d60dfac"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.2.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dd56a35ac1e816614fb1f5541e7bcc18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26097,
+        "upload_time": "2022-06-03T17:44:49",
+        "upload_time_iso_8601": "2022-06-03T17:44:49.100880Z",
+        "url": "https://files.pythonhosted.org/packages/0a/84/4e880e82f6482569cd6d505f8b0059e71946f389f0770c1b9190da25b1d7/meta-memcache-0.9.2.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2.dev2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9721b82977382ae388da3eb2c1c4d4853cae406a60f65701e78f2f2a630b2b8",
+          "md5": "1fc3a850e97dee6af738c76476d44324",
+          "sha256": "4660603c44183c0234974d384e7ff3ac52e177bddd6ba0a4b88a809b741ff25a"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.2.dev2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1fc3a850e97dee6af738c76476d44324",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25558,
+        "upload_time": "2022-06-03T18:06:17",
+        "upload_time_iso_8601": "2022-06-03T18:06:17.797805Z",
+        "url": "https://files.pythonhosted.org/packages/b9/72/1b82977382ae388da3eb2c1c4d4853cae406a60f65701e78f2f2a630b2b8/meta_memcache-0.9.2.dev2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b44498f2df83c7fe30db81f16207e64d2fae14cc29f82f0801671f9ca178769",
+          "md5": "12012fde88e726913d343c5707d9fd5e",
+          "sha256": "0fcd07303d6119e021c50d76028595114b5b663956bbac4d205a7da320608464"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.2.dev2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "12012fde88e726913d343c5707d9fd5e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26096,
+        "upload_time": "2022-06-03T18:06:19",
+        "upload_time_iso_8601": "2022-06-03T18:06:19.199442Z",
+        "url": "https://files.pythonhosted.org/packages/3b/44/498f2df83c7fe30db81f16207e64d2fae14cc29f82f0801671f9ca178769/meta-memcache-0.9.2.dev2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.3.dev2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e7c83d409f4aa8ebe4ebd04235e4f59863632cabe5b715f66dbaa8d93c268ac4",
+          "md5": "9fb07842d887794cd9b2a585bf4b29a2",
+          "sha256": "503345bfee7252e50ab4a6aa1b40db38dd5a9a606412497cbac3154a8bf50b7e"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.3.dev2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9fb07842d887794cd9b2a585bf4b29a2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 25558,
+        "upload_time": "2022-06-03T21:07:21",
+        "upload_time_iso_8601": "2022-06-03T21:07:21.722289Z",
+        "url": "https://files.pythonhosted.org/packages/e7/c8/3d409f4aa8ebe4ebd04235e4f59863632cabe5b715f66dbaa8d93c268ac4/meta_memcache-0.9.3.dev2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a550886afa63a559ceb169abe660a932931ab39d89c5ea07a83dee29c4775197",
+          "md5": "2b8783e2cfb39012773a0cf9c1c07284",
+          "sha256": "ce3b7d117a3c9835010f14d80f36e6cbf79f5509f9bd70956f1a9d24e5eb1a07"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.3.dev2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2b8783e2cfb39012773a0cf9c1c07284",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26102,
+        "upload_time": "2022-06-03T21:07:23",
+        "upload_time_iso_8601": "2022-06-03T21:07:23.003512Z",
+        "url": "https://files.pythonhosted.org/packages/a5/50/886afa63a559ceb169abe660a932931ab39d89c5ea07a83dee29c4775197/meta-memcache-0.9.3.dev2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d3ca118ff99f735c24764997b1bd8c980284dbbcb21e6005a4d2685024dd2843",
+          "md5": "980e7c72f593747c86974e9684bae4e0",
+          "sha256": "041b3abd0d91bde6085bad83c04a6b73de277787020249d96d0074807b658f15"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "980e7c72f593747c86974e9684bae4e0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 31105,
+        "upload_time": "2022-11-30T09:44:53",
+        "upload_time_iso_8601": "2022-11-30T09:44:53.596855Z",
+        "url": "https://files.pythonhosted.org/packages/d3/ca/118ff99f735c24764997b1bd8c980284dbbcb21e6005a4d2685024dd2843/meta_memcache-0.9.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f69861aa9a21b1de7efab861880be3bbaefbedb5a167480632fcf5e44a7ad7c6",
+          "md5": "24c622b94f3e1a8bea763def38875cb1",
+          "sha256": "0a6f422e0714946f8328748b676f3dcd99d58b163838c30b06e4aa90374b209e"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24c622b94f3e1a8bea763def38875cb1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 31818,
+        "upload_time": "2022-11-30T09:44:55",
+        "upload_time_iso_8601": "2022-11-30T09:44:55.066486Z",
+        "url": "https://files.pythonhosted.org/packages/f6/98/61aa9a21b1de7efab861880be3bbaefbedb5a167480632fcf5e44a7ad7c6/meta_memcache-0.9.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.4.dev3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ae1ebf4d2b679e93d526b80a5b9e3bf5f1b933bf0bb34fb11ea79dcfc3f3adf0",
+          "md5": "8e82115f1292e3ccf3a49602d19ce302",
+          "sha256": "e5eb55797441ed37a6446b8006eaa2c31fe99e3d2f983ad48521d2df29d21b79"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.4.dev3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8e82115f1292e3ccf3a49602d19ce302",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26313,
+        "upload_time": "2022-11-29T14:00:16",
+        "upload_time_iso_8601": "2022-11-29T14:00:16.814703Z",
+        "url": "https://files.pythonhosted.org/packages/ae/1e/bf4d2b679e93d526b80a5b9e3bf5f1b933bf0bb34fb11ea79dcfc3f3adf0/meta_memcache-0.9.4.dev3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "214e1d7331c2585d487d0eab23d5ef07c5e298fe5b1c49d0ac9728cfe11a83a6",
+          "md5": "02f7cd6e95b7dc85246fe1e79ed3d04e",
+          "sha256": "74671467ab1ace102af8ccb6ebf613a4d64520a40fb95bcc122b17e0f6862457"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.4.dev3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02f7cd6e95b7dc85246fe1e79ed3d04e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 26992,
+        "upload_time": "2022-11-29T14:00:18",
+        "upload_time_iso_8601": "2022-11-29T14:00:18.139333Z",
+        "url": "https://files.pythonhosted.org/packages/21/4e/1d7331c2585d487d0eab23d5ef07c5e298fe5b1c49d0ac9728cfe11a83a6/meta-memcache-0.9.4.dev3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.4a0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c63d1cf752e4f9e1f57689df8a54525775fc7200eca7ffe9d71e3b75b50b9329",
+          "md5": "a2cd2c19b640a390e3896105f61bb47d",
+          "sha256": "e4335cf6c4a7d2bab041c6e688fbc6f716b9381e6a691b7ad6e2dbe3eac64874"
+        },
+        "downloads": -1,
+        "filename": "meta_memcache-0.9.4a0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a2cd2c19b640a390e3896105f61bb47d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30470,
+        "upload_time": "2022-07-27T18:08:57",
+        "upload_time_iso_8601": "2022-07-27T18:08:57.922565Z",
+        "url": "https://files.pythonhosted.org/packages/c6/3d/1cf752e4f9e1f57689df8a54525775fc7200eca7ffe9d71e3b75b50b9329/meta_memcache-0.9.4a0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dc8cb160a2c864f2ceda747c4c8f5acdbe98cb665868bd4672f3998cc78dadea",
+          "md5": "c9bedf4ea75771705b3606b6978170c7",
+          "sha256": "033907e4c3d52192a181a4f92cfbcb93cb6e093eafc0ffb718724dacabb94d01"
+        },
+        "downloads": -1,
+        "filename": "meta-memcache-0.9.4a0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c9bedf4ea75771705b3606b6978170c7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 30901,
+        "upload_time": "2022-07-27T18:08:56",
+        "upload_time_iso_8601": "2022-07-27T18:08:56.317951Z",
+        "url": "https://files.pythonhosted.org/packages/dc/8c/b160a2c864f2ceda747c4c8f5acdbe98cb665868bd4672f3998cc78dadea/meta-memcache-0.9.4a0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d3ca118ff99f735c24764997b1bd8c980284dbbcb21e6005a4d2685024dd2843",
+        "md5": "980e7c72f593747c86974e9684bae4e0",
+        "sha256": "041b3abd0d91bde6085bad83c04a6b73de277787020249d96d0074807b658f15"
+      },
+      "downloads": -1,
+      "filename": "meta_memcache-0.9.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "980e7c72f593747c86974e9684bae4e0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 31105,
+      "upload_time": "2022-11-30T09:44:53",
+      "upload_time_iso_8601": "2022-11-30T09:44:53.596855Z",
+      "url": "https://files.pythonhosted.org/packages/d3/ca/118ff99f735c24764997b1bd8c980284dbbcb21e6005a4d2685024dd2843/meta_memcache-0.9.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f69861aa9a21b1de7efab861880be3bbaefbedb5a167480632fcf5e44a7ad7c6",
+        "md5": "24c622b94f3e1a8bea763def38875cb1",
+        "sha256": "0a6f422e0714946f8328748b676f3dcd99d58b163838c30b06e4aa90374b209e"
+      },
+      "downloads": -1,
+      "filename": "meta_memcache-0.9.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "24c622b94f3e1a8bea763def38875cb1",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 31818,
+      "upload_time": "2022-11-30T09:44:55",
+      "upload_time_iso_8601": "2022-11-30T09:44:55.066486Z",
+      "url": "https://files.pythonhosted.org/packages/f6/98/61aa9a21b1de7efab861880be3bbaefbedb5a167480632fcf5e44a7ad7c6/meta_memcache-0.9.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

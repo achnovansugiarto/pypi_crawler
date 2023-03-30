@@ -1,0 +1,398 @@
+{
+  "info": {
+    "author": "Ben Howes",
+    "author_email": "b.howes@neuronostics.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Mishka Queue - A django task queue\n\nMishka queue is a task queue system for Django backed by postgres.\n\nIt was forked from:\n- https://github.com/SweetProcess/django-pg-queue, which in turn was forked from\n- https://github.com/gavinwahl/django-postgres-queue by Gavin Wahl.\n\n# Why postgres?\n\nI thought you were never supposed to use an RDBMS as a queue? Well,\npostgres has some features that make it not as bad as you might think,\nit has some compelling advantages.\n\n- Transactional behavior and reliability.\n\n    Adding tasks is atomic with respect to other database work. There is\n    no need to use `transaction.on_commit` hooks and there is no risk of\n    a transaction being committed but the tasks it queued being lost.\n\n    Processing tasks is atomic with respect to other database work.\n    Database work done by a task will either be committed, or the task\n    will not be marked as processed, no exceptions. If the task only\n    does database work, you achieve true exactly-once message\n    processing.\n\n-   Operational simplicity\n\n    By reusing the durable, transactional storage that we're already\n    using anyway, there's no need to configure, monitor, and backup\n    another stateful service. For small teams and light workloads, this\n    is the right trade-off.\n\n-   Easy introspection\n\n    Since tasks are stored in a database table, it's easy to query and\n    monitor the state of the queue.\n\n-   Safety\n\n    By using postgres transactions, there is no possibility of jobs\n    being left in a locked or ambiguous state if a worker dies. Tasks\n    immediately become available for another worker to pick up. You can\n    even `kill -9` a worker and be sure your database and queue will be\n    left in a consistent state.\n\n-   Priority queues\n\n    Since ordering is specified explicitly when selecting the next task\n    to work on, it's easy to ensure high-priority tasks are processed\n    first.\n\n-   Queues\n\n    Simply implemented by allowing filtering by a queue name in the\n    query.\n\n# Disadvantages\n\n-   Lower throughput than a dedicated queue server.\n-   Harder to scale a relational database than a dedicated queue server.\n-   Thundering herd. Postgres will notify all workers who LISTEN for the\n    same name.\n-   With at-least-once delivery, a postgres transaction has to be held\n    open for the duration of the task. For long running tasks, this can\n    cause table bloat and performance problems.\n-   When a task crashes or raises an exception under at-least-once\n    delivery, it immediately becomes eligible to be retried. If you want\n    to implement a retry delay, you must catch exceptions and requeue\n    the task with a delay. If your task crashes without throwing an\n    exception (eg SIGKILL), you could end up in an endless retry loop\n    that prevents other tasks from being processed.\n\n# How it works\n\nmishka-queue is able to claim, process, and remove a task in a single\n(simplified) query.\n\n``` sql\nDELETE FROM pgq_job\nWHERE id = (\n    SELECT id\n    FROM pgq_job\n    WHERE execute_at <= now()\n    ORDER BY priority DESC, created_at\n    FOR UPDATE SKIP LOCKED\n    LIMIT 1\n)\nRETURNING *;\n```\n\nAs soon as this query runs, the task is unable to be claimed by other\nworkers. When the transaction commits, the task will be deleted. If the\ntransaction rolls back or the worker crashes, the task will immediately\nbecome available for another worker.\n\nTo achieve at-least-once delivery, we begin a transaction, process the\ntask, then commit the transaction. For at-most-once, we claim the task\nand immediately commit the transaction, then process the task. For tasks\nthat don't have any external effects and only do database work, the\nat-least-once behavior is actually exactly-once (because both the\nclaiming of the job and the database work will commit or rollback\ntogether).\n\n# Comparison to Celery\n\nmishka queue fills the same role as Celery. You must use postgres as the\nbackend and the library is small enough that you can read and understand\nall the code.\n\n# A note on the use of `AtLeastOnceQueue` and Django's `transaction.on_commit()`\n\nA failure in an `on_commit()` callback will not cause that job to be\nretried when using an `AtLeastOnceQueue` (usually a job in an\n`AtLeastOnceQueue` queue will remain in the queue if the job fails).\nThis is because `on_commit()` callbacks are executed after the\ntransaction has been committed and, for mishka-queue, the job is\nremoved from the queue when the transaction commits.\n\nIf you require more certainty that the code in an `on_commit()` callback\nis executed successfully, you may need to ensure it is idempotent and\ncall it from within the job rather than using `on_commit()`.\n\n## Usage\n\n# Requirements\n\nmishka-queue is tested against python 3.9+, at least postgres 9.5 and at least\nDjango 3.2.\n\n# Installation\n\nInstall with pip:\n\n    pip install mishka-queue\n\nThen add `'pgq'` to your `INSTALLED_APPS`. Run `manage.py migrate` to\ncreate the jobs table.\n\nInstantiate a queue object. This can go wherever you like and be named\nwhatever you like. For example, `someapp/queue.py`:\n\n``` python\nfrom pgq.queue import AtLeastOnceQueue\n\nqueue = AtLeastOnceQueue(\n    tasks={\n        # ...\n    },\n    queue='my-queue',\n    notify_channel='my-queue',\n)\n```\n\nYou will need to import this queue instance to queue or process tasks.\nUse `AtLeastOnceQueue` for at-least-once delivery, or `AtMostOnceQueue`\nfor at-most-once delivery.\n\nmishka-queue comes with a management command base class that you can\nuse to consume your tasks. It can be called whatever you like, for\nexample in a `someapp/managment/commands/worker.py`:\n\n``` python\nfrom pgq.commands import Worker\n\nfrom someapp.queue import queue\n\nclass Command(Worker):\n    queue = queue\n```\n\nThen you can run `manage.py worker` to start your worker.\n\nA task function takes two arguments -- the queue instance in use, and\nthe Job instance for this task. The function can be defined anywhere and\ncalled whatever you like. Here's an example:\n\n``` python\nfrom pgq.decorators import task\n\nfrom .queues import queue\n\n@task(queue)\ndef debug_task(queue, job, args, meta):\n    print(args)\n```\n\nInstead of using the task decorator, you can manually register it as a\ntask. Add it to your queue instance when it is being created:\n\n``` python\nqueue = AtLeastOnceQueue(tasks={\n    'debug_task': debug_task,\n}, queue='my-queue')\n```\n\nThe key is the task name, used to queue the task. It doesn't have to\nmatch the function name.\n\nTo queue the task, if you used the task decorator you may:\n\n``` python\ndebug_task.enqueue({'some_args': 0})\n```\n\nTo manually queue the task, use the `enqueue` method on your queue\ninstance:\n\n``` python\nqueue.enqueue('debug_task', {'some_args': 0})\n```\n\nAssuming you have a worker running for this queue, the task will be run\nimmediately. The second argument must be a single json-serializeable\nvalue and will be available to the task as `job.args`.\n\nTasks registered using the `@task` decorator will only be available on\nthe queue if the file in which the task is defined has been imported. If\nyour worker doesn't import the file containing the `@task` decorators\nsomewhere, the tasks will not be available for dispatch. Importing files\nin the `apps.py` `AppConfig.ready()` method will ensure that the tasks\nare always available on the queue without having to import them in your\nworker just for the import side effects.\n\n``` python\n# Contents of someapp/apps.py\nfrom django.apps import AppConfig\n\nclass SomeAppAppConfig(AppConfig):\n    def ready(self):\n        # Tasks registered with @task are defined in this import\n        import someapp.tasks\n```\n\n# Multiple Queues\n\nYou may run multiple queues and workers may each listen to a queue. You\ncan have multiple workers listening to the same queue too. A queue is\nimplemented as a CharField in the database. The queue would simply\nfilter for jobs matching its queue name.\n\n# Bulk Enqueue\n\nMany jobs can be efficiently created using `bulk_enqueue()` which\naccepts one task name for all the jobs being created and a list of\ndictionaries containing `args` for the task to execute with and,\noptionally, `priority` and `execute_at` for that particular job.\n\n``` python\nqueue.bulk_enqueue(\n    'debug_task',\n    [\n        {'args': {'some_args': 0}},\n        {\n            'args': {'some_args': 10}\n            'priority': 10,\n            'execute_at': timezone.now() + timedelta(days=1),\n        },\n    ]\n)\n```\n\n# Monitoring\n\nTasks are just database rows stored in the `pgq_job` table, so you can\nmonitor the system with SQL.\n\nTo get a count of current tasks:\n\n``` sql\nSELECT queue, count(*) FROM pgq_job WHERE execute_at <= now() GROUP BY queue\n```\n\nThis will include both tasks ready to process and tasks currently being\nprocessed. To see tasks currently being processed, we need visibility\ninto postgres row locks. This can be provided by the [pgrowlocks\nextension](https://www.postgresql.org/docs/9.6/static/pgrowlocks.html).\nOnce installed, this query will count currently-running tasks:\n\n``` sql\nSELECT queue, count(*)\nFROM pgrowlocks('pgq_job')\nWHERE 'For Update' = ANY(modes)\nGROUP BY queue;\n```\n\nYou could join the results of `pgrowlocks` with `pgq_job` to get the\nfull list of tasks in progress if you want.\n\n# Logging\n\nmishka-queue logs through Python's logging framework, so can be\nconfigured with the `LOGGING` dict in your Django settings. It will not\nlog anything under the default config, so be sure to configure some form\nof logging. Everything is logged under the `pgq` namespace. Here is an\nexample configuration that will log INFO level messages to stdout:\n\n``` python\nLOGGING = {\n    'version': 1,\n    'root': {\n        'level': 'DEBUG',\n        'handlers': ['console'],\n    },\n    'formatters': {\n        'verbose': {\n            'format': '%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s',\n        },\n    },\n    'handlers': {\n        'console': {\n            'level': 'INFO',\n            'class': 'logging.StreamHandler',\n            'formatter': 'verbose',\n        },\n    },\n    'loggers': {\n        'pgq': {\n            'handlers': ['console'],\n            'level': 'INFO',\n            'propagate': False,\n        },\n    }\n}\n```\n\nIt would also be sensible to log WARNING and higher messages to\nsomething like Sentry:\n\n``` python\nLOGGING = {\n    'version': 1,\n    'root': {\n        'level': 'INFO',\n        'handlers': ['sentry', 'console'],\n    },\n    'formatters': {\n        'verbose': {\n            'format': '%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s',\n        },\n    },\n    'handlers': {\n        'console': {\n            'level': 'INFO',\n            'class': 'logging.StreamHandler',\n            'formatter': 'verbose',\n        },\n        'sentry': {\n            'level': 'WARNING',\n            'class': 'raven.contrib.django.handlers.SentryHandler',\n        },\n    },\n    'loggers': {\n        'pgq': {\n            'level': 'INFO',\n            'handlers': ['console', 'sentry'],\n            'propagate': False,\n        },\n    },\n}\n```\n\nYou could also log to a file by using the built-in\n`logging.FileHandler`.\n\n## Useful Recipes\n\nThese recipes aren't officially supported features of <span\nclass=\"title-ref\">mishka-queue</span>. We provide them so that you\ncan mimick some of the common features in other task queues.\n\n# `QUEUE_ALWAYS_EAGER`\n\nThe queues in this library allow you to use the `QUEUE_ALWAYS_EAGER`\nsetting to run a task immediately, without queueing it for a worker. It\ncould be used during tests, and while debugging in a development\nenvironment with any workers turned off.\n\nIt is similar in behaviour to `CELERY_ALWAYS_EAGER` setting in Celery.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "BSD-2-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "mishka-queue",
+    "package_url": "https://pypi.org/project/mishka-queue/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/mishka-queue/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/mishka-queue/1.2.0/",
+    "requires_dist": [
+      "django (>=3.2)"
+    ],
+    "requires_python": ">=3.8,<4.0",
+    "summary": "Mishka Queue - A django task queue",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17344930,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db4dcd274addfb4c942210a52cba2a5295a566bae43c77a2a9380d78c501daa9",
+          "md5": "8c8e846042a65ffe9c87b117d07cb648",
+          "sha256": "b229b72c70d4d221c02d92b38f13f5142d5228fe8672a91b6e733c8829672a5c"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8c8e846042a65ffe9c87b117d07cb648",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14883,
+        "upload_time": "2022-10-25T13:06:54",
+        "upload_time_iso_8601": "2022-10-25T13:06:54.772199Z",
+        "url": "https://files.pythonhosted.org/packages/db/4d/cd274addfb4c942210a52cba2a5295a566bae43c77a2a9380d78c501daa9/mishka_queue-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f810120e4e9bd79bef5c2034e26ac8e662c51d84db287dd6247d50dc1f98f7b3",
+          "md5": "24e9cfefcf4873cf386a6c0c9a2f593c",
+          "sha256": "4a9f82b40b7339685a4aa5f8ebf5edaf1ef0f83db294550299111bbf74f7d515"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "24e9cfefcf4873cf386a6c0c9a2f593c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18003,
+        "upload_time": "2022-10-25T13:06:56",
+        "upload_time_iso_8601": "2022-10-25T13:06:56.250709Z",
+        "url": "https://files.pythonhosted.org/packages/f8/10/120e4e9bd79bef5c2034e26ac8e662c51d84db287dd6247d50dc1f98f7b3/mishka-queue-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49f019928e8bd188adfd21da80de57d28875daf4b195acbe7cf4e8b71461acc4",
+          "md5": "6ee663d3ac04d4455eed7a0d2feebc7f",
+          "sha256": "793f1362c328314bd48b9f9e1c7cc62fedd95c2c2063b3196c3c2af527a2b630"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6ee663d3ac04d4455eed7a0d2feebc7f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14868,
+        "upload_time": "2022-10-25T13:12:44",
+        "upload_time_iso_8601": "2022-10-25T13:12:44.200256Z",
+        "url": "https://files.pythonhosted.org/packages/49/f0/19928e8bd188adfd21da80de57d28875daf4b195acbe7cf4e8b71461acc4/mishka_queue-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f80f16bd1965050e40f501c6a2fea97f64e076ed3be84dbf728c88bce5be02e1",
+          "md5": "2842ee33e7ddc3fc84293ed22e6b2973",
+          "sha256": "447f2f81ddfb6073f85e2507df71072ddbbad73a0672db04baf2ba847dbdc563"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2842ee33e7ddc3fc84293ed22e6b2973",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18005,
+        "upload_time": "2022-10-25T13:12:45",
+        "upload_time_iso_8601": "2022-10-25T13:12:45.696451Z",
+        "url": "https://files.pythonhosted.org/packages/f8/0f/16bd1965050e40f501c6a2fea97f64e076ed3be84dbf728c88bce5be02e1/mishka-queue-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d8ac00ab847065c9d4f68d8a2b0511f95b2615273d8208cf2a736d0e945056c1",
+          "md5": "78beada2db07a9115da54fc335789ccb",
+          "sha256": "5e22e6023229a9f786d4fd72a81090eb0b56acc0afc0453ddf50d8ed9c5c5745"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "78beada2db07a9115da54fc335789ccb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14871,
+        "upload_time": "2022-10-25T13:13:33",
+        "upload_time_iso_8601": "2022-10-25T13:13:33.613125Z",
+        "url": "https://files.pythonhosted.org/packages/d8/ac/00ab847065c9d4f68d8a2b0511f95b2615273d8208cf2a736d0e945056c1/mishka_queue-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cdac5726c0beef5b69bce27264c6490e907233459287c8ec92a2554c28f4e949",
+          "md5": "9a52a184da5388876ed46488d728c6fb",
+          "sha256": "66b4dd47b9dc400847f0bda8c2187af33b8742cf9cf9afc9aa53914cb9a7f363"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9a52a184da5388876ed46488d728c6fb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18008,
+        "upload_time": "2022-10-25T13:13:35",
+        "upload_time_iso_8601": "2022-10-25T13:13:35.135177Z",
+        "url": "https://files.pythonhosted.org/packages/cd/ac/5726c0beef5b69bce27264c6490e907233459287c8ec92a2554c28f4e949/mishka-queue-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0479452bc233e4435da9eb861da9f52dba3a66d03bc88ce06536cb41db5371cf",
+          "md5": "ebd42dd6f30f34868cb37c6c320aa28b",
+          "sha256": "5d5b403c9aec69f0e4a490c1d14b62fb1e2abac19328504e3970a7ab425a3d2b"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ebd42dd6f30f34868cb37c6c320aa28b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14880,
+        "upload_time": "2022-10-25T13:24:50",
+        "upload_time_iso_8601": "2022-10-25T13:24:50.472043Z",
+        "url": "https://files.pythonhosted.org/packages/04/79/452bc233e4435da9eb861da9f52dba3a66d03bc88ce06536cb41db5371cf/mishka_queue-1.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "84ec05125235cbf14ffaa023e24dac8c269647f6f7eb723b8c920b561ed38cf9",
+          "md5": "c8dc46225d493e81eaca44dae9e7eea1",
+          "sha256": "b0b288f27a0f5f71daa7dc9110fedfe5b6d62521733b6deada8e8f3a7551f5f8"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c8dc46225d493e81eaca44dae9e7eea1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18013,
+        "upload_time": "2022-10-25T13:24:51",
+        "upload_time_iso_8601": "2022-10-25T13:24:51.876005Z",
+        "url": "https://files.pythonhosted.org/packages/84/ec/05125235cbf14ffaa023e24dac8c269647f6f7eb723b8c920b561ed38cf9/mishka-queue-1.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "490205f1c6ba4b4319f551ecc0944fecf3bc0b4c9ec6aec6a559fb2aa05e8d96",
+          "md5": "e7424b2bf9147735ca412fe9fc38cfaa",
+          "sha256": "548359245a82c49c0ca61578556c9566f44dd1948cfae96d9a0f85cf6c603696"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e7424b2bf9147735ca412fe9fc38cfaa",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15597,
+        "upload_time": "2022-11-14T09:21:24",
+        "upload_time_iso_8601": "2022-11-14T09:21:24.537750Z",
+        "url": "https://files.pythonhosted.org/packages/49/02/05f1c6ba4b4319f551ecc0944fecf3bc0b4c9ec6aec6a559fb2aa05e8d96/mishka_queue-1.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c234425691985ad1b7a83e6e3192d0481d2246d5ad955ed98e18422c8e9c3148",
+          "md5": "1dae451cc2c1c19988d21c3e6db92e44",
+          "sha256": "d0476e158eadf86254b60b03b1d620d1318017de301c5062cd5f14909bb15551"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1dae451cc2c1c19988d21c3e6db92e44",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18415,
+        "upload_time": "2022-11-14T09:21:25",
+        "upload_time_iso_8601": "2022-11-14T09:21:25.891993Z",
+        "url": "https://files.pythonhosted.org/packages/c2/34/425691985ad1b7a83e6e3192d0481d2246d5ad955ed98e18422c8e9c3148/mishka-queue-1.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec1433cfb1ce8816a63b97dbf9e927658664e7e0a3772e4efdee069df0d3d44c",
+          "md5": "254beb12eeb8560878fd1e439d7f61b6",
+          "sha256": "9ec50e7ac5ef131fcff14c6947850a9e5b3ea198474d7bc85f7e03167ce9047d"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "254beb12eeb8560878fd1e439d7f61b6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15643,
+        "upload_time": "2022-11-23T15:25:32",
+        "upload_time_iso_8601": "2022-11-23T15:25:32.714661Z",
+        "url": "https://files.pythonhosted.org/packages/ec/14/33cfb1ce8816a63b97dbf9e927658664e7e0a3772e4efdee069df0d3d44c/mishka_queue-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63c5ab16f4ef18f12cb41b197fa2561fc1d88a8250c7319c59b8140dd5aa50e9",
+          "md5": "d2cf1216457298a41941095682c353a2",
+          "sha256": "dc92ffb3b4a3313aaacc00c774b46317ac034b4a7d379bf64b22269bc39e4887"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d2cf1216457298a41941095682c353a2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18382,
+        "upload_time": "2022-11-23T15:25:33",
+        "upload_time_iso_8601": "2022-11-23T15:25:33.966883Z",
+        "url": "https://files.pythonhosted.org/packages/63/c5/ab16f4ef18f12cb41b197fa2561fc1d88a8250c7319c59b8140dd5aa50e9/mishka-queue-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c2b89dd933cec3a05b1d588ea3646eb9080747a91aab3fe5cb11a48473f2d69",
+          "md5": "188d13559b6603bc157ca5273350c904",
+          "sha256": "dca3a522c325ed4ae5ed3f189aec024ee7c36e034a7de0ee7de33830eebdb946"
+        },
+        "downloads": -1,
+        "filename": "mishka_queue-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "188d13559b6603bc157ca5273350c904",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 15687,
+        "upload_time": "2023-03-18T11:58:17",
+        "upload_time_iso_8601": "2023-03-18T11:58:17.917289Z",
+        "url": "https://files.pythonhosted.org/packages/7c/2b/89dd933cec3a05b1d588ea3646eb9080747a91aab3fe5cb11a48473f2d69/mishka_queue-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "442a76c2eb26374663718b03f8c604d2f1af5451742a69893b13c5856d049ab6",
+          "md5": "f701f4adaefe98462ac7283174c3939e",
+          "sha256": "cc2fed9db86398a691125cb0e247d6c1ba64f2b1e0166ccfd3364bccccaf8e5e"
+        },
+        "downloads": -1,
+        "filename": "mishka-queue-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f701f4adaefe98462ac7283174c3939e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 18433,
+        "upload_time": "2023-03-18T11:58:19",
+        "upload_time_iso_8601": "2023-03-18T11:58:19.605016Z",
+        "url": "https://files.pythonhosted.org/packages/44/2a/76c2eb26374663718b03f8c604d2f1af5451742a69893b13c5856d049ab6/mishka-queue-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7c2b89dd933cec3a05b1d588ea3646eb9080747a91aab3fe5cb11a48473f2d69",
+        "md5": "188d13559b6603bc157ca5273350c904",
+        "sha256": "dca3a522c325ed4ae5ed3f189aec024ee7c36e034a7de0ee7de33830eebdb946"
+      },
+      "downloads": -1,
+      "filename": "mishka_queue-1.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "188d13559b6603bc157ca5273350c904",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 15687,
+      "upload_time": "2023-03-18T11:58:17",
+      "upload_time_iso_8601": "2023-03-18T11:58:17.917289Z",
+      "url": "https://files.pythonhosted.org/packages/7c/2b/89dd933cec3a05b1d588ea3646eb9080747a91aab3fe5cb11a48473f2d69/mishka_queue-1.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "442a76c2eb26374663718b03f8c604d2f1af5451742a69893b13c5856d049ab6",
+        "md5": "f701f4adaefe98462ac7283174c3939e",
+        "sha256": "cc2fed9db86398a691125cb0e247d6c1ba64f2b1e0166ccfd3364bccccaf8e5e"
+      },
+      "downloads": -1,
+      "filename": "mishka-queue-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f701f4adaefe98462ac7283174c3939e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 18433,
+      "upload_time": "2023-03-18T11:58:19",
+      "upload_time_iso_8601": "2023-03-18T11:58:19.605016Z",
+      "url": "https://files.pythonhosted.org/packages/44/2a/76c2eb26374663718b03f8c604d2f1af5451742a69893b13c5856d049ab6/mishka-queue-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

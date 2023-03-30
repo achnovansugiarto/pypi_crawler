@@ -1,0 +1,235 @@
+{
+  "info": {
+    "author": "Felix Schwarz",
+    "author_email": "felix.schwarz@oss.schwarz.eu",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "\n## mailqueue-runner\n\nThis library helps sending email messages to an SMTP server. Its main feature\nis a queuing system to handle (temporary) errors when sending the message\n(e.g. interrupted network connection) and detailed error logging.\n\nWhen a message can not be sent via SMTP it can be stored in a maildir-like queue\non disk. An external helper script (`mq-run`) picks them up at a later time and\ntries to deliver these messages again. The helper script must be called\nregularly (e.g. via cron).\n\nAs a nice bonus the library is pretty modular so you can plug in custom code and\nadapt the library to your needs.\n\n### Usage (mail submission)\n\n```python\nfrom schwarz.mailqueue import init_smtp_mailer, MaildirBackend, MessageHandler\n# settings: a dict-like instance with keys as shown below in the \"Configuration\" section\nsettings = {}\n# Adapt the list of transports as you like (ordering matters):\n# - always enqueue: use \"MaildirBackend()\" only\n# - never enqueue: use \"init_smtp_mailer()\" only\ntransports = [\n    init_smtp_mailer(settings),\n    MaildirBackend('/path/to/queue-dir'),\n]\nhandler = MessageHandler(transports)\nmsg = b'…' # RFC-822/RFC-5322 message as bytes or email.Message instance\nwas_sent = handler.send_message(msg, sender='foo@site.example', recipient='bar@site.example')\n# \"was_sent\" evaluates to True if the message was sent via SMTP or queued\n# for later delivery.\nwas_queued = (getattr(send_result, 'queued', None) is not False)\n```\n\n\n### Usage (mq-run)\n\nThe `mq-run` script sends all queued messages to an SMTP server:\n\n    mq-run /path/to/config.ini /path/to/queue\n\nIf you want to test your configuration you can send a test message to ensure\nthe mail flow is set up correctly:\n\n    mq-send-test /path/to/config.ini /path/to/queue --to=recipient@site.example\n\n### Configuration (mq-run)\n\nThe configuration file uses the traditional \"ini\"-like format:\n\n    [mqrunner]\n    smtp_hostname = hostname\n    smtp_port = 587\n    smtp_username = someuser@site.example\n    smtp_password = secret\n    # optional, format as described in\n    # https://docs.python.org/3/library/logging.config.html#logging-config-fileformat\n    logging_conf = /path/to/logging.conf\n\nFor more information about wrapping `mq-run` (e.g. to reuse an existing configuration format) please read [Cookbook: Custom wrapper for mq-run](#cookbook-custom-wrapper-for-mq-run).\n\n\n### Logging\n\nLogs can help you monitoring the mail processing. The library uses two separate\nloggers depending on the type of delivery:\n\n- `mailqueue.delivery_log`: message was delivered to the SMTP server\n- `mailqueue.queue_log`: message was queued and will be delivered later by `mq-run`\n\n\n### Plugins\n\nThe library allows customization of message handling via plugins. Plugins are built\nwith the [Puzzle Plugin System](https://github.com/FelixSchwarz/puzzle-plugin-system) ([blinker](https://github.com/jek/blinker)+setuptools).\n\nFeatures which can be implemented by plugins:\n\n- notification about successful/failed deliveries (e.g. additional logging, storing some data in external databases, ...)\n- discarding queued messages after failed delivery attempts (e.g. give up after 10 failed attempts)\n\nTo learn more about plugin discovery/plugin development please head of to the [Puzzle Plugin project](https://github.com/FelixSchwarz/puzzle-plugin-system).\n\n\nCLI tools like `mq-run` will load your plugin if it is added to the\nextension point `mailqueue.plugins`, e.g.\n\n```\n# setup.cfg (of your custom app)\n[options.entry_points]\nmailqueue.plugins =\n    myplugin = example.app.mqplugin\n```\n\nExample plugin code:\n\n```python\n# example/app/mqplugin.py\nfrom schwarz.puzzle_plugins import connect_signals, disconnect_signals\nfrom schwarz.mailqueue import registry, MQAction, MQSignal\n\nclass MyPlugin:\n    def __init__(self, registry):\n        self._connected_signals = None\n        self._registry = registry\n\n    def signal_map(self):\n        return {\n            MQSignal.delivery_successful: self.delivery_successful,\n            MQSignal.delivery_failed: self.delivery_failed,\n        }\n\n    def delivery_successful(self, _, msg, send_result):\n        # called when a message was delivered successfully\n        pass\n\n    def delivery_failed(self, _, msg, send_result):\n        # called when message delivery failed\n        if msg.retries > 10:\n            # discard messsage after 10 failed delivery attempts\n            return MQAction.DISCARD\n        return None\n\ndef initialize(context, registry):\n    plugin = MyPlugin(registry)\n    plugin._connected_signals = connect_signals(plugin.signal_map(), registry)\n    context['plugin'] = plugin\n\ndef terminate(context):\n    plugin = context['plugin']\n    disconnect_signals(plugin._connected_signals, plugin._registry)\n    plugin._registry = None\n    plugin._connected_signals = None\n```\n\n\n### Cookbook: Custom wrapper for mq-run\n\nWhile `mq-run` usually works great, sometimes you might want more control. For example you might not want to duplicate your configuration (once for your actual application and once for `mq-run`). The good news is that you can write a pretty minimal wrapper to leverage your existing code without duplicating `mq-run`'s functionaliy:\n\n```python\n#!/usr/bin/env python3\n\nfrom schwarz.mailqueue.queue_runner import one_shot_queue_run\n\ndef main():\n    # set up custom configuration, logging here (use your existing code)\n    cli_options = {'verbose': True}\n    # prepare configuration as expected by mailqueue-runner\n    settings = {\n        # … (smtp settings)\n\n        # --- optional ---\n        # only load \"myplugin\" plugin\n        'plugins': 'myplugin',\n        # do not reset currently configured loggers, just add a few for UI output\n        'basic_logging_configured': True,\n        # ability to inject a custom MessageHandler instance for maximum flexibility\n        #'mh': …\n    }\n    one_shot_queue_run(queue_dir, options=cli_options, settings=settings)\n\nif __name__ == '__main__':\n    main()\n```\n\n\n### Cookbook: Conservative Message Sending\n\nThe default configuration shown above tries to send messages via SMTP if possible and only serialize the data to persistent storage (filesystem) when the SMTP delivery failed. That approach is usually a good compromise between performance (serializing to disk is slow) while ensuring that messages will be sent eventually.\n\nHowever sometimes it is really important that you never loose a single message even if mailqueue-runner has a bug and crashes directly after trying to send the message with SMTP. To mitigate this risk you can use mailqueue-runner to store the message persistently before even trying to send it via SMTP:\n\n```python\nfrom schwarz.mailqueue import enqueue_message, MessageHandler\n\nmd_msg = enqueue_message(msg, path_maildir,\n    sender      = '...',\n    recipients  = ('...',),\n    in_progress = True,\n    return_msg  = True,\n)\nhandler = MessageHandler(transports=...)\nwas_sent = handler.send_message(md_msg, sender='foo@site.example', recipient='bar@site.example')\n```\n\nPlease note that you don't have to use a single approach exclusively in your application. You can use conservative message sending as shown above for really important messages while relying on a performance-focussed approach for not-so-important majority of your messages.\n\n\n### Motivation / related software\n\nMany web applications need to send emails. Usually this works by delivering the\nmessage to a real SMTP server which then distributes the messages to remote\nmailservers all over the net (well, mostly Gmail these days ;-).\nAll is fine until your SMTP server is not reachable (e.g. network errors) or\ndoes not accept the message due to temporary errors (e.g. DNS failure, unable\nto verify the sender).\n\n\"mailqueue-runner\" implements a (persistent) message queue and provides a\nscript which helps sending emails reliably (assuming you have sufficiently\nfree disk space).\n\n[repoze.sendmail](https://github.com/repoze/repoze.sendmail) is similar and a\nsolid piece of software. I wrote yet another library because I wanted\n\n - avoid data loss if the SMTP server does not accept messages due to (temporary)\n   errors without delaying messages while everything is working fine (i.e. most\n   of the time)\n - avoid nasty surprises if the SMTP server rejects one (but not all) recipients\n   in a message to multiple recipients\n - different error handling/better integration into custom web applications\n   (delivery logs, error handling)\n - better error logging (including the ability to log the complete SMTP dialog)\n - only minimal modification to queued messages (repoze.sendmail uses Python's\n   email module to manipulate message headers required for delivery)\n\n[django-mail-queue](https://github.com/Privex/django-mail-queue) provides a Django app which also provides a web ui. Obviously restricted to Django and there is too much implicit (\"magic\") behavior for my taste. However I recommend trying this library if you are using Django.\n\n\n### Non-goals\n\n - No code to actually generate an email (e.g. from a template, add attachments, ...)\n - Probably not suited for high volume message sending (>> 100 messages per second)\n   when your SMTP server is not available as messages will be stored on the\n   (slow) file system.\n\n\n### Tested Python versions\n\nI use [Travis](https://travis-ci.com/FelixSchwarz/mailqueue-runner) and\n[appveyor (Windows)](https://ci.appveyor.com/project/FelixSchwarz/mailqueue-runner) to run the\ntest suite. Hopefully this means all tested versions are suitable for production.\nAt the moment I test Python 2.7 and Python 3.6-3.8 as well as pypy3 on Linux.\nDeployment on Windows is not recommended as all locking will be disabled on\nWindows (due to its inability to delete/move open files) but development on\na Windows machine should be fine.\n\n\n### License\n\nThe code is licensed unter the MIT license with only few exceptions: It\ncontains a custom (slightly modified) version of Python's smtplib which is\nlicensed under the [Python License 2.0](https://spdx.org/licenses/Python-2.0.html).\n\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/FelixSchwarz/mailqueue-runner",
+    "keywords": "",
+    "license": "MIT and Python",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "mailqueue-runner",
+    "package_url": "https://pypi.org/project/mailqueue-runner/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/mailqueue-runner/",
+    "project_urls": {
+      "Homepage": "https://github.com/FelixSchwarz/mailqueue-runner"
+    },
+    "release_url": "https://pypi.org/project/mailqueue-runner/0.9.2/",
+    "requires_dist": [
+      "boltons",
+      "docopt",
+      "PuzzlePluginSystem (>=0.6.0)",
+      "six",
+      "portalocker (<2.0) ; python_version < \"3.0\"",
+      "portalocker ; python_version > \"3.0\"",
+      "ddt ; extra == 'testing'",
+      "FakeFSHelpers ; extra == 'testing'",
+      "pymta (>=0.7.0) ; extra == 'testing'",
+      "PythonicTestcase (>=1.4.1) ; extra == 'testing'",
+      "schwarzlog ; extra == 'testing'",
+      "setuptools ; extra == 'testing'",
+      "testfixtures ; extra == 'testing'",
+      "freezegun (<1.0) ; (python_version < \"3.0\") and extra == 'testing'",
+      "mock ; (python_version < \"3.0\") and extra == 'testing'",
+      "freezegun ; (python_version > \"3.0\") and extra == 'testing'",
+      "pymta ; extra == 'testutils'",
+      "schwarzlog ; extra == 'testutils'"
+    ],
+    "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+    "summary": "",
+    "version": "0.9.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9599306,
+  "releases": {
+    "0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22804382eb3fae259137f882cc8d4f3179df1c1373bf75dfd98a56ec401d6438",
+          "md5": "6f0d843ed54df4b0707c3b4d9fb11389",
+          "sha256": "1f5a78a43583c91b7eeb194e2f11dffc2d9313c393871338769dae0b6a8397e8"
+        },
+        "downloads": -1,
+        "filename": "mailqueue_runner-0.9-py2.py3-none-any.whl",
+        "has_sig": true,
+        "md5_digest": "6f0d843ed54df4b0707c3b4d9fb11389",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 39474,
+        "upload_time": "2020-10-29T09:58:02",
+        "upload_time_iso_8601": "2020-10-29T09:58:02.568581Z",
+        "url": "https://files.pythonhosted.org/packages/22/80/4382eb3fae259137f882cc8d4f3179df1c1373bf75dfd98a56ec401d6438/mailqueue_runner-0.9-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22d4cfa42de60a84f01e8b38377921cb11f1c2abc1a26fba7cc969faceb0cb1b",
+          "md5": "6537f239e1ca27275ca0803a9dd8621e",
+          "sha256": "c61277b7cc50548cfd50ee8cece496efe496bab873f87e0897d4fba3ca5425a9"
+        },
+        "downloads": -1,
+        "filename": "mailqueue-runner-0.9.tar.gz",
+        "has_sig": true,
+        "md5_digest": "6537f239e1ca27275ca0803a9dd8621e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 35302,
+        "upload_time": "2020-10-29T09:58:05",
+        "upload_time_iso_8601": "2020-10-29T09:58:05.535811Z",
+        "url": "https://files.pythonhosted.org/packages/22/d4/cfa42de60a84f01e8b38377921cb11f1c2abc1a26fba7cc969faceb0cb1b/mailqueue-runner-0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0fbf4008cac05d1bc68cd245a4a756b5d4a25755f6c2788f5ad5834337de44f",
+          "md5": "ebc5d88a47cad8cc0006e01a66d3dcec",
+          "sha256": "c9ce6ceeee4c189eb5352b1b26cdc9efc0a854cf186f179dcd62415a4d56d7df"
+        },
+        "downloads": -1,
+        "filename": "mailqueue_runner-0.9.1-py2.py3-none-any.whl",
+        "has_sig": true,
+        "md5_digest": "ebc5d88a47cad8cc0006e01a66d3dcec",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 43802,
+        "upload_time": "2020-11-13T09:12:29",
+        "upload_time_iso_8601": "2020-11-13T09:12:29.020737Z",
+        "url": "https://files.pythonhosted.org/packages/f0/fb/f4008cac05d1bc68cd245a4a756b5d4a25755f6c2788f5ad5834337de44f/mailqueue_runner-0.9.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dae3f3b5131661466af95574d75b30ad2b3cfdee29810809ac080c5cb206affb",
+          "md5": "ad3de7eb29c9906a1dce9c8bacb1c2ae",
+          "sha256": "efdad4ab8e0448c2c83a444d397eb2f2f2657e5502bf77d0843c003c418a69f3"
+        },
+        "downloads": -1,
+        "filename": "mailqueue-runner-0.9.1.tar.gz",
+        "has_sig": true,
+        "md5_digest": "ad3de7eb29c9906a1dce9c8bacb1c2ae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 45986,
+        "upload_time": "2020-11-13T09:12:30",
+        "upload_time_iso_8601": "2020-11-13T09:12:30.645266Z",
+        "url": "https://files.pythonhosted.org/packages/da/e3/f3b5131661466af95574d75b30ad2b3cfdee29810809ac080c5cb206affb/mailqueue-runner-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f7ee1b2e0c5893d96df1ffbc612bb76870a6689b8e06cebfd8b9042683200642",
+          "md5": "a44faf763246b195294a8858f4cf6621",
+          "sha256": "6246b4afe056d7f2891e50e01e068ca77104b29af311d33e2c4a3caf66e7d2f9"
+        },
+        "downloads": -1,
+        "filename": "mailqueue_runner-0.9.2-py2.py3-none-any.whl",
+        "has_sig": true,
+        "md5_digest": "a44faf763246b195294a8858f4cf6621",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 44082,
+        "upload_time": "2021-03-02T16:38:07",
+        "upload_time_iso_8601": "2021-03-02T16:38:07.016386Z",
+        "url": "https://files.pythonhosted.org/packages/f7/ee/1b2e0c5893d96df1ffbc612bb76870a6689b8e06cebfd8b9042683200642/mailqueue_runner-0.9.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "08e9668f2e1f35fa69d8b9f81be4f20fdb6cb32c2454a797a546ecb45d21c5a9",
+          "md5": "53976bcf42f5302ee7e3b9d9ec669199",
+          "sha256": "1930027190c4134da459eaae60681bcac4f55eae798dd8191d2d6ed71ceaab3d"
+        },
+        "downloads": -1,
+        "filename": "mailqueue-runner-0.9.2.tar.gz",
+        "has_sig": true,
+        "md5_digest": "53976bcf42f5302ee7e3b9d9ec669199",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+        "size": 46382,
+        "upload_time": "2021-03-02T16:38:09",
+        "upload_time_iso_8601": "2021-03-02T16:38:09.034965Z",
+        "url": "https://files.pythonhosted.org/packages/08/e9/668f2e1f35fa69d8b9f81be4f20fdb6cb32c2454a797a546ecb45d21c5a9/mailqueue-runner-0.9.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "f7ee1b2e0c5893d96df1ffbc612bb76870a6689b8e06cebfd8b9042683200642",
+        "md5": "a44faf763246b195294a8858f4cf6621",
+        "sha256": "6246b4afe056d7f2891e50e01e068ca77104b29af311d33e2c4a3caf66e7d2f9"
+      },
+      "downloads": -1,
+      "filename": "mailqueue_runner-0.9.2-py2.py3-none-any.whl",
+      "has_sig": true,
+      "md5_digest": "a44faf763246b195294a8858f4cf6621",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+      "size": 44082,
+      "upload_time": "2021-03-02T16:38:07",
+      "upload_time_iso_8601": "2021-03-02T16:38:07.016386Z",
+      "url": "https://files.pythonhosted.org/packages/f7/ee/1b2e0c5893d96df1ffbc612bb76870a6689b8e06cebfd8b9042683200642/mailqueue_runner-0.9.2-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "08e9668f2e1f35fa69d8b9f81be4f20fdb6cb32c2454a797a546ecb45d21c5a9",
+        "md5": "53976bcf42f5302ee7e3b9d9ec669199",
+        "sha256": "1930027190c4134da459eaae60681bcac4f55eae798dd8191d2d6ed71ceaab3d"
+      },
+      "downloads": -1,
+      "filename": "mailqueue-runner-0.9.2.tar.gz",
+      "has_sig": true,
+      "md5_digest": "53976bcf42f5302ee7e3b9d9ec669199",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,>=2.7",
+      "size": 46382,
+      "upload_time": "2021-03-02T16:38:09",
+      "upload_time_iso_8601": "2021-03-02T16:38:09.034965Z",
+      "url": "https://files.pythonhosted.org/packages/08/e9/668f2e1f35fa69d8b9f81be4f20fdb6cb32c2454a797a546ecb45d21c5a9/mailqueue-runner-0.9.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

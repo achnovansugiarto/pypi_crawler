@@ -1,0 +1,407 @@
+{
+  "info": {
+    "author": "Zhou Bo",
+    "author_email": "baudzhou@outlook.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      "Topic :: Scientific/Engineering :: Image Processing",
+      "Topic :: Text Processing"
+    ],
+    "description": "# MindsporeTrainer\n ![PyPI](https://img.shields.io/pypi/v/MindsporeTrainer?color=blue) \n ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/MindsporeTrainer)\n ![GitHub Workflow Status](https://img.shields.io/github/workflow/status/baudzhou/MindsporeTrainer/Upload%20Python%20Package)\n  ![issues](https://img.shields.io/github/issues/baudzhou/MindsporeTrainer) \n  ![License](https://img.shields.io/github/license/baudzhou/MindsporeTrainer) \n\n**MindsporeTrainer** 是基于昇思MindSpore的训练框架。让Mindspore的算法研究更容易一些。  \n  \nMindspore上手不易，希望能帮助各位炼丹师的升级之路更容易些。  \n\n[**Home page**](https://github.com/baudzhou/MindsporeTrainer)\n# 目录\n* [主要特性](#主要特性)\n* [安装](#安装)\n* [使用方法](#使用方法)\n    * [DeBERTa预训练任务示例](#DeBERTa预训练任务示例)\n    * [多卡训练](#多卡训练)\n* [模型创建](#模型创建)\n* [参数介绍](#参数介绍)\n* [Task](#Task)\n* [API](#API)\n* [models](#models)\n# 主要特性\n主要的几个出发点是：  \n+ 采用纯python实现，方便多卡训练过程中的调试\n+ 易于扩展，对新任务采用插件式接入\n+ 方便实现多种模型的训练、评估、预测等  \n# 安装\n## pip\n`pip install MindsporeTrainer`\n## 源码\n`python setup.py`\n# 使用方法\n## DeBERTa预训练任务示例\n### 1. 定义task\n[MindsporeTrainer/apps/tasks/deberta.py](./MindsporeTrainer/apps/tasks/deberta.py)\n```\nfrom collections import OrderedDict\nimport numpy as np\nimport os\nimport random\nfrom shutil import copyfile\nfrom loguru import logger\n\nfrom mindspore.communication import get_rank, get_group_size\n\nfrom MindsporeTrainer.data import ExampleInstance, ExampleSet\nfrom MindsporeTrainer.data.example import *\nfrom MindsporeTrainer.apps.tasks import EvalData, TransformerTask\nfrom MindsporeTrainer.apps.tasks import register_task\nfrom MindsporeTrainer.utils.metrics import *\nfrom MindsporeTrainer.utils.metrics import BertMetric\nfrom MindsporeTrainer.utils.masker import NGramMaskGenerator\nfrom MindsporeTrainer.data.dynamic_dataset import create_dynamic_dataset\nfrom MindsporeTrainer.modeling.tokenizers import BertTokenizer\n\n@register_task(name=\"DEBERTA\", desc=\"Basic DEBERTA task\")\nclass DEBERTATask(TransformerTask):\n    def __init__(self, data_dir, args, **kwargs):\n        super().__init__(args, **kwargs)\n        self.max_seq_length = 512\n        self.model_config = 'data/pretrained_models/deberta-base-v2/model_config.json'\n        self.vocab_type = 'BERT'\n        self.vocab_path = 'data/pretrained_models/deberta-base-v2/vocab.txt'\n        self.data_dir = data_dir\n        self.args = args\n        self.metric = 'bert'\n        self.main_metric = 'perplexity'\n        self.optimizer_name = 'Lamb'\n        self.tokenizer = BertTokenizer(self.vocab_path)\n        if args.distribute:\n            self.rank_id = get_rank()\n            self.rank_size = get_group_size()\n        else:\n            self.rank_id = 0\n            self.rank_size = 1\n\n    def train_data(self, max_seq_len=512, batch_size=32, **kwargs):\n        data_path = os.path.join(self.data_dir, 'daizhige.pkl')\n        data = self.load_data(data_path, 'GW', max_seq_len)\n        # data = ExampleSet(data)\n        output_columns = [\"input_ids\", \"input_mask\", \"token_type_id\", \"next_sentence_labels\",\n                                    \"masked_lm_positions\", \"masked_lm_ids\", \"masked_lm_weights\"]\n        return create_dynamic_dataset(data, self.get_feature_fn(), \n                                      batch_size=batch_size,\n                                      output_columns=output_columns, \n                                      repeat=self.args.num_train_epochs,\n                                      num_workers=self.args.data_workers,\n                                      num_shards=self.rank_size, \n                                      shard_id=self.rank_id)\n\n    def eval_data(self, max_seq_len=512, batch_size=32, **kwargs):\n        ...\n\n    def get_metrics(self, **kwargs):\n        \"\"\"Calcuate metrics based on prediction results\"\"\"\n        return OrderedDict(\n            bert = BertMetric(self.args.eval_batch_size),\n            )\n\n    def get_eval_fn(self, **kwargs):\n        data = kwargs.get('data')\n        if data is None:\n            data = self.eval_data(**kwargs)\n        def run_eval(model, name, prefix):\n            '''\n            args: \n                model: Model instance\n                name: evaluate name\n                prefix: prefix of file\n            return:\n                float, main metric of this task, used to save best metric model\n            '''\n            res = model.eval(data, dataset_sink_mode=False)\n            res = res['bert']\n            main_metric = res[self.main_metric]\n            if self.rank_id == 0:\n                output=os.path.join(self.args.output_dir, 'submit-{}-{}.tsv'.format(name, prefix))\n                metric_str = '\\n'.join([f'{k}: {v:.4f}' for k, v in res.items()])\n                metric_str = metric_str + '\\n'\n                logger.info(\"====================================\")\n                logger.info(\"evaluate result:\\n\")\n                logger.info(metric_str)\n                logger.info(\"====================================\")\n\n                with open(output, 'w', encoding='utf-8') as fs:\n                    fs.write(f\"metrics:\\n{metric_str}\\n\")\n            return main_metric\n        return run_eval\n\n\n    def get_feature_fn(self, max_seq_len=512, ext_params=None, rng=None, **kwargs):\n        tokenizer = self.tokenizer\n        mask_generator = NGramMaskGenerator(tokenizer)\n        def example_to_feature(*example):\n            '''\n            sample: text, label\n            return: [\"input_ids\", \"input_mask\", \"token_type_id\", \"next_sentence_labels\",\n                    masked_lm_positions\", \"masked_lm_ids\", \"masked_lm_weights\"]\n            '''\n            ......\n            return tuple(features)\n\n        return example_to_feature\n\n    def load_data(self, path, type=None, max_seq_len=512):\n        examples = []\n        ......\n        return ExampleSet(examples)\n\n\n    def get_model(self):\n        from MindsporeTrainer.modeling.models import BertPreTraining, DebertaPreTraining\n        from MindsporeTrainer import build_transformer_model\n        if self.args.fp16:\n            compute_type = mstype.float16\n        else:\n            compute_type = mstype.float32\n        model, config = build_transformer_model(self.model_config, \n                                                model=DebertaPreTraining, \n                                                compute_type=compute_type, \n                                                padding_idx=self.tokenizer._convert_token_to_id(self.tokenizer.pad_token))\n        with open(os.path.join(self.args.output_dir, 'config.json'), 'w', encoding='utf-8') as f:\n            f.write(config.to_json_string())\n        copyfile(self.vocab_path, os.path.join(self.args.output_dir, 'vocab.txt'))\n        return model\n        # return partial_class\n\n    def get_loss(self, *args, **kwargs):\n        from MindsporeTrainer.modeling.loss import BertPretrainingLoss\n        return BertPretrainingLoss(self.tokenizer.vocab_size)\n\n    def get_eval_head(self, *args, **kwargs):\n        from MindsporeTrainer.modeling.models import BertEvalHead\n        return BertEvalHead(self.tokenizer.vocab_size)\n\n    def get_opt_fn(self, *args, **kwargs):\n        return None\n\n```\n### 2. 编写启动脚本\nrun.py\n```\nimport MindsporeTrainer as mst\nmst.launch()\n```\n### 3. 运行任务\n```\npython run.py --task_name=RESNETTask --do_train --do_eval --data_dir=data --num_train_epochs=10 --learning_rate=1e-2 --train_batch_size=64 --save_eval_steps=1000 --output_dir=output\n```\n## 多卡训练\n官方推荐编写bash脚本，利用mpi进行训练，这里采用了纯python的实现。\n### 定义必须的环境变量\n\nbash\n```\nexport RANK_SIZE = 8\nexport RANK_TABLE_FILE = /path/hccl.json\n```\nvscode调试环境\n```\n\"env\": {\n    \"RANK_SIZE\": \"8\",\n    \"RANK_TABLE_FILE\": \"/path/hccl.json\"\n}\n```\n设置参数，开始训练\n```\npython run.py ...... --device_num=8 --device_id=0,1,2,3,4,5,6,7\n```\n# 模型创建\n## 自定义模型\nMindspore相对TF和PyTorch，有其自身的特点，建模习惯也不同。在本框架中，为了便于模块化与代码复用，将模型分为**backbone**和**predict head**两部分。  \n需要注意的是，模型定义中，construct函数返回都应当是tuple，即使只有一个对象返回，也应当采用(obj,)的形式。\n### backbone\n模型的主体部分定义。\n### predict head\n模型的附属部分，根据模型的用途，通常可以定义为loss层，或者在evaluation过程中定义的eval head，又或者其他用途的头。\n## 使用官方[model_zoo](https://gitee.com/mindspore/models)中的模型\n其代码结构如下\n```shell\nmodels\n├── official                                    # 官方支持模型\n│   └── XXX                                     # 模型名\n│       ├── README.md                           # 模型说明文档\n│       ├── requirements.txt                    # 依赖说明文件\n│       ├── eval.py                             # 精度验证脚本\n│       ├── export.py                           # 推理模型导出脚本\n│       ├── scripts                             # 脚本文件\n│       │   ├── run_distributed_train.sh        # 分布式训练脚本\n│       │   ├── run_eval.sh                     # 验证脚本\n│       │   └── run_standalone_train.sh         # 单机训练脚本\n│       ├── src                                 # 模型定义源码目录\n│       │   ├── XXXNet.py                       # 模型结构定义\n│       │   ├── callback.py                     # 回调函数定义\n│       │   ├── config.py                       # 模型配置参数文件\n│       │   └── dataset.py                      # 数据集处理定义\n│       ├── ascend_infer                        # （可选）用于在Ascend推理设备上进行离线推理的脚本\n│       ├── third_party                         # （可选）第三方代码\n│       │   └── XXXrepo                         # （可选）完整克隆自第三方仓库的代码\n│       └── train.py                            # 训练脚本\n├── research                                    # 非官方研究脚本\n├── community                                   # 合作方脚本链接\n└── utils                                       # 模型通用工具\n```\n找到所需的模型目录后，在src/xxxmodel.py中找到相应的定义，如果有定义好的backbone和head，那么可以直接引入使用。  \n例如使用其中的BERT模型：  \n`git clone https://gitee.com/mindspore/models`  \n复制出bert源码到工作目录`models/official/nlp/bert/src`  \n定义task\n```\n    from bert.src.bert_for_pre_training import BertPreTraining, BertPretrainingLoss\n    ......\n    def get_model(self):\n        from MindsporeTrainer import build_transformer_model\n        if self.args.fp16:\n            compute_type = mstype.float16\n        else:\n            compute_type = mstype.float32\n        model, config = build_transformer_model(self.model_config, \n                                                model=BertPreTraining, \n                                                compute_type=compute_type, \n                                                padding_idx=self.tokenizer._convert_token_to_id(self.tokenizer.pad_token))\n        with open(os.path.join(self.output_dir, 'config.json'), 'w', encoding='utf-8') as f:\n            f.write(config.to_json_string())\n        copyfile(self.vocab_path, os.path.join(self.output_dir, 'vocab.txt'))\n        return model\n\n    def get_loss(self, *args, **kwargs):\n        return BertPretrainingLoss(self.tokenizer.vocab_size)\n\n    def get_eval_head(self, *args, **kwargs):\n        from MindsporeTrainer.modeling.models import BertEvalHead\n        return BertEvalHead(self.tokenizer.vocab_size)\n```\n# 参数介绍\n训练超参数基本上都是通过运行参数来控制的，另外一些则可以在task定义中控制。\n## commmon args\n+ --accumulation_steps   \n    type=int  \n    default=1  \n    Accumulating gradients N times before weight update, default is 1.\n+ --allreduce_post_accumulation  \n    type=str  \n    default=true  \n    choices=[true, false]  \n    Whether to allreduce after accumulation of N steps or after each step, default is true.\n+ --data_dir  \n    default=None  \n    type=str  \n    required=False  \n    The input data dir. Should contain the .tsv files (or other data files) for the task.\n+ --data_sink_steps  \n    type=int   \n    default=1  \n    Sink steps for each epoch, default is 1.\n\n+ --do_train  \n    default=False  \n    action='store_true'  \n    Whether to run training.\n\n+ --do_eval  \n    default=False  \n    action='store_true'  \n    Whether to run eval on the dev set.\n\n+ --do_predict  \n    default=False  \n    action='store_true'  \n    Whether to run prediction on the test set.\n\n+ --debug  \n    default=False  \n    action='store_true'  \n    Whether to cache cooked binary features\n\n+ --device_target   \n    type=str  \n    default='Ascend'   \n    choices=['Ascend   'GPU']  \n    device where the code will be implemented. (Default: Ascend)\n\n+ --distribute  \n    default=False  \n    action='store_true'  \n    Run distribute, default is false.\n\n+ --device_id  \n  type=str  \n  default=0  \n  Device id, default is 0.\n+ --device_num  \n  type=int  \n  default=1  \n  Use device nums, default is 1.\n+ --enable_data_sink  \n    default=False  \n    action='store_true'  \n    Enable data sink, default is false.\n+ --load_checkpoint_path  \n    type=str  \n    default=''  \n    Load checkpoint file path\n+ --num_train_epochs  \n    default=1  \n    type=int  \n    Total number of training epochs to perform.\n+ --output_dir  \n    default=None  \n    type=str  \n    required=True  \n    The output directory where the model checkpoints will be written.\n+ --run_mode  \n    type=str  \n    default='GRAPH'  \n    choices=['GRAPH   'PY']  \n    0: GRAPH_MODE, 1: PY_NATIVE_MODE\n+ --save_eval_steps  \n    type=int  \n    default=1000  \n    Save checkpoint and evaluate steps, default is 1000.\n+ --save_checkpoint_num  \n    type=int  \n    default=1  \n    Save checkpoint numbers, default is 1.\n+ --tag  \n    type=str  \n    default='final'  \n    The tag name of current prediction/runs.\n+ --task_dir  \n    default=None  \n    type=str  \n    required=False  \n    The directory to load customized tasks.\n+ --task_name  \n    default=None  \n    type=str  \n    action=LoadTaskAction  \n    required=True  \n    The name of the task to train.\n\n## train args\n\n+ --data_workers  \n            type=int  \n            default=4  \n            The workers to load data.  \n+ --enable_graph_kernel   \n    type=str   \n    default=auto   \n    choices=[auto, true, false]  \n    Accelerate by graph kernel, default is auto.\n+ --eval_batch_size   \n    default=32  \n    type=int  \n    Total batch size for eval.\n+ --enable_global_norm  \n            type=bool  \n            default=False  \n            enable global norm  \n+ --predict_batch_size  \n    default=32  \n    type=int  \n    Total batch size for prediction.\n+ --report_interval  \n            default=1  \n            type=int  \n            Interval steps for state report.  \n+ --save_graphs   \n    default=False  \n    action='store_true'  \n    Whether to save graphs\n+ --seed  \n            type=int  \n            default=1234  \n            random seed for initialization  \n+ --thor   \n    default=False  \n    action='store_true' \n    Whether to convert model to thor optimizer\n+ --train_batch_size  \n            default=64  \n            type=int  \n            Total batch size for training.  \n+ --train_steps  \n    type=int  \n    default=-1  \n    Training Steps, default is -1, meaning run all steps according to epoch number.\n## optimizer args\n+ --fp16  \n            default=False  \n            type=boolean_string  \n            Whether to use 16-bit float precision instead of 32-bit\n\n+ --learning_rate  \n            default=5e-5  \n            type=float  \n            The initial learning rate for Adam.\n\n+ --loss_scale_value  \n            type=int  \n            default=1024  \n            initial loss scale value  \n\n+ --resume_opt_path  \n            type=str.lower  \n            default=''  \n            The optimizer to be resumed.\n+ --scale_factor  \n            type=int  \n            default=4  \n            loss scale factor  \n\n+ --scale_window  \n            type=int  \n            default=1000  \n            loss window  \n\n+ --warmup  \n            default=0.1  \n            type=float  \n            Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10% of training.\n## task中增加自定义参数\n```\n    @classmethod\n    def add_arguments(cls, parser):\n        \"\"\"Add task specific arguments\n            e.g. parser.add_argument('--data_dir', type=str, help='The path of data directory.')\n        \"\"\"\n        parser.add_argument('--task_example_arg', type=str, default=None, help='An example task specific argument')\n\n        return parser\n```\n\n# Task\n所有的task都应当继承于`MindsporeTrainer.apps.tasks.Task`,   \n为transformer定义的`MindsporeTrainer.apps.tasks.TransformerTask`也继承自Task。  \nTask类的定义为:\n```\nclass Task():\n    _meta={}\n\n    def __init__(self, args, **kwargs):\n        self.args = args\n    \n    def eval_data(self, **kwargs):\n        \"\"\"\n        Get eval dataset object.\n        \"\"\"\n        return None\n\n    def train_data(self, **kwargs):\n        \"\"\"\n        Get train dataset object.\n        \"\"\"\n        return None\n\n    def test_data(self, **kwargs):\n        return None\n\n    def get_labels(self):\n        \"\"\"Gets the list of labels for this data set.\"\"\"\n        return None\n\n    def get_eval_fn(self, *args, **kwargs):\n        \"\"\"\n        Get the evaluation function\n        \"\"\"\n        return None\n\n    def get_eval_head(self, *args, **kwargs):\n        \"\"\"\n        Get the evaluate head, the head replace loss function head when evaluation process\n        \"\"\"\n        return None\n\n    def get_pred_fn(self, *args, **kwargs):\n        \"\"\"\n        Get the predict function\n        \"\"\"\n        return None\n\n    def get_loss(self, *args, **kwargs):\n        \"\"\"\n        Get the loss function\n        \"\"\"\n        return None\n\n    def get_opt_fn(self, *args, **kwargs):\n        \"\"\"\n        Get a function wich return the opimizer\n        \"\"\"\n        def get_optimizer(*args, **kwargs):\n            pass\n        return get_optimizer\n\n    def get_metrics(self):\n        \"\"\"Calcuate metrics based on prediction results\"\"\"\n        return None\n\n    def get_predict_fn(self):\n        \"\"\"Calcuate metrics based on prediction results\"\"\"\n        def predict_fn(logits, output_dir, name, prefix):\n            pass\n        return None\n\n    def get_feature_fn(self, **kwargs):\n        \"\"\"\n        get the featurize function\n        \"\"\"\n        def _example_to_feature(**kwargs):\n             return feature\n        return _example_to_feature\n    \n    def get_model(self):\n        \"\"\"\n        Get a model instance\n        \"\"\"\n        raise NotImplementedError('method not implemented yet.')\n\n    @classmethod\n    def add_arguments(cls, parser):\n        \"\"\"Add task specific arguments\n        \"\"\"\n        pass\n```\n# API\n## MindsporeTrainer\n    MindsporeTrainer.launch()\n    启动器，可支持分布式启动\n    MindsporeTrainer.build_transformer_model(\n                                            config_path=None,\n                                            model='bert',\n                                            application='encoder',\n                                            **kwargs\n                                            )\n    创建transformer模型  \n    args:   \n        config_path model config 路径  \n        model 为str的话，从预定义模型中获取模型类，为类名的话，直接进行实例化  \n        application 用途，默认为'encoder'，TODO：实现decoder等  \n        其他参数\n## MindsporeTrainer.modeling\n    建模模块，并提供若干预定义的模型，目前包括BERT和DeBERTa。\n### MindsporeTrainer.modeling.models\n    提供若干预定义的模型，目前包括BERT和DeBERTa。\n### MindsporeTrainer.modeling.loss\n    提供预定义的loss\n### MindsporeTrainer.modeling.tokenizers\n    提供预定义的tokenizers，目前仅支持BertTokenizer\n## MindsporeTrainer.data \n    数据相关\n### MindsporeTrainer.data.ExampleInstance\n    样本实例\n### MindsporeTrainer.data.ExampleSet\n    样本集\n### MindsporeTrainer.data.dynamic_dataset\n    创建动态数据集\n## MindsporeTrainer.utils\n    各种实用组件\n### MindsporeTrainer.utils.metrics\n    提供多种自定义metric\n### MindsporeTrainer.utils.masker\n    用于生成MLM的mask\n## MindsporeTrainer.apps.tasks\n    任务相关\n### MindsporeTrainer.apps.tasks.Task\n    任务基类\n### MindsporeTrainer.apps.tasks.TransformerTask\n    Transformer任务类，继承自Task\n## MindsporeTrainer.optims\n    优化器、学习率调度等\n\n# models\n作者实现的模型，努力丰富中......\n## DeBERTa\n原论文：[DeBERTa: Decoding-enhanced BERT with Disentangled Attention](https://arxiv.org/abs/2006.03654)  \n原仓库：[https://github.com/microsoft/DeBERTa](https://github.com/microsoft/DeBERTa)  \n实现的是DeBERTa v2，详见[DeBERTa](./MindsporeTrainer/apps/tasks/deberta.py) task  \n# 作者\n周波 \n\nDMAC Group@ZJU 浙江大学人工智能研究所\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/baudzhou/MindsporeTrainer",
+    "keywords": "Deep Learning,NLP,CV,Transformers,MindSpore",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "MindsporeTrainer",
+    "package_url": "https://pypi.org/project/MindsporeTrainer/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/MindsporeTrainer/",
+    "project_urls": {
+      "Homepage": "https://github.com/baudzhou/MindsporeTrainer"
+    },
+    "release_url": "https://pypi.org/project/MindsporeTrainer/0.2.0/",
+    "requires_dist": [
+      "loguru",
+      "ujson",
+      "tqdm",
+      "scipy",
+      "scikit-learn"
+    ],
+    "requires_python": "",
+    "summary": "Make Mindspore Training Easier",
+    "version": "0.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15467520,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6676729b9ad9a9d8f3a0a2d944c43254ff563ce6f2f7506292f04aaff9cb6ab",
+          "md5": "e7a5a3bb223318155ca36b2bebf29826",
+          "sha256": "34c07b0d2f0ae1598d59954d8aea214783ce7a8bed7a75b093002a00566cbc2f"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e7a5a3bb223318155ca36b2bebf29826",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 202418,
+        "upload_time": "2022-08-30T03:10:10",
+        "upload_time_iso_8601": "2022-08-30T03:10:10.015124Z",
+        "url": "https://files.pythonhosted.org/packages/a6/67/6729b9ad9a9d8f3a0a2d944c43254ff563ce6f2f7506292f04aaff9cb6ab/MindsporeTrainer-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce545f77c687e27a1bf4a2c03512f70ba218cd6f24e7d53a2b9607c9212daaeb",
+          "md5": "05a705ac117975fc691f78070bb1c88f",
+          "sha256": "7ca42f96a27f40b61ccced707afc764ad30108a014e292715c375601a12c481f"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "05a705ac117975fc691f78070bb1c88f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 133121,
+        "upload_time": "2022-08-30T03:10:12",
+        "upload_time_iso_8601": "2022-08-30T03:10:12.011349Z",
+        "url": "https://files.pythonhosted.org/packages/ce/54/5f77c687e27a1bf4a2c03512f70ba218cd6f24e7d53a2b9607c9212daaeb/MindsporeTrainer-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c00590c9d09062254cebabf85c83b0a65d9e0c8e9a0d986481d33a25e1c66db3",
+          "md5": "c9e28c15e3a6b8604ac4437b1af561ab",
+          "sha256": "5b001dc7c7ed4e88e6897974dc943bb947f859ff6483337b808e27e531eb6bb1"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c9e28c15e3a6b8604ac4437b1af561ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 165593,
+        "upload_time": "2022-08-30T04:21:09",
+        "upload_time_iso_8601": "2022-08-30T04:21:09.764395Z",
+        "url": "https://files.pythonhosted.org/packages/c0/05/90c9d09062254cebabf85c83b0a65d9e0c8e9a0d986481d33a25e1c66db3/MindsporeTrainer-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e6463b3e3016a46ca29c3828a249843bfd1348ba348395f28493e24782fcc9c1",
+          "md5": "dda0c1e95b25a464c7a72cea24f90fb4",
+          "sha256": "824366664b83af8273dd0d4fc7bb18496fae488f2080f0899ef7adf6666b4630"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dda0c1e95b25a464c7a72cea24f90fb4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 141024,
+        "upload_time": "2022-08-30T04:21:11",
+        "upload_time_iso_8601": "2022-08-30T04:21:11.487085Z",
+        "url": "https://files.pythonhosted.org/packages/e6/46/3b3e3016a46ca29c3828a249843bfd1348ba348395f28493e24782fcc9c1/MindsporeTrainer-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2b14cd1bd85f1108d3b020ebc99938656fbc7f49e76feaa3ec32a4b2f5c1c8b9",
+          "md5": "1e0844fb3b20d377c9d664efd6b807b9",
+          "sha256": "f56d9c7ac66b2109176c1dcaebfa027ab2e9f53d4303f224dfb840b7b4a9c4be"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1e0844fb3b20d377c9d664efd6b807b9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 165878,
+        "upload_time": "2022-09-01T13:58:24",
+        "upload_time_iso_8601": "2022-09-01T13:58:24.560122Z",
+        "url": "https://files.pythonhosted.org/packages/2b/14/cd1bd85f1108d3b020ebc99938656fbc7f49e76feaa3ec32a4b2f5c1c8b9/MindsporeTrainer-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8320c2e2ff9b72376d8dce1fda599ba5d8d861951db58c33db17bc51649459d0",
+          "md5": "f1d836bc1f079631a633d452022e50bd",
+          "sha256": "bb82f5f77d94d09ff7b3d84559c0188e9962e39aa1cb56fe62e786389689f154"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f1d836bc1f079631a633d452022e50bd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 141457,
+        "upload_time": "2022-09-01T13:58:25",
+        "upload_time_iso_8601": "2022-09-01T13:58:25.756393Z",
+        "url": "https://files.pythonhosted.org/packages/83/20/c2e2ff9b72376d8dce1fda599ba5d8d861951db58c33db17bc51649459d0/MindsporeTrainer-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd26af621f2b144f845ee1abc74cfa897bae1faa3a54970709de21f0f03e6de2",
+          "md5": "879f2c734033904271847f16cf229966",
+          "sha256": "f778254b53e6a3781d50a6af0d89d2007805c2b90b92e01bbf5cb547ee477b80"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "879f2c734033904271847f16cf229966",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 166168,
+        "upload_time": "2022-09-06T05:56:46",
+        "upload_time_iso_8601": "2022-09-06T05:56:46.694246Z",
+        "url": "https://files.pythonhosted.org/packages/bd/26/af621f2b144f845ee1abc74cfa897bae1faa3a54970709de21f0f03e6de2/MindsporeTrainer-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b1e78663de1fd98b536c0b4f0367e595bf438dab24a0bf430738422bef8d102",
+          "md5": "f8529e0432d818c5467fd8e4f47fb964",
+          "sha256": "781576216cf0a93e07102dfc77be9d815b4fd79981a0a9ff9115740d31385450"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f8529e0432d818c5467fd8e4f47fb964",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 141738,
+        "upload_time": "2022-09-06T05:56:47",
+        "upload_time_iso_8601": "2022-09-06T05:56:47.953827Z",
+        "url": "https://files.pythonhosted.org/packages/1b/1e/78663de1fd98b536c0b4f0367e595bf438dab24a0bf430738422bef8d102/MindsporeTrainer-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01ed9b7ab3a9d141e2efadc09e083c6d3d6dd527da8ec2c0ce8a4991d42ebe68",
+          "md5": "a284164f668b12da632dae040ea4fc84",
+          "sha256": "6956c3a169355e41a6e44c88c9d666ef0386ff30b6f781e927ac46d3fd7d5ab3"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a284164f668b12da632dae040ea4fc84",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 166373,
+        "upload_time": "2022-09-13T15:26:21",
+        "upload_time_iso_8601": "2022-09-13T15:26:21.387144Z",
+        "url": "https://files.pythonhosted.org/packages/01/ed/9b7ab3a9d141e2efadc09e083c6d3d6dd527da8ec2c0ce8a4991d42ebe68/MindsporeTrainer-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8ac12b30daa273c7b821b358608bfd90e465a7dc987008fd9d00b4766e1726bb",
+          "md5": "35fe972cdf42a660af2bbc35c9ae8f1f",
+          "sha256": "6357591a7658c80295566db45bbd03d27293913202717b86ea131e1ed9c8dc92"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "35fe972cdf42a660af2bbc35c9ae8f1f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 141887,
+        "upload_time": "2022-09-13T15:26:23",
+        "upload_time_iso_8601": "2022-09-13T15:26:23.486138Z",
+        "url": "https://files.pythonhosted.org/packages/8a/c1/2b30daa273c7b821b358608bfd90e465a7dc987008fd9d00b4766e1726bb/MindsporeTrainer-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "415144046552d4b074d92e2b1e76da637b2ddaef9f338a24c204dc716d364157",
+          "md5": "2bf03090ab64919f48bf34df74d57aae",
+          "sha256": "5a9234cb3e134f9b1fff67aaf01847b95afa862c0fee4f82bccd0bbcd436eac5"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2bf03090ab64919f48bf34df74d57aae",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 170727,
+        "upload_time": "2022-09-21T05:04:20",
+        "upload_time_iso_8601": "2022-09-21T05:04:20.359999Z",
+        "url": "https://files.pythonhosted.org/packages/41/51/44046552d4b074d92e2b1e76da637b2ddaef9f338a24c204dc716d364157/MindsporeTrainer-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f8cea322c793f059e62ccdaf9741cb09d66f91cb64ab64590941af4038fd4f0c",
+          "md5": "d4586d9224942845ae20e765eee5df54",
+          "sha256": "aa1af6ac7632090ffcc8e587b01c69e373b8f0b420aae5f37c297fcce5276528"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d4586d9224942845ae20e765eee5df54",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 143143,
+        "upload_time": "2022-09-21T05:04:22",
+        "upload_time_iso_8601": "2022-09-21T05:04:22.615504Z",
+        "url": "https://files.pythonhosted.org/packages/f8/ce/a322c793f059e62ccdaf9741cb09d66f91cb64ab64590941af4038fd4f0c/MindsporeTrainer-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "affd00a6eeecad32903a8e4fe8e92c6ff997c862b34277ef9411ae7eef5155d4",
+          "md5": "cccb1f2533f6fdf7c9632eb730ad0eba",
+          "sha256": "6f12a5e2e4a925aed0c22f055bb961c5788720931cfd660b8081d40cbbf94f88"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cccb1f2533f6fdf7c9632eb730ad0eba",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 181580,
+        "upload_time": "2022-10-20T01:01:56",
+        "upload_time_iso_8601": "2022-10-20T01:01:56.935703Z",
+        "url": "https://files.pythonhosted.org/packages/af/fd/00a6eeecad32903a8e4fe8e92c6ff997c862b34277ef9411ae7eef5155d4/MindsporeTrainer-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a400f77bfebed24c34b7e65fef0783201893667bb832a34b1ffee67f447cfb8",
+          "md5": "335a6991eb5f8c88bd2f0dd6e96c5c98",
+          "sha256": "4048eedb85c19648e23829e01e6ec4c0010b9e8a57eb9c30aa7db92d36b7ea6c"
+        },
+        "downloads": -1,
+        "filename": "MindsporeTrainer-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "335a6991eb5f8c88bd2f0dd6e96c5c98",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 149569,
+        "upload_time": "2022-10-20T01:01:58",
+        "upload_time_iso_8601": "2022-10-20T01:01:58.750968Z",
+        "url": "https://files.pythonhosted.org/packages/2a/40/0f77bfebed24c34b7e65fef0783201893667bb832a34b1ffee67f447cfb8/MindsporeTrainer-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "affd00a6eeecad32903a8e4fe8e92c6ff997c862b34277ef9411ae7eef5155d4",
+        "md5": "cccb1f2533f6fdf7c9632eb730ad0eba",
+        "sha256": "6f12a5e2e4a925aed0c22f055bb961c5788720931cfd660b8081d40cbbf94f88"
+      },
+      "downloads": -1,
+      "filename": "MindsporeTrainer-0.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "cccb1f2533f6fdf7c9632eb730ad0eba",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 181580,
+      "upload_time": "2022-10-20T01:01:56",
+      "upload_time_iso_8601": "2022-10-20T01:01:56.935703Z",
+      "url": "https://files.pythonhosted.org/packages/af/fd/00a6eeecad32903a8e4fe8e92c6ff997c862b34277ef9411ae7eef5155d4/MindsporeTrainer-0.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2a400f77bfebed24c34b7e65fef0783201893667bb832a34b1ffee67f447cfb8",
+        "md5": "335a6991eb5f8c88bd2f0dd6e96c5c98",
+        "sha256": "4048eedb85c19648e23829e01e6ec4c0010b9e8a57eb9c30aa7db92d36b7ea6c"
+      },
+      "downloads": -1,
+      "filename": "MindsporeTrainer-0.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "335a6991eb5f8c88bd2f0dd6e96c5c98",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 149569,
+      "upload_time": "2022-10-20T01:01:58",
+      "upload_time_iso_8601": "2022-10-20T01:01:58.750968Z",
+      "url": "https://files.pythonhosted.org/packages/2a/40/0f77bfebed24c34b7e65fef0783201893667bb832a34b1ffee67f447cfb8/MindsporeTrainer-0.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

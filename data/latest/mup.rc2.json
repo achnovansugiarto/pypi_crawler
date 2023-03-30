@@ -1,0 +1,135 @@
+{
+  "info": {
+    "author": "Edward J Hu, Greg Yang",
+    "author_email": "edwardjhu@edwardjhu.com, gregyang@microsoft.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Maximal Update Parametrization (μP) and Hyperparameter Transfer (μTransfer) \n\nIn [*Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer*](https://arxiv.org/abs/2203.03466), we show that hyperparameters become stable across neural network sizes when we parametrize the model in [maximal update parametrization (μP)](http://arxiv.org/abs/2011.14522).\nThis can be used to tune extremely large neural networks such as large pretrained transformers, as we have done in our work.\nMore generally, μP reduces the fragility and uncertainty when transitioning from exploration to scaling up, which are not often talked about explicitly in the deep learning literature.\n\n![](figures/sp_vs_mup_dashed.png)\n<font size=\"1\"> *Figure above: Training loss against learning rate on Transformers of varying `d_model` trained with Adam.*</font> \n\n\nμP turns out to be the *unique* \"natural\" parametrization that has this hyperparameter stability property across width, as empirically verified in the gif below on MLPs trained with SGD. Here, across time, we interpolate between PyTorch default and μP's learning rate and initialization scalings (right), and we scale up the width-256 model (log2(width)=8) to width 2^13 = 8192 using this interpolated scaling rule (left).\n\n![](figures/parametrizations.gif)\n\nThis repo contains the source code for the `mup` package, our tool that makes the implementation of μP in Pytorch models effortless and less error-prone.\n\n\n## Installation\n\n```\npip install mup\n```\n\n### Install From Source\n\nClone this repo, change to its directory, and do\n```\npip install -r requirement.txt\npip install -e .\n```\n\n## Basic Usage\n\n```Python\nfrom mup import MuReadout, make_base_shapes, set_base_shapes, MuSGD, MuAdam\n\nclass MyModel(nn.Module):\n    def __init__(self, width, ...):\n        ...\n        ### In model definition, replace output layer with MuReadout\n        # readout = nn.Linear(width, d_out)\n        readout = MuReadout(width, d_out)\n        ### If tying weights with an input nn.Embedding layer, do\n        # readout = MuSharedReadout(input_layer.weight)\n        ...\n    def forward(self, ...):\n        ...\n        ### If using a transformer, make sure to use\n        ###   1/d instead of 1/sqrt(d) attention scaling\n        # attention_scores = query @ key.T / d**0.5\n        attention_scores = query @ key.T * 8 / d\n        ### We use 8/d instead of 1/d here to be backward compatible\n        ###   with 1/d**0.5 when d=64, a common head dimension.\n        ...\n\n### Instantiate a base model\nbase_model = MyModel(width=1)\n### Instantiate a \"delta\" model that differs from the base model\n###   in all dimensions (\"widths\") that one wishes to scale.\n### Here it's simple, but e.g., in a Transformer, you may want to scale\n###   both nhead and dhead, so the delta model should differ in both.\ndelta_model = MyModel(width=2)\n\n### Instantiate the target model (the model you actually want to train).\n### This should be the same as the base model except \n###   the widths could be potentially different.\n### In particular, base_model and model should have the same depth.\nmodel = MyModel(width=100)\n\n### Set base shapes\n### IMPORTANT: this should be called as soon as possible,\n###   before re-initialization and optimizer definition.\nset_base_shapes(model, base_model, delta=delta_model)\n\n### Alternatively, one can save the base model shapes in a file\n# make_base_shapes(base_model, delta_model, filename)\n### and later set base shapes directly from the filename\n# set_base_shapes(model, filename)\n### This is useful when one cannot fit both \n###   base_model and model in memory at the same time\n\n### Replace your custom init, if any\nfor param in model.parameters():\n    ### If initializing manually with fixed std or bounds,\n    ### then replace with same function from mup.init\n    # torch.nn.init.uniform_(param, -0.1, 0.1)\n    mup.init.uniform_(param, -0.1, 0.1)\n    ### Likewise, if using\n    ###   `xavier_uniform_, xavier_normal_, kaiming_uniform_, kaiming_normal_`\n    ### from `torch.nn.init`, replace with the same functions from `mup.init`\n\n### Use the optimizers from `mup.optim` instead of `torch.optim`\n# optimizer = torch.optim.SGD(model.parameters(), lr=0.1)\noptimizer = MuSGD(model.parameters(), lr=0.1)\n\n### Then just train normally\n```\n\nNote the base and delta models *do not need to be trained* --- we are only extracting parameter shape information from them.\nIdeally, we can do so without instantiating the model parameters at all, like in JAX, but unfortunately we currently can't do that in pytorch.\n<!-- - `set_base_shapes(model, ...)` assumes that `model`'s `nn.Linear` layers have been initialized by PyTorch in the default way and rescales its parameters to be consistent with μP. Any custom initialization should come after this and have `torch.init` functions swapped out for `mup.init` functions, as demonstrated above. -->\n\n## How `mup` Works Under the Hood\n\n\nBy invoking `set_base_shapes(model, ...)`, each parameter tensor `p` of `model` gets a `p.infshape` attribute that stores, for each of its dimensions, the corresponding base dimension and whether that dimension should be considered `infinite` (i.e. will be scaled up/down, e.g., `d_model` of a Transformer) or `finite` (i.e. will be fixed, e.g., vocabulary size).\nThis information is used in the initializers and optimizers to automatically scale the parameters or learning rates to be compliant with μP.\nFor example, the Adam learning rate of hidden weights `p` is calculated as  `globalLR / p.infshape.width_mult()`, where `p.infshape.width_mult()` essentially calculates `fan_in / base_fan_in`.\n\n\n## Current Limitations\n\n- `set_base_shapes(model, ...)` assumes that `model` has just been randomly initialized in the standard way and rescales its parameters using the base shape information so the model is in μP.\n- If you want data parallelism, please use `torch.nn.parallel.DistributedDataParallel` instead of `torch.nn.DataParallel`. This is because the latter removes the attributes the `mup` package adds to each parameter tensor of the model. Also, for performance, `pytorch` [recommends the former anyway](https://pytorch.org/docs/stable/notes/cuda.html#cuda-nn-ddp-instead).\n- We scale the learning rate according to μP explicitly creating refined parameter groups from what is passed to the `mup` optimizer and by manipulating the `lr` attribute in those groups. This means, if your code modifies the `lr` in the optimizer `param_groups` dynamically after the creation of the optimizer, then `mup` might not work as expected.\n- By default, any parameter matrix that has 2 \"infinite\" dimensions (i.e. dimensions that are different from base dimensions) are considered by `mup` to have shape (fan_out, fan_in), i.e., in the forward pass, this matrix multiplies its input on the right. This is the case with all `nn.Linear` weights from pytorch. If you have a custom parameter, say `W`, that violates this convention, you can manually set `W.infshape.main_idx = 0; W.infshape.main = W.infshape[0]` to let `mup` know that its shape corresponds to (fan_in, fan_out). A similar discussion applies if you have a parameter *tensor* with many dimensions but exactly 2 \"infinite\" dimensions, for which the first is fan_in and the second is fan_out.\n- Currently, [`torch.save` does not save the `infshape` objects attached to each parameter tensor](https://github.com/pytorch/pytorch/issues/72129). Before this is fixed, you would have to set base shape manually after loading a model checkpoint like so:\n```python\nmodel = torch.load('my/model/path.pt')\n# Important: note the flag `rescale_params=False`!\nset_base_shapes(model, 'my/base/shape/path.bsh', rescale_params=False)\n```\n(`set_base_shapes` by default rescales the parameters of `model`, assuming it's freshly initialized by PyTorch, to be consistent with μP.\nThe `rescale_params=False` flag turns off this behavior.)\n\n\n## Checking Correctness of Parametrization\n\n\n### Coord Check\n\nJust like gradient checking is a simple way of verifying the correctness of an autograd implementation, *coordinate checking* is a simple way to verify you have implemented μP correctly: calculate the average size (which we denote in the y-axis below by `l1`) of the coordinates of each activation vector in, and output of, the model, for a few steps of training and a few different widths.\nIf implemented correctly, then we shall see this `l1` stable over many widths; otherwise, the `l1` can blow up or shrink to 0 with width.\n(We are essentially checking desideratum 1 described below.)\n(The `l1` calculates `x.abs().mean()` for each activation vector `x` and is just one measure of the \"average size\" of `x`'s entries; one can also use analogously defined `l2`, `l4`, etc, though they may exhibit greater fluctuation with random seeds.)\n\nFor example, in the following, we plot `width` vs `l1` for 2 steps of training, where t=1 means at initialization, before any gradient update.\nEach curve corresponds to an (pre-)activation vector of a layer or the output of the network.\nThe first set of 3 plots shows an MLP in standard parametrization (SP), trained by adam.\nWe see after 1 step of update, activation/output `l1` are exploding with width.\nThis means SP is \"incorrect.\"\n![](coord_checks/sp_mlp_adam_lr0.001_nseeds5_bn0_coord.png)\nWe now do the same for an MLP in maximal update parametrization (μP) (including using `mup.optim.MuAdam` instead of `torch.optim.Adam`).\nIn contrast to the above, all curves stay horizontal, indicating that μP is implemented correctly.\n![](coord_checks/μp_mlp_adam_lr0.001_nseeds5_bn0_coord.png)\nWe call this way of checking implementation correctness a *coord check*, short for \"coordinate check.\"\n\n### Making Your Own Coord Check Plots\nWe provide an easy way to implement this check via functions in the `mup.coord_check` module.\nThe workflow typically looks like the following.\n\n```Python\nfrom mup.coord_check import get_coord_data, plot_coord_data\n# construct a dictionary of lazy μP models with differing widths\ndef lazy_model(width):\n    # `set_base_shapes` returns the model\n    return lambda: set_base_shapes(MyMuModel(width), 'my/base/shape/path.bsh')\n    # Note: any custom initialization with `mup.init` would need to\n    # be done inside the lambda as well\nmodels = {64: lazy_model(64), ..., 1024: lazy_model(1024)}\n# make a dataloader with small batch size/seq len\n#   just for testing\ndataloader = ...\n# record data from the model activations over a few steps of training\n# this returns a pandas dataframe\ndf = get_coord_data(models, dataloader)\n# This saves the coord check plots to filename.\nplot_coord_data(df, save_to=filename)\n# If you are in jupyter notebook, you can also do\n#   `plt.show()`\n# to show the plot\n```\nFor example, the `mup.coord_check.example_plot_coord_check` function is implemented this way for toy MLP and CNN models.\n\nIf you see the curves blow up or shrink to 0 with width after a few steps of training, then there's a bug in your μP implementation (did you forget to vary some dimension, like `d_ffn`, in the delta model?).\nIf instead you see the curves converge to the right, then most likely your implementation is correct.\nHowever, there are two typical exceptions to this;\nthe following can shrink to 0 at initialization in μP (at a 1/sqrt(width) rate):\n  - the network output\n  - the attention logits in a Transformer\n\nThese are transient, and after a few steps their curves should be roughly flat.\nNevertheless, to remove the discrepancy at init, we recommend\n   - initializing the output layer \n   (should be a `MuReadout` instance) weights to be 0 via\n   the `readout_zero_init=True` option and\n   - initializing the query matrix in a Transformer to 0\n     (this has to be done manually). If symmetry-breaking is desired in the attention logits at init, initialize the (relative) position biases with nonzero variance.\n\n### Wider is Always Better\n\n![](figures/widerbetter.png)\n\nAnother sign that μP has not been implemented correctly is if going wider does worse (on training loss) after some width, at some point during training.\nThe figure above illustrates this in a collection of training curves: (left) the correct implementation should always see performance improve with width, at any point in training; (middle) if you used standard parametrization (SP), sometimes you may see performance improve with width up to some point and then suddenly it becomes worse with wider models; (right) or you may immediately see worsening performance even for narrow models.\n\n## Examples\nSee the `MLP`, `Transformer`, and `ResNet` folders inside `examples/` as well as the tests in `mup/test` for examples.\nPeople familiar with [Huggingface Transformers](https://github.com/huggingface/transformers) may also find the `examples/mutransformers` submodule instructive (obtained via `git submodule update --init`), which is also available standalone at [https://github.com/microsoft/mutransformers](https://github.com/microsoft/mutransformers).\n\n## Running Tests\nTo run tests, do\n```bash\npython -m mup.test\n```\n\n\n## The Basic Math\n\nμP is designed so as to satisfy the following desiderata:\n\n> At any time during training\n> 1. Every (pre)activation vector in a network should have Θ(1)-sized coordinates\n> 2. Neural network output should be O(1).\n> 3. All parameters should be updated as much as possible (in terms of scaling in width) without leading to divergence\n\nIt turns out these desiderata uniquely single out μP.\nTo derive μP from them, one needs to carefully consider how the *coordinate size* of a vector Av, resulting from a square matrix A multiplying vector v, depends on those of A and v, when A and v are \"correlated\".\nHere you can think of A as weights and v as an activation vector.\nThis in turn depends on what kind of matrix is A and what kind of vector is v.\nIn the context of training a wide neural network, it turns out we only need to consider vectors that has approximately iid coordinates, and two kinds of matrices: 1) those that look like outer products of such vectors, and 2) random iid matrices.\nThose of type 1 cover things like weight gradients; those of type 2 cover things like weight initialization.\nThen, if A and v both have entry size Θ(1) and they are correlated in ways that arise naturally during training, then we have the following table.\n\n|                  | outer product A (type 1) | iid A  (type 2)    |\n|------------------|--------------------------|--------------------|\n| Entry size of Av | Θ(n)                     | Θ(sqrt(n))         |\n\nGiven this table, one can then trace the forward and backward computation of a network to derive μP straightforwardly.\n\nSee [our blog post](https://www.microsoft.com/en-us/research/?p=823648) for a gentle primer and [our paper](https://arxiv.org/abs/2203.03466) for details.\n\n\n## Contributing\n\nThis project welcomes contributions and suggestions.  Most contributions require you to agree to a\nContributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us\nthe rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.\n\nWhen you submit a pull request, a CLA bot will automatically determine whether you need to provide\na CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions\nprovided by the bot. You will only need to do this once across all repos using our CLA.\n\nThis project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).\nFor more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or\ncontact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.\n\n## Trademarks\n\nThis project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft \ntrademarks or logos is subject to and must follow \n[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).\nUse of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.\nAny use of third-party trademarks or logos are subject to those third-party's policies.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://github.com/microsoft/mup/archive/refs/tags/v1.0.0.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/microsoft/mup",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "mup",
+    "package_url": "https://pypi.org/project/mup/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/mup/",
+    "project_urls": {
+      "Download": "https://github.com/microsoft/mup/archive/refs/tags/v1.0.0.tar.gz",
+      "Homepage": "https://github.com/microsoft/mup"
+    },
+    "release_url": "https://pypi.org/project/mup/1.0.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "Maximal Update Parametrization",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13114308,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ffbdc6887b6423191b1f12ac5ee97e0e78cfca76e83659aba21cb42577ad70df",
+          "md5": "e51fc311e8fe40406ee17dd359c505f7",
+          "sha256": "b89fc4a7672ab62ff2109299d1dbfc668bfcf346b6ddb5ad1fb2d8cdc66df87d"
+        },
+        "downloads": -1,
+        "filename": "mup-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e51fc311e8fe40406ee17dd359c505f7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 8839,
+        "upload_time": "2021-10-11T18:32:02",
+        "upload_time_iso_8601": "2021-10-11T18:32:02.952590Z",
+        "url": "https://files.pythonhosted.org/packages/ff/bd/c6887b6423191b1f12ac5ee97e0e78cfca76e83659aba21cb42577ad70df/mup-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2bda49e56b1fd7386697eedf7b65b0e2e118e2da7209e5aad223c8abc959fb10",
+          "md5": "eac8dd73d908e31ecfb09e303e597ba3",
+          "sha256": "43d9d5ae35f0d21e71c10e9b5c23eb38e7d296c552a4445ec639a8e075964120"
+        },
+        "downloads": -1,
+        "filename": "mup-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "eac8dd73d908e31ecfb09e303e597ba3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 8346,
+        "upload_time": "2021-10-11T18:32:06",
+        "upload_time_iso_8601": "2021-10-11T18:32:06.124882Z",
+        "url": "https://files.pythonhosted.org/packages/2b/da/49e56b1fd7386697eedf7b65b0e2e118e2da7209e5aad223c8abc959fb10/mup-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c1f8f76cd8765b48193e60101f80387e9c7817566529a703e63c78f784dde46",
+          "md5": "a9f2730724344eb228524b17b29900e7",
+          "sha256": "9639e3d19f90e754f985ed444542ed2f8a049f3c0488fcb6efe150f30922cf74"
+        },
+        "downloads": -1,
+        "filename": "mup-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a9f2730724344eb228524b17b29900e7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 28031,
+        "upload_time": "2022-03-08T15:18:07",
+        "upload_time_iso_8601": "2022-03-08T15:18:07.249391Z",
+        "url": "https://files.pythonhosted.org/packages/1c/1f/8f76cd8765b48193e60101f80387e9c7817566529a703e63c78f784dde46/mup-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1c1f8f76cd8765b48193e60101f80387e9c7817566529a703e63c78f784dde46",
+        "md5": "a9f2730724344eb228524b17b29900e7",
+        "sha256": "9639e3d19f90e754f985ed444542ed2f8a049f3c0488fcb6efe150f30922cf74"
+      },
+      "downloads": -1,
+      "filename": "mup-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "a9f2730724344eb228524b17b29900e7",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 28031,
+      "upload_time": "2022-03-08T15:18:07",
+      "upload_time_iso_8601": "2022-03-08T15:18:07.249391Z",
+      "url": "https://files.pythonhosted.org/packages/1c/1f/8f76cd8765b48193e60101f80387e9c7817566529a703e63c78f784dde46/mup-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

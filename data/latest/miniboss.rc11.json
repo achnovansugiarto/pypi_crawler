@@ -1,0 +1,540 @@
+{
+  "info": {
+    "author": "Ulas Turkmen",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 3 - Alpha",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Topic :: Software Development :: Build Tools",
+      "Topic :: Software Development :: Testing"
+    ],
+    "description": "[![afroisalreadyinu](https://circleci.com/gh/afroisalreadyinu/miniboss.svg?style=svg)](https://app.circleci.com/pipelines/github/afroisalreadyinu/miniboss)\n\n[![PyPI version](https://badge.fury.io/py/miniboss.svg)](https://badge.fury.io/py/miniboss)\n\n<img src=\"https://github.com/afroisalreadyinu/miniboss/raw/main/logo.png\" width=\"200\">\n\n# miniboss\n\nminiboss is a Python application for locally running a collection of\ninterdependent docker services, individually rebuilding and restarting them, and\nmanaging application state with lifecycle hooks. Services definitions can be\nwritten in Python, allowing the use of programming logic instead of markup.\n\n## Why not docker-compose?\n\nFirst and foremost, good old Python instead of YAML. `docker-compose` is in the\nschool of yaml-as-service-description, which means that going beyond a static\ndescription of a service set necessitates templates, or some kind of scripting.\nOne could just as well use a full-blown programming language, while trying to\nkeep simple things simple. Another thing sorely missing in `docker-compose` is\nlifecycle hooks, i.e. a mechanism whereby scripts can be executed when the state\nof a container changes. Lifecycle hooks have been\n[requested](https://github.com/docker/compose/issues/1809)\n[multiple](https://github.com/docker/compose/issues/5764)\n[times](https://github.com/compose-spec/compose-spec/issues/84), but were not\ndeemed to be in the domain of `docker-compose`.\n\n## Installation\n\nminiboss is [on PyPi](https://pypi.org/project/miniboss/); you can install it\nwith the following:\n\n```\npip install miniboss\n```\n\n## Usage\n\nHere is a very simple service specification:\n\n```python\n#! /usr/bin/env python3\nimport miniboss\n\nminiboss.group_name('readme-demo')\n\nclass Database(miniboss.Service):\n    name = \"appdb\"\n    image = \"postgres:10.6\"\n    env = {\"POSTGRES_PASSWORD\": \"dbpwd\",\n           \"POSTGRES_USER\": \"dbuser\",\n           \"POSTGRES_DB\": \"appdb\" }\n    ports = {5432: 5433}\n\nclass Application(miniboss.Service):\n    name = \"python-todo\"\n    image = \"afroisalreadyin/python-todo:0.0.1\"\n    env = {\"DB_URI\": \"postgresql://dbuser:dbpwd@appdb:5432/appdb\"}\n    dependencies = [\"appdb\"]\n    ports = {8080: 8080}\n    stop_signal = \"SIGINT\"\n\nif __name__ == \"__main__\":\n    miniboss.cli()\n```\n\nThe first use of miniboss is in the call to `miniboss.group_name`, which\nspecifies a name for this group of services. If you don't set it, sluggified\nform of the directory name will be used. Group name is used to identify the\nservices and the network defined in a miniboss file. Setting it manually to a\nnon-default value will allow miniboss to manage multiple collections in the same\ndirectory.\n\nA **service** is defined by subclassing `miniboss.Service` and overriding, in\nthe minimal case, the fields `image` and `name`. The `env` field specifies the\nenvironment variables. As in the case of the `appdb` service, you can use\nordinary variables anywhere Python accepts them. The other available fields are\nexplained in the section [Service definition\nfields](#service-definition-fields). In the [above example](#usage), we are\ncreating two services: The application service `python-todo` (a simple Flask\ntodo application defined in the `sample-apps` directory) depends on `appdb` (a\nPostgresql container), specified through the `dependencies` field. As in\n`docker-compose`, this means that `python-todo` will get started after `appdb`\nreaches running status.\n\nThe `miniboss.cli` function is the main entry point; you need to call it in the\nmain section of your script. Let's run the script above without arguments, which\nleads to the following output:\n\n```\nUsage: miniboss-main.py [OPTIONS] COMMAND [ARGS]...\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  start\n  stop\n```\n\nWe can start our small collection of services by running `./miniboss-main.py\nstart`. After spitting out some logging text, you will see that starting the\ncontainers failed, with the `python-todo` service throwing an error that it\ncannot reach the database. The reason for this error is that the Postgresql\nprocess has started, but is still initializing, and does not accept connections\nyet. The standard way of dealing with this issue is to include backoff code in\nyour application that checks on the database port regularly, until the\nconnection is accepted. `miniboss` offers an alternative with [lifecycle\nevents](#lifecycle-events). For the time being, you can simply rerun\n`./miniboss-main.py start`, which will restart only the `python-todo` service,\nas the other one is already running. You should be able to navigate to\n`http://localhost:8080` and view the todo app page.\n\nYou can also exclude services from the list of services to be started with the\n`--exclude` argument; `./miniboss-main.py start --exclude python-todo` will\nstart only `appdb`. If you exclude a service that is depended on by another, you\nwill get an error. If a service fails to start (i.e. container cannot be started\nor the lifecycle events fail), it and all the other services that depend on it\nare registered as failed.\n\n### Stopping services\n\nOnce you are done working with a collection, you can stop the running services\nwith `miniboss-main.py stop`. This will stop the services in the reverse order\nof dependency, i.e. first `python-todo` and then `appdb`. Exclusion is possible\nalso when stopping services with the same `--exclude` argument. Running\n`./miniboss-main.py stop --exclude appdb` will stop only the `python-todo`\nservice. If you exclude a service whose dependency will be stopped, you will get\nan error. If, in addition to stopping the service containers, you want to remove\nthem, include the option `--remove`. If you don't remove the containers,\nminiboss will restart the existing containers (modulo changes in service\ndefinition) instead of creating new ones the next time it's called with `start`.\nThis behavior can be modified with the `always_start_new` field; see the details\nin [Service definition fields](#service-definition-fields).\n\n### Reloading a service\n\nminiboss also allows you to reload a specific service by building a new\ncontainer image from a directory. You need to provide the path to the directory\nin which the Dockerfile and build context of a service resides in order to use\nthis feature. You can also provide an alternative Dockerfile name. Here is an\nexample:\n\n```python\nclass Application(miniboss.Service):\n    name = \"python-todo\"\n    image = \"afroisalreadyin/python-todo:0.0.1\"\n    env = {\"DB_URI\": \"postgresql://dbuser:dbpwd@appdb:5432/appdb\"}\n    dependencies = [\"appdb\"]\n    ports = {8080: 8080}\n    build_from = \"python-todo/\"\n    dockerfile = \"Dockerfile\"\n```\n\nThe `build_from` option has to be a path relative to the main miniboss file.\nWith such a service configuration, you can run `./miniboss-main.py reload\npython-todo`, which will cause miniboss to build the container image, stop the\nrunning service container, and restart the new image. Since [the\ncontext](#the-global-context) generated at start is saved in a file, any context\nvalues used in the service definition are available to the new container.\n\n## Lifecycle events\n\nOne of the differentiating feature of miniboss is lifecycle events, which are\nhooks that can be customized to execute code at certain points in a service's or\nthe whole collection's lifecycle.\n\n### Per-service events\n\nFor per-service events, `miniboss.Service` has three methods that can be\noverriden in order to correctly change states and execute actions on the\ncontainer:\n\n- **`Service.pre_start()`**: Executed before the service is started. Can be used\n  for things like initializing mount directory contents or downloading online\n  content.\n\n- **`Service.ping()`**: Executed repeatedly right after the service starts with\n  a 0.1 second delay between executions. If this method does not return `True`\n  within a given timeout value (can be set with the `--timeout` argument,\n  default is 300 seconds), the service is registered as failed. Any exceptions\n  in this method will be propagated, and also cause the service to fail. If\n  there is already a service instance running, it is not pinged.\n\n- **`Service.post_start()`**: This method is executed after a successful `ping`.\n  It can be used to prime a service by e.g. creating data on it, or bringing it\n  to a certain state. You can also use the global context in this method; see\n  [The global context](#the-global-context) for details. If there is already a\n  service running, or an existing container image is started insted of creating\n  a new one, this method is not called.\n\nThese methods are [noop](https://en.wikipedia.org/wiki/NOP_(code)) by default. A\nservice is not registered as properly started before lifecycle methods are\nexecuted successfully; only then are the dependant services started.\n\nThe `ping` method is particularly useful if you want to avoid the situation\ndescribed above, where a container starts, but the main process has not\ncompleted initializing before any dependent services start. Here is an example\nfor how one would ping the `appdb` service to make sure the Postgresql database\nis accepting connections:\n\n```python\nimport psycopg2\n\nclass Database(miniboss.Service):\n    # fields same as above\n\n    def ping(self):\n        try:\n            connection = psycopg2.connect(\"postgresql://dbuser:dbpwd@localhost:5433/appdb\")\n            cur = connection.cursor()\n            cur.execute('SELECT 1')\n        except psycopg2.OperationalError:\n            return False\n        else:\n            return True\n```\n\nOne thing to pay attention to is that, in the call to `psycopg2.connect`, we are\nusing `localhost:5433` as host and port, whereas the `python-todo` environment\nvariable `DBURI` has `appdb:5433` instead. This is because the `ping` method is\nexecuted on the host computer. The next section explains the details.\n\n### Collection events\n\nIt is possible to hook into collection change commands using the following\nhooks. You can call them on the base `miniboss` module and set a hook by passing\nit in as the sole argument, e.g. as follows:\n\n```python\nimport miniboss\n\ndef print_services(service_list):\n    print(\"Started \", ' '.join(service_list))\n\nminiboss.on_start_services(print_services)\n```\n\n- **`on_start_services`** hook is called after the `miniboss.start` command is\n  executed. The single argument is a list of the names of the services that were\n  successfully started.\n\n- **`on_stop_services`** hook is called after the `miniboss.stop` command is\n  executed. The single argument is a list of the services that were stopped.\n\n- **`on_reload_service`** hook is called after the `miniboss.reload` command is\n  executed. The single argument is the name of the service that was reloaded.\n\n\n## Ports and hosts\n\nminiboss starts services on an isolated bridge network, mapping no ports by\ndefault. The name of this service can be specified with the `--network-name`\nargument when starting a group. If it's not specified, the name will be\ngenerated from the group name by prefixing it with `miniboss-`. On the\ncollection network, services can be contacted under the service name as\nhostname, on the ports they are listening on. The `appdb` Postgresql service\n[above](#usage), for example, can be contacted on the port 5432, the default\nport on which Postgresql listens. This is the reason the host part of the\n`DB_URI` environment variable on the `python-todo` service is `appdb:5432`. If\nyou want to reach `appdb` on the port `5433` from the host system, which would\nbe necessary to implement the `ping` method as above, you need to make this\nmapping explicit with the `ports` field of the service definition. This field\naccepts a dictionary of integer keys and values. The key is the service\ncontainer port, and the value is the host port. In the case of `appdb`, the\nPostgresql port of the container is mapped to port 5433 on the local machine, in\norder not to collide with any local Postgresql instances. With this\nconfiguration, the `appdb` database can be accessed at `localhost:5433`.\n\n### The global context\n\nThe object `miniboss.Context`, derived from the standard dict class, can be used\nto store values that are accessible to other service definitions, especially in\nthe `env` field. For example, if you create a user in the `post_start` method of\na service, and would like to make the ID of this user available to a dependant\nservice, you can set it on the context with `Context['user_id'] = user.id`. In\nthe definition of the second service, you can refer to this value in a field\nwith the standard Python keyword formatting syntax, as in the following:\n\n```python\nclass DependantService(miniboss.Service):\n    # other fields\n\tenv = {'USER_ID': '{user_id}'}\n```\n\nYou can of course also programmatically access it as `Context['user_id']` once a\nvalue has been set.\n\nWhen a service collection is started, the generated context is saved in the file\n`.miniboss-context`, in order to be used when the same containers are restarted\nor a specific service is [reloaded](#reloading-a-service).\n\n## Service definition fields\n\n- **`name`**: The name of the service. Must be non-empty and unique for one\n  miniboss definition module. The container can be contacted on the network\n  under this name; it must therefore be a valid hostname.\n\n- **`image`**: Container image of the service. Must be non-empty. You can use a\n  repository URL here; if the image is not locally available, it will be pulled.\n  You are highly advised to specify a tag, even if it's `latest`, because\n  otherwise miniboss will not be able to identify which container image was used\n  for a service, and start a new container each time. If the tag of the `image`\n  is `latest`, and the `build_from` directory option is specified, the container\n  image will be built each time the service is started.\n\n- **`entrypoint`**: Container entrypoint, the executable that is run when the\n  container starts. See [Docker\n  documentation](https://docs.docker.com/engine/reference/builder/#entrypoint) for\n  details.\n\n- **`cmd`**: `CMD` option for a container. See [Docker\n  documentation](https://docs.docker.com/engine/reference/builder/#cmd) for\n  details.\n\n- **`user`**: `USER` option for a container See [Docker\n  documentation](https://docs.docker.com/engine/reference/builder/#user) for\n  details.\n\n- **`dependencies`**: A list of the dependencies of a service by name. If there\n  are any invalid or circular dependencies, an exception will be raised.\n\n- **`env`**: Environment variables to be injected into the service container, as\n  a dict. The values of this dict can contain extrapolations from the global\n  context; these extrapolations are executed when the service starts.\n\n- **`ports`**: A mapping of the ports that must be exposed on the running host.\n  Keys are ports local to the container, values are the ports of the running\n  host. See [Ports and hosts](#ports-and-hosts) for more details on networking.\n\n- **`volumes`**: Directories to be mounted inside the services as a volume, on\n  which mount points. The value of `volumes` can be either a list of strings, in\n  the format `\"directory:mount_point:mode\"`, or in the dictionary format\n  `{directory: {\"bind\": mount_point, \"mode\": mode}}`. In both cases, `mode` is\n  optional. See the [Using\n  volumes](https://docker-py.readthedocs.io/en/stable/api.html#docker.api.container.ContainerApiMixin.create_container)\n  section of Docker Python SDK documentation for details.\n\n- **`always_start_new`**: Whether to create a new container each time a service\n  is started or restart an existing but stopped container. Default value is\n  `False`, meaning that by default existing container will be restarted.\n\n- **`stop_signal`**: Which stop signal Docker should use to stop the container,\n  by name (not by integer value, so don't use values from the `signal` standard\n  library module here). Default is `SIGTERM`. Accepted values are `SIGINT`,\n  `SIGTERM`, `SIGKILL` and `SIGQUIT`.\n\n- **`build_from`**: The directory from which a service can be reloaded. It\n  should be either absolute, or relative to the main script. Required if you\n  want to be able to reload a service. If this option is specified, and the tag\n  of the `image` option is `latest`, the container image will be built each time\n  the service is started.\n\n- **`dockerfile`**: Dockerfile to use when building a service from the\n  `build_from` directory. Default is `Dockerfile`.\n\n## Release notes\n\n### 0.3.0\n\n- Linting\n- Pull container image if it doesn't exist\n- Integration tests\n- Mounting volumes\n- Pre-start lifetime event\n\n### 0.4.0\n\n- Don't fail on start if excluded services depend on each other\n- Destroy service if it cannot be started\n- Log when custom post_start is done\n- Don't start new if int-string env keys don't differ\n- Don't run pre-start if container found\n- Multiple clusters on single host with group id\n- Build container if tag doesn't exist and it has `build_from`\n- Better pypi readme with release notes\n\n### 0.4.1\n\n- Tests for CLI commands\n- Collection lifecycle hooks\n\n### 0.4.2\n\n- Removed group name requirement\n- Logging fixes\n- Sample app fixes\n\n### 0.4.3\n\n- Entrypoint, cmd and user fields on service\n- Type hints\n- Use tbump for version bumping\n\n### 0.4.3\n\n- Corrected docker lcient library version in dependencies\n\n## Todos\n\n- [ ] User attrs properly with types\n- [ ] Add stop-only command\n- [ ] Add start-only command\n- [ ] Making easier to test on the cloud??\n- [ ] Run tests in container (how?)\n- [ ] Exporting environment values for use in shell\n- [ ] Running one-off containers\n- [ ] Configuration object extrapolation\n- [ ] Running tests once system started\n- [ ] Using context values in tests\n- [ ] Dependent test suites and setups\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/afroisalreadyinu/miniboss",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "miniboss",
+    "package_url": "https://pypi.org/project/miniboss/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/miniboss/",
+    "project_urls": {
+      "Homepage": "https://github.com/afroisalreadyinu/miniboss"
+    },
+    "release_url": "https://pypi.org/project/miniboss/0.4.5/",
+    "requires_dist": [
+      "click (>7)",
+      "docker (>4)",
+      "furl (>2)",
+      "requests (>2)",
+      "attrs (>20)",
+      "python-slugify (>6.0.0)"
+    ],
+    "requires_python": ">3.8.0",
+    "summary": "Containerized app testing framework",
+    "version": "0.4.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13478599,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b0326ead2bca1c84f7cb7e1d464ecfedacff0f51e2239fab5f7bad79662078b",
+          "md5": "bc79286a514f1363f50d2bd4d7a7e58d",
+          "sha256": "1040f02d14b42a19f42b44d744f1c7f886c96586bcc56afe4dcd559534df1a19"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc79286a514f1363f50d2bd4d7a7e58d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10327,
+        "upload_time": "2020-07-23T18:07:36",
+        "upload_time_iso_8601": "2020-07-23T18:07:36.127316Z",
+        "url": "https://files.pythonhosted.org/packages/7b/03/26ead2bca1c84f7cb7e1d464ecfedacff0f51e2239fab5f7bad79662078b/miniboss-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d63dd71e72e1e5e41036d85a3b84640ef5f693ca5f82e0d2c3ac50cc3b4af0b",
+          "md5": "ff66cba9a8ea5dedd6ae98f64a05d6a4",
+          "sha256": "a938faa4f015835cf6b80a39dd0884c1fc216568d45d0f1eafc5d1bda75045d4"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ff66cba9a8ea5dedd6ae98f64a05d6a4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11631,
+        "upload_time": "2020-07-23T18:07:38",
+        "upload_time_iso_8601": "2020-07-23T18:07:38.725602Z",
+        "url": "https://files.pythonhosted.org/packages/7d/63/dd71e72e1e5e41036d85a3b84640ef5f693ca5f82e0d2c3ac50cc3b4af0b/miniboss-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "724f450b29b4105cfc95c7e81a8453531329614d404b754c92ee7e2f4a3c2117",
+          "md5": "7d9b9c5e620490953fbc4f7f50318cb3",
+          "sha256": "dc2b39e52a2c77443d622d844cbac0429308f1766149fbe4af60ef51a500d335"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7d9b9c5e620490953fbc4f7f50318cb3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10474,
+        "upload_time": "2020-07-23T18:19:11",
+        "upload_time_iso_8601": "2020-07-23T18:19:11.377167Z",
+        "url": "https://files.pythonhosted.org/packages/72/4f/450b29b4105cfc95c7e81a8453531329614d404b754c92ee7e2f4a3c2117/miniboss-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9469ec1b5ebefd8e597886c58ce865d3e9e8a87c6ef63de3c95995ca966d4086",
+          "md5": "5b6d9499ac25c43f45ac2b81410ad491",
+          "sha256": "a7e671105eba466c9a881d36f828aa9323b8eb6c2b0172ea446f751d2e64657e"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5b6d9499ac25c43f45ac2b81410ad491",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11842,
+        "upload_time": "2020-07-23T18:19:13",
+        "upload_time_iso_8601": "2020-07-23T18:19:13.096630Z",
+        "url": "https://files.pythonhosted.org/packages/94/69/ec1b5ebefd8e597886c58ce865d3e9e8a87c6ef63de3c95995ca966d4086/miniboss-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "304ef71399701ca50a983c5073cb4ea1a54daef3f9f4f744e345227791b5c59b",
+          "md5": "0c754cfbb8a490585835d8edf774b024",
+          "sha256": "c1a461a58a80ca7f563d421a3d7e0d149d3a20482356aad5cca60d4a09164df3"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0c754cfbb8a490585835d8edf774b024",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 10477,
+        "upload_time": "2020-07-23T18:20:40",
+        "upload_time_iso_8601": "2020-07-23T18:20:40.432987Z",
+        "url": "https://files.pythonhosted.org/packages/30/4e/f71399701ca50a983c5073cb4ea1a54daef3f9f4f744e345227791b5c59b/miniboss-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "575fe71a407479531a758d7235aa7476e719851c47fd66b0ceb08d5ca15a7c1d",
+          "md5": "ae498ca200168a08d6f9c0ff8590fc55",
+          "sha256": "ac7935285dd91593ea4b6cee2f89c7b15b5996fcb82bde11a7f3fd9755693000"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ae498ca200168a08d6f9c0ff8590fc55",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11840,
+        "upload_time": "2020-07-23T18:20:41",
+        "upload_time_iso_8601": "2020-07-23T18:20:41.790782Z",
+        "url": "https://files.pythonhosted.org/packages/57/5f/e71a407479531a758d7235aa7476e719851c47fd66b0ceb08d5ca15a7c1d/miniboss-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7b3511865e04650514787704a80d1b96182bd4b19267faf7e5f2225187039957",
+          "md5": "6bb75343ce75d23896dfde5b3ee0ae83",
+          "sha256": "a45f9e365a7999b08c4cecb8e392b23d9c4e30c77bb41e958879291766240afe"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6bb75343ce75d23896dfde5b3ee0ae83",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11134,
+        "upload_time": "2020-08-10T07:39:01",
+        "upload_time_iso_8601": "2020-08-10T07:39:01.424780Z",
+        "url": "https://files.pythonhosted.org/packages/7b/35/11865e04650514787704a80d1b96182bd4b19267faf7e5f2225187039957/miniboss-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d200506c66b5903050538aa04748d920d58009e5fdb7e3bef4e148301d9fbe43",
+          "md5": "3c945b024196fd29fabc705f72c2f82b",
+          "sha256": "e58afedee8a2216626eb5cb4ed51da9de7cece5071a43eec158de8fd9d6f649a"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3c945b024196fd29fabc705f72c2f82b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12706,
+        "upload_time": "2020-08-10T07:39:02",
+        "upload_time_iso_8601": "2020-08-10T07:39:02.790899Z",
+        "url": "https://files.pythonhosted.org/packages/d2/00/506c66b5903050538aa04748d920d58009e5fdb7e3bef4e148301d9fbe43/miniboss-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ce226d9cad28d13369810954d3b3d1016652640ecb826ddd5e6e84f1f9465dae",
+          "md5": "ce42998b02bd20003bf19af3f797a457",
+          "sha256": "461b5f9369371db84bc5cf507961356bfaf7d3067f6796a2f23763bb7860a71c"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ce42998b02bd20003bf19af3f797a457",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12813,
+        "upload_time": "2020-09-09T11:42:43",
+        "upload_time_iso_8601": "2020-09-09T11:42:43.750480Z",
+        "url": "https://files.pythonhosted.org/packages/ce/22/6d9cad28d13369810954d3b3d1016652640ecb826ddd5e6e84f1f9465dae/miniboss-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c6baaeaccaa70454e8cfcd5d5247e36e88ee8942c5eec851b102e601501f6b14",
+          "md5": "a891e530f175c8eb74732b1e7eda6d85",
+          "sha256": "f1bdf7897c73d7b526b1444e959a6c8adcfa20f56b5dd8065b5e9d736e358c34"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a891e530f175c8eb74732b1e7eda6d85",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14122,
+        "upload_time": "2020-11-13T12:29:20",
+        "upload_time_iso_8601": "2020-11-13T12:29:20.990163Z",
+        "url": "https://files.pythonhosted.org/packages/c6/ba/aeaccaa70454e8cfcd5d5247e36e88ee8942c5eec851b102e601501f6b14/miniboss-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6315ae77d99c6bc803b6e624aeb97b7c0281a24a7f70b19bc354611fd4076d26",
+          "md5": "26ef97b93fd64ef9bbb7049aa95418a0",
+          "sha256": "123867cd0d5771f180f8266b7b5fcd236af60923d425d18c734284b670176637"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "26ef97b93fd64ef9bbb7049aa95418a0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 18761,
+        "upload_time": "2021-01-20T20:20:42",
+        "upload_time_iso_8601": "2021-01-20T20:20:42.510139Z",
+        "url": "https://files.pythonhosted.org/packages/63/15/ae77d99c6bc803b6e624aeb97b7c0281a24a7f70b19bc354611fd4076d26/miniboss-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec723288be3f362af51f1dc4e0e1c1e89c86020bf1102c36313d04ae00f9e0dc",
+          "md5": "94dde6af47d7bb58abd9da447a1a5920",
+          "sha256": "ca0017e7c59841af82f54e7d76b3f5f839850887810aaca7d74096ebef0a2393"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "94dde6af47d7bb58abd9da447a1a5920",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22808,
+        "upload_time": "2021-01-20T20:20:44",
+        "upload_time_iso_8601": "2021-01-20T20:20:44.173359Z",
+        "url": "https://files.pythonhosted.org/packages/ec/72/3288be3f362af51f1dc4e0e1c1e89c86020bf1102c36313d04ae00f9e0dc/miniboss-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4217d4b4c5bd991dc640ce72ecd9ae4d2469d44b4d6df6cc4e5011370d2e5e8b",
+          "md5": "82c963cf707ef3ecf64e93e548333ec6",
+          "sha256": "97251bacb02cbf18ce10ca911d2a12c22217318472be65bb4b6797610e557c78"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "82c963cf707ef3ecf64e93e548333ec6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 19329,
+        "upload_time": "2021-12-06T18:18:53",
+        "upload_time_iso_8601": "2021-12-06T18:18:53.966770Z",
+        "url": "https://files.pythonhosted.org/packages/42/17/d4b4c5bd991dc640ce72ecd9ae4d2469d44b4d6df6cc4e5011370d2e5e8b/miniboss-0.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76af2cb97158f7a3cccbaab5dddf02e1eeaf0ef7393529c3b222766da5a497b0",
+          "md5": "2820a5c75224159b1122e158ee77e082",
+          "sha256": "1a9828d09c819a00273b2c03b24d083ff6ebf83160db490e4657cbdf60d138d5"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2820a5c75224159b1122e158ee77e082",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23161,
+        "upload_time": "2021-12-06T18:18:56",
+        "upload_time_iso_8601": "2021-12-06T18:18:56.137546Z",
+        "url": "https://files.pythonhosted.org/packages/76/af/2cb97158f7a3cccbaab5dddf02e1eeaf0ef7393529c3b222766da5a497b0/miniboss-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aea3430fd443a07646d536c36b261b476a6dfe435893144ce634100f9029b894",
+          "md5": "8eaf08c259b087542376f7032d8d06c7",
+          "sha256": "f742b069d328efa487e2a84d32c53cf04a2b6aa627a0c087ea8546f2adb45fb9"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8eaf08c259b087542376f7032d8d06c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">3.8.0",
+        "size": 19408,
+        "upload_time": "2022-03-02T14:57:48",
+        "upload_time_iso_8601": "2022-03-02T14:57:48.715330Z",
+        "url": "https://files.pythonhosted.org/packages/ae/a3/430fd443a07646d536c36b261b476a6dfe435893144ce634100f9029b894/miniboss-0.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1609c64109a450b337357d28c8a0a3e64acb3302286e654d160330df0c7b487d",
+          "md5": "faca30282ce03ac9c44b31ea3dac4e6a",
+          "sha256": "fc3216cfd4137d3a838e39afaf5a3efec2c7729a3fb9bfc7c2476d0845ef8663"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "faca30282ce03ac9c44b31ea3dac4e6a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">3.8.0",
+        "size": 23256,
+        "upload_time": "2022-03-02T14:57:50",
+        "upload_time_iso_8601": "2022-03-02T14:57:50.845630Z",
+        "url": "https://files.pythonhosted.org/packages/16/09/c64109a450b337357d28c8a0a3e64acb3302286e654d160330df0c7b487d/miniboss-0.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "12417f654970d2e9fa538a02322eba3c381895a6a8f82ac6f79fb60735db785d",
+          "md5": "3321d3cfe3efd3eb54c02dfd4084b9a5",
+          "sha256": "06732c8987d156a5885c6a32e5c36a1a43a736fed2cb0072052c6cdc950d2883"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3321d3cfe3efd3eb54c02dfd4084b9a5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">3.8.0",
+        "size": 20656,
+        "upload_time": "2022-04-10T15:52:34",
+        "upload_time_iso_8601": "2022-04-10T15:52:34.084900Z",
+        "url": "https://files.pythonhosted.org/packages/12/41/7f654970d2e9fa538a02322eba3c381895a6a8f82ac6f79fb60735db785d/miniboss-0.4.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bdc613d49b7ad797dccf837fcd7004850101e29724e20f3a70fe0b8b96d7e599",
+          "md5": "5956d4af4b00d8c158cf92e2021bd012",
+          "sha256": "81aa1d1eb4d9f26b0a5228bb6b97c55212338acabcf835281304e8a0d1d1bc08"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5956d4af4b00d8c158cf92e2021bd012",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">3.8.0",
+        "size": 24514,
+        "upload_time": "2022-04-10T15:52:36",
+        "upload_time_iso_8601": "2022-04-10T15:52:36.605870Z",
+        "url": "https://files.pythonhosted.org/packages/bd/c6/13d49b7ad797dccf837fcd7004850101e29724e20f3a70fe0b8b96d7e599/miniboss-0.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c56d2264f4e88af01756d1e65d624da47dc65f5e99fdcdabc422d85e7f480125",
+          "md5": "b9b79e19570a4ab65fc90e33f1ff8c04",
+          "sha256": "e17d7a451cd27fabad9600f8822e831dd6a0a7a2e5f0d91b0a8883fa6040d89e"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b9b79e19570a4ab65fc90e33f1ff8c04",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">3.8.0",
+        "size": 20696,
+        "upload_time": "2022-04-11T14:27:49",
+        "upload_time_iso_8601": "2022-04-11T14:27:49.287660Z",
+        "url": "https://files.pythonhosted.org/packages/c5/6d/2264f4e88af01756d1e65d624da47dc65f5e99fdcdabc422d85e7f480125/miniboss-0.4.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "065444a3908754ca7770e5b4248ca25b444d6ad73529821692773c5dc49c317c",
+          "md5": "5f644af5c8fb3630867147743110c65c",
+          "sha256": "a6a6ac8b2bb96bed9661e9a6833d81d057fa9078d89839c9eeb32bfbc4760886"
+        },
+        "downloads": -1,
+        "filename": "miniboss-0.4.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5f644af5c8fb3630867147743110c65c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">3.8.0",
+        "size": 24628,
+        "upload_time": "2022-04-11T14:27:50",
+        "upload_time_iso_8601": "2022-04-11T14:27:50.996121Z",
+        "url": "https://files.pythonhosted.org/packages/06/54/44a3908754ca7770e5b4248ca25b444d6ad73529821692773c5dc49c317c/miniboss-0.4.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "c56d2264f4e88af01756d1e65d624da47dc65f5e99fdcdabc422d85e7f480125",
+        "md5": "b9b79e19570a4ab65fc90e33f1ff8c04",
+        "sha256": "e17d7a451cd27fabad9600f8822e831dd6a0a7a2e5f0d91b0a8883fa6040d89e"
+      },
+      "downloads": -1,
+      "filename": "miniboss-0.4.5-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "b9b79e19570a4ab65fc90e33f1ff8c04",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">3.8.0",
+      "size": 20696,
+      "upload_time": "2022-04-11T14:27:49",
+      "upload_time_iso_8601": "2022-04-11T14:27:49.287660Z",
+      "url": "https://files.pythonhosted.org/packages/c5/6d/2264f4e88af01756d1e65d624da47dc65f5e99fdcdabc422d85e7f480125/miniboss-0.4.5-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "065444a3908754ca7770e5b4248ca25b444d6ad73529821692773c5dc49c317c",
+        "md5": "5f644af5c8fb3630867147743110c65c",
+        "sha256": "a6a6ac8b2bb96bed9661e9a6833d81d057fa9078d89839c9eeb32bfbc4760886"
+      },
+      "downloads": -1,
+      "filename": "miniboss-0.4.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "5f644af5c8fb3630867147743110c65c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">3.8.0",
+      "size": 24628,
+      "upload_time": "2022-04-11T14:27:50",
+      "upload_time_iso_8601": "2022-04-11T14:27:50.996121Z",
+      "url": "https://files.pythonhosted.org/packages/06/54/44a3908754ca7770e5b4248ca25b444d6ad73529821692773c5dc49c317c/miniboss-0.4.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

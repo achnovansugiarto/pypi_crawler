@@ -1,0 +1,1419 @@
+{
+  "info": {
+    "author": "msimonin",
+    "author_email": "matthieu.simonin@inria.fr",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "\nRationale\n---------\n\n- You wrote a program ``a.out`` with some parameters\n- You need to explore the space of parameters (or at least a large subset of it)\n\n**Minionize** is a solution to spawn a legion of ``a.out`` in a massively\nparallel manner. By *minionizing* your program, your *minions* will take\ntheir inputs from various sources (e.g filesystem, pub/sub) and run it. Also\ninputs can be acked or redelivered to another minions.\n\nYou can also think about **minionize** as an equivalent to the \"``| xargs``\"\nshell construction but where:\n\n- the ``pipe |`` can transmit your data from many different sources (not\n  only from the stdout of the previous process)\n- the ``xargs`` can transform the received data before sending them to your\n  program.\n\nThat being said, **Minionize** is a good choice for your `besteffort and\nidempotent\n<http://oar.imag.fr/docs/latest/user/mechanisms.html#besteffort-jobs>`_\ncomputations on scientific testbeds (Igrida, Grid'5000) but also if you need\na quick way to turn you binary into a micro-service (e.g for Kubernetes).\n\n**Minionize** provides some observability features out-of-the box:\nit exposes an api to retrieve the stats and a basic cli to display some of\nthem (to be honest, I dream of an ``mtop``: ``htop`` for minions). But\ncurrently it looks more or less like this:\n\n.. image:: https://gitlab.inria.fr/msimonin/minionize/-/raw/master/images/stats.png\n   :height: 500\n\nHow does it work\n----------------\n\nA classical pattern to do the above is to apply the master/worker pattern\nwhere a master gives tasks to workers. Workers repeatedly fetch a new task\nfrom a queue , run it and report back to the master its status (e.g success,\nfailure). **Minionize** applies somehow this pattern but is *masterless*\nout-of-the box. Indeed modern queue implementations expose APIs to\nacknowledge/requeue messages.\n\nCurrently we support:\n\n- For the ``pipe |`` part:\n    - ``execo`` based queue: the queue is stored in a shared file system in your cluster (no external process involved)\n    - ``Google pub/sub`` based queue: the queue is hosted by Google\n    - ``Apache pulsar``, a pub/sub system you can self-host\n    - ``file``, take inputs from a regular file (e.g stdin)\n\n- For the ``xargs`` part:\n    - ``processes``: launch you program isolated in a process upon reception.\n    - ``functions``: launch a python function upon reception.\n    - ``docker`` : launch a docker container upon reception.\n\n\nSome examples\n-------------\n\nSimplest use case\n~~~~~~~~~~~~~~~~~\n\nIn this case the received params are appended to the\nminionized program. If you need more control on the params you'll need to\nwrite your own Callback (see below).\n\n- with `Execo` engine:\n\n    .. code-block:: bash\n\n        # Install the execo minionizer\n        pip install minionize[execo]\n\n        # Create the queue of params\n        # You'll have to run this prior to launching your minions (adapt to\n        # your need / make a regular script)\n        $) python -c \"from execo_engine.sweep import ParamSweeper; ParamSweeper('sweeps', sweeps=range(10), save_sweeps=True)\"\n\n        # start your minions\n        $) MINION_ENGINE=execo minionize echo hello\n        hello 0\n        hello 1\n        hello 2\n        hello 3\n        hello 4\n        hello 5\n        hello 6\n        hello 7\n        hello 8\n        hello 9\n\n    .. note::\n\n        In other words the ``minionize`` wrapper lets you populate the queue\n        with strings representing the parameter of your command line\n\n- Record some stats: you need to setup a ``Reporter`` to report your stats.\n\n    .. code-block:: bash\n\n        # Install the execo minionizer\n        pip install minionize[execo]\n\n        # Create the queue of params\n        # You'll have to run this prior to launching your minions (adapt to\n        # your need / make a regular script)\n        $) python -c \"from execo_engine.sweep import ParamSweeper; ParamSweeper('sweeps', sweeps=range(10), save_sweeps=True)\"\n\n        # start your minions\n        MINION_ENGINE=execo MINION_REPORTER=json minionize sleep\n\n        # read the stats (while running or no)\n        MINION_REPORTER=json minion-status\n\n- On a OAR cluster (Igrida/Grid5000):\n\n  - Generate the queue for example with Execo\n\n    .. code-block:: bash\n\n        python -c \"from execo_engine.sweep import ParamSweeper; ParamSweeper('sweeps', sweeps=range(1000), save_sweeps=True)\"\n\n    - Create your oar scan script:\n\n    .. code-block:: bash\n\n        #!/usr/bin/env bash\n\n        #OAR -n kpd\n        #OAR -l nodes=1,walltime=1:0:0\n        #OAR -t besteffort\n        #OAR -t idempotent\n\n        # oarsub --array 10 -S ./oar.sh\n\n        set -eux\n\n        pip install minionize\n\n        minionize echo \"hello from $OAR_JOB_ID\"\n\n    - Start your minions\n\n    .. code-block:: bash\n\n        echo \"MINION_ENGINE=execo\" > .env\n        oarsub --array 10 -S ./oar.sh\n\n    .. note::\n\n        ``.env`` file is read when minionizing starts so the scan script can\n        remain the same whatever engine is used.\n\n    - Example of output:\n\n    .. code-block:: bash\n\n        $) cat OAR.1287856.stdout\n        [...]\n        hello from 1287856 135\n        hello from 1287856 139\n        hello from 1287856 143\n        hello from 1287856 147\n        hello from 1287856 151\n        hello from 1287856 155\n        hello from 1287856 159\n        hello from 1287856 163\n        hello from 1287856 167\n        [...]\n\n    .. note::\n\n        As expected params have been distributed to different minions\n\nCustom Callbacks\n~~~~~~~~~~~~~~~~\n\nThe params sent to your program can be anything (e.g a python dict). In\nsome cases (many actually), you'll need to transform these params to\nsomething that you program can understand. **So you'll need to tell\nminionize how to minionize**. This is achieved using specific callbacks.\n\nThe easiest way to write a custom callbacks is to inherit from\n``ProcessCallback`` or ``FuncCallback``. With these Callbacks you don't\nhave to worry about the acknowledgement logic.\n\n.. code-block:: python\n\n    #   a.out is invoked like this: a.out --arg1 varg1 varg2\n    #   but the queue holds json like object:\n    #   {\"arg1\": varg11, \"arg2\": varg21}, {\"arg1\": varg12, \"arg2\": varg22} ...\n    # we can write a custom ProcessCallback which overrides the to_cmd method\n\n    class MyProcessCallBack(ProcessCallback):\n        def to_cmd(param: Param):\n            return f\"a.out --arg1 {param['arg1']} {param['arg2']}\"\n\n    m = minionizer(MyProcessCallback())\n    m.run()\n\n.. code-block:: python\n\n    #   you want to minionize a python function `my_function`\n    #   but the queue holds json like object:\n    #   {\"arg1\": varg11, \"arg2\": varg21}, {\"arg1\": varg12, \"arg2\": varg22} ...\n    # we can use the FuncCallback for this purpose\n\n    def myfunc(...)\n        # this is your function\n\n    def _myfunc(param: Param)\n        # this is the wrapper which invokes myfunc based on the params\n        return myfunc(param[\"arg1\"], param[\"arg2\"])\n\n    m = minionizer(FuncCallback(_myfunc))\n    m.run()\n\n\nEnvironment variables\n---------------------\n\n*Minionize* is configured using environment variables.\nBy default it reads a ``.env`` file in the current directory but doesn't\noverride existing system environment variables.\n\nDefault values\n~~~~~~~~~~~~~~\n\n.. code-block:: bash\n\n    --------------------------------------------\n\n    # which engine (queue implementation) to use\n    MINION_ENGINE=execo # google, pulsar\n\n    # Execo\n    EXECO_PERSISTENCE_DIR=sweeps\n\n    # Google\n    GOOGLE_PROJECT_ID=/mandatory/\n    GOOGLE_TOPIC_ID=/mandatory/\n    GOOGLE_SUBSCRIPTIOn=/mandatory/\n    GOOGLE_APPLICATION_CREDENTIALS=/mandatory/\n    GOOGLE_DECODER=identity\n\n\n    # Pulsar\n    PULSAR_CONNECTION=pulsar://localhost:6650\n    PULSAR_TOPIC=/mandatory/\n    PULSAR_DECODER=identity\n\n    ---------------------------------------------\n\n    # Stat reporter\n    MINION_REPORTER=null # json, stdout\n\n    # Json\n    REPORTER_JSON_DIRECTORY=minion-report\n\n\nRoadmap\n-------\n\n- Easy integration as docker entrypoint\n- Minionize python function (e.g @minionize decorator)\n- Support new queues (Apache pulsar, Redis stream, RabbitMQ, Kakfa ...)\n- Support new abstractions to run container based application (docker, singularity...)\n- Automatic encapsulation using a .minionize.yml\n- Minions statistics\n- Keep in touch (matthieu dot simonin at inria dot fr)",
+    "description_content_type": "text/x-rst",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://gitlab.inria.fr/msimonin/minionize",
+    "keywords": "experimentation,oar,grid5000,igrida,parallel",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "minionize",
+    "package_url": "https://pypi.org/project/minionize/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/minionize/",
+    "project_urls": {
+      "Homepage": "https://gitlab.inria.fr/msimonin/minionize",
+      "Repository": "https://gitlab.inria.fr/msimonin/minionize"
+    },
+    "release_url": "https://pypi.org/project/minionize/0.3.4/",
+    "requires_dist": [
+      "python-dotenv (>=0.14.0,<0.15.0)",
+      "tox (>=3.20.0,<4.0.0)",
+      "docker (>=4.4.0,<5.0.0)",
+      "execo (>=2.6.4,<3.0.0); extra == \"execo\"",
+      "google-cloud-pubsub (>=2.0.0,<3.0.0); extra == \"google\"",
+      "pulsar-client (>=2.6.1,<3.0.0); extra == \"pulsar\"",
+      "pandas (>=1.1.3,<2.0.0)",
+      "asciichartpy (>=1.5.25,<2.0.0)",
+      "humanize (>=3.0.1,<4.0.0)"
+    ],
+    "requires_python": ">=3.6.1,<4.0.0",
+    "summary": "Massively Parallel operations made easy",
+    "version": "0.3.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9069764,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9cdd30c1b3f0ca2715fe075e27c78f451382c54817b44cc5861e0cbdfe171aea",
+          "md5": "09fd2d3d4191da0782e4e2b688b508c1",
+          "sha256": "8966e4241732091f1d34d66cf4bd7d482203173a075202b690556cf3af196678"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "09fd2d3d4191da0782e4e2b688b508c1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 7171,
+        "upload_time": "2020-09-02T20:55:23",
+        "upload_time_iso_8601": "2020-09-02T20:55:23.813575Z",
+        "url": "https://files.pythonhosted.org/packages/9c/dd/30c1b3f0ca2715fe075e27c78f451382c54817b44cc5861e0cbdfe171aea/minionize-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "334487cceb780e6da693877db49c166640df50c232e86aa7e5af4f1008118c42",
+          "md5": "79b1d93975748ed361be6a46a23f6d34",
+          "sha256": "c684c0eef39898b60eb371a3952bb81f8cefc660865b07b5e5562c8572e52609"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "79b1d93975748ed361be6a46a23f6d34",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 5866,
+        "upload_time": "2020-09-02T20:55:25",
+        "upload_time_iso_8601": "2020-09-02T20:55:25.847528Z",
+        "url": "https://files.pythonhosted.org/packages/33/44/87cceb780e6da693877db49c166640df50c232e86aa7e5af4f1008118c42/minionize-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "069619265e2b0bed7fb698401793a4dc33be07d0c6eb6edcf386058dbedaf24c",
+          "md5": "f9ea3a90224cbcefc3e9a5f038f55374",
+          "sha256": "3f2789055f6a2cf9a32fa13ba369e08e99fa6c4a9b166dace6e5d251553a38c6"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f9ea3a90224cbcefc3e9a5f038f55374",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8275,
+        "upload_time": "2020-09-02T20:59:19",
+        "upload_time_iso_8601": "2020-09-02T20:59:19.405226Z",
+        "url": "https://files.pythonhosted.org/packages/06/96/19265e2b0bed7fb698401793a4dc33be07d0c6eb6edcf386058dbedaf24c/minionize-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ac3243fb87cd5ea8301c2f05107ab24f465102bcd0c4e1522e71fc97a8e0ffee",
+          "md5": "06c9cd31a2052922f2043910df7f539d",
+          "sha256": "e57462666d7e9e4d31e90b8967d70291bfa57ae7d91df314de1d2afbfc2ff7ac"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06c9cd31a2052922f2043910df7f539d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 7234,
+        "upload_time": "2020-09-02T20:59:20",
+        "upload_time_iso_8601": "2020-09-02T20:59:20.836968Z",
+        "url": "https://files.pythonhosted.org/packages/ac/32/43fb87cd5ea8301c2f05107ab24f465102bcd0c4e1522e71fc97a8e0ffee/minionize-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "57fbd2318a59c9b844e241718be1ea1984bb4ad2919369518d5d18d57c303342",
+          "md5": "89e7f578d19798dcbbd4be6885b7103f",
+          "sha256": "f150009f2c8e325526ec9acbdb60a961910deb5993c8ca239b3f394d62b6740d"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "89e7f578d19798dcbbd4be6885b7103f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12979,
+        "upload_time": "2020-09-24T17:09:18",
+        "upload_time_iso_8601": "2020-09-24T17:09:18.197712Z",
+        "url": "https://files.pythonhosted.org/packages/57/fb/d2318a59c9b844e241718be1ea1984bb4ad2919369518d5d18d57c303342/minionize-0.1.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "96190e72fedf6492b784d2d279d6790d27c00a94d37dab9116602659e74d70a7",
+          "md5": "075584d1633a1a4d957eeb0822eb6f9e",
+          "sha256": "50624998aa344495fc7aa6ae3549027180fe2c774c054bf6ff46e445cf84ce87"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "075584d1633a1a4d957eeb0822eb6f9e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12494,
+        "upload_time": "2020-09-24T17:09:19",
+        "upload_time_iso_8601": "2020-09-24T17:09:19.554774Z",
+        "url": "https://files.pythonhosted.org/packages/96/19/0e72fedf6492b784d2d279d6790d27c00a94d37dab9116602659e74d70a7/minionize-0.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa3c23ce28a5670a2977d085d9104bbd5151d7352cb0628492810c7878c27409",
+          "md5": "024d7fb6773aef92a7d05bef481494a4",
+          "sha256": "291bd81f6c217d52da7b611be927fbec340d922793d55e12aa4e032816e4700b"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.11-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "024d7fb6773aef92a7d05bef481494a4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 13186,
+        "upload_time": "2020-09-29T10:21:41",
+        "upload_time_iso_8601": "2020-09-29T10:21:41.133407Z",
+        "url": "https://files.pythonhosted.org/packages/aa/3c/23ce28a5670a2977d085d9104bbd5151d7352cb0628492810c7878c27409/minionize-0.1.11-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c594f0ddee6ec67a9ab291f341bd710391e9122cedfc110c4dcac1ae01801c11",
+          "md5": "8c136e4e0b17b0051e8356f8df5d98b1",
+          "sha256": "0c852f10b302494d1645d679e19e5100ae0e45dbaeb1a1967e2db11c99ef034e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8c136e4e0b17b0051e8356f8df5d98b1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12994,
+        "upload_time": "2020-09-29T10:21:42",
+        "upload_time_iso_8601": "2020-09-29T10:21:42.597164Z",
+        "url": "https://files.pythonhosted.org/packages/c5/94/f0ddee6ec67a9ab291f341bd710391e9122cedfc110c4dcac1ae01801c11/minionize-0.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.12": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0b7f27193b26d96d2a36e89f6c481942f6d4b69dddf28606be2ec19e62d9183",
+          "md5": "72b2a1d73771912bd9b8d21b9cfccefd",
+          "sha256": "31c96ad3dd7d0d04676d8e514cbdcb414c4c48e8564c9afc519f4c9b8fcff196"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.12-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "72b2a1d73771912bd9b8d21b9cfccefd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 13188,
+        "upload_time": "2020-09-30T11:45:10",
+        "upload_time_iso_8601": "2020-09-30T11:45:10.361617Z",
+        "url": "https://files.pythonhosted.org/packages/d0/b7/f27193b26d96d2a36e89f6c481942f6d4b69dddf28606be2ec19e62d9183/minionize-0.1.12-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c7c6b15154f78778ef2c6d02042164d4f0984d3ec349143f22c7a005d20a9a4",
+          "md5": "17a66e595bdf22b0f43a2278ce98a930",
+          "sha256": "c24708cb15278c9c608b1daf127072b62be0c73c62d3657e8c5fb836dc7fd8bd"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.12.tar.gz",
+        "has_sig": false,
+        "md5_digest": "17a66e595bdf22b0f43a2278ce98a930",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 13019,
+        "upload_time": "2020-09-30T11:45:11",
+        "upload_time_iso_8601": "2020-09-30T11:45:11.639244Z",
+        "url": "https://files.pythonhosted.org/packages/6c/7c/6b15154f78778ef2c6d02042164d4f0984d3ec349143f22c7a005d20a9a4/minionize-0.1.12.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.13": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a75fd96ec25e6d76b1d99ba1ef5152c95a6340f47414b3e16ff6298515a90112",
+          "md5": "9c497fb1434039220f4f36d0153c7f3c",
+          "sha256": "8b163d6f2c97b3e6417215bf23f49e325619156725a6e2160d939bd9c7e3931c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.13-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9c497fb1434039220f4f36d0153c7f3c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17263,
+        "upload_time": "2020-10-07T08:50:57",
+        "upload_time_iso_8601": "2020-10-07T08:50:57.570606Z",
+        "url": "https://files.pythonhosted.org/packages/a7/5f/d96ec25e6d76b1d99ba1ef5152c95a6340f47414b3e16ff6298515a90112/minionize-0.1.13-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c3acfedf56fff88ca0609a2d3eff17eea3e6c614c3bba8e448cd111546abea7",
+          "md5": "aa3014d6141c861cadbaeca7fb3c7677",
+          "sha256": "f08bd7dea900c2b4680d26069064f990e1fc385abfe72c7e31d7195ceab5f70c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.13.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aa3014d6141c861cadbaeca7fb3c7677",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17249,
+        "upload_time": "2020-10-07T08:50:59",
+        "upload_time_iso_8601": "2020-10-07T08:50:59.117754Z",
+        "url": "https://files.pythonhosted.org/packages/6c/3a/cfedf56fff88ca0609a2d3eff17eea3e6c614c3bba8e448cd111546abea7/minionize-0.1.13.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.14": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4d5d41ba68da3389448fbfc5c51170010e56d263c5f5117e06e7ad8419bd30fc",
+          "md5": "63a42b61ed098d49a668ef9b4d3a54e4",
+          "sha256": "10275527295409071a37a1413dc29f71e82fd3320dd7bd5f10265dc6e4f6cf09"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.14-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "63a42b61ed098d49a668ef9b4d3a54e4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17279,
+        "upload_time": "2020-10-07T09:36:12",
+        "upload_time_iso_8601": "2020-10-07T09:36:12.379052Z",
+        "url": "https://files.pythonhosted.org/packages/4d/5d/41ba68da3389448fbfc5c51170010e56d263c5f5117e06e7ad8419bd30fc/minionize-0.1.14-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be4586ddf7dd471343011263ea2e1c0e4843e46a2448b4ed03f53a41f199e7b8",
+          "md5": "e563fcb6308df7a306539274d1d0674d",
+          "sha256": "39e7f6721aae84948d5022343c3b7e721d7fda3008133836f3f9dbfb9af1cb61"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.14.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e563fcb6308df7a306539274d1d0674d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17303,
+        "upload_time": "2020-10-07T09:36:13",
+        "upload_time_iso_8601": "2020-10-07T09:36:13.809968Z",
+        "url": "https://files.pythonhosted.org/packages/be/45/86ddf7dd471343011263ea2e1c0e4843e46a2448b4ed03f53a41f199e7b8/minionize-0.1.14.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.15": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "caf58847f8832416224586432170f675e2d5e85119d7ffa8076a1c5485632e17",
+          "md5": "6d583dfb0b8f5c920e5f25fc160680e7",
+          "sha256": "15f23f5b3091886fd285a302df80ff4c48a456e08c91e0c11174ddf975d4cca7"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.15-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6d583dfb0b8f5c920e5f25fc160680e7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17275,
+        "upload_time": "2020-10-07T15:51:18",
+        "upload_time_iso_8601": "2020-10-07T15:51:18.953152Z",
+        "url": "https://files.pythonhosted.org/packages/ca/f5/8847f8832416224586432170f675e2d5e85119d7ffa8076a1c5485632e17/minionize-0.1.15-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3709de53cd19ff03ca2e7162810d2158ac47ee772d5bee0fc64ceaf9ae46206",
+          "md5": "5ed0fbe30651370d7c9e3d44a871597e",
+          "sha256": "42846acf882710aea8df04b03da2c65bcb0df554df65535c1a1008fe420f84df"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.15.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5ed0fbe30651370d7c9e3d44a871597e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17321,
+        "upload_time": "2020-10-07T15:51:20",
+        "upload_time_iso_8601": "2020-10-07T15:51:20.273969Z",
+        "url": "https://files.pythonhosted.org/packages/a3/70/9de53cd19ff03ca2e7162810d2158ac47ee772d5bee0fc64ceaf9ae46206/minionize-0.1.15.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.16": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1363626a8dbdedf2ab9ceb321da1bd4f19711f0ce3e9564897ddc4e4a5efa752",
+          "md5": "32a5e078a21ad9cee38aee6224acbc5a",
+          "sha256": "4680b8820b6f50a50c0ec5381de4114a0a02558c11d04643a51057ded6011fda"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.16-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "32a5e078a21ad9cee38aee6224acbc5a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17294,
+        "upload_time": "2020-10-07T16:44:04",
+        "upload_time_iso_8601": "2020-10-07T16:44:04.590592Z",
+        "url": "https://files.pythonhosted.org/packages/13/63/626a8dbdedf2ab9ceb321da1bd4f19711f0ce3e9564897ddc4e4a5efa752/minionize-0.1.16-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a64296d764f8869d9a1e841c57e7f0212a7954eb14e49f52f98f8e331ccbeebb",
+          "md5": "63247316d088c407011ad39cf818f464",
+          "sha256": "b55fa1e37a1d896f5d80de8b127baa860f9a3fabca3c2a726f5c99bcfb903bb2"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.16.tar.gz",
+        "has_sig": false,
+        "md5_digest": "63247316d088c407011ad39cf818f464",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 17348,
+        "upload_time": "2020-10-07T16:44:05",
+        "upload_time_iso_8601": "2020-10-07T16:44:05.838786Z",
+        "url": "https://files.pythonhosted.org/packages/a6/42/96d764f8869d9a1e841c57e7f0212a7954eb14e49f52f98f8e331ccbeebb/minionize-0.1.16.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.17": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b9cea27017162c8926a6f8c9f702e8b096da57bba1eb3680c373b429721c1ff9",
+          "md5": "5c95637371e2520e173d9496a5efc65c",
+          "sha256": "00556cad267962fb3012b261542203ace08f3e7ccac0d4b7d56ab3dd3396aad9"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.17-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5c95637371e2520e173d9496a5efc65c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18756,
+        "upload_time": "2020-10-07T21:50:32",
+        "upload_time_iso_8601": "2020-10-07T21:50:32.276049Z",
+        "url": "https://files.pythonhosted.org/packages/b9/ce/a27017162c8926a6f8c9f702e8b096da57bba1eb3680c373b429721c1ff9/minionize-0.1.17-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "71f4719861819c57803f6cb653c8a1868e47d77f18bf465d6b6c76ab084bff26",
+          "md5": "3fd4080a7b0dfbff164d71c99352291b",
+          "sha256": "b95b3c0e09a70c36907bc803fa5f3a509a3c68af05262d4b99098d1d9bb36612"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.17.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3fd4080a7b0dfbff164d71c99352291b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18700,
+        "upload_time": "2020-10-07T21:50:33",
+        "upload_time_iso_8601": "2020-10-07T21:50:33.532704Z",
+        "url": "https://files.pythonhosted.org/packages/71/f4/719861819c57803f6cb653c8a1868e47d77f18bf465d6b6c76ab084bff26/minionize-0.1.17.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.18": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "204a6776019058fce232833f53eeef0c869375a17ae388119c2c3e36b89036d9",
+          "md5": "7005d8d38a141efbf95d47e34ef307b1",
+          "sha256": "dd40259bdba3c41c10815c93b8b59bc13a86693c436f1d6558c0639dae49d86c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.18-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7005d8d38a141efbf95d47e34ef307b1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18827,
+        "upload_time": "2020-10-07T22:07:15",
+        "upload_time_iso_8601": "2020-10-07T22:07:15.431251Z",
+        "url": "https://files.pythonhosted.org/packages/20/4a/6776019058fce232833f53eeef0c869375a17ae388119c2c3e36b89036d9/minionize-0.1.18-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3de4bf51e2c2c1a37e904dcce2eb454f43e0a5b6ce38d2a82493765495b62469",
+          "md5": "558affecfc5a62c9aac462430c3f1000",
+          "sha256": "6e79eee3037d4c04cad9f5573fbe56a2ce1786dc7b2e034d8acc169784190219"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.18.tar.gz",
+        "has_sig": false,
+        "md5_digest": "558affecfc5a62c9aac462430c3f1000",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18845,
+        "upload_time": "2020-10-07T22:07:16",
+        "upload_time_iso_8601": "2020-10-07T22:07:16.817414Z",
+        "url": "https://files.pythonhosted.org/packages/3d/e4/bf51e2c2c1a37e904dcce2eb454f43e0a5b6ce38d2a82493765495b62469/minionize-0.1.18.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.19": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b3de6215f3dedf86742f7e68f58ac18c65420663e4349af932b0f304e9fe840f",
+          "md5": "f0c44452db29eaf770f45bae40479276",
+          "sha256": "45847089ce76788f5d5d58f1b5b8fc750449c611ed9398abf2fd24f86ffc83f1"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.19-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f0c44452db29eaf770f45bae40479276",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18831,
+        "upload_time": "2020-10-08T05:52:50",
+        "upload_time_iso_8601": "2020-10-08T05:52:50.416906Z",
+        "url": "https://files.pythonhosted.org/packages/b3/de/6215f3dedf86742f7e68f58ac18c65420663e4349af932b0f304e9fe840f/minionize-0.1.19-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b8bafc1da778ec2ad954cb70229bc875d2db560e23b0ff7d904158a1cd83a5f",
+          "md5": "98eff2b7db9e61ecd4abc48e96c60e97",
+          "sha256": "b7a02929da24c51616f61f18adfd06d2d4b7fa583b7a4c173ed171a92d66ff37"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.19.tar.gz",
+        "has_sig": false,
+        "md5_digest": "98eff2b7db9e61ecd4abc48e96c60e97",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18855,
+        "upload_time": "2020-10-08T05:52:52",
+        "upload_time_iso_8601": "2020-10-08T05:52:52.050321Z",
+        "url": "https://files.pythonhosted.org/packages/3b/8b/afc1da778ec2ad954cb70229bc875d2db560e23b0ff7d904158a1cd83a5f/minionize-0.1.19.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a875414d6807a003e9816112c000206653a9d94aec8041e486c39e2fbb6df7b",
+          "md5": "22c9856ed8bfce462d61d8b2f8bb7539",
+          "sha256": "79da85ced281d448dd8df3fc4144824dd361b8bf5521223b755498eb875163eb"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "22c9856ed8bfce462d61d8b2f8bb7539",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8377,
+        "upload_time": "2020-09-03T07:22:03",
+        "upload_time_iso_8601": "2020-09-03T07:22:03.797605Z",
+        "url": "https://files.pythonhosted.org/packages/4a/87/5414d6807a003e9816112c000206653a9d94aec8041e486c39e2fbb6df7b/minionize-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c18dbd8eaf65d86f4b62e27a7487b5c91bedeb8e3c1d26a6718bcf7c53b5c037",
+          "md5": "569dec8565f43ae8d88fbc2f5e247cdf",
+          "sha256": "f3fe8790af4a7c0eda282488b8483f34570851e79b6bd4b8f252620ec53d449c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "569dec8565f43ae8d88fbc2f5e247cdf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 7406,
+        "upload_time": "2020-09-03T07:22:04",
+        "upload_time_iso_8601": "2020-09-03T07:22:04.970876Z",
+        "url": "https://files.pythonhosted.org/packages/c1/8d/bd8eaf65d86f4b62e27a7487b5c91bedeb8e3c1d26a6718bcf7c53b5c037/minionize-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.20": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b70a0e8e02a3eeada4737eb3bb33e5c459e22da159a28796fc9ee26d362ceab",
+          "md5": "9d644fc475d60a70eea6dd792c757c24",
+          "sha256": "64cb425dcaead91059bf4e4838bf3b165240202d4e2ad3803bcd216425c49647"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.20-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9d644fc475d60a70eea6dd792c757c24",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18847,
+        "upload_time": "2020-10-09T09:22:17",
+        "upload_time_iso_8601": "2020-10-09T09:22:17.353574Z",
+        "url": "https://files.pythonhosted.org/packages/9b/70/a0e8e02a3eeada4737eb3bb33e5c459e22da159a28796fc9ee26d362ceab/minionize-0.1.20-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "008e5f2b43595f7b2f7272936b1b11748cdc488c834fb87f7e6882d54c34bef7",
+          "md5": "42d482dd5a5a7ae16ea3b59817fbc7c0",
+          "sha256": "f69e4a9d1ab8af5f531562a770b168a3ccca80ca5de722810dc34b044903bdf6"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.20.tar.gz",
+        "has_sig": false,
+        "md5_digest": "42d482dd5a5a7ae16ea3b59817fbc7c0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18792,
+        "upload_time": "2020-10-09T09:22:18",
+        "upload_time_iso_8601": "2020-10-09T09:22:18.750698Z",
+        "url": "https://files.pythonhosted.org/packages/00/8e/5f2b43595f7b2f7272936b1b11748cdc488c834fb87f7e6882d54c34bef7/minionize-0.1.20.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1c3fcea0c931d23f3ec9e74c78021a09d36e1639ec0f9fe7f1a2207a3ce1890d",
+          "md5": "34f5f97867094a814554820bce4a313c",
+          "sha256": "1edb913e737a445014134ede28649fc36ca5871301e3f73bb021423f5bdd9b6c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "34f5f97867094a814554820bce4a313c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18848,
+        "upload_time": "2020-10-09T10:10:01",
+        "upload_time_iso_8601": "2020-10-09T10:10:01.298778Z",
+        "url": "https://files.pythonhosted.org/packages/1c/3f/cea0c931d23f3ec9e74c78021a09d36e1639ec0f9fe7f1a2207a3ce1890d/minionize-0.1.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5251e502bdae3c587de5e55c4ca173aaf5e985a21e4657962171c97cde0d621",
+          "md5": "4d9d8cd7f55f6b7a7f9bfb2d39c3d47e",
+          "sha256": "3a1188916eba38a0087ac3c08bed7f90471c3adb8a6c48ca8aecc2a5dc574799"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.21.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4d9d8cd7f55f6b7a7f9bfb2d39c3d47e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18777,
+        "upload_time": "2020-10-09T10:10:03",
+        "upload_time_iso_8601": "2020-10-09T10:10:03.018581Z",
+        "url": "https://files.pythonhosted.org/packages/c5/25/1e502bdae3c587de5e55c4ca173aaf5e985a21e4657962171c97cde0d621/minionize-0.1.21.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.22": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "63622429f71f6421c8d60a0e2055f6e8fc9957b466117b29dc3a0d1a7a4d590b",
+          "md5": "c06bb80f55146c418c2ff998825c95c2",
+          "sha256": "31e7e2fd2dc43e272e2161907042e641cab5264a451e7e4bd70a427b6e034b28"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.22-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c06bb80f55146c418c2ff998825c95c2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18872,
+        "upload_time": "2020-10-09T14:59:22",
+        "upload_time_iso_8601": "2020-10-09T14:59:22.620739Z",
+        "url": "https://files.pythonhosted.org/packages/63/62/2429f71f6421c8d60a0e2055f6e8fc9957b466117b29dc3a0d1a7a4d590b/minionize-0.1.22-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "be218d6a7e21ab9612ad841e52636bb96ca10950d0ad01716587f96943c4a5f6",
+          "md5": "722e0173b866b7b08675dd09e93c0fd5",
+          "sha256": "5ae4638a05f8dee6128cfa0d444e60e74f8074a59290a8733fe85664272180b7"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.22.tar.gz",
+        "has_sig": false,
+        "md5_digest": "722e0173b866b7b08675dd09e93c0fd5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 18803,
+        "upload_time": "2020-10-09T14:59:23",
+        "upload_time_iso_8601": "2020-10-09T14:59:23.990786Z",
+        "url": "https://files.pythonhosted.org/packages/be/21/8d6a7e21ab9612ad841e52636bb96ca10950d0ad01716587f96943c4a5f6/minionize-0.1.22.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fdffd50dfd6fceafec65769e509e9d4e5c3665b86ab00bdfac286227a8c7bd97",
+          "md5": "b0eac79361016b1b11022cd7797a4cc8",
+          "sha256": "afe282ef5bd50a42bb7b2899620b20715818c955a54b918e5f7de1efafcba63e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b0eac79361016b1b11022cd7797a4cc8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9123,
+        "upload_time": "2020-09-03T14:31:22",
+        "upload_time_iso_8601": "2020-09-03T14:31:22.519609Z",
+        "url": "https://files.pythonhosted.org/packages/fd/ff/d50dfd6fceafec65769e509e9d4e5c3665b86ab00bdfac286227a8c7bd97/minionize-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "204650088ceaf2080edab33c34dd2eee6fec0b5369e7584437b2cbc6f2a20072",
+          "md5": "deb743f8ac7c9ec81bde3346cc24952a",
+          "sha256": "8775a834b6914ee884e6d3ec942cedc1e9ba9c50ad8a2ca2c21b20f1412d5731"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "deb743f8ac7c9ec81bde3346cc24952a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 8127,
+        "upload_time": "2020-09-03T14:31:23",
+        "upload_time_iso_8601": "2020-09-03T14:31:23.758681Z",
+        "url": "https://files.pythonhosted.org/packages/20/46/50088ceaf2080edab33c34dd2eee6fec0b5369e7584437b2cbc6f2a20072/minionize-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "10a4c6c252411dc620d2dda8ddd06f1b01130eef9cbcd30f3173cd8123726064",
+          "md5": "722a55c57f66e1e9ee83744e8837f35e",
+          "sha256": "7f54864f0f886c335265266a4e210cdfd69920b8b002a7abefe61af14fc60112"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "722a55c57f66e1e9ee83744e8837f35e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9692,
+        "upload_time": "2020-09-03T15:00:28",
+        "upload_time_iso_8601": "2020-09-03T15:00:28.738420Z",
+        "url": "https://files.pythonhosted.org/packages/10/a4/c6c252411dc620d2dda8ddd06f1b01130eef9cbcd30f3173cd8123726064/minionize-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2591cf0e31c2c86e1930e4ff8616aacbf196c7156bea06387b2b13f5d64f6c0a",
+          "md5": "0a4f3a0fd8c0a7dbd3ecd0df94c42294",
+          "sha256": "0ba6a1313d4af68853ac84ea13dec84f875d6ec1888cbc0359a92bc87780442f"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0a4f3a0fd8c0a7dbd3ecd0df94c42294",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7,<4.0",
+        "size": 9312,
+        "upload_time": "2020-09-03T15:00:30",
+        "upload_time_iso_8601": "2020-09-03T15:00:30.162364Z",
+        "url": "https://files.pythonhosted.org/packages/25/91/cf0e31c2c86e1930e4ff8616aacbf196c7156bea06387b2b13f5d64f6c0a/minionize-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "77c9fe6363bf2740b1a993c6df2e0bd3a783df822092972383f53d8e12fe7e93",
+          "md5": "a8cc373b54ec1774fa56a5779da91f0d",
+          "sha256": "464981427d68144edf3837e432b20e4229dfa73d49b30b1f3eb77a0fcc55cea1"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a8cc373b54ec1774fa56a5779da91f0d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 10564,
+        "upload_time": "2020-09-06T20:29:43",
+        "upload_time_iso_8601": "2020-09-06T20:29:43.744763Z",
+        "url": "https://files.pythonhosted.org/packages/77/c9/fe6363bf2740b1a993c6df2e0bd3a783df822092972383f53d8e12fe7e93/minionize-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a2c22385344ef9f0165f889b4987d254f554fa63eee02323ab82ed438013fbe9",
+          "md5": "b9f5ba6e628b26ee188a308e3c8ce633",
+          "sha256": "fad76da861e7e3e107cebcf23bac7c5e4273b4a48c9dcff36d57f075873a445d"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b9f5ba6e628b26ee188a308e3c8ce633",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 10872,
+        "upload_time": "2020-09-06T20:29:44",
+        "upload_time_iso_8601": "2020-09-06T20:29:44.925576Z",
+        "url": "https://files.pythonhosted.org/packages/a2/c2/2385344ef9f0165f889b4987d254f554fa63eee02323ab82ed438013fbe9/minionize-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3442210335309450e9fe700422388f51faa1441a350a8f2030946512389c2b51",
+          "md5": "dc72c2c67f62376556b9878580d81ec8",
+          "sha256": "9f48d7254559e127569f36a0eff00fc0f4afb36314fff5f3edc5bd833f580e47"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "dc72c2c67f62376556b9878580d81ec8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 10869,
+        "upload_time": "2020-09-10T11:48:06",
+        "upload_time_iso_8601": "2020-09-10T11:48:06.994246Z",
+        "url": "https://files.pythonhosted.org/packages/34/42/210335309450e9fe700422388f51faa1441a350a8f2030946512389c2b51/minionize-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "46324debaef456e313440aa3d2836e158fdb64ee33acda6de5597b005711987e",
+          "md5": "5f42ac9405c465f331dc67efe5f93a5e",
+          "sha256": "3d8fa8af581ce32676660c98f679f57b376943ab599df0ec71ce62561f66a14b"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5f42ac9405c465f331dc67efe5f93a5e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 11116,
+        "upload_time": "2020-09-10T11:48:08",
+        "upload_time_iso_8601": "2020-09-10T11:48:08.277228Z",
+        "url": "https://files.pythonhosted.org/packages/46/32/4debaef456e313440aa3d2836e158fdb64ee33acda6de5597b005711987e/minionize-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e6a1d09905f91f8b918c9106ae938d28c6d3053176a944e113ca85b94705d57b",
+          "md5": "d50212181c13c2b8d0d40b3b892063cb",
+          "sha256": "bf537fd29245d9afc53c356b7605c78224a9c9fc2a9e1762baf74e0623713d52"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d50212181c13c2b8d0d40b3b892063cb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12478,
+        "upload_time": "2020-09-18T15:10:24",
+        "upload_time_iso_8601": "2020-09-18T15:10:24.897102Z",
+        "url": "https://files.pythonhosted.org/packages/e6/a1/d09905f91f8b918c9106ae938d28c6d3053176a944e113ca85b94705d57b/minionize-0.1.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f26b4972ba7e162aaa428ac999cf5863e559ca6fc677175c8fc0543e87c20f3",
+          "md5": "838c4a697ba24d0c76d90aeeb212d962",
+          "sha256": "470382a58e1c7b849f03152814cdf00de2f7d343bef6170faa305384602b30cc"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "838c4a697ba24d0c76d90aeeb212d962",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 11909,
+        "upload_time": "2020-09-18T15:10:26",
+        "upload_time_iso_8601": "2020-09-18T15:10:26.536767Z",
+        "url": "https://files.pythonhosted.org/packages/4f/26/b4972ba7e162aaa428ac999cf5863e559ca6fc677175c8fc0543e87c20f3/minionize-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4dbcc318acecd62906825f52e05900d5a8d36d3af9ae7bda60b03ae8cdddda07",
+          "md5": "a4ebd5f646b8a0c6d8167dde6525a283",
+          "sha256": "9e33ea7cb513e53254ce8764c1af7c0e1d76e70be952d36b5d57bdf84824af34"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a4ebd5f646b8a0c6d8167dde6525a283",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12688,
+        "upload_time": "2020-09-18T22:59:19",
+        "upload_time_iso_8601": "2020-09-18T22:59:19.947479Z",
+        "url": "https://files.pythonhosted.org/packages/4d/bc/c318acecd62906825f52e05900d5a8d36d3af9ae7bda60b03ae8cdddda07/minionize-0.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3a728535e4c265532b30aa53f830bfeeff7f05f20c8591d5ff38b8d6806ca67d",
+          "md5": "4cdb10ac7b5f3817849c44d4a48d585a",
+          "sha256": "1f880623b81b339baf6f1d1123a93ec7b90cf9226839a484c1576b2825201dd4"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4cdb10ac7b5f3817849c44d4a48d585a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12124,
+        "upload_time": "2020-09-18T22:59:21",
+        "upload_time_iso_8601": "2020-09-18T22:59:21.483339Z",
+        "url": "https://files.pythonhosted.org/packages/3a/72/8535e4c265532b30aa53f830bfeeff7f05f20c8591d5ff38b8d6806ca67d/minionize-0.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01e7d74469c2ba6524939d000972892eed82712feb50640aeda7d77eed8e362d",
+          "md5": "15588da977b22ed87b8fc05b60354678",
+          "sha256": "eb029013e9d17e161ec7253038fe184ac8530c32dc43c695895bd7392e3ba34e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "15588da977b22ed87b8fc05b60354678",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12805,
+        "upload_time": "2020-09-20T19:27:58",
+        "upload_time_iso_8601": "2020-09-20T19:27:58.687711Z",
+        "url": "https://files.pythonhosted.org/packages/01/e7/d74469c2ba6524939d000972892eed82712feb50640aeda7d77eed8e362d/minionize-0.1.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "10790fed75ecb9710ce15a715fe39535657e0f52a3dc0554951cca2c8756d351",
+          "md5": "b49fa7d7ed8add4ea83eab2020871773",
+          "sha256": "24ff509842b80f2fdfe7a7e1ae79bea349914f255aa30a90c966de6e051c0d7d"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b49fa7d7ed8add4ea83eab2020871773",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 12326,
+        "upload_time": "2020-09-20T19:27:59",
+        "upload_time_iso_8601": "2020-09-20T19:27:59.973092Z",
+        "url": "https://files.pythonhosted.org/packages/10/79/0fed75ecb9710ce15a715fe39535657e0f52a3dc0554951cca2c8756d351/minionize-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4132b5e27925da5554930f5a52ff124c0e9a7d98db62067a56dcb2c24db61301",
+          "md5": "0bdbb9b86e3b271dbf4884f12ac116c3",
+          "sha256": "5fe67e8ad9ffa9daaea7b70ced257021f7d103d448892722adab507bb2718e4c"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0bdbb9b86e3b271dbf4884f12ac116c3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21040,
+        "upload_time": "2020-10-12T13:12:34",
+        "upload_time_iso_8601": "2020-10-12T13:12:34.394780Z",
+        "url": "https://files.pythonhosted.org/packages/41/32/b5e27925da5554930f5a52ff124c0e9a7d98db62067a56dcb2c24db61301/minionize-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb66f6828f10a6f34eef2f844f0ac36b09ff2e6fd34dbc3f149138e5f46eebef",
+          "md5": "a03be2d0a1504756d2043d852cf68cc6",
+          "sha256": "8766592772f9402bbb75531a3cd27c5ec8e48d74c4378172a6d75189a568dfa4"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a03be2d0a1504756d2043d852cf68cc6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21054,
+        "upload_time": "2020-10-12T13:12:36",
+        "upload_time_iso_8601": "2020-10-12T13:12:36.023234Z",
+        "url": "https://files.pythonhosted.org/packages/eb/66/f6828f10a6f34eef2f844f0ac36b09ff2e6fd34dbc3f149138e5f46eebef/minionize-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7e03e33c85b16b7f966fbeccd05877aef5ca29460dd20a9c2721495f73a76d7b",
+          "md5": "1b7d881962dfb79ff93568f565f4f56b",
+          "sha256": "8ac842689e4e24107b27d43dd5c743a40180be2683b3b4f28937c11ab0bdfaed"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b7d881962dfb79ff93568f565f4f56b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21039,
+        "upload_time": "2020-10-12T21:43:20",
+        "upload_time_iso_8601": "2020-10-12T21:43:20.227037Z",
+        "url": "https://files.pythonhosted.org/packages/7e/03/e33c85b16b7f966fbeccd05877aef5ca29460dd20a9c2721495f73a76d7b/minionize-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d793e710b96b80c2e3e7ae895927a51beb50b0b2f006a1502af85e20f01037b3",
+          "md5": "b39078b2d2a1f076c0362bd732bd3c87",
+          "sha256": "3f18e85098dcebfe291fad0ccd260a669153a501e468cf9dd6b53eb52d9c932e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b39078b2d2a1f076c0362bd732bd3c87",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21093,
+        "upload_time": "2020-10-12T21:43:21",
+        "upload_time_iso_8601": "2020-10-12T21:43:21.561198Z",
+        "url": "https://files.pythonhosted.org/packages/d7/93/e710b96b80c2e3e7ae895927a51beb50b0b2f006a1502af85e20f01037b3/minionize-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6565a3566554bb6f2aa0573a36b07fe30bd5008adbe9c77c6d9ecb82a39b5bc4",
+          "md5": "0d40ba3279fb4c101e2f3cf414bc8215",
+          "sha256": "eac95a707660585af1cf8741c4e87590ffaf7971fbd5622bf46fca61d039a53a"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0d40ba3279fb4c101e2f3cf414bc8215",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21498,
+        "upload_time": "2020-10-16T12:52:07",
+        "upload_time_iso_8601": "2020-10-16T12:52:07.783869Z",
+        "url": "https://files.pythonhosted.org/packages/65/65/a3566554bb6f2aa0573a36b07fe30bd5008adbe9c77c6d9ecb82a39b5bc4/minionize-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a188dbd948c596bc49d4bce54c571ab52d64578ac75d1692ce92d89f12d3e219",
+          "md5": "0f8d613d94bfb70cd96b5632d4b6bdaf",
+          "sha256": "6d12c86eb8aa51662ba42f9d4aecbc407f05af5392d39fe9dc8e0389c11d7281"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f8d613d94bfb70cd96b5632d4b6bdaf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21545,
+        "upload_time": "2020-10-16T12:52:09",
+        "upload_time_iso_8601": "2020-10-16T12:52:09.304214Z",
+        "url": "https://files.pythonhosted.org/packages/a1/88/dbd948c596bc49d4bce54c571ab52d64578ac75d1692ce92d89f12d3e219/minionize-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "237e866a75bd53e20873903b77a60d33fb6b0964c6bec3320b162b7be0955601",
+          "md5": "902bc660795253667dc472b5d4a1c229",
+          "sha256": "937fe9081ab6daa789e8cb674a5456c4034bf0fad63526ce933cc03aed40a019"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "902bc660795253667dc472b5d4a1c229",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21518,
+        "upload_time": "2020-10-18T19:28:54",
+        "upload_time_iso_8601": "2020-10-18T19:28:54.213853Z",
+        "url": "https://files.pythonhosted.org/packages/23/7e/866a75bd53e20873903b77a60d33fb6b0964c6bec3320b162b7be0955601/minionize-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a09328f538c120b70206fac66f0b7ce6970d4af1a92665ca76008e00a3753b5d",
+          "md5": "d4ce650a3a4518754162bff359c703ab",
+          "sha256": "373488c2c8c645687afc8e93ab2b84d0c522984417a19d9902a7299945b10196"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d4ce650a3a4518754162bff359c703ab",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 21557,
+        "upload_time": "2020-10-18T19:28:55",
+        "upload_time_iso_8601": "2020-10-18T19:28:55.426920Z",
+        "url": "https://files.pythonhosted.org/packages/a0/93/28f538c120b70206fac66f0b7ce6970d4af1a92665ca76008e00a3753b5d/minionize-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dfa6e014ff44ed43d59aba9ce5a76dc84106fb3fa212dddafc6f863baa58c263",
+          "md5": "afa0a45b8cb76c62d87f08499ebc070b",
+          "sha256": "5b04921cbdfefa85c49fd2fc134f6218c6df1feb8572942a72b291b0fa11132e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "afa0a45b8cb76c62d87f08499ebc070b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22939,
+        "upload_time": "2020-11-24T13:35:09",
+        "upload_time_iso_8601": "2020-11-24T13:35:09.716683Z",
+        "url": "https://files.pythonhosted.org/packages/df/a6/e014ff44ed43d59aba9ce5a76dc84106fb3fa212dddafc6f863baa58c263/minionize-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "61212926253ed60abc19177fd96c58c9ae8e5dd1acb04d2040c0a05b352efb0a",
+          "md5": "2f7765c2c145cd4af398c837fb4be07d",
+          "sha256": "4bfcda1c68980560f37790f3c5933cc53594606f5ecc38d472c0d8675a08633a"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f7765c2c145cd4af398c837fb4be07d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22717,
+        "upload_time": "2020-11-24T13:35:11",
+        "upload_time_iso_8601": "2020-11-24T13:35:11.218140Z",
+        "url": "https://files.pythonhosted.org/packages/61/21/2926253ed60abc19177fd96c58c9ae8e5dd1acb04d2040c0a05b352efb0a/minionize-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d6e8837799ebb60c10870fca56e1dfe768e99c481240111d63cf625d4000f85",
+          "md5": "f1b347265a57fb5eacf493ac98d38d66",
+          "sha256": "3eccf9b57243c1875cb516217cc14affe91baa2d6bd8070ca7014f35ef9de42e"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f1b347265a57fb5eacf493ac98d38d66",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22935,
+        "upload_time": "2020-11-24T20:44:20",
+        "upload_time_iso_8601": "2020-11-24T20:44:20.628729Z",
+        "url": "https://files.pythonhosted.org/packages/2d/6e/8837799ebb60c10870fca56e1dfe768e99c481240111d63cf625d4000f85/minionize-0.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c1d03e686f4ec2844ec1a47144c96c74b66282e295895b127b614cea84bde9b",
+          "md5": "dc97257bd0e1946e19272861138a73ec",
+          "sha256": "5d302c84b11d297121a5f107e90e26feb9d3bca95c4d371ee21a9809e9db344b"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dc97257bd0e1946e19272861138a73ec",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22749,
+        "upload_time": "2020-11-24T20:44:21",
+        "upload_time_iso_8601": "2020-11-24T20:44:21.838402Z",
+        "url": "https://files.pythonhosted.org/packages/6c/1d/03e686f4ec2844ec1a47144c96c74b66282e295895b127b614cea84bde9b/minionize-0.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d399c17c40916766e1ea823d71db5c0a471d1c8c252207a49fe3301523a99dba",
+          "md5": "1b820edec700cde6b553035bbad3728d",
+          "sha256": "12187b515ef5177b6302e442f23fcb84cdf004f44e3730e4d90749e4b71b4021"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b820edec700cde6b553035bbad3728d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22958,
+        "upload_time": "2021-01-06T18:56:47",
+        "upload_time_iso_8601": "2021-01-06T18:56:47.272571Z",
+        "url": "https://files.pythonhosted.org/packages/d3/99/c17c40916766e1ea823d71db5c0a471d1c8c252207a49fe3301523a99dba/minionize-0.3.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37ed58365544c9128390f2f3bc40c937b9f450c8700fb30d762f8fefc2381ded",
+          "md5": "5003dafd7730c199bea81630e6aa12cb",
+          "sha256": "2fe369674401353d1e0fbb01e951decdd9bc81ef239cfd9c5527c2f97cea9fa2"
+        },
+        "downloads": -1,
+        "filename": "minionize-0.3.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5003dafd7730c199bea81630e6aa12cb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.1,<4.0.0",
+        "size": 22717,
+        "upload_time": "2021-01-06T18:56:48",
+        "upload_time_iso_8601": "2021-01-06T18:56:48.633756Z",
+        "url": "https://files.pythonhosted.org/packages/37/ed/58365544c9128390f2f3bc40c937b9f450c8700fb30d762f8fefc2381ded/minionize-0.3.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d399c17c40916766e1ea823d71db5c0a471d1c8c252207a49fe3301523a99dba",
+        "md5": "1b820edec700cde6b553035bbad3728d",
+        "sha256": "12187b515ef5177b6302e442f23fcb84cdf004f44e3730e4d90749e4b71b4021"
+      },
+      "downloads": -1,
+      "filename": "minionize-0.3.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "1b820edec700cde6b553035bbad3728d",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6.1,<4.0.0",
+      "size": 22958,
+      "upload_time": "2021-01-06T18:56:47",
+      "upload_time_iso_8601": "2021-01-06T18:56:47.272571Z",
+      "url": "https://files.pythonhosted.org/packages/d3/99/c17c40916766e1ea823d71db5c0a471d1c8c252207a49fe3301523a99dba/minionize-0.3.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "37ed58365544c9128390f2f3bc40c937b9f450c8700fb30d762f8fefc2381ded",
+        "md5": "5003dafd7730c199bea81630e6aa12cb",
+        "sha256": "2fe369674401353d1e0fbb01e951decdd9bc81ef239cfd9c5527c2f97cea9fa2"
+      },
+      "downloads": -1,
+      "filename": "minionize-0.3.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "5003dafd7730c199bea81630e6aa12cb",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6.1,<4.0.0",
+      "size": 22717,
+      "upload_time": "2021-01-06T18:56:48",
+      "upload_time_iso_8601": "2021-01-06T18:56:48.633756Z",
+      "url": "https://files.pythonhosted.org/packages/37/ed/58365544c9128390f2f3bc40c937b9f450c8700fb30d762f8fefc2381ded/minionize-0.3.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

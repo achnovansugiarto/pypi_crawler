@@ -1,0 +1,521 @@
+{
+  "info": {
+    "author": "Wid L. Hacker",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# miniwdl AWS plugin\n\n**Extends [miniwdl](https://github.com/chanzuckerberg/miniwdl) to run workflows on [AWS Batch](https://aws.amazon.com/batch/) and [EFS](https://aws.amazon.com/efs/)**\n\nThis miniwdl plugin enables it to execute WDL tasks as AWS Batch jobs. It uses EFS for work-in-progress file I/O, optionally uploading final workflow outputs to S3.\n\nBefore diving into this, first consider [Amazon Omics](https://aws.amazon.com/omics/), which includes a [WDL workflow runner service](https://docs.aws.amazon.com/omics/latest/dev/creating-workflows.html) that doesn't need you to deploy compute infrastructure in your AWS account. (The behind-the-scenes implementation differs from the plugin found here.)\n\nThere are a few ways to deploy this miniwdl-aws plugin:\n\n## Amazon Genomics CLI\n\n[Amazon Genomics CLI](https://aws.amazon.com/genomics-cli/) can deploy a [miniwdl-aws context](https://aws.github.io/amazon-genomics-cli/docs/workflow-engines/miniwdl/) into your AWS account with all the necessary infrastructure.\n\n## Amazon SageMaker Studio\n\nOr, try the [**miniwdl-aws-studio**](https://github.com/miniwdl-ext/miniwdl-aws-studio) recipe to install miniwdl for interactive use within [Amazon SageMaker Studio](https://aws.amazon.com/sagemaker/studio/), a web IDE with a terminal and filesystem browser. You can use the terminal to operate `miniwdl run` against AWS Batch, the filesystem browser to manage the inputs and outputs on EFS, and the Jupyter notebooks to further analyze the outputs.\n\n[<img width=\"985\" alt=\"image\" src=\"https://user-images.githubusercontent.com/356550/135670945-62ccb938-4195-4537-8eaf-9a0d57f97ea1.png\">](https://github.com/miniwdl-ext/miniwdl-aws-studio)\n\n## `miniwdl-aws-submit` with custom infrastructure\n\nLastly, advanced operators can use [**miniwdl-aws-terraform**](https://github.com/miniwdl-ext/miniwdl-aws-terraform) to deploy/customize the necessary AWS infrastructure, including a VPC, EFS file system, Batch queues, and IAM roles.\n\nIn this scheme, a local command-line wrapper `miniwdl-aws-submit` *launches miniwdl in its own small Batch job* to orchestrate a workflow. This **workflow job** then spawns WDL **task jobs** as needed, without needing the submitting laptop to remain connected for the duration. The workflow jobs run on lightweight [Fargate](https://docs.aws.amazon.com/batch/latest/userguide/fargate.html) resources, while task jobs run on EC2 spot instances.\n\n### Submitting workflow jobs\n\nAfter deploying [miniwdl-aws-terraform](https://github.com/miniwdl-ext/miniwdl-aws-terraform), `pip3 install miniwdl-aws` locally to make the `miniwdl-aws-submit` program available. Try the self-test:\n\n```\nminiwdl-aws-submit --self-test --follow --workflow-queue miniwdl-workflow \n```\n\nThen launch a [viral genome assembly](https://github.com/broadinstitute/viral-pipelines/) that should run in 10-15 minutes:\n\n```\nminiwdl-aws-submit \\\n  https://github.com/broadinstitute/viral-pipelines/raw/v2.1.28.0/pipes/WDL/workflows/assemble_refbased.wdl \\\n  reads_unmapped_bams=https://github.com/broadinstitute/viral-pipelines/raw/v2.1.19.0/test/input/G5012.3.testreads.bam \\\n  reference_fasta=https://github.com/broadinstitute/viral-pipelines/raw/v2.1.19.0/test/input/ebov-makona.fasta \\\n  sample_name=G5012.3 \\\n  --workflow-queue miniwdl-workflow \\\n  --s3upload s3://MY-BUCKET/assemblies \\\n  --verbose --follow\n```\n\nThe command line resembles `miniwdl run`'s with extra AWS-related arguments:\n\n* `--workflow-queue` Batch job queue on which to schedule the workflow job; output from miniwdl-aws-terraform, default `miniwdl-workflow`. (Also set by environment variable `MINIWDL__AWS__WORKFLOW_QUEUE`)\n* `--follow` live-streams the workflow log instead of exiting immediately upon submission. (`--wait` blocks on the workflow without streaming the log.)\n* `--s3upload` (optional) S3 folder URI under which to upload the workflow products, including the log and output files (if successful). The bucket must be allow-listed in the miniwdl-aws-terraform deployment.\n  * Unless `--s3upload` ends with /, one more subfolder is added to the uploaded URI prefix, equal to miniwdl's automatic timestamp-prefixed run name. If it does end in /, then the uploads go directly into/under that folder (and a repeat invocation would be expected to overwrite them).\n\n`miniwdl-aws-submit` detects other infrastructure details (task queue, EFS access point, IAM role) based on the workflow queue; see `miniwdl-aws-submit --help` for additional options to override those defaults.\n\nIf the specified WDL source code is an existing local .wdl or .zip file, `miniwdl-aws-submit` automatically ships it with the workflow job as the WDL to execute. Given a .wdl file, it runs `miniwdl zip` to detect & include any imported WDL files; while it assumes .zip files were also generated by `miniwdl zip`. If the source code is too large to fit in the AWS Batch request payload (~50KB), then you'll instead have to pass it by reference to a URL or EFS path.\n\nArguments not consumed by `miniwdl-aws-submit` are *passed through* to `miniwdl run` inside the workflow job; as are environment variables whose names begin with `MINIWDL__`, allowing override of any [miniwdl configuration option](https://miniwdl.readthedocs.io/en/latest/runner_reference.html#configuration) (disable wih `--no-env`). See [miniwdl_aws.cfg](miniwdl_aws.cfg) for various options preconfigured in the workflow job container.\n\nThe workflow and task jobs all mount EFS at `/mnt/efs`. Although workflow input files are usually specified using HTTPS or S3 URIs, files already resident on EFS can be used with their `/mnt/efs` paths (which probably don't exist locally on the submitting machine). Unlike the WDL source code, `miniwdl-aws-submit` will not attempt to ship/upload local input files.\n\n## Run directories on EFS\n\nMiniwdl runs the workflow in a directory beneath `/mnt/efs/miniwdl_run` (override with `--dir`). The outputs also remain cached there for potential reuse in future runs (to avoid, submit with `--no-cache` or wipe `/mnt/efs/miniwdl_run/_CACHE`).\n\nGiven the EFS-centric I/O model, you'll need a way to browse and manage the filesystem contents remotely. The companion recipe [lambdash-efs](https://github.com/miniwdl-ext/lambdash-efs) is one option; miniwdl-aws-terraform outputs the infrastructure details needed to deploy it (pick any subnet). Or, set up an instance/container mounting your EFS, to access via SSH or web app (e.g. [JupyterHub](https://jupyter.org/hub), [Cloud Commander](http://cloudcmd.io/), [VS Code server](https://github.com/cdr/code-server)).\n\nYou can also automate cleanup of EFS run directories by setting `miniwdl-aws-submit --s3upload` and:\n\n* `--delete-after success` to delete the run directory immediately after successful output upload\n* `--delete-after failure` to delete the directory after failure\n* `--delete-after always` to delete it in either case\n* (or set environment variable `MINIWDL__AWS__DELETE_AFTER_S3_UPLOAD`)\n\nDeleting a run directory after success prevents the outputs from being reused in future runs. Deleting it after failures can make debugging more difficult (although logs are retained, see below).\n\n### Security note on file system isolation\n\nGoing through AWS Batch & EFS, miniwdl can't enforce the strict file system isolation between WDL task containers that it does locally. All the AWS Batch containers have read/write access to the entire EFS file system (as viewed through the access point), not only their initial working directory.\n\nThis is usually benign, because WDL tasks should only read their declared inputs and write into their respective working/temporary directories. But poorly- or maliciously-written tasks could read & write files elsewhere on EFS, even changing their own input files or those of other tasks. This risks unintentional side-effects or worse security hazards from untrusted code.\n\nTo mitigate this, test workflows thoroughly using the local backend, which strictly isolates task containers' file systems. If WDL tasks insist on modifying their input files in place, then `--copy-input-files` can unblock them (at a cost in time, space, and IOPS). Lastly, avoid using untrusted WDL code or container images; but if they're necessary, then use a separate EFS access point and restrict the IAM and network configuration for the AWS Batch containers appropriately.\n\n### EFS performance considerations\n\nTo scale up to larger workloads, it's important to study AWS documentation on EFS [performance](https://docs.aws.amazon.com/efs/latest/ug/performance.html) and [monitoring](https://docs.aws.amazon.com/efs/latest/ug/monitoring-cloudwatch.html). Like any network file system, EFS limits on throughput and IOPS can cause bottlenecks; and worse, exhaustion of the default bursting throughput mode can effectively freeze a workflow.\n\nManagement tips:\n\n* Monitor file system throughput limits, IOPS, and burst credits in the EFS area of the AWS Console.\n* Stage large datasets onto the file system well in advance, increasing the available burst throughput.\n* Enable the *Elastic* or *Provisioned* throughput modes (at increased cost)\n* Code WDL tasks to write any purely-temporary files into `$TMPDIR`, which may use local scratch space, instead of the EFS working directory.\n* Configure miniwdl and AWS Batch to limit the number of concurrent jobs and/or the rate at which they turn over (see [miniwdl_aws.cfg](https://github.com/miniwdl-ext/miniwdl-aws/blob/main/miniwdl_aws.cfg) for relevant details).\n* Spread out separate workflow runs over time or across multiple EFS file systems.\n\n### FSx for Lustre and other shared filesystems\n\nIf EFS performance remains insufficient, then you can configure your Batch compute environments to automatically mount some other shared filesystem upon instance startup. Then use `miniwdl-aws-submit --no-efs` to make it assume the filesystem will already be mounted at a certain location (default `--mount /mnt/net`) across all instances. In this case, the compute environment for workflow jobs is expected to use EC2 instead of Fargate resources (usually necessary for mounting).\n\nThe miniwdl-aws-terraform repo [includes a variant](https://github.com/miniwdl-ext/miniwdl-aws-terraform/tree/main/fsx) setting this up with [FSx for Lustre](https://aws.amazon.com/fsx/lustre/). FSx offers higher throughput scalability, but has other downsides compared to EFS (higher upfront costs, manual capacity scaling, single-AZ deployment, fewer AWS service integrations).\n\n## Logs & troubleshooting\n\nIf the terminal log isn't available (through Studio or `miniwdl-submit-awsbatch --follow`) to trace a workflow failure, look for miniwdl's usual log files written in the run directory on EFS or copied to S3.\n\nEach task job's log is also forwarded to [CloudWatch Logs](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/WhatIsCloudWatchLogs.html) under the `/aws/batch/job` group and a log stream name reported in miniwdl's log. Using `miniwdl-aws-submit`, the workflow job's log is also forwarded. CloudWatch Logs indexes the logs for structured search through the AWS Console & API.\n\nMisconfigured infrastructure might prevent logs from being written to EFS or CloudWatch at all. In that case, use the AWS Batch console/API to find status messages for the workflow or task jobs.\n\n## Contributing\n\nPull requests are welcome! For help, open an issue here or drop in on [#miniwdl in the OpenWDL Slack](https://openwdl.slack.com/archives/C02JCRJU79T).\n\n**Code formatting and linting.** To prepare your code to pass the CI checks,\n\n```\npip3 install --upgrade -r test/requirements.txt\npre-commit run --all-files\n```\n\n**Running tests.** In an AWS-credentialed terminal session,\n\n```\nMINIWDL__AWS__WORKFLOW_QUEUE=miniwdl-workflow test/run_tests.sh\n```\n\nThis builds the requisite Docker image from the current code revision and pushes it to an ECR repository (which must be prepared once with `aws ecr create-repository --repository-name miniwdl-aws`). To test an image from the [GitHub public registry](https://github.com/miniwdl-ext/miniwdl-aws/pkgs/container/miniwdl-aws) or some other version, set `MINIWDL__AWS__WORKFLOW_IMAGE` to the desired tag.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "miniwdl-aws",
+    "package_url": "https://pypi.org/project/miniwdl-aws/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/miniwdl-aws/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/miniwdl-aws/0.9.1/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "miniwdl AWS backend (Batch+EFS)",
+    "version": "0.9.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16743167,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "68528dd2194a38664c07518acdc3cb2f8d6fcd29322fb8b98ce1f96ede52ded9",
+          "md5": "6aa9db93c0e98c1b002fd12addbd6922",
+          "sha256": "0e16720a513efc81b4c26dff1947e3f438b0ffe000e84526bcbbe6cb405c7ab7"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6aa9db93c0e98c1b002fd12addbd6922",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 20462,
+        "upload_time": "2021-07-21T10:14:55",
+        "upload_time_iso_8601": "2021-07-21T10:14:55.265883Z",
+        "url": "https://files.pythonhosted.org/packages/68/52/8dd2194a38664c07518acdc3cb2f8d6fcd29322fb8b98ce1f96ede52ded9/miniwdl-aws-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "adbc720b955ddd109eded75ddaebf05fd6eb1633c1bf4b15c86f5fe2000c1084",
+          "md5": "bc84ff9c4f645dda1e8a6b6cd2513f12",
+          "sha256": "66fdd7cc4c11e0f495f79cbb73b6dcba047146ad267283cad779088204d5ea1f"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bc84ff9c4f645dda1e8a6b6cd2513f12",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25868,
+        "upload_time": "2021-08-05T06:38:14",
+        "upload_time_iso_8601": "2021-08-05T06:38:14.371692Z",
+        "url": "https://files.pythonhosted.org/packages/ad/bc/720b955ddd109eded75ddaebf05fd6eb1633c1bf4b15c86f5fe2000c1084/miniwdl-aws-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "67d98c320f61672bb2b7f8cb14e4f7869a4a72da3c3c170aa2b3efe2e5050349",
+          "md5": "b44f6b90cc78d4509998995fe3b46df9",
+          "sha256": "c429624996e8e691daa27c69f4a221d9fa893d05a5e33917cd43dd6e541d70e7"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b44f6b90cc78d4509998995fe3b46df9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29006,
+        "upload_time": "2021-10-13T07:56:21",
+        "upload_time_iso_8601": "2021-10-13T07:56:21.397168Z",
+        "url": "https://files.pythonhosted.org/packages/67/d9/8c320f61672bb2b7f8cb14e4f7869a4a72da3c3c170aa2b3efe2e5050349/miniwdl-aws-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6bb610ddd33080fb0624d50977a1fa81763e0c0dfc8299f10e65a4b61ca1bc35",
+          "md5": "4c42bf142ae7ecc16b18dea3577cddc5",
+          "sha256": "af02966100eb8ae171403d87e6f041f5bdd5854277e22cb8c3da9082523cf6a0"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c42bf142ae7ecc16b18dea3577cddc5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30309,
+        "upload_time": "2022-04-05T09:09:58",
+        "upload_time_iso_8601": "2022-04-05T09:09:58.853160Z",
+        "url": "https://files.pythonhosted.org/packages/6b/b6/10ddd33080fb0624d50977a1fa81763e0c0dfc8299f10e65a4b61ca1bc35/miniwdl-aws-0.1.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.11": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "37312d59a83e9c31f75f65a1f47078108f662f412857fd4281f8b977d31a788f",
+          "md5": "62f49efd0661ae02a54a9f3e8f99ad56",
+          "sha256": "e42515cbaa473832c58d37cdf8fe0cb6176d923d987a4439256ddc9c7ba2e1b9"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.11.tar.gz",
+        "has_sig": false,
+        "md5_digest": "62f49efd0661ae02a54a9f3e8f99ad56",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30315,
+        "upload_time": "2022-04-05T09:28:56",
+        "upload_time_iso_8601": "2022-04-05T09:28:56.685474Z",
+        "url": "https://files.pythonhosted.org/packages/37/31/2d59a83e9c31f75f65a1f47078108f662f412857fd4281f8b977d31a788f/miniwdl-aws-0.1.11.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a20f8ebbe668372efa8cd5ebc9c95454ef917d75da5563f4569fcef8752d390",
+          "md5": "f36773232ba63831dbd0dc7d4a335757",
+          "sha256": "c755dd8363870de3ebad9c4d70b1beb93cadff325e2d7855e440a5bdca1d1003"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f36773232ba63831dbd0dc7d4a335757",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29070,
+        "upload_time": "2021-10-16T09:44:55",
+        "upload_time_iso_8601": "2021-10-16T09:44:55.792511Z",
+        "url": "https://files.pythonhosted.org/packages/4a/20/f8ebbe668372efa8cd5ebc9c95454ef917d75da5563f4569fcef8752d390/miniwdl-aws-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "236b0c8da0e8013401651aa3dc54c9c64b3663e2f7b523e29b5330bf26a47dc5",
+          "md5": "0f51919ea85c35e044129c82df9ebcae",
+          "sha256": "7b1f512f8e738e3d9aaac7fde0e3b00006ee696e7c21d80fe5ff3a447b7e6745"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0f51919ea85c35e044129c82df9ebcae",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29098,
+        "upload_time": "2021-10-18T08:44:26",
+        "upload_time_iso_8601": "2021-10-18T08:44:26.616071Z",
+        "url": "https://files.pythonhosted.org/packages/23/6b/0c8da0e8013401651aa3dc54c9c64b3663e2f7b523e29b5330bf26a47dc5/miniwdl-aws-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b2866c2e1a9c656d6b6dc7e29dee6264a93ced5fda3e6a28e5bd4e91c94638dc",
+          "md5": "2589c9900c56da07609159d2a1b5f627",
+          "sha256": "37b99129ac56a9b4172e05e2266ef734cf80128fab28ffd8696d8ac5133225a2"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2589c9900c56da07609159d2a1b5f627",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29194,
+        "upload_time": "2021-10-20T09:55:04",
+        "upload_time_iso_8601": "2021-10-20T09:55:04.624910Z",
+        "url": "https://files.pythonhosted.org/packages/b2/86/6c2e1a9c656d6b6dc7e29dee6264a93ced5fda3e6a28e5bd4e91c94638dc/miniwdl-aws-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fdea11c621b96ade5795110baf23082e486235812c482f48e8001ad18ffd2c9",
+          "md5": "7b6afc181e39d468235312e46111c080",
+          "sha256": "7b3146594586ea61bd0b660bebfa4b34cdd4825d608056ad0229520e46e49e6e"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7b6afc181e39d468235312e46111c080",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 29201,
+        "upload_time": "2021-10-24T10:31:01",
+        "upload_time_iso_8601": "2021-10-24T10:31:01.726190Z",
+        "url": "https://files.pythonhosted.org/packages/6f/de/a11c621b96ade5795110baf23082e486235812c482f48e8001ad18ffd2c9/miniwdl-aws-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ec76dd8bfedcbd36ee7d2fb694e0d0c7df9976f717d1587e90ec8ddd303d975d",
+          "md5": "219c7fb16c08a8a8d402d2c13fcbe687",
+          "sha256": "5c1f6912fce642c14fb4f419b65fd297f984589567dc5676d07cd8aef4f0e186"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "219c7fb16c08a8a8d402d2c13fcbe687",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 31040,
+        "upload_time": "2022-05-01T01:01:11",
+        "upload_time_iso_8601": "2022-05-01T01:01:11.361100Z",
+        "url": "https://files.pythonhosted.org/packages/ec/76/dd8bfedcbd36ee7d2fb694e0d0c7df9976f717d1587e90ec8ddd303d975d/miniwdl-aws-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0b3c9dbcd96fbc255cbbf5b2bf619b340b4c3465236c30ceb214ad34430d398d",
+          "md5": "c122ae2aa49adb9235dd35e80f38d8a0",
+          "sha256": "64ce75971e4e119b75e8e97956150d6f7bea3c7c16de464ef6a413e56f8b5d50"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c122ae2aa49adb9235dd35e80f38d8a0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30535,
+        "upload_time": "2022-05-09T10:22:14",
+        "upload_time_iso_8601": "2022-05-09T10:22:14.056101Z",
+        "url": "https://files.pythonhosted.org/packages/0b/3c/9dbcd96fbc255cbbf5b2bf619b340b4c3465236c30ceb214ad34430d398d/miniwdl-aws-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "717301d198a6a13baeab3420c511cc3e30b974369aa03a221f758591a71dc03a",
+          "md5": "ee6cbc2687b1863d44ec921faa87c834",
+          "sha256": "917aa4f3184e7f9158274623b3e27cbacb02ec02d730bee771f31b48968cd848"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ee6cbc2687b1863d44ec921faa87c834",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30647,
+        "upload_time": "2022-06-01T20:28:43",
+        "upload_time_iso_8601": "2022-06-01T20:28:43.530231Z",
+        "url": "https://files.pythonhosted.org/packages/71/73/01d198a6a13baeab3420c511cc3e30b974369aa03a221f758591a71dc03a/miniwdl-aws-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2a3804a275373b74d7ce80ac51d87f5f672437e197dbdef99e7a07fad335e509",
+          "md5": "199e242e4f0316a9e739758c9b9d7cf9",
+          "sha256": "5916eb9b669470b1a4a4d9fd3201f6e2811ba9c836a864f337b2d16d0a4ecbbc"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "199e242e4f0316a9e739758c9b9d7cf9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30707,
+        "upload_time": "2022-06-28T09:54:55",
+        "upload_time_iso_8601": "2022-06-28T09:54:55.892176Z",
+        "url": "https://files.pythonhosted.org/packages/2a/38/04a275373b74d7ce80ac51d87f5f672437e197dbdef99e7a07fad335e509/miniwdl-aws-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "92197759bc2625dafeca1f1ccf37831cdd02761c93942fe052dcecdcc4084286",
+          "md5": "5b5153c94bfc21a054d230d9fc74fdf9",
+          "sha256": "b08888bd68cd5aa3994c60536f571e0eb5c111d40bc79a2920b938cf5785fcfe"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5b5153c94bfc21a054d230d9fc74fdf9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 30440,
+        "upload_time": "2022-07-31T10:32:43",
+        "upload_time_iso_8601": "2022-07-31T10:32:43.347932Z",
+        "url": "https://files.pythonhosted.org/packages/92/19/7759bc2625dafeca1f1ccf37831cdd02761c93942fe052dcecdcc4084286/miniwdl-aws-0.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "01d88615a2d1529944a991c1f238d108aa880d998221ed20e483eef414147fa7",
+          "md5": "6afafdbf51a3a04051c4571100f761f4",
+          "sha256": "ce4439b237cb36b30f37f77c6ae9a3e897af0717c2557205f35f03784010660c"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6afafdbf51a3a04051c4571100f761f4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 32290,
+        "upload_time": "2022-09-16T16:44:14",
+        "upload_time_iso_8601": "2022-09-16T16:44:14.351578Z",
+        "url": "https://files.pythonhosted.org/packages/01/d8/8615a2d1529944a991c1f238d108aa880d998221ed20e483eef414147fa7/miniwdl-aws-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50589208bfda4ade7df2914d9ff5f308dfd41071320302efe892c0d19a89d837",
+          "md5": "ff79c01a5e58fa11d67376ca1cbba933",
+          "sha256": "74923086866c69911459c09bb4e0940911f84bbe0a235a035e26106d894f2605"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ff79c01a5e58fa11d67376ca1cbba933",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 33874,
+        "upload_time": "2022-10-03T10:09:53",
+        "upload_time_iso_8601": "2022-10-03T10:09:53.665585Z",
+        "url": "https://files.pythonhosted.org/packages/50/58/9208bfda4ade7df2914d9ff5f308dfd41071320302efe892c0d19a89d837/miniwdl-aws-0.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "df05eb6e7d0ff95663576cc15569cf790de88d9e944efe122b75871641c51066",
+          "md5": "8240143fa49e3cec1c89b5fb65d9764e",
+          "sha256": "129294effbb5eb2b376add511eae2ee08feb6070bc0c176517ddc43eb9aed35a"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8240143fa49e3cec1c89b5fb65d9764e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 34605,
+        "upload_time": "2022-10-16T09:11:46",
+        "upload_time_iso_8601": "2022-10-16T09:11:46.941178Z",
+        "url": "https://files.pythonhosted.org/packages/df/05/eb6e7d0ff95663576cc15569cf790de88d9e944efe122b75871641c51066/miniwdl-aws-0.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee6ed84d92cc97481deee29e246f06fc4bae0837c6c32b352ba72621539f4809",
+          "md5": "e76d1fa3996998ea84ef4d20dd9e3a9f",
+          "sha256": "a6376516a0f83e72230e8199901a5547e48c9144d026dccb95b394fc5f7cf1e5"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.8.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e76d1fa3996998ea84ef4d20dd9e3a9f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35347,
+        "upload_time": "2022-12-18T03:39:53",
+        "upload_time_iso_8601": "2022-12-18T03:39:53.591865Z",
+        "url": "https://files.pythonhosted.org/packages/ee/6e/d84d92cc97481deee29e246f06fc4bae0837c6c32b352ba72621539f4809/miniwdl-aws-0.8.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b904f3d3a59ee09500871e601f1d82b8422399b66879182fdc139019178fbe6b",
+          "md5": "81b59ddf2a1d85b7f7b2db02632e6d98",
+          "sha256": "ac60b8b924dd1e810ef2bfeb4237a062f83517abcda4a7be3d73857f82e3b706"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.9.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81b59ddf2a1d85b7f7b2db02632e6d98",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35588,
+        "upload_time": "2023-01-28T10:21:59",
+        "upload_time_iso_8601": "2023-01-28T10:21:59.771306Z",
+        "url": "https://files.pythonhosted.org/packages/b9/04/f3d3a59ee09500871e601f1d82b8422399b66879182fdc139019178fbe6b/miniwdl-aws-0.9.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "100c7481d4b13a9d48048c35a8b4145d04f5a1058ed47f6293b008180b6a4d83",
+          "md5": "b547061bb3e07cb5577fdb83aeeabed3",
+          "sha256": "f19941ed72deb63f7bdc56782d21b49a651fed1eff9f298bd2dfbae6c33c8ae3"
+        },
+        "downloads": -1,
+        "filename": "miniwdl-aws-0.9.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b547061bb3e07cb5577fdb83aeeabed3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 35612,
+        "upload_time": "2023-02-08T08:01:00",
+        "upload_time_iso_8601": "2023-02-08T08:01:00.103266Z",
+        "url": "https://files.pythonhosted.org/packages/10/0c/7481d4b13a9d48048c35a8b4145d04f5a1058ed47f6293b008180b6a4d83/miniwdl-aws-0.9.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "100c7481d4b13a9d48048c35a8b4145d04f5a1058ed47f6293b008180b6a4d83",
+        "md5": "b547061bb3e07cb5577fdb83aeeabed3",
+        "sha256": "f19941ed72deb63f7bdc56782d21b49a651fed1eff9f298bd2dfbae6c33c8ae3"
+      },
+      "downloads": -1,
+      "filename": "miniwdl-aws-0.9.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "b547061bb3e07cb5577fdb83aeeabed3",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 35612,
+      "upload_time": "2023-02-08T08:01:00",
+      "upload_time_iso_8601": "2023-02-08T08:01:00.103266Z",
+      "url": "https://files.pythonhosted.org/packages/10/0c/7481d4b13a9d48048c35a8b4145d04f5a1058ed47f6293b008180b6a4d83/miniwdl-aws-0.9.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
