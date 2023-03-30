@@ -1,0 +1,183 @@
+{
+  "info": {
+    "author": "Ali Kore",
+    "author_email": "akore654@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3.10",
+      "Topic :: Scientific/Engineering :: Artificial Intelligence"
+    ],
+    "description": "# RPQ-pytorch\nReverse Product Quantization (RPQ) of weights to reduce static memory usage.\n\n![](https://github.com/a-kore/RPQ-pytorch/raw/main/assets/rpq_diagram.gif)\n\n<!-- Go into how the method works. -->\n\n## Table of Contents\n\n- [Introduction](#introduction)\n- [Installation](#installation)\n- [Usage](#usage)\n- [Benchmarks](#benchmarks)\n\n## Introduction\n\n[Product quantization](https://www.pinecone.io/learn/product-quantization/) is a method for reducing the memory requirements for vector similarity search.  It reduces the memory footprint by chunking the vectors into subvectors that are each compressed into a set of codebooks with 256 codes each.  This allows us to have a set of codes that can be represented by uint8 indices instead of the full vector representation.\n\nIf we reverse this process, we can dynamically spawn a larger set of vectors from a much smaller set of codebooks containing sub-vectors and a set of randomized uint8 indices, rather than having to persistently hold a much larger set of vectors.  This can be used during the forward pass to expand/compile the weight just-in-time in order to perform the operations on the input.  \n\nThis creates a state for a model where the weights are \"dormant\" and expanded to their active state just before use.  This plays very well with methods like **gradient checkpointing** (and inference, similarly) where we can unpack the weights again rather then storing them.\n\nHowever, this doesn't come for free, the indices inherit from a set of shared codebooks, so the larger the weights, the more likelihood that vectors generated will share sub-vectors.  This can be prevented by increasing the number of codebooks, but requires more testing to see what the minimum number of codebooks required for each implementation should be.\n\nFor instance, in the [Usage](#usage) section we define an RPQOPT model(OPT variant w/ RPQ weights) where the number of codebooks is set to the number of heads.  This is chosen abitrarily, but works well since the `hidden_dim` must be divisible by `num_codebooks`. \n\nThe effect of having a set of entangled vectors is unknown and would require rigorous testing with standard benchmarks for comparison.  Intuitively, this would have a different outcome depending on the way the final weight structure is used.  For a vector quantization module, it could be advantageous to have codes be entangled to avoid the issue of \"dead codes\" and increase codebook utilization.\n\n\n## Installation\n\n```bash\npip install rpq-pytorch\n```\n\n## Usage\n\n### Layers\n\nA set of common layers are re-implemented with quantized weights.  It follows the same usage as `torch.nn` modules with an extra argument for the `num_codebooks` for each layer.  For each layer, the `out_features`/`num_embeddings` must be divisible by the `num_codebooks`.\n\n```python\nfrom rpq.nn import RPQLinear\n\nlayer = RPQLinear(in_features=1024, out_features=4096, num_codebooks=16)\n\nx = torch.randn(1, 1, 1024) # (b, n, d)\ny = layer(x) # (1, 1, 4096)\n\n```\n\nLayers implemented:\n\n- [x] `RPQLinear`\n- [x] `RPQEmbedding`*\n- [ ] `RPQConv1d`\n- [ ] `RPQConv2d`\n- [ ] `RPQConvTranspose2d`\n- [ ] `RPQConv1d`\n- [ ] `RPQConvTranspose1d`\n- [ ] `RPQConv3d`\n- [ ] `RPQConvTranspose3d`\n- [ ] `RPQBilinear`\n\n*Note: `Embedding` layers are a lookup table and therefore very fast, as such the operation to expand the weights for `RPQEmbedding` adds a lot of time to the operation especially for a small number of tokens (10s of $\\mu s$ -> 10s of ms).\n\n### Models\n\nUsing the layer implementations, we can implement models via drop-in replacement of their static weight counterparts.\n\n#### RPQViT (ViT Giant)\n\n```python\nfrom vit_pytorch import ViT\nfrom rpq.models.rpqvit import RPQViT\nfrom rpq.utils import model_size\n\n# vit_giant_patch14_336\nmodel = ViT(\n    image_size=336,\n    patch_size=14,\n    num_classes=1000,\n    dim=1280,\n    depth=32,\n    heads=16,\n    mlp_dim=5120,\n    dropout=0.1,\n    emb_dropout=0.1\n)\n\n# rpqvit_giant_patch14_336\nrpq_model = RPQViT(\n    image_size=336,\n    patch_size=14,\n    num_classes=1000,\n    dim=1280,\n    depth=32,\n    heads=16,\n    mlp_dim=5120,\n    dropout=0.1,\n    emb_dropout=0.1\n)\n\nmodel_size(model)\nmodel_size(rpq_model)\n```\n```\nmodel size: 2252.157MB\nmodel size: 361.429MB  \n```\nApproximately ~6x reduction in model size.\n\n#### RPQOPT (opt-66b)\n\n```python\n\nimport torch\nfrom transformers.models.opt.modeling_opt import OPTConfig\nfrom transformers import GPT2Tokenizer\nfrom rpq.models.rpqopt import RPQOPTModel\nfrom rpq.utils import model_size\n\n\ntokenizer = GPT2Tokenizer.from_pretrained(\"facebook/opt-66b\")\nconf = OPTConfig.from_pretrained(\"facebook/opt-66b\")\nrpq_model = RPQOPTModel(conf) # randomly initialized model\n\ninputs = tokenizer(\"Hello, my dog is cute.\", return_tensors=\"pt\")\n\nwith torch.no_grad():\n    outputs = rpq_model(**inputs)\n\nmodel_size(rpq_model)\n```\n```\nmodel size: 5885.707MB \n```\nThis is an RPQOPT-66b initialized at float32 precision, a static weight version (standard OPT-66b) would be **264 GB** in size. This amount to approximately ~44x reduction in size.\n\n\n## Benchmarks\n\nDue to the entanglement of the weight matrix arising as result of the inheritance from a shared set of codebooks, testing the RPQ model variants against the original methods would be important to characterize issues/tradeoffs with training stability, especially at scale.  Those tests will be displayed in the table below:\n\n| Model | Config | Model Size | Dataset | Validation Accuracy | Epochs |\n| --- | --- | --- | --- | --- | -- |\n| ViT | vit_base_patch16_224 | 330MB | Imagenet | TBD | 90 |\n| RPQViT | vit_base_patch16_224 | 88MB | Imagenet | TBD | 90 |\n\n## TODO\n\n- [ ] Implement `RPQConv1d` layer\n- [ ] Implement `RPQConv2d` layer\n- [ ] Implement `RPQConv3d` layer\n- [ ] Implement `RPQConvTranspose1d` layer\n- [ ] Implement `RPQConvTranspose2d` layer\n- [ ] Implement `RPQConvTranspose3d` layer\n- [ ] Implement `RPQBilinear` layer\n- [ ] Perform More benchmarks with LLMs (BERT, OPT, etc.,)\n- [ ] Explore methods of conversion from pre-trained static weights to dynamic RPQ weights\n\n\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/a-kore/RPQ-pytorch",
+    "keywords": "artificial intelligence,AI,machine learning,deep learning,pytorch,quantization,product quantization,reverse product quantization,memory reduction",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "RPQ-pytorch",
+    "package_url": "https://pypi.org/project/RPQ-pytorch/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/RPQ-pytorch/",
+    "project_urls": {
+      "Homepage": "https://github.com/a-kore/RPQ-pytorch"
+    },
+    "release_url": "https://pypi.org/project/RPQ-pytorch/0.0.21/",
+    "requires_dist": [
+      "torch (>=1.6)",
+      "einops (>=0.6)",
+      "transformers (>=4.0)",
+      "vit-pytorch (>=0.40)"
+    ],
+    "requires_python": "",
+    "summary": "Reverse Product Quantization (RPQ) of weights to reduce static memory usage.",
+    "version": "0.0.21",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16187623,
+  "releases": {
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c69515b579f8fb270fe9bcbd57741f7999f8b684099575357bee5d524a95ed17",
+          "md5": "16d9d3bb0f2b27266e4a502a8b7af7cf",
+          "sha256": "8e1334c348e1bf47bb71f3bfaeb02c4899f83547c7587b58997f8a9d1bb0ec1e"
+        },
+        "downloads": -1,
+        "filename": "RPQ_pytorch-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "16d9d3bb0f2b27266e4a502a8b7af7cf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20131,
+        "upload_time": "2022-12-22T16:13:37",
+        "upload_time_iso_8601": "2022-12-22T16:13:37.085775Z",
+        "url": "https://files.pythonhosted.org/packages/c6/95/15b579f8fb270fe9bcbd57741f7999f8b684099575357bee5d524a95ed17/RPQ_pytorch-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bc8ab958021625776985fed05d6e19ce9a12307c27985cebc4467f69d35a5216",
+          "md5": "6690590c959a1b4b28a4edaed40451a4",
+          "sha256": "b8db80a46c524fdf19934fb316c425e4e29515b6d49acb74aa09ebd4f306649c"
+        },
+        "downloads": -1,
+        "filename": "RPQ-pytorch-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6690590c959a1b4b28a4edaed40451a4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19214,
+        "upload_time": "2022-12-22T16:13:38",
+        "upload_time_iso_8601": "2022-12-22T16:13:38.528227Z",
+        "url": "https://files.pythonhosted.org/packages/bc/8a/b958021625776985fed05d6e19ce9a12307c27985cebc4467f69d35a5216/RPQ-pytorch-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.21": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e524e269dba5c43eb270b14feb4e35b868816d07b32567b0f7aaf0a35ff0f87",
+          "md5": "26c23f391ea7773d005bfa07f41c45b0",
+          "sha256": "4510ce9a9ef114bc7add6a4b4442c630df517decfe272b262b9621ba51412be4"
+        },
+        "downloads": -1,
+        "filename": "RPQ_pytorch-0.0.21-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "26c23f391ea7773d005bfa07f41c45b0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20128,
+        "upload_time": "2022-12-22T16:19:03",
+        "upload_time_iso_8601": "2022-12-22T16:19:03.347295Z",
+        "url": "https://files.pythonhosted.org/packages/9e/52/4e269dba5c43eb270b14feb4e35b868816d07b32567b0f7aaf0a35ff0f87/RPQ_pytorch-0.0.21-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79ff509ed761050dfaeef010d59bbcf24ceeca790f3bf96ce4b4b4f5391cf1e2",
+          "md5": "9e811dbf2ede348c356e168bafb3ee46",
+          "sha256": "d9b0b562e7eec56ad4054057b817b163dcdd64b2f0379f82add976e4eae29ce5"
+        },
+        "downloads": -1,
+        "filename": "RPQ-pytorch-0.0.21.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e811dbf2ede348c356e168bafb3ee46",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 19206,
+        "upload_time": "2022-12-22T16:19:05",
+        "upload_time_iso_8601": "2022-12-22T16:19:05.034757Z",
+        "url": "https://files.pythonhosted.org/packages/79/ff/509ed761050dfaeef010d59bbcf24ceeca790f3bf96ce4b4b4f5391cf1e2/RPQ-pytorch-0.0.21.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "9e524e269dba5c43eb270b14feb4e35b868816d07b32567b0f7aaf0a35ff0f87",
+        "md5": "26c23f391ea7773d005bfa07f41c45b0",
+        "sha256": "4510ce9a9ef114bc7add6a4b4442c630df517decfe272b262b9621ba51412be4"
+      },
+      "downloads": -1,
+      "filename": "RPQ_pytorch-0.0.21-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "26c23f391ea7773d005bfa07f41c45b0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 20128,
+      "upload_time": "2022-12-22T16:19:03",
+      "upload_time_iso_8601": "2022-12-22T16:19:03.347295Z",
+      "url": "https://files.pythonhosted.org/packages/9e/52/4e269dba5c43eb270b14feb4e35b868816d07b32567b0f7aaf0a35ff0f87/RPQ_pytorch-0.0.21-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "79ff509ed761050dfaeef010d59bbcf24ceeca790f3bf96ce4b4b4f5391cf1e2",
+        "md5": "9e811dbf2ede348c356e168bafb3ee46",
+        "sha256": "d9b0b562e7eec56ad4054057b817b163dcdd64b2f0379f82add976e4eae29ce5"
+      },
+      "downloads": -1,
+      "filename": "RPQ-pytorch-0.0.21.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9e811dbf2ede348c356e168bafb3ee46",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 19206,
+      "upload_time": "2022-12-22T16:19:05",
+      "upload_time_iso_8601": "2022-12-22T16:19:05.034757Z",
+      "url": "https://files.pythonhosted.org/packages/79/ff/509ed761050dfaeef010d59bbcf24ceeca790f3bf96ce4b4b4f5391cf1e2/RPQ-pytorch-0.0.21.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

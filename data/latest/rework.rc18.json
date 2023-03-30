@@ -1,0 +1,502 @@
+{
+  "info": {
+    "author": "Aurelien Campeas",
+    "author_email": "aurelien.campeas@pythonian.fr",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Topic :: Database",
+      "Topic :: Software Development :: Object Brokering",
+      "Topic :: System :: Distributed Computing"
+    ],
+    "description": "# REWORK\n\n`rework` is a distributed execution system for the execution of tasks\nthat can belong to independant python environments and code bases,\neven hosted on different computers.\n\nThe only constraint is that postgres must be accessible from all nodes\nof a given `rework` installation.\n\n## Principles\n\nRework might interest people who:\n\n* want Postgres (and *only Postgres*) as a Task Queue Manager,\n  Input/Output store and task log store\n\n* have Python long-running tasks to run, with the ability to\n  preemptively kill tasks\n\n* want a tiny, self-contained tool with great functional test\n  abilities.\n\nThe most common python library for such things is Celery. If you don't\nmind depending on RabbitMQ and the Celery API and feature set, Celery\nis for you. It is mature, probably well-tested, and largely used.\n\n\n## Basic usage\n\n### Setting up a database\n\nYou need a postgresql database. Rework will install its tables into\nits own `rework` namespace schema, so you can use either a dedicated\ndatabase or an exising one, with little risk of conflict.\n\nIf you don't already have a database, create a fresh one with:\n\n```shell\ncreatedb jobstore\n```\n\nTo install rework inside:\n\n```shell\nrework init-db postgres://babar:password@localhost:5432/jobstore\n```\n\n\n### Declaring and scheduling a task\n\nAll the features are covered in the [test suite][1], which can\nhenceforth be regarded as a reasonnable source of\ndocumentation. However here's a simple example:\n\n```python\nfrom time import sleep\nfrom rework import api\nfrom sqlalchemy import create_engine\n\n\n@api.task\ndef my_first_task(task):\n    with task.capturelogs(std=True):\n        print('I am running')\n        somevalue = task.input * 2\n        task.save_output(somevalue)\n        print('I am done')\n\n\ndef main(dburi):\n    engine = create_engine(dburi)\n\n    # record the decorated tasks\n    api.freeze_operations(engine)\n\n    # now, schedule tasks\n    t1 = api.schedule(engine, 'my_first_task', 'hello')\n    t2 = api.schedule(engine, 'my_first_task', 100)\n\n    # wait til they are completed\n    t1.join()\n    t2.join()\n\n    assert t1.output == 'hellohello'\n    assert t2.output == 200\n\n\nif __name__ == '__main__':\n    main('postgres://babar:password@localhost:5432/jobstore')\n```\n\nIf you put this into a `test_rework.py` module and type `python\ntest_rework.py` it should *hang* forever. Hold on, what's missing ?\n\nOn another terminal, one needs to *start* the workers that will\nexecute the tasks. Do as follows:\n\n```shell\nrework monitor postgres://babar:password@localhost:5432/jobstore\n```\n\nThen, the script will quickly terminate, as both tasks have been\nexecuted.\n\n\n### Specifying inputs\n\nHaving a formal declaration of the task input can help validate them\nand also, in [rework_ui][reworkui] it will provide an interactive web\nform allowing subsequent launch of the task.\n\n```python\nfrom rework import api, io\n\n@api.task(inputs=(\n    io.file('myfile.txt', required=True),\n    io.string('name', required=True),\n    io.string('option', choices=('foo', 'bar')),\n    io.number('weight'),\n    io.datetime('birthdate'),\n    io.moment('horizon')\n))\ndef compute_things(task):\n    inp = task.input\n    assert 'name' in inp\n    ...\n```\n\n... and then, later:\n\n```python\ntask = api.schedule(\n    engine, 'compute_things',\n    {'myfile.txt': b'file contents',\n     'birthdate': datetime(1973, 5, 20, 9),\n     'name': 'Babar',\n     'weight': 65,\n     'horizon': '(shifted (today) #:days 7)'\n     }\n)\n\nassert task.input == {\n    'myfile.txt': b'file contents',\n    'birthdate': datetime(1973, 5, 20, 9),\n    'name': 'Babar',\n    'weight': 65,\n    'horizon': datetime(2021, 1, 7)\n}\n```\n\n### Specifying outputs\n\nAs for the inputs, and for the same reasons, we can provide a spec for\nthe outputs.\n\n```python\nfrom rework import api, io\n\n@api.task(outputs=(\n    io.string('name'),\n    io.datetime('birthdate')\n))\ndef compute_things(task):\n    ...\n    task.save_output({\n        'name': 'Babar',\n        'birthdate': datetime(1931, 1, 1)\n    })\n```\n\nAnd this will of course be fetched from the other side:\n\n```python\nt = api.schedule(engine, 'compute_things')\nassert t.output == {\n    'name': 'Babar',\n    'birthdate': datetime(1931, 1, 1)\n}\n```\n\n### Scheduling\n\nWhile the base api provides a `schedule` call that schedules a task\nfor immediate execution, there is also a `prepare` call that allows to\ndefine the exact moment the task ought to be executed, using a\n`crontab` like notation.\n\nExample:\n\n```python\napi.prepare(\n    engine,\n    'compute_things',\n    {'myfile.txt': b'file contents',\n     'birthdate': datetime(1973, 5, 20, 9),\n     'name': 'Babar',\n     'weight': 65\n    },\n    rule='0 0 8,12 * * *'\n)\n```\n\nThis would schedule the task every day at 8:00 and 12:00. The extended\ncrontab notation also features a field for seconds (in first\nposition).\n\n\n### Debugging\n\nIf you need to debug some task, the standard advice is:\n\n* write your task content in plain functions and have them unit-tested\n  with e.g. `pytest`\n\n```python\n@api.task\ndef my_fancy_task(task):\n    the_body_of_my_fancy_task(task.input)\n```\n\n* you can also you use print-based logging as shown there:\n\n```python\n@api.task\ndef my_fancy_task(task):\n    with task.capturelogs(std=True):\n        print('starting')\n        # do stuff\n        print('done', result)\n```\n\n* finally, it may happen that a task is \"stuck\" because of a deadlock,\n  and in this case, starting the monitor with `--debug-port` will help:\n\n```bash\n$ pip install pystuck\n$ rework monitor postgres://babar:password@localhost:5432/jobstore --debug-port=666\n```\n\nThen launching `pystuck` (possibly from another machine) is done as such:\n\n```bash\n$ pystuck -h <host> -p 666\n```\n\n\n### Organize tasks in code\n\nA common pattern is to have a `project/tasks.py` module.\n\nOne can manage the tasks using the `register-operations` and\n`unregister-operation` commands.\n\n```bash\n$ rework register-operations <dburi> /path/to/project/tasks.py\n```\n\nand also\n\n```bash\n``` rework unregister-operation <dburi> <opname>\ndelete <opname> <domain> /path/to/project/tasks.py <hostid>\nreally remove those [y/n]? [y/N]: y\n```\n\nThis pair of operations can be used also whenever a task input or\noutput specifications have changed.\n\n\n## API\n\nThe `api` module exposes most if what is needed. The `task` module\nand task objects provide the rest.\n\n\n### `api` module\n\nThree functions are provided: the `task` decorator, the\n`freeze_operations`, `schedule` and `prepare` functions.\n\nDefining tasks is done using the `task` decorator:\n\n```python\nfrom rework.api import task\n\n@task\ndef my_task(task):\n    pass\n```\n\nIt is also possible to specify a non-default `domain`:\n\n```python\n@task(domain='scrapers')\ndef my_scraper(task):\n    pass\n```\n\nA `timeout` parameter is also available:\n\n```python\nfrom datetime import timedelta\n\n@task(timeout=timedelta(seconds=30)\ndef my_time_limited_task(task):\n    pass\n```\n\nTo make the tasks available for use, they must be recorded within\nthe database referential. We use `freeze_operations` for this:\n\n```python\nfrom sqlalchemy import create_engine\nfrom rework.api import freeze_operations\n\nengine = create_engine('postgres://babar:password@localhost:5432/jobstore')\napi.freeze_operations(engine)\n```\n\nFinally, one can schedule tasks as such:\n\n```python\nfrom sqlalchemy import create_engine\nfrom rework.api import schedule\n\nengine = create_engine('postgres://babar:password@localhost:5432/jobstore')\n\n# immediate executionn\ntask = api.schedule(engine, 'my_task', 42)\n\n# execution every five minutes\napi.prepare(engine, 'my_task', 42, rule='0 */5 * * * *')\n```\n\nThe `schedule` function wants these mandatory parameters:\n\n* `engine`: sqlalchemy engine\n\n* `operation`: string\n\n* `inputdata`: any python picklable object (if no input specification\n  is provided, else the input formalism provides ways for numbers,\n  strings, dates and files)\n\n\nIt also accepts two more options:\n\n* `domain`: a domain identifier (for cases when the same service is\n  available under several domains and you want to force one)\n\n* `hostid`: an host identifier (e.g. '192.168.1.1')\n\n* `metadata`: a json-serializable dictionary (e.g. {'user': 'Babar'})\n\nThe `prepare` function takes the same parameters as `schedule` plus a\n`rule` option using `crontab` notation with seconds in first position.\n\n\n### Task objects\n\nTask objects can be obtained from the `schedule` api call (as seen in the\nprevious example) or through the `task` module.\n\n```python\nfrom task import Task\n\ntask = task.byid(engine, 42)\n```\n\nThe task object provides:\n\n* `.state` attribute to describe the task state (amongst: `queued`,\n  `running`, `aborting`, `aborted`, `failed`, `done`)\n\n* `.join()` method to wait synchronously for the task completion\n\n* `.capturelogs(sync=True, level=logging.NOTSET, std=False)` method to\n  record matching logs into the db (`sync` controls whether the logs\n  are written synchronously, `level` specifies the capture level,\n  `std` permits to also record prints as logs)\n\n* `.input` attribute to get the task input (yields any object)\n\n* `.save_output(<obj>)` method to store any object\n\n* `.abort()` method to preemptively stop the task\n\n* `.log(fromid=None)` method to retrieve the task logs (all or from a\n  given log id)\n\n\n## Command line\n\n### Operations\n\nIf you read the previous chapter, you already know the `init-db` and\n`monitor` commands.\n\nThe `rework` command, if typed without subcommand, shows its usage:\n\n```shell\n$ rework\nUsage: rework [OPTIONS] COMMAND [ARGS]...\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  abort-task            immediately abort the given task This will be done...\n  export-scheduled\n  import-scheduled\n  init-db               initialize the database schema for rework in its\n                        own...\n  kill-worker           ask to preemptively kill a given worker to its...\n  list-monitors\n  list-operations\n  list-scheduled\n  list-tasks\n  list-workers\n  log-task\n  monitor               start a monitor controlling min/max workers\n  new-worker            spawn a new worker -- this is a purely *internal*...\n  register-operations   register operations from a python module containing...\n  shutdown-worker       ask a worker to shut down as soon as it becomes\n                        idle...\n  unregister-operation  unregister an operation (or several) using its name...\n  vacuum                delete non-runing workers or finished tasks\n```\n\nOf those commands, `new-worker` is for purely internal purposes, and\nunless you know what you're doing, you should never use it.\n\nOne can list the tasks:\n\n```shell\nrework list-tasks postgres://babar:password@localhost:5432/jobstore\n1 my_first_task done [2017-09-13 17:08:48.306970+02]\n2 my_first_task done [2017-09-13 17:08:48.416770+02]\n```\n\nIt is possible to monitor the output of a given task:\n\n```shell\n$ rework log-task postgres://babar:password@localhost:5432/jobstore 1\nstdout:INFO: 2017-09-13 17:08:49: I am running\nstdout:INFO: 2017-09-13 17:08:49: I am done\n```\n\nThe last argument `1` is the task identifier as was shown by the\n`list-tasks` command.\n\nNotice how we capture the standard output (print calls) using the\n`task.capturelogs` context manager. This is completely optional of\ncourse but quite handy. The line shown above actually capture\n*standard output*, *standard error* and *all logs*. It accepts a\n`level` parameter, like e.g. `capturelogs(level=logging.INFO)`.\n\nLastly, `list-workers` will show the currently running workers:\n\n```shell\n$ rework list-workers postgres://babar:password@localhost:5432/jobstore\n1 4889896@192.168.1.2 30 Mb [running]\n2 4889748@192.168.1.2 30 Mb [running]\n```\n\n[1]: https://hg.sr.ht/~pythonian/rework/browse/tests/test_monitor.py?rev=tip\n\n\n### Extensions\n\nIt is possible to augment the `rework` command with new subcommands (or\naugment, modify existing commands).\n\nAny program doing so must define a new command and declare a setup\ntools entry point named `rework:subcommand` as in e.g.:\n\n```python\n\n    entry_points={'rework.subcommands': [\n        'view=rework_ui.cli:view'\n    ]}\n```\n\nFor instance, the [rework_ui][reworkui] python package provides such a\n`view` subcommand to launch a monitoring webapp for a given rework job\nstore.\n\n[reworkui]: https://hg.sr.ht/~pythonian/rework_ui\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://hg.sr.ht/~pythonian/rework",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "rework",
+    "package_url": "https://pypi.org/project/rework/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/rework/",
+    "project_urls": {
+      "Homepage": "https://hg.sr.ht/~pythonian/rework"
+    },
+    "release_url": "https://pypi.org/project/rework/0.15.1/",
+    "requires_dist": [
+      "psutil",
+      "colorama",
+      "sqlalchemy",
+      "sqlhelp",
+      "psycopg2-binary",
+      "click",
+      "tzlocal",
+      "inireader",
+      "apscheduler",
+      "pyzstd",
+      "python-dateutil",
+      "psyl",
+      "pystuck ; extra == 'debug'",
+      "pytest ; extra == 'test'",
+      "pytest-sa-pg ; extra == 'test'"
+    ],
+    "requires_python": "",
+    "summary": "A database backed distributed task dispatcher",
+    "version": "0.15.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15371775,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b1fe4a9ec9cdacf06300c33649c607d8066293334120dce83f97e4676271213",
+          "md5": "d7ef3d37cf882d9cc6648169237096a3",
+          "sha256": "bd59759e880eeba511cd16254dd19051330ee270b15e7d5bf4e7c2b764d53224"
+        },
+        "downloads": -1,
+        "filename": "rework-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d7ef3d37cf882d9cc6648169237096a3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 12875,
+        "upload_time": "2017-11-09T17:19:42",
+        "upload_time_iso_8601": "2017-11-09T17:19:42.551067Z",
+        "url": "https://files.pythonhosted.org/packages/4b/1f/e4a9ec9cdacf06300c33649c607d8066293334120dce83f97e4676271213/rework-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.10.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "22e2998d63d9eff1791c0fae1415f3c4783a350d2ace18deeb22cf8eda01fea5",
+          "md5": "57b1a247f0c950f194547626a797d313",
+          "sha256": "f2289280537367b0221b85029be4810cf129e8617911c416c15093e8e7399656"
+        },
+        "downloads": -1,
+        "filename": "rework-0.10.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "57b1a247f0c950f194547626a797d313",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 22771,
+        "upload_time": "2019-11-20T16:02:13",
+        "upload_time_iso_8601": "2019-11-20T16:02:13.298533Z",
+        "url": "https://files.pythonhosted.org/packages/22/e2/998d63d9eff1791c0fae1415f3c4783a350d2ace18deeb22cf8eda01fea5/rework-0.10.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0283d48111425129600e88aaebc6651ac6d968a25baae4dbbcee84b1ae1435d7",
+          "md5": "0f2e6708befa6035b4adce309ccc9bd6",
+          "sha256": "b4a654693ef3e03f3950510593e2c9b90ec261c95b92c6a4724785a63a1f4009"
+        },
+        "downloads": -1,
+        "filename": "rework-0.11.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0f2e6708befa6035b4adce309ccc9bd6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 23329,
+        "upload_time": "2020-07-03T13:23:34",
+        "upload_time_iso_8601": "2020-07-03T13:23:34.540135Z",
+        "url": "https://files.pythonhosted.org/packages/02/83/d48111425129600e88aaebc6651ac6d968a25baae4dbbcee84b1ae1435d7/rework-0.11.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.11.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59e642b2e1744fb5ad906560ee944e5a5282b3ad4517321a3abbb11264b9dcc0",
+          "md5": "df12c19b382118c07b8fa7bbcf0db0ca",
+          "sha256": "01be16907159140b0d211715fe98ba31a492886a75476631cf014f4b027f2624"
+        },
+        "downloads": -1,
+        "filename": "rework-0.11.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "df12c19b382118c07b8fa7bbcf0db0ca",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 23348,
+        "upload_time": "2020-07-16T09:39:42",
+        "upload_time_iso_8601": "2020-07-16T09:39:42.609395Z",
+        "url": "https://files.pythonhosted.org/packages/59/e6/42b2e1744fb5ad906560ee944e5a5282b3ad4517321a3abbb11264b9dcc0/rework-0.11.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.12.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b00b52c390e0bd2cd648f67a17a9b354b420d7668607cddb10a982bde9a7b0f",
+          "md5": "3dd7dd0cf7fab4ac2cf2226c84745e8c",
+          "sha256": "61adf763705f744e04bb5d94c428627a88e92b668b0343c5bf9b158875100461"
+        },
+        "downloads": -1,
+        "filename": "rework-0.12.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "3dd7dd0cf7fab4ac2cf2226c84745e8c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 28714,
+        "upload_time": "2020-12-11T16:30:25",
+        "upload_time_iso_8601": "2020-12-11T16:30:25.626697Z",
+        "url": "https://files.pythonhosted.org/packages/3b/00/b52c390e0bd2cd648f67a17a9b354b420d7668607cddb10a982bde9a7b0f/rework-0.12.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.13.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c888370ca579dfde6e91e0eacc2837a80b4afcb675a3ecf52e748fefccf60d16",
+          "md5": "06e019e8aec2858ecab439bfbdf027bf",
+          "sha256": "71837de681cb9f8c00e2f7f35081d8c4153efcb246c606db8103398be578bf6a"
+        },
+        "downloads": -1,
+        "filename": "rework-0.13.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "06e019e8aec2858ecab439bfbdf027bf",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 30542,
+        "upload_time": "2021-09-21T16:45:26",
+        "upload_time_iso_8601": "2021-09-21T16:45:26.233500Z",
+        "url": "https://files.pythonhosted.org/packages/c8/88/370ca579dfde6e91e0eacc2837a80b4afcb675a3ecf52e748fefccf60d16/rework-0.13.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.14.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4a66563403d54d5b37797bb96d806c83145f264fc33598463221d91de6d897f4",
+          "md5": "f1ef79dec334199f9c4bf2c6912c7ff6",
+          "sha256": "c1dc56a1b9bced387d814aeb554ac5aa5a636a07bed7cb77ccf0bd026c5f664b"
+        },
+        "downloads": -1,
+        "filename": "rework-0.14.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f1ef79dec334199f9c4bf2c6912c7ff6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 31076,
+        "upload_time": "2022-01-13T15:12:32",
+        "upload_time_iso_8601": "2022-01-13T15:12:32.197773Z",
+        "url": "https://files.pythonhosted.org/packages/4a/66/563403d54d5b37797bb96d806c83145f264fc33598463221d91de6d897f4/rework-0.14.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.15.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6398eab44df114ed172dab51cb852820bb8151ef3e5d766291c285af9eeeae09",
+          "md5": "6a00ee87a8c2703b92f94161462a12d7",
+          "sha256": "7231fb835f6f32a1174bfe177076943f9b76dba32df070dcb25ea947a5f39ec5"
+        },
+        "downloads": -1,
+        "filename": "rework-0.15.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6a00ee87a8c2703b92f94161462a12d7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 32762,
+        "upload_time": "2022-06-23T13:45:51",
+        "upload_time_iso_8601": "2022-06-23T13:45:51.053033Z",
+        "url": "https://files.pythonhosted.org/packages/63/98/eab44df114ed172dab51cb852820bb8151ef3e5d766291c285af9eeeae09/rework-0.15.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.15.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2c44589901db634ba52b73a3227a1fd3ae67bd35b56ab19a9959dc9a30fe1cb6",
+          "md5": "f6e6f802d212dacf02a8977933bd872d",
+          "sha256": "89ab1e7fb6d232cc192a9500126d31f2933b2848c594166587868a8c65696268"
+        },
+        "downloads": -1,
+        "filename": "rework-0.15.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f6e6f802d212dacf02a8977933bd872d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 32763,
+        "upload_time": "2022-10-11T09:53:38",
+        "upload_time_iso_8601": "2022-10-11T09:53:38.664559Z",
+        "url": "https://files.pythonhosted.org/packages/2c/44/589901db634ba52b73a3227a1fd3ae67bd35b56ab19a9959dc9a30fe1cb6/rework-0.15.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86087920eb3eae7f2293f24d353b647c3721f172f28efd388fed40ae185f5959",
+          "md5": "ea718673ecd84c39c56bc15c58562d7a",
+          "sha256": "439b19a2470be129a942799a217a28cbf5fa4f23d9414106dc618e0c604c7e8e"
+        },
+        "downloads": -1,
+        "filename": "rework-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ea718673ecd84c39c56bc15c58562d7a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 13897,
+        "upload_time": "2018-01-25T09:31:50",
+        "upload_time_iso_8601": "2018-01-25T09:31:50.258089Z",
+        "url": "https://files.pythonhosted.org/packages/86/08/7920eb3eae7f2293f24d353b647c3721f172f28efd388fed40ae185f5959/rework-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d84686e5af8cd9a2d725484a15971ec3db437585d178d2bca838c90e972e02ec",
+          "md5": "d18506fa3f12aff091484e1a589c8f09",
+          "sha256": "a789333e30983e8cb3b8a4a687f15d62be010540b6bbe37bac8f063a574d8275"
+        },
+        "downloads": -1,
+        "filename": "rework-0.3.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d18506fa3f12aff091484e1a589c8f09",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14261,
+        "upload_time": "2018-04-23T09:20:18",
+        "upload_time_iso_8601": "2018-04-23T09:20:18.372378Z",
+        "url": "https://files.pythonhosted.org/packages/d8/46/86e5af8cd9a2d725484a15971ec3db437585d178d2bca838c90e972e02ec/rework-0.3.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a6b5c764008748ab106440a67425ab6f61753ac6b1d68101e85da97f9a5a8fd4",
+          "md5": "d03e01a72cb75772bb83e8753ab31414",
+          "sha256": "b45a4d9c7899881defde4383a61ccd707e23d041e61e4a4e802b917b2ebeae08"
+        },
+        "downloads": -1,
+        "filename": "rework-0.4.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d03e01a72cb75772bb83e8753ab31414",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 14252,
+        "upload_time": "2018-06-18T13:55:11",
+        "upload_time_iso_8601": "2018-06-18T13:55:11.907811Z",
+        "url": "https://files.pythonhosted.org/packages/a6/b5/c764008748ab106440a67425ab6f61753ac6b1d68101e85da97f9a5a8fd4/rework-0.4.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1ffd32167a51c7b1da67585087dbaa76cf9a00427e400951d5269d478f26b060",
+          "md5": "d852c23fa152824d02778cd869007899",
+          "sha256": "9b881dd61198246127089898e53150e02ad934f8a1a9cf570560fb4e3a38df53"
+        },
+        "downloads": -1,
+        "filename": "rework-0.6.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d852c23fa152824d02778cd869007899",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15517,
+        "upload_time": "2018-10-05T12:16:24",
+        "upload_time_iso_8601": "2018-10-05T12:16:24.962233Z",
+        "url": "https://files.pythonhosted.org/packages/1f/fd/32167a51c7b1da67585087dbaa76cf9a00427e400951d5269d478f26b060/rework-0.6.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b0ef2f98b418909b1b6b89d025628ba09583979dbcd3b3a109ce8a67115c9765",
+          "md5": "f7e6ed9caee36acbea67c06eaf1b37a5",
+          "sha256": "0ea75a7c5e2f3e05842ea867ed8c29b014898eece1bce9b9def436dd6b4ae115"
+        },
+        "downloads": -1,
+        "filename": "rework-0.7.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f7e6ed9caee36acbea67c06eaf1b37a5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 15838,
+        "upload_time": "2018-11-09T10:56:18",
+        "upload_time_iso_8601": "2018-11-09T10:56:18.507326Z",
+        "url": "https://files.pythonhosted.org/packages/b0/ef/2f98b418909b1b6b89d025628ba09583979dbcd3b3a109ce8a67115c9765/rework-0.7.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.8.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "782916d88b6caa18310aa97d0ef9c4fca133a90e60c90f617fc102420c3d7f67",
+          "md5": "4f3f576a4332ad2bbd7027b769ca697f",
+          "sha256": "7991f25ec46f36b8cce2d6f6546560313a206d781760713463019557e6900056"
+        },
+        "downloads": -1,
+        "filename": "rework-0.8.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4f3f576a4332ad2bbd7027b769ca697f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 18818,
+        "upload_time": "2018-12-21T14:56:01",
+        "upload_time_iso_8601": "2018-12-21T14:56:01.140911Z",
+        "url": "https://files.pythonhosted.org/packages/78/29/16d88b6caa18310aa97d0ef9c4fca133a90e60c90f617fc102420c3d7f67/rework-0.8.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3690cfcc3274aee22db74b477bf60e097ee1f687bb113d46f593ff236fe0feb4",
+          "md5": "e86a70187899a15d2725d8f6c9184b33",
+          "sha256": "6e9c3c8b22b0c1387ccce91df0599e7210ccb3bfc43ae0a1dfcd00fc3ea8ab2b"
+        },
+        "downloads": -1,
+        "filename": "rework-0.9.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e86a70187899a15d2725d8f6c9184b33",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 18596,
+        "upload_time": "2019-07-16T15:01:23",
+        "upload_time_iso_8601": "2019-07-16T15:01:23.177862Z",
+        "url": "https://files.pythonhosted.org/packages/36/90/cfcc3274aee22db74b477bf60e097ee1f687bb113d46f593ff236fe0feb4/rework-0.9.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21da4c35010674ffb51507dbd3a036deb1d6a6016a19f61e2524ba6ca9506a4b",
+          "md5": "0d1419e307b526a180664a116c05b7f3",
+          "sha256": "b0ac5076ce9a02f99e0c15c91f436d65df782710ad43f0a31faa60734255b90c"
+        },
+        "downloads": -1,
+        "filename": "rework-0.9.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0d1419e307b526a180664a116c05b7f3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 22252,
+        "upload_time": "2019-09-04T16:59:32",
+        "upload_time_iso_8601": "2019-09-04T16:59:32.648303Z",
+        "url": "https://files.pythonhosted.org/packages/21/da/4c35010674ffb51507dbd3a036deb1d6a6016a19f61e2524ba6ca9506a4b/rework-0.9.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.9.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "eb5f3da6f6dd5a585e7367aca6210d59baa2b7386d72ad70110e461d39911c86",
+          "md5": "ccff28ab2c9e98a7ce52a25ac8ed0e4a",
+          "sha256": "bde454235c9ecae8da91df34e2fe301731926fcd6f62a3d9b216181d7cc437a8"
+        },
+        "downloads": -1,
+        "filename": "rework-0.9.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ccff28ab2c9e98a7ce52a25ac8ed0e4a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 22249,
+        "upload_time": "2019-09-19T12:09:01",
+        "upload_time_iso_8601": "2019-09-19T12:09:01.376372Z",
+        "url": "https://files.pythonhosted.org/packages/eb/5f/3da6f6dd5a585e7367aca6210d59baa2b7386d72ad70110e461d39911c86/rework-0.9.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2c44589901db634ba52b73a3227a1fd3ae67bd35b56ab19a9959dc9a30fe1cb6",
+        "md5": "f6e6f802d212dacf02a8977933bd872d",
+        "sha256": "89ab1e7fb6d232cc192a9500126d31f2933b2848c594166587868a8c65696268"
+      },
+      "downloads": -1,
+      "filename": "rework-0.15.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "f6e6f802d212dacf02a8977933bd872d",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 32763,
+      "upload_time": "2022-10-11T09:53:38",
+      "upload_time_iso_8601": "2022-10-11T09:53:38.664559Z",
+      "url": "https://files.pythonhosted.org/packages/2c/44/589901db634ba52b73a3227a1fd3ae67bd35b56ab19a9959dc9a30fe1cb6/rework-0.15.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

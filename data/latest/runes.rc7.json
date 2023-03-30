@@ -1,0 +1,394 @@
+{
+  "info": {
+    "author": "Rusty Russell",
+    "author_email": "rusty@rustcorp.com.au",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# Runes - Simple Cookies You Can Extend (similar to Macaroons)\n\nhttps://research.google/pubs/pub41892/ is a paper called \"Macaroons:\nCookies with Contextual Caveats for Decentralized Authorization in the\nCloud\".  It has one good idea, some extended ideas nobody implements,\nand lots and lots of words.\n\nThe idea: a server issues a cookie to Alice.  She can derive cookies\nwith extra restrictions and hand them to Bob and Carol to send back to\nthe server, and they can't remove the restrictions.\n\nBut they did it using a Message Authetication Code (MAC, get it?),\nwhich is actually counter-productive, since it's simpler and better to\nuse Length Extension to achieve the same results.  I call that a Rune;\nthis version really only handles strings, but you can use hex or another\nencoding.\n\n## Rune Language\n\nA *rune* is a series of restrictions; you have to pass all of them (so\nappending a new one always makes the rune less powerful).  Each\nrestriction is one or more alternatives (\"cmd=foo OR cmd=bar\"), any\none of which can pass.\n\nThe form of each alternative is a simple string:\n\n    ALTERNATIVE := FIELDNAME CONDITION VALUE\n\n`FIELDNAME` contains only UTF-8 characters, exclusive of\n! \" # $ % & ' ( ) * +, - . / : ;  ? @ [ \\ ] ^ _ \\` { | } ~ (C's ispunct()).\nThese can appear inside a `VALUE`, but `&`, `|` and `\\\\` must be escaped with `\\` (escaping is legal for any character, but unnecessary).\n\n\n`CONDITION` is one of the following values:\n* `!`: Pass if field is missing (value ignored)\n* `=`: Pass if exists and exactly equals\n* `/`: Pass if exists and is not exactly equal\n* `^`: Pass if exists and begins with\n* `$`: Pass if exists and ends with\n* `~`: Pass if exists and contains\n* `<`: Pass if exists, is a valid integer (may be signed), and numerically less than\n* `>`: Pass if exists, is a valid integer (may be signed), and numerically greater than\n* `}`: Pass if exists and lexicograpically greater than (or longer)\n* `{`: Pass if exists and lexicograpically less than (or shorter)\n* `#`: Always pass: no condition, this is a comment.\n\nGrouping using `(` and `)` may be added in future.\n\nA restriction is a group of alternatives separated by `|`; restrictions\nare separated by `&`.\ne.g.\n\n    cmd=foo | cmd=bar\n\t& subcmd! | subcmd{get\n\nThe first requires `cmd` be present, and to be `foo` or `bar`.  The second\nrequires that `subcmd` is not present, or is lexicographically less than `get`.\nBoth must be true for authorization to succeed.\n\n\n## Rune Authorization\n\nA run also comes with a SHA-256 authentication code.  This is\ngenerated as SHA-256 of the following bytestream:\n\n1. The secret (less than 56 bytes, known only to the server which issued it).\n2. For every restriction:\n   1. Pad the stream as per SHA-256 (i.e. append 0x80, then zeroes, then\n      the big-endian 64-bit bitcount so far, such that it's a multiple of 64\n      bytes).\n   2. Append the restriction.\n\nBy using the same padding scheme as SHA-256 usually uses to end the\ndata, we have the property that we can initialize the SHA-256 function\nwith the result from any prior restriction, and continue.\n\nThe server can validate the rune authorization by repeating this\nprocedure and checking the result.\n\n\n## Rune Encoding\n\nRunes are encoded as base64, starting with the 256-bit SHA256\nauthentication code, the followed by one or more restrictions\nseparated by `&`.\n\nNot because base64 is good, but because it's familiar to Web people;\nwe use RFC3548 with `+` and `/` replaced by `-` and `_` to make\nit URL safe.\n\n(There's also a string encoding which is easier to read and debug).\n\n## Best Practices\n\nIt's usually worth including an id in each rune you hand out so that\nyou can blacklist particular runes in future (your other option is to\nchange your master secret, but that revokes all runes).  Because this\nappears in all runes, using the empty fieldname (''), and a simple\ncounter reduces overall size, but you could use a UUID.\n\nThis is made trivial by the `unique_id` parameter to Rune() and\nMasterRune(): it adds such an empty field with the unique id (which\nthe default evaluator will ignore unless you handle it explicitly).\n\nYou may also include version number, to allow future runes to have\ndifferent interpretations: this appends '-[version]' in the '' field:\nthe default handler will fail any cookie that has a version field\n(for safe forward compatibility).\n\nThe rune unmarshalling code ensures that if an empty parameter exists,\nit's the first one, and it's of a valid form.\n\nSee [examples/blacklist.py](examples/blacklist.py).\n\n\n## API Example\n\nHere's the server, making you a rune! (spoiler: it's\n\"-YpZTBZ4Tb5SsUz3XIukxBxR619iEthm9oNJnC0LxZM=\")\n\n```\nimport runes\nimport secrets\n\n# Secret determined by fair dice roll.\nsecret = bytes([5] * 16)\n\n# Make an unrestricted rune.\nrune = runes.MasterRune(secret)\n\n# We could add our own restrictions here, if we wanted.\nprint(\"Your rune is {}\".format(rune.to_base64()))\n```\n\nHere's the server, checking a rune.  You will need to define what\nconditions you provide for the rune to test; one of the most useful\nones is time, but other common things are the resource being accessed,\n(e.g. URL, or command and parameters), or who is accessing it (assuming\nyou have authenticated them already in some way).\n\n```\nimport runes\nimport time\nimport sys\n\nsecret = bytes([5] * 16)\n\n# In real life, this would come from the web data.\nrunestring = sys.argv[1]\n\n# This checks the format is correct, it's authorized, an that it meets\n# our values.  I assume we have values time (UNIX, seconds since\n# 1970), command and optional id.\n# (You can also use rune.check() if you don't care *why* it failed)\nok, whyfail = rune.check_with_reason(secret, runestring,\n                                     {'time': int(time.time()),\n                                      'command': 'somecommand',\n                                      'id': 'DEADBEEF'})\nif not ok:\n    print(\"Rune restrictions failed: {}\".format(whyfail))\n    sys.exit(1)\n\nprint(\"Yes, you passed!\")\n```\n\n\nHere's the client Alice.  She gets the rune and gives Bob a variant\nthat can only be used for 1 minute:\n\n```\nimport runes\nimport time\n\n# In real life, this would come from the web data.\nrunestring = sys.argv[1]\n\n# You'd catch exceptions here, usually.\nrune = runes.from_base64(runestring)\n\n# You can construct a Restriction class from a sequence of Alternative\n# but it's easier to use decode() to translate a string\nrune.add_restriction(rune.Restriction.decode(\"time < {}\".format((int)time.time() + 60))\n\nprint(\"Your restricted rune is {}\".format(rune.to_base64()))\n```\n\nYou can find more examples in the examples/ subdirectory.\n\n\n## Advanced Techniques\n\nIf you place a callable in the dictionary to check(), that will be\ncalled if referred to by a restriction, so you can perform your own\nprocessing.\n\nThis is useful in implementing ratelimiting, for example: you can have\na last-used time for each id, and thus fail if it is too soon.\n\nSee [examples/ratelimit.py](examples/ratelimit.py).\n\n\n## Author\n\nRusty Russell wrote it; but I blame @roasbeef for raving about them\nlong enough at LnConf that I actually read the paper.  It only took me\n18 months to find a day to implement them.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "http://github.com/rustyrussell/runes",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "runes",
+    "package_url": "https://pypi.org/project/runes/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/runes/",
+    "project_urls": {
+      "Homepage": "http://github.com/rustyrussell/runes"
+    },
+    "release_url": "https://pypi.org/project/runes/0.5/",
+    "requires_dist": [
+      "sha256"
+    ],
+    "requires_python": "",
+    "summary": "Simple Cookies You Can Extend (similar to Macaroons)",
+    "version": "0.5",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14207246,
+  "releases": {
+    "0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8576d16264e2e432502b681be8519405561cc88066fd8b9770f8fe1eb5f5a6ed",
+          "md5": "c4786cf812a947d8c461b001a3dfa60c",
+          "sha256": "76a59f9089a84ab3e5a640fa95fdde47ef79d5cdf264a79e22e4824dcad771af"
+        },
+        "downloads": -1,
+        "filename": "runes-0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c4786cf812a947d8c461b001a3dfa60c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3601,
+        "upload_time": "2021-07-30T02:12:20",
+        "upload_time_iso_8601": "2021-07-30T02:12:20.649182Z",
+        "url": "https://files.pythonhosted.org/packages/85/76/d16264e2e432502b681be8519405561cc88066fd8b9770f8fe1eb5f5a6ed/runes-0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6a8db4763cbf2e0476ddfed7ee2ef0355db912c9710821627f2f681a7d38830",
+          "md5": "d287cb9b4a6e3acf72ebe79ab029cec9",
+          "sha256": "ab63015c73a7c121d792d1a38a28e40819b05c3423b0209bc9e51fae127a4586"
+        },
+        "downloads": -1,
+        "filename": "runes-0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d287cb9b4a6e3acf72ebe79ab029cec9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4391,
+        "upload_time": "2021-07-30T02:12:22",
+        "upload_time_iso_8601": "2021-07-30T02:12:22.020629Z",
+        "url": "https://files.pythonhosted.org/packages/d6/a8/db4763cbf2e0476ddfed7ee2ef0355db912c9710821627f2f681a7d38830/runes-0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "56a7b4a6c672c5994477d8f2a92d49091fbb97ffb6396b6f4adc21b8270b7391",
+          "md5": "119d1ae2780b1eb6e5910af0bc6dbf34",
+          "sha256": "cb91fa1ce0cb0f4efaee33edf4a75b43bff1a3e8b1d2737194aa3210a5879560"
+        },
+        "downloads": -1,
+        "filename": "runes-0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "119d1ae2780b1eb6e5910af0bc6dbf34",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3782,
+        "upload_time": "2021-07-31T05:23:57",
+        "upload_time_iso_8601": "2021-07-31T05:23:57.326587Z",
+        "url": "https://files.pythonhosted.org/packages/56/a7/b4a6c672c5994477d8f2a92d49091fbb97ffb6396b6f4adc21b8270b7391/runes-0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "79fb1bfe725d1ed3a0c40e584cfc72a95366a5ec1d9f7c27b56b9ab6f4c0cef3",
+          "md5": "ba87b8c701575f8dafcb193e38e2df89",
+          "sha256": "3959222a6c08c9565fcaed3000e2d37b1944769a35d4555403a622a1101775b3"
+        },
+        "downloads": -1,
+        "filename": "runes-0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ba87b8c701575f8dafcb193e38e2df89",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4604,
+        "upload_time": "2021-07-31T05:23:59",
+        "upload_time_iso_8601": "2021-07-31T05:23:59.430861Z",
+        "url": "https://files.pythonhosted.org/packages/79/fb/1bfe725d1ed3a0c40e584cfc72a95366a5ec1d9f7c27b56b9ab6f4c0cef3/runes-0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a3990ea664cc327599c6919decaca148f614d5bd8b28e7ff556c34203d8ef0fc",
+          "md5": "5b26b89b4f6e5bb8a7e94be7d6d13954",
+          "sha256": "3f03dc69f84ecec2e47fd6690a762960b82998a579639feeedefee9d656bf762"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5b26b89b4f6e5bb8a7e94be7d6d13954",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3845,
+        "upload_time": "2021-08-01T05:29:23",
+        "upload_time_iso_8601": "2021-08-01T05:29:23.929434Z",
+        "url": "https://files.pythonhosted.org/packages/a3/99/0ea664cc327599c6919decaca148f614d5bd8b28e7ff556c34203d8ef0fc/runes-0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "80301fbb932823b09e325a71d55fa1e4c6dd049e4cdd228c05026971ce81f645",
+          "md5": "0bc48e3bc4783d7e3869b459207e0567",
+          "sha256": "10adfd3c1d53cfd5b93e8b825c7e221b30c74fc997c138c5047ff5e7ab9ad28c"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0bc48e3bc4783d7e3869b459207e0567",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4671,
+        "upload_time": "2021-08-01T05:29:25",
+        "upload_time_iso_8601": "2021-08-01T05:29:25.886507Z",
+        "url": "https://files.pythonhosted.org/packages/80/30/1fbb932823b09e325a71d55fa1e4c6dd049e4cdd228c05026971ce81f645/runes-0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "555e824ec43e9f9f36138a333cb436a7c33ef264a984181d984456d39b51c3c7",
+          "md5": "9da8382834cec41b60daeb545c526242",
+          "sha256": "ee9787bce6026df7b491f1af1747e61d9f0e318cbe1bf12b97114327d13aadaa"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9da8382834cec41b60daeb545c526242",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 3868,
+        "upload_time": "2021-08-02T03:08:42",
+        "upload_time_iso_8601": "2021-08-02T03:08:42.757713Z",
+        "url": "https://files.pythonhosted.org/packages/55/5e/824ec43e9f9f36138a333cb436a7c33ef264a984181d984456d39b51c3c7/runes-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0399576b90c64ef09827fba13c09bf9b97de07e7f0e338e4ac8d51b58eb21b3b",
+          "md5": "0cc7e3c2f1f90ca2ef0e30acdb787bce",
+          "sha256": "166b8bc112b7613592adc2538977ba39b4bc53d39737aa29f47bfebf9139eeff"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0cc7e3c2f1f90ca2ef0e30acdb787bce",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 4682,
+        "upload_time": "2021-08-02T03:08:44",
+        "upload_time_iso_8601": "2021-08-02T03:08:44.603727Z",
+        "url": "https://files.pythonhosted.org/packages/03/99/576b90c64ef09827fba13c09bf9b97de07e7f0e338e4ac8d51b58eb21b3b/runes-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f14dc4c08ea0bda31c2402296391fa133b5c3785e30dd3eaab1313fc600e7bd8",
+          "md5": "f0978a9883cad85efb36923068994d07",
+          "sha256": "2f51efe8d8e98a79794edd8721ed8c043605cc8bff13c0a85bf3469621718f63"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f0978a9883cad85efb36923068994d07",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 7846,
+        "upload_time": "2021-08-03T04:19:21",
+        "upload_time_iso_8601": "2021-08-03T04:19:21.463842Z",
+        "url": "https://files.pythonhosted.org/packages/f1/4d/c4c08ea0bda31c2402296391fa133b5c3785e30dd3eaab1313fc600e7bd8/runes-0.3.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de94a0dec338fcb5c3b8e79b6e3378a93eaf440192f4a5736d1e9be5350e2c95",
+          "md5": "01b53164947c82f0c001c1fb27b619a6",
+          "sha256": "ad3e9d4cfce6a72c8c190acc6df515c1dd29a739908a22e3ecde8b04adc3c5ba"
+        },
+        "downloads": -1,
+        "filename": "runes-0.3.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "01b53164947c82f0c001c1fb27b619a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8855,
+        "upload_time": "2021-08-03T04:19:23",
+        "upload_time_iso_8601": "2021-08-03T04:19:23.045659Z",
+        "url": "https://files.pythonhosted.org/packages/de/94/a0dec338fcb5c3b8e79b6e3378a93eaf440192f4a5736d1e9be5350e2c95/runes-0.3.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6627f55c15cebc140c9d3aa51e49da9decd49c960fb749f3fdfde3ee078ea0cb",
+          "md5": "33c706f6f4b7e1281e8dd6c9e7d11e69",
+          "sha256": "45695bdbe81183bfef60b6118188eb93d4755412053e21d2768f60920a6cbe9a"
+        },
+        "downloads": -1,
+        "filename": "runes-0.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "33c706f6f4b7e1281e8dd6c9e7d11e69",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 8803,
+        "upload_time": "2021-08-10T20:40:08",
+        "upload_time_iso_8601": "2021-08-10T20:40:08.727664Z",
+        "url": "https://files.pythonhosted.org/packages/66/27/f55c15cebc140c9d3aa51e49da9decd49c960fb749f3fdfde3ee078ea0cb/runes-0.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7fc89eb1a444c36af890d69116ad849893ff17a699949370e64b9c2613bf82b3",
+          "md5": "6d8aff578014f651236604fe1ba5bd61",
+          "sha256": "0c746bbece9c8eabeeb0bd6d9be9650d36fb8b7d359242dff6a8162c6cef363f"
+        },
+        "downloads": -1,
+        "filename": "runes-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6d8aff578014f651236604fe1ba5bd61",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10064,
+        "upload_time": "2021-08-10T20:40:10",
+        "upload_time_iso_8601": "2021-08-10T20:40:10.089231Z",
+        "url": "https://files.pythonhosted.org/packages/7f/c8/9eb1a444c36af890d69116ad849893ff17a699949370e64b9c2613bf82b3/runes-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "04b843b958b60e146edc4a050e2cd5cc290fa4f91953040b7a540861798ff697",
+          "md5": "13ba2e8fada5501c47fb0f3e8d496f98",
+          "sha256": "ed7417127ee0b30aeedd32a8588f9ae2fe72f8f6fa6d9d29cb870aec0c3d6a74"
+        },
+        "downloads": -1,
+        "filename": "runes-0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "13ba2e8fada5501c47fb0f3e8d496f98",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9377,
+        "upload_time": "2022-06-22T04:04:27",
+        "upload_time_iso_8601": "2022-06-22T04:04:27.249962Z",
+        "url": "https://files.pythonhosted.org/packages/04/b8/43b958b60e146edc4a050e2cd5cc290fa4f91953040b7a540861798ff697/runes-0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f338037789277392bfb357544b21d35a4eb7e7e8b17bcc3029f95fdf3020e02",
+          "md5": "5ec92781ee1a8646a59f08956c64bef0",
+          "sha256": "a07c03295b81caf3c7257c49820ec4ecc6a7ed6b1e337b53c9716a284d42bf39"
+        },
+        "downloads": -1,
+        "filename": "runes-0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5ec92781ee1a8646a59f08956c64bef0",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12280,
+        "upload_time": "2022-06-22T04:04:29",
+        "upload_time_iso_8601": "2022-06-22T04:04:29.708270Z",
+        "url": "https://files.pythonhosted.org/packages/8f/33/8037789277392bfb357544b21d35a4eb7e7e8b17bcc3029f95fdf3020e02/runes-0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "04b843b958b60e146edc4a050e2cd5cc290fa4f91953040b7a540861798ff697",
+        "md5": "13ba2e8fada5501c47fb0f3e8d496f98",
+        "sha256": "ed7417127ee0b30aeedd32a8588f9ae2fe72f8f6fa6d9d29cb870aec0c3d6a74"
+      },
+      "downloads": -1,
+      "filename": "runes-0.5-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "13ba2e8fada5501c47fb0f3e8d496f98",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 9377,
+      "upload_time": "2022-06-22T04:04:27",
+      "upload_time_iso_8601": "2022-06-22T04:04:27.249962Z",
+      "url": "https://files.pythonhosted.org/packages/04/b8/43b958b60e146edc4a050e2cd5cc290fa4f91953040b7a540861798ff697/runes-0.5-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "8f338037789277392bfb357544b21d35a4eb7e7e8b17bcc3029f95fdf3020e02",
+        "md5": "5ec92781ee1a8646a59f08956c64bef0",
+        "sha256": "a07c03295b81caf3c7257c49820ec4ecc6a7ed6b1e337b53c9716a284d42bf39"
+      },
+      "downloads": -1,
+      "filename": "runes-0.5.tar.gz",
+      "has_sig": false,
+      "md5_digest": "5ec92781ee1a8646a59f08956c64bef0",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 12280,
+      "upload_time": "2022-06-22T04:04:29",
+      "upload_time_iso_8601": "2022-06-22T04:04:29.708270Z",
+      "url": "https://files.pythonhosted.org/packages/8f/33/8037789277392bfb357544b21d35a4eb7e7e8b17bcc3029f95fdf3020e02/runes-0.5.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

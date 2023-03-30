@@ -1,0 +1,1414 @@
+{
+  "info": {
+    "author": "Lucas Nestler",
+    "author_email": "github.revlib@nestler.sh",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Software Development :: Libraries :: Python Modules"
+    ],
+    "description": "# RevLib\n\nSimple and efficient RevNet-Library for PyTorch with XLA and DeepSpeed support and parameter offload\n\n## Table of Contents\n\n* [RevLib](#revlib)\n    * [Table Of Contents](#table-of-contents)\n    * [Features](#features)\n    * [Getting Started](#getting-started)\n        * [Installation](#installation)\n    * [Examples](#examples)\n        * [Reversible Backward](#reversible-backward)\n        * [Parameter Offload](#parameter-offload)\n        * [Coupling](#coupling)\n        * [Models](#models)\n            * [iRevNet](#irevnet)\n            * [Reformer](#reformer)\n        * [Utils](#utils)\n            * [HuggingFace](#huggingface-integration)\n            * [Cast Intermediates](#Cast-Intermediates)\n            * [Offload Intermediates](#Offload-Intermediates)\n    * [Explanation](#explanation)\n    * [Citation](#citation)\n\n## Features\n\n* Less memory than gradient checkpointing (`2 * output_size` instead of `n_layers * output_size`)\n* Same speed as activation checkpointing\n* Extensible\n* Native HuggingFace, DeepSpeed, and XLA support\n\n## Getting started\n\n### Installation\n\n```\npython3 -m pip install revlib\n```\n\n### Examples\n\n#### Reversible Backward\n\nInvertible functions allow for huge memory savings as the input can be recovered from which the gradient computation can\nbe restarted. It's a bit like gradient checkpointing, but with recoverable inputs. That's why a reversible network\nshould use less memory than a network with gradient checkpointing, and both should use less maximum memory than a normal\nnetwork.\n\n```PYTHON\nimport torch\nfrom torch.utils.checkpoint import checkpoint as checkpoint_fn\nimport copy\nimport revlib\n\ndepth = 1024\nbatch_size = 4096\n\n# Create network of multiple layers (so that checkpointing makes a difference) with weight sharing (cheaper)\nbase = [torch.nn.Sequential(torch.nn.Linear(1, 1, bias=False), torch.nn.ReLU(),\n                            torch.nn.Linear(1, 1, bias=False))] * depth\nbaseline = torch.nn.Sequential(*base)\nrevnet = revlib.ReversibleSequential(*base)\ncheckpoint = base[0]\n\n\n# Forcibly enable gradients so that checkpointing stores tensors\n@torch.enable_grad()\ndef memory_utilization(mod: torch.nn.Module, checkpoint: bool = False, features: int = 1) -> int:\n    torch.cuda.empty_cache()  # Empty cache, just in case PyTorch didn't do it (which is usually the case)\n    mod = copy.deepcopy(mod).cuda()  # Copy model to avoid modifying the global copy. Deallocated after the function ran\n    inp = torch.randn(batch_size, features, requires_grad=True).cuda()\n    if not checkpoint:\n        _unused = mod(inp)  # Compute a normal forward pass if not using gradient checkpointing\n    else:\n        for _ in range(depth):\n            inp = checkpoint_fn(mod, inp)  # Manually iterate over all layers as torch doesn't support module wrapping\n    return torch.cuda.memory_allocated()  # Take accurate GPU memory measurements (CPU is very inaccurate)\n\n\nassert memory_utilization(baseline) > memory_utilization(baseline, True) > memory_utilization(revnet, features=2)\n# Outputs: 50349056, 16794624, 99328\n# 48 MiB, 16 MiB, 97 KiB\n```\n\n#### Parameter Offload\n\nAnother way to save even more memory, especially for deep networks, is to offload parameters and optimizer parameters\noff the GPU onto the CPU. That way the permanent storage of the network is offloaded and only the frequently-accessed\ntemporary cache, used to compute the immediate gradients, is kept on the GPU.\n\n```PYTHON\nimport torch\nimport copy\nimport revlib\n\ndepth = 256\nwidth = 1024\nbatch_size = 1\n\nbase = [torch.nn.Linear(width, width, bias=False) for _ in range(depth)]\n\n\n# Initialize network with separate weights for each layer, so that offloading has a measurable benefit\n\n\ndef memory_utilization(offload: bool) -> int:\n    torch.cuda.empty_cache()  # Empty cache, just in case PyTorch didn't do it (which is usually the case)\n    mod = copy.deepcopy(revlib.ReversibleSequential(*base, target_device=\"cuda\" * offload))  # Copy to dealloc model\n    if not offload:  # If not offloading to CPU, manually move the parameters\n        mod = mod.cuda()\n    _unused = mod(torch.randn(batch_size, width * 2).cuda())  # Normal forward pass, 2x features because of RevNet\n    return torch.cuda.memory_allocated()  # Take accurate GPU memory measurements (CPU is very inaccurate)\n\n\nassert memory_utilization(False) > memory_utilization(True)\n# Outputs: 1073750016, 8192\n# 1 GiB, 8 KiB\n```\n\nAnother way of doing parameter offload would be to manually call `revlib.offload_tensor` before accessing each parameter\nof a custom model. This way, you can control when the parameters are loaded onto the GPU. Sometimes it's faster to load\neverything onto the GPU in a single operation, such as before calling a TorchScript function, while other times it's\nmore memory-efficient to load every parameter seconds before its usage.\\\nInternally, RevLib has the offload_tensor functionality integrated into its reversible core, giving a faster experience\nthanks to parallel `non_blocking` operations.\n\n#### Coupling\n\nAnother major feature of RevLib is to use custom coupling functions such as the one used in\n[MomentumNet](https://arxiv.org/abs/2102.07870). It's a recent paper that made significant advancements in the area of\nmemory-efficient networks. They propose to use a momentum stream instead of a second model output as illustrated\nbelow: ![MomentumNetIllustration](http://limitless.sh/momentumnet.png)\n<p align=\"center\">Image from <a href=https://twitter.com/PierreAblin/status/1426899071495819265>the plagiarized</a> <a href=https://arxiv.org/abs/2108.05862v2>mRevNet</a></p>\n\nUsing a custom coupling operation (the functional analogue of [MemCNN](https://github.com/silvandeleemput/memcnn)) that\nmerges input and output streams, MomentumNet can be implemented in RevLib as seen below:\n\n```PYTHON\nimport torch\nfrom torch import nn\nimport revlib\n\nchannels = 64\ndepth = 16\nmomentum_ema_beta = 0.99\n\n\n# Compute y2 from x2 and f(x1) by merging x2 and f(x1) in the forward pass.\ndef momentum_coupling_forward(other_stream: torch.Tensor, fn_out: torch.Tensor) -> torch.Tensor:\n    return other_stream * momentum_ema_beta + fn_out * (1 - momentum_ema_beta)\n\n\n# Calculate x2 from y2 and f(x1) by manually computing the inverse of momentum_coupling_forward.\ndef momentum_coupling_inverse(output: torch.Tensor, fn_out: torch.Tensor) -> torch.Tensor:\n    return (output - fn_out * (1 - momentum_ema_beta)) / momentum_ema_beta\n\n\n# Pass in coupling functions which will be used instead of x2 + f(x1) and y2 - f(x1)\nrev_model = revlib.ReversibleSequential(*[layer for _ in range(depth)\n                                          for layer in [nn.Conv2d(channels, channels, (3, 3), padding=1),\n                                                        nn.Identity()]],\n                                        coupling_forward=[momentum_coupling_forward, revlib.additive_coupling_forward],\n                                        coupling_inverse=[momentum_coupling_inverse, revlib.additive_coupling_inverse])\n\ninp = torch.randn((16, channels * 2, 224, 224))\nout = rev_model(inp)\nassert out.size() == (16, channels * 2, 224, 224)\n```\n\nWhen implementing MomentumNet like this, there is no storage for lost information in the forward pass which the\nMomentumNet paper accounts for. One way to work around that issue is to avoid the coupling function\naltogether. [HomebrewNLP integrated the coupling functions into f() and g()](https://github.com/HomebrewNLP/HomebrewNLP/blob/efda4b1dbc320c620ed024208f0745b82fb30ebf/src/model.py#L209-L232)\nwhich means that there is no loss of information, no matter the depth or beta of the model. The same integrated\nMomentumNet is available via the [utils module](#utils).\n\n#### Models\n\n##### iRevNet\n\n[iRevNet](https://openreview.net/forum?id=HJsjkMb0Z) is not only partially reversible but instead a fully-invertible\nmodel. The [source code](https://github.com/jhjacobsen/pytorch-i-revnet) looks complex at first glance. It also doesn't\nuse the memory savings it could utilize, as RevNet requires custom AutoGrad functions that are hard to maintain. An\niRevNet can be implemented like this using revlib:\n\n```PYTHON\nimport torch\nfrom torch import nn\nimport revlib\n\nchannels = 64\nchannel_multiplier = 4\ndepth = 3\nclasses = 1000\n\n\n# Create a basic function that's reversibly executed multiple times. (Like f() in ResNet)\ndef conv(in_channels, out_channels):\n    return nn.Conv2d(in_channels, out_channels, (3, 3), padding=1)\n\n\ndef block_conv(in_channels, out_channels):\n    return nn.Sequential(conv(in_channels, out_channels),\n                         nn.Dropout(0.2),\n                         nn.BatchNorm2d(out_channels),\n                         nn.ReLU())\n\n\ndef block():\n    return nn.Sequential(block_conv(channels, channels * channel_multiplier),\n                         block_conv(channels * channel_multiplier, channels),\n                         nn.Conv2d(channels, channels, (3, 3), padding=1))\n\n\n# Create a reversible model. f() is invoked depth-times with different weights.\nrev_model = revlib.ReversibleSequential(*[block() for _ in range(depth)])\n\n# Wrap reversible model with non-reversible layers\nmodel = nn.Sequential(conv(3, 2 * channels), rev_model, conv(2 * channels, classes))\n\n# Use it like you would a regular PyTorch model\ninp = torch.randn((1, 3, 224, 224))\nout = model(inp)\nout.mean().backward()\nassert out.size() == (1, 1000, 224, 224)\n```\n\n##### Reformer\n\n[Reformer](https://arxiv.org/abs/2001.04451) uses RevNet with chunking and LSH-attention to efficiently train a\ntransformer. Using revlib, standard implementations, such\nas [lucidrains' Reformer](https://github.com/lucidrains/reformer-pytorch/), can be improved upon to use less memory.\nBelow we're still using the basic building blocks from lucidrains' code to have a comparable model.\n\n```PYTHON\nimport torch\nfrom torch import nn\nfrom reformer_pytorch.reformer_pytorch import LSHSelfAttention, Chunk, FeedForward, AbsolutePositionalEmbedding\nimport revlib\n\n\nclass Reformer(torch.nn.Module):\n    def __init__(self, sequence_length: int, features: int, depth: int, heads: int, bucket_size: int = 64,\n                 lsh_hash_count: int = 8, ff_chunks: int = 16, input_classes: int = 256, output_classes: int = 256):\n        super(Reformer, self).__init__()\n        self.token_embd = nn.Embedding(input_classes, features * 2)\n        self.pos_embd = AbsolutePositionalEmbedding(features * 2, sequence_length)\n\n        self.core = revlib.ReversibleSequential(*[nn.Sequential(nn.LayerNorm(features), layer) for _ in range(depth)\n                                                  for layer in\n                                                  [LSHSelfAttention(features, heads, bucket_size, lsh_hash_count),\n                                                   Chunk(ff_chunks, FeedForward(features, activation=nn.GELU),\n                                                         along_dim=-2)]],\n                                                split_dim=-1)\n        self.out_norm = nn.LayerNorm(features * 2)\n        self.out_linear = nn.Linear(features * 2, output_classes)\n\n    def forward(self, inp: torch.Tensor) -> torch.Tensor:\n        return self.out_linear(self.out_norm(self.core(self.token_embd(inp) + self.pos_embd(inp))))\n\n\nsequence = 1024\nclasses = 16\nmodel = Reformer(sequence, 256, 6, 8, output_classes=classes)\nout = model(torch.ones((16, sequence), dtype=torch.long))\nassert out.size() == (16, sequence, classes)\n```\n\n#### Merged Optimizer\n\nAnother optimization RevLib allows is to merge the optimizer step and backward.\\\nInstead of first computing a backward pass and then applying the gradients in a separate stage, RevLib can apply the\ngradients immediately while calculating the backward pass. This change allows you to get speedups by taking advantage of\nasynchronous computation and means that you don't have to instantiate all gradients simultaneously. So, instead of\nstoring all gradients simultaneously, you only keep the gradients of one layer while still arriving at the same results.\nBelow is a small example demonstrating just how much memory this can save:\n\n```PYTHON\nimport random\nimport typing\n\nimport numpy as np\nimport torch\n\nimport revlib\n\n\ndef optim(params: typing.Iterable[torch.Tensor]):\n    return torch.optim.SGD(params, lr=1e-3)\n\n\nSIZE = 2048\nDEPTH = 64\nBATCH_SIZE = 1\nSTEPS = 4\n\n\ndef block():\n    return torch.nn.Sequential(torch.nn.Linear(SIZE, SIZE),\n                               torch.nn.ReLU(),\n                               torch.nn.Linear(SIZE, SIZE))\n\n\ndef run(fused: bool):\n    torch.manual_seed(42069)\n    random.seed(42069)\n    np.random.seed(42069)\n    model = revlib.ReversibleSequential(*[block() for _ in range(DEPTH)], fused_optimizer=optim if fused else None)\n    model.cuda()\n\n    optimizer = None if fused else optim(model.parameters())\n    mean_loss = 0\n    max_mem = 0\n    for i in range(STEPS):\n        max_mem = max(torch.cuda.memory_allocated(), max_mem)\n        inp = torch.randn((BATCH_SIZE, SIZE * 2), requires_grad=True, device='cuda')\n        max_mem = max(torch.cuda.memory_allocated(), max_mem)\n        loss = (model(inp) - inp).abs().mean()\n        max_mem = max(torch.cuda.memory_allocated(), max_mem)\n        loss.backward()\n        max_mem = max(torch.cuda.memory_allocated(), max_mem)\n        if not fused:\n            optimizer.step()\n            max_mem = max(torch.cuda.memory_allocated(), max_mem)\n            model.zero_grad(set_to_none=True)\n        max_mem = max(torch.cuda.memory_allocated(), max_mem)\n        with torch.no_grad():\n            mean_loss += loss.item()\n    print(f\"Loss: {mean_loss / STEPS:12.10f} - Memory: {max_mem * 2 ** -20:7.2f} MiB\")\n\n\nrun(True)  # Fused Optimizer. Results:       Loss: 1.7444351912 - Memory: 2049.05 MiB\nrun(False)  # Default Optimizer. Results:    Loss: 1.7444351912 - Memory: 4098.03 MiB\n```\n\nAs you can see, while the loss is still the exact same, the model uses half the memory at its peak. The freed-up memory\nwould allow you to create 504 million more parameters. Considering that the model only has 512 million parameters, this\nwould mean you could use ~100% more parameters!\\\nOf course, the absolute freed memory would stay the same if the optimizer had buffers, such as SGD with momentum.\nBecause of that, the relative memory advantage would decrease. That's why a memory-efficient optimizer\nlike [SM3](https://arxiv.org/abs/1901.11150) or\n[8-bit Adam](https://github.com/facebookresearch/bitsandbytes/#using-the-8-bit-optimizers) is perfect here.\n\n#### Utils\n\n##### HuggingFace Integration\n\nRevLib also has its own `utils` module which provides helpful functions as `residual_to_momentum_net`. Using RevLib, you\ncan trivially convert any HuggingFace transformer into a MomentumNet without significant loss of performance. Especially\nduring fine-tuning, this can be a life-saver, as it allows for significantly bigger models to fit into memory without\nthe need to manually (or [automatically](https://arxiv.org/abs/2006.09616)) create countless buffers for activation\ncheckpointing.\\\nWith the addition of `MomentumNet`, there is one more hyperparameter to tune. Small values of `beta` allow the model to\ncontinue functioning as normal:\n\n```PYTHON\nfrom transformers import AutoModelForCausalLM, GPT2TokenizerFast\nfrom revlib.utils import module_list_to_momentum_net\n\ntokenizer = GPT2TokenizerFast.from_pretrained('gpt2')\ntokens = tokenizer([\"The shadowy hacker group Eleuther\"], return_tensors='pt')['input_ids']\nmodel = AutoModelForCausalLM.from_pretrained(\"EleutherAI/gpt-neo-2.7B\")\noriginal_layers = model.transformer.h\nprint(tokenizer.decode(model.generate(input_ids=tokens)[0]))\n# The shadowy hacker group Eleutheria has been busy for the past few months. The group has been\n\nmodel.transformer.h = module_list_to_momentum_net(original_layers, residual=True, beta=0.1)\nprint(tokenizer.decode(model.generate(input_ids=tokens)[0]))\n# The shadowy hacker group Eleutheria has been busy for the past few months. The group has been\n```\n\nOn the other hand, large values improve numerical stability of deep networks at the cost of slightly altering the\ninformation flow.\n\n```PYTHON\nmodel.transformer.h = module_list_to_momentum_net(original_layers, residual=True, beta=0.5)\nprint(tokenizer.decode(model.generate(input_ids=tokens)[0]))\n# The shadowy hacker group Eleutherian psi- psi- psi- psi psi psi psi psi psi psi\n```\n\nEither way, both can be used to train the models just the same as you're used to! While the gradients might differ\nbetween models, there is no performance degradation after fine-tuning.\n\n```PYTHON\nmodel(tokens)[0].mean().backward()\nprint(next(iter(model.parameters())).grad.mean().item())\n# -7.596428730494154e-08\n```\n\nAs expected, the memory consumption for the modified model is significantly lower during training than that of a\nnon-checkpointed model:\n\n```PYTHON\nimport time\nimport torch\nfrom transformers import AutoModelForCausalLM\nfrom memory_profiler import memory_usage\n\nmodel = AutoModelForCausalLM.from_pretrained(\"EleutherAI/gpt-neo-2.7B\")\ntokens = torch.zeros((4, 2048), dtype=torch.long)\nstart_time = time.time()\nmemory = max(memory_usage((lambda: model(tokens)[0].mean().backward(),)))\nprint(time.time() - start_time)\n# 206.94576001167297\nprint(memory - max(memory_usage((lambda: None,))))\n# 150272.09765625\n```\n\n```PYTHON\nimport time\nimport torch\nfrom transformers import AutoModelForCausalLM\nfrom revlib.utils import module_list_to_momentum_net\nfrom memory_profiler import memory_usage\n\nmodel = AutoModelForCausalLM.from_pretrained(\"EleutherAI/gpt-neo-2.7B\")\nmodel.transformer.h = module_list_to_momentum_net(model.transformer.h, residual=True, beta=0.5)  # The only difference\ntokens = torch.zeros((4, 2048), dtype=torch.long)\nstart_time = time.time()\nmemory = max(memory_usage((lambda: model(tokens)[0].mean().backward(),)))\nprint(time.time() - start_time)\n# 275.42114186286926\nprint(memory - max(memory_usage((lambda: None,))))\n# 6187.0703125\n```\n\n##### Cast Intermediates\n\nAnother nice feature RevLib has, is that it can automatically offload intermediate values or cast them to another\ndatatype. Casting the intermediate tensors used during the backward pass from float32 to half-precision (float16) would\nhalve the memory required for intermediate values.\\\nTo integrate it into your existing code, you only have to wrap your step with the `memory_efficient_intermediates`\ncontext manager. Wrapping multiple steps or even the entire training loop would cause memory leaks. Below you can see a\nsmall example of how the optimisation could use it in practice:\n\n```PYTHON\nimport torch\n\nfrom revlib.utils import memory_efficient_intermediates\n\nITEMS = 2 ** 24\nITERATIONS = 32\n\n\ndef run():\n    # Model code here\n    torch.manual_seed(0)\n    out = a = torch.randn((ITEMS,), device='cuda', dtype=torch.float32, requires_grad=True)\n    for i in range(ITERATIONS):\n        out = out * torch.randn_like(out)\n    print(f'Output: {out.mean().item():} - Memory: {torch.cuda.memory_allocated() * 1e-6:.2f}MB', end='')\n    out.mean().backward()\n    print(f' - Grad: {a.grad.mean().item()}')\n\n\nrun()  # Output: -0.0002206185890827328 - Memory: 2281.70MB - Grad: 0.00011316053132759407\n\nwith memory_efficient_intermediates(torch.half):\n    run()  # Output: -0.0002206185890827328 - Memory: 1207.96MB - Grad: 0.00011316053132759407\n```\n\nThe peak memory consumption is over 2GB when running the function normally, as PyTorch has to allocate many intermediate\nvalues and store them in float32. If you instead add a cast to the tensors kept for the backward pass, the memory\nconsumption gets halved while both output and gradient stay the same. Here, we only have to add\nthe `memory_efficient_intermediates` context wrapper, which handles casts automatically. Note that this only changes the\ntensors that are kept for the backward pass and alters the gradients slightly but doesn't influence the forward pass in\nany way. Nevertheless, doing it this way is critical to avoid casting down to float16 and back up again during the\nforward pass.\\\nSimilar to casts from float32 to float16, you could also cast float64 to float16, float64 to float32 or even mix these!\\\nFor example, when switching the computation datatype above from float32 to float64, the program will generate the\nfollowing printout:\n\n```\nOutput: 0.00019801305610731704 - Memory: 4563.40MB - Grad: -1.1288092155692513e-11\nOutput: 0.00019801305610731704 - Memory: 1342.18MB - Grad: -1.1293845258815898e-11\n```\n\nAs you can see, the model uses almost four times less memory, giving you the memory advantages of float16 without losing\nany of the precision of float64.\n\n##### Offload Intermediates\n\nGoing one step further with the concepts from above, we can even offload the intermediate values onto the CPU.\nIntermediate-Offloading is akin [Parameter-Offloading](#parameter-offload), as we've done above, but moves the adaptive\nmemory onto the CPU while the GPU is free to compute whatever it wants. In practice, moving all intermediates means that\nthe model has the same GPU-memory consumption as if it were to run with `torch.no_grad` or in `torch.inference_mode`\nwhile still allowing backpropagation without any loss of accuracy!\n\n```PYTHON\nimport torch\n\nfrom revlib.utils import memory_efficient_intermediates\n\nITEMS = 2 ** 24\nITERATIONS = 32\n\n\ndef run():\n    # Model code here\n    torch.manual_seed(0)\n    out = a = torch.randn((ITEMS,), device='cuda', dtype=torch.float32, requires_grad=True)\n    for i in range(ITERATIONS):\n        out = out * torch.randn_like(a)\n    print(f'Output: {a.mean().item():} - Memory: {torch.cuda.memory_allocated() * 1e-6:.2f}MB', end='')\n    out.mean().backward()\n    print(f' - Grad: {out.mean().item()}')\n\n\nrun()  # Output: 0.00011316053132759407 - Memory: 2281.70MB - Grad: 1.1337489974616588e-11\n\nwith memory_efficient_intermediates(storage_device='cpu'):  # <-- This is the only line that's modified\n    run()  # Output: 0.00011316053132759407 - Memory: 134.22MB - Grad: 1.1337489974616588e-11\n\nwith torch.no_grad():\n    run()  # Output: 0.00011316053132759407 - Memory: 134.22MB\n    # It will error here, but that doesn't matter as the memory gets measured before the backward pass.\n```\n\nAs you can see, the new memory consumption is the same as if the model were to run with `torch.no_grad`, with the minor\ndifference that it can still produce 100% accurate gradients. Of course, this free memory doesn't come from anywhere.\nIt's just that the tensors that have to be stored in the normal computation (but not with `torch.no_grad`)\nare now moved to the CPU.\\\nHowever, as there is no real prefetching, the model will be slower, as PyTorch has to query a buffer for every\nintermediate tensor used in the backward pass and get the tensors from there.\n\n## Explanation\n\nMost other RevNet libraries, such as [MemCNN](https://github.com/silvandeleemput/memcnn)\nand [Revtorch](https://github.com/RobinBruegger/RevTorch) calculate both f() and g() in one go, to create one large\ncomputation. RevLib, on the other hand, brings Mesh\nTensorFlow's [\"reversible half residual and swap\"](https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/layers.py#L2191)\nto PyTorch. `reversible_half_residual_and_swap` computes only one of f() and g() and swaps the inputs and gradients.\nThis way, the library only has to store one output as it can recover the other output during the backward pass.\\\nFollowing Mesh TensorFlow's example, revlib also uses separate x1 and x2 tensors instead of concatenating and splitting\nat every step to reduce the cost of memory-bound operations.\n\nRevNet's memory consumption doesn't scale with its depth, so it's significantly more memory-efficient for deep models.\nOne problem in most implementations was that two tensors needed to be stored in the output, quadrupling the required\nmemory. The high memory consumption rendered RevNet nearly useless for small networks, such as BERT, with its six\nlayers.\\\nRevLib works around this problem by storing only one output and two inputs for each forward pass, giving a model as\nsmall as BERT a >2x improvement!\n\nIgnoring the dual-path structure of a RevNet, it usually used to be much slower than gradient checkpointing. However,\nRevLib uses minimal coupling functions and has no overhead between Sequence items, allowing it to train as fast as a\ncomparable model with gradient checkpointing.\n\n## Citation\n\n```BIBTEX\n@software{nestler_lucas_2022_6837352,\n  author       = {Nestler, Lucas},\n  title        = {RevLib},\n  month        = jul,\n  year         = 2022,\n  publisher    = {Zenodo},\n  version      = {1.7.0},\n  doi          = {10.5281/zenodo.6837352},\n  url          = {https://doi.org/10.5281/zenodo.6837352}\n}```\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/clashluke/revlib",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "revlib",
+    "package_url": "https://pypi.org/project/revlib/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/revlib/",
+    "project_urls": {
+      "Homepage": "https://github.com/clashluke/revlib"
+    },
+    "release_url": "https://pypi.org/project/revlib/1.7.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "Simple and efficient RevNet-Library for PyTorch with XLA and DeepSpeed support and parameter offload",
+    "version": "1.7.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14675823,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21d67ddb17fdfc538ab794920215b722d4352bccb77210b09f013995367b9a16",
+          "md5": "272648e69786882ecdd7eb59b6510e31",
+          "sha256": "fb6fcf582421d129b76827f4435617ad3ab665e4af24cb67f8cde8d609924fc7"
+        },
+        "downloads": -1,
+        "filename": "revlib-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "272648e69786882ecdd7eb59b6510e31",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 3191,
+        "upload_time": "2021-08-17T17:36:26",
+        "upload_time_iso_8601": "2021-08-17T17:36:26.311664Z",
+        "url": "https://files.pythonhosted.org/packages/21/d6/7ddb17fdfc538ab794920215b722d4352bccb77210b09f013995367b9a16/revlib-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ee95fd21fea9e0d4f41925c6f00a209d38da8747e188e5d5788980ef394c99fa",
+          "md5": "7867629966c3c42a69fd3993b9c1a25a",
+          "sha256": "cd97e05335f33502cca11b8ab6365164d9d8276870757798380600d6b6548dfd"
+        },
+        "downloads": -1,
+        "filename": "revlib-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7867629966c3c42a69fd3993b9c1a25a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 2297,
+        "upload_time": "2021-08-17T17:36:28",
+        "upload_time_iso_8601": "2021-08-17T17:36:28.009667Z",
+        "url": "https://files.pythonhosted.org/packages/ee/95/fd21fea9e0d4f41925c6f00a209d38da8747e188e5d5788980ef394c99fa/revlib-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ee19eda36713041a5fbcc73200c0bc68e8b780c767480d5a5dc0263e65c680a",
+          "md5": "0e90562840aba2e8e171b2fc099120a9",
+          "sha256": "b86fa4ded722ac040ab3a69867612bbca3fac8d94569ebdd0ddf126ca2646baa"
+        },
+        "downloads": -1,
+        "filename": "revlib-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0e90562840aba2e8e171b2fc099120a9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 3179,
+        "upload_time": "2021-08-17T17:39:35",
+        "upload_time_iso_8601": "2021-08-17T17:39:35.682836Z",
+        "url": "https://files.pythonhosted.org/packages/6e/e1/9eda36713041a5fbcc73200c0bc68e8b780c767480d5a5dc0263e65c680a/revlib-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49ecd64c8b1b5b4388582c7a92248d99d3c4c02f619f0f3f37b705135cacf2a2",
+          "md5": "1426742eca861d6d5bd3dc2cf5b7cec8",
+          "sha256": "9c19c2de5f626f134205abae42b5109488065ceacc6d58d6a56c8202b1ae1473"
+        },
+        "downloads": -1,
+        "filename": "revlib-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1426742eca861d6d5bd3dc2cf5b7cec8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 2288,
+        "upload_time": "2021-08-17T17:39:36",
+        "upload_time_iso_8601": "2021-08-17T17:39:36.989806Z",
+        "url": "https://files.pythonhosted.org/packages/49/ec/d64c8b1b5b4388582c7a92248d99d3c4c02f619f0f3f37b705135cacf2a2/revlib-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3cab1ba092290506fde1cf3af41a037a06170bc6ef5571c3b3818d8aae30272d",
+          "md5": "37ac7dd6ba926c69165f1cdba8826b07",
+          "sha256": "b8066da9a89ccf134906f46f01cb73ea7c57b63468a7872dd54ee127b0994946"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "37ac7dd6ba926c69165f1cdba8826b07",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6028,
+        "upload_time": "2021-08-17T21:04:47",
+        "upload_time_iso_8601": "2021-08-17T21:04:47.454099Z",
+        "url": "https://files.pythonhosted.org/packages/3c/ab/1ba092290506fde1cf3af41a037a06170bc6ef5571c3b3818d8aae30272d/revlib-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4e24e4e7a5fa2fb6170933d1b70f3433755a0c826ebd8703b8e9704f7e4c217d",
+          "md5": "98cd8ea3f576a501f77b60e1986e8d57",
+          "sha256": "7632c3fba7cd4afdfcb477add7fc6cf1213e458d35e1ee70e819586d0f67a35f"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "98cd8ea3f576a501f77b60e1986e8d57",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 5946,
+        "upload_time": "2021-08-17T21:04:49",
+        "upload_time_iso_8601": "2021-08-17T21:04:49.119265Z",
+        "url": "https://files.pythonhosted.org/packages/4e/24/e4e7a5fa2fb6170933d1b70f3433755a0c826ebd8703b8e9704f7e4c217d/revlib-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a676635fb2d3b493148d7c2f282bb8e06f9da7d3ca389efd278e46b9085cc375",
+          "md5": "f0201017a1a939b420fce28256ff5472",
+          "sha256": "8c706730eb686b0947c7609208ef0cd650cee69424aadc2aed2e94c4dc74f7a5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f0201017a1a939b420fce28256ff5472",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6063,
+        "upload_time": "2021-08-17T21:15:16",
+        "upload_time_iso_8601": "2021-08-17T21:15:16.506782Z",
+        "url": "https://files.pythonhosted.org/packages/a6/76/635fb2d3b493148d7c2f282bb8e06f9da7d3ca389efd278e46b9085cc375/revlib-1.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8205d7aa3fca49256bce635299c0b2b2f752e94925e2c1a050b6868ee20bdf7b",
+          "md5": "78098f61e09708c05e229b5f2862996c",
+          "sha256": "f40e94b12d793f9373a43dfbc70f5eb7ab7ba56a9c8dd2feb2eb8db96afdc894"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "78098f61e09708c05e229b5f2862996c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 5981,
+        "upload_time": "2021-08-17T21:15:18",
+        "upload_time_iso_8601": "2021-08-17T21:15:18.265648Z",
+        "url": "https://files.pythonhosted.org/packages/82/05/d7aa3fca49256bce635299c0b2b2f752e94925e2c1a050b6868ee20bdf7b/revlib-1.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.10": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a147cab778e12cbfb5d1bf62bf5dd9f8e904a7166556226cf8d114c7602dc87",
+          "md5": "ccc22457068132cef29ce31fd4938068",
+          "sha256": "b3809b5ffd8a0dac3748f80a20ca7f258e10c44ecb9c4b0c7ca406cd9747ed28"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.10-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ccc22457068132cef29ce31fd4938068",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6123,
+        "upload_time": "2021-08-29T05:27:17",
+        "upload_time_iso_8601": "2021-08-29T05:27:17.303801Z",
+        "url": "https://files.pythonhosted.org/packages/9a/14/7cab778e12cbfb5d1bf62bf5dd9f8e904a7166556226cf8d114c7602dc87/revlib-1.0.10-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c0a133df797fc85c4127666a08eaa78fd3f0ee5ea68f4ac4f40eb2d52293a96",
+          "md5": "db0fb91bf9cef367d8f7dada1399a801",
+          "sha256": "c594e47f15a8e6e6087579d3b5ed6c26f6155849d22d7ecfde06c473b8e62663"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.10.tar.gz",
+        "has_sig": false,
+        "md5_digest": "db0fb91bf9cef367d8f7dada1399a801",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6012,
+        "upload_time": "2021-08-29T05:27:18",
+        "upload_time_iso_8601": "2021-08-29T05:27:18.562503Z",
+        "url": "https://files.pythonhosted.org/packages/6c/0a/133df797fc85c4127666a08eaa78fd3f0ee5ea68f4ac4f40eb2d52293a96/revlib-1.0.10.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a5ad39c8fc718e37cf68ff33aaafbb1a400811abfdc14ccf74bd73e118f0bac5",
+          "md5": "b3696f66ff0cf8dcf179b6c2f7032f66",
+          "sha256": "ab8423c17f75b33c14ead3c71803a8cc0bda32861efbe087e38b57ce955f46b0"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b3696f66ff0cf8dcf179b6c2f7032f66",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6057,
+        "upload_time": "2021-08-17T21:16:22",
+        "upload_time_iso_8601": "2021-08-17T21:16:22.234164Z",
+        "url": "https://files.pythonhosted.org/packages/a5/ad/39c8fc718e37cf68ff33aaafbb1a400811abfdc14ccf74bd73e118f0bac5/revlib-1.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "614727c7ef5956432f346349562d452c1088bb4001206bdddc47c784ac5cd8ff",
+          "md5": "c2cac7a98446a0e37b8e20e7c8781f5a",
+          "sha256": "8e6d2b969743da29877dba296c4085a7f25be9339ea2fda7bfbb170682e3f880"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c2cac7a98446a0e37b8e20e7c8781f5a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 5968,
+        "upload_time": "2021-08-17T21:16:24",
+        "upload_time_iso_8601": "2021-08-17T21:16:24.046518Z",
+        "url": "https://files.pythonhosted.org/packages/61/47/27c7ef5956432f346349562d452c1088bb4001206bdddc47c784ac5cd8ff/revlib-1.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6fcb8b09e14a8078616b177f7238b34e2fe426ce6e92bfd7b8d7fd8a32d2446a",
+          "md5": "126dc8c161d9da2b9f2e9fb38ae2a884",
+          "sha256": "c4f74bb6402a447c64753707114ca16bbbd561f89e630cf14e7f780784ad4c7c"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "126dc8c161d9da2b9f2e9fb38ae2a884",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6062,
+        "upload_time": "2021-08-17T21:38:50",
+        "upload_time_iso_8601": "2021-08-17T21:38:50.936549Z",
+        "url": "https://files.pythonhosted.org/packages/6f/cb/8b09e14a8078616b177f7238b34e2fe426ce6e92bfd7b8d7fd8a32d2446a/revlib-1.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "59c878da49f16236b887fb948525a72355705991f38da6a6dcf85626bae597f3",
+          "md5": "dda5d8572c00a99d2e716e7da0eb37ee",
+          "sha256": "7b8122d8c9e8216a2a1ac03b5ff3b0ad23e64bc5f0cddc40d3d3d3a2b28a6724"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "dda5d8572c00a99d2e716e7da0eb37ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 5971,
+        "upload_time": "2021-08-17T21:38:52",
+        "upload_time_iso_8601": "2021-08-17T21:38:52.706085Z",
+        "url": "https://files.pythonhosted.org/packages/59/c8/78da49f16236b887fb948525a72355705991f38da6a6dcf85626bae597f3/revlib-1.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1843a3a77a923159774c575ee343428773018fb1031c439d0cbcad9a3c660c4b",
+          "md5": "a5a34640242c7e4f3d0b6d185653a017",
+          "sha256": "5a7c9344fd0ca9ef69d412d08dbc0f9e304db8e9828cdd6f14568af03eaff04c"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a5a34640242c7e4f3d0b6d185653a017",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6170,
+        "upload_time": "2021-08-18T13:42:59",
+        "upload_time_iso_8601": "2021-08-18T13:42:59.793646Z",
+        "url": "https://files.pythonhosted.org/packages/18/43/a3a77a923159774c575ee343428773018fb1031c439d0cbcad9a3c660c4b/revlib-1.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e1c6c815fe28a085a8fc177ffbd3f6e46044e1c3c61c56343719b637d0cb4f0a",
+          "md5": "67c995cacc2574ebd8186945eca28d15",
+          "sha256": "cad068164b975e9b13ce0413743859bc34106268608636b57b6c2588f3a69d16"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "67c995cacc2574ebd8186945eca28d15",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6073,
+        "upload_time": "2021-08-18T13:43:01",
+        "upload_time_iso_8601": "2021-08-18T13:43:01.665920Z",
+        "url": "https://files.pythonhosted.org/packages/e1/c6/c815fe28a085a8fc177ffbd3f6e46044e1c3c61c56343719b637d0cb4f0a/revlib-1.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d0e9557db2da7e1367dbc2764c2e8f03e63d9c1f3ab8662f7aa290152a74e1a9",
+          "md5": "8771754dbb64f6866fbb8f5be68c94bb",
+          "sha256": "9ecc9b0624b64642ec0392752f5546486e37d7506c76e3f0732452301ac25db7"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8771754dbb64f6866fbb8f5be68c94bb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6180,
+        "upload_time": "2021-08-22T16:56:00",
+        "upload_time_iso_8601": "2021-08-22T16:56:00.339258Z",
+        "url": "https://files.pythonhosted.org/packages/d0/e9/557db2da7e1367dbc2764c2e8f03e63d9c1f3ab8662f7aa290152a74e1a9/revlib-1.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d370b101f64129d52ae6d7055453d742e4889089b1feec289d45539d02d51cf",
+          "md5": "11513472c0eca18aea828da238c97535",
+          "sha256": "72d99bc10235bdcd27dadde6a2e520156bbde3c7bdc8e010b35ba4f41c4482f8"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "11513472c0eca18aea828da238c97535",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6079,
+        "upload_time": "2021-08-22T16:56:02",
+        "upload_time_iso_8601": "2021-08-22T16:56:02.223516Z",
+        "url": "https://files.pythonhosted.org/packages/1d/37/0b101f64129d52ae6d7055453d742e4889089b1feec289d45539d02d51cf/revlib-1.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ece630e17e1713d3bceb9efc4ec5dff4698901a6695beb20088a5b77b2722cb",
+          "md5": "31755b6a6bf55326b377a9c456022df2",
+          "sha256": "b1fbeb3b419090e11063be9c622b6fa005fd875406186dade830ac3e3632725f"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "31755b6a6bf55326b377a9c456022df2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6109,
+        "upload_time": "2021-08-22T18:08:03",
+        "upload_time_iso_8601": "2021-08-22T18:08:03.349597Z",
+        "url": "https://files.pythonhosted.org/packages/9e/ce/630e17e1713d3bceb9efc4ec5dff4698901a6695beb20088a5b77b2722cb/revlib-1.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bcc4d783d9c8298d386a2967d03ee2fe1699c7d0ed928f36f3fbcc98ab9d2ed1",
+          "md5": "723bcc1e20f5735413caa386cb40fc61",
+          "sha256": "16b2d02f1e9581de7e514faee9b197949949b5e38711b15cb9b5f156e7780572"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "723bcc1e20f5735413caa386cb40fc61",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6012,
+        "upload_time": "2021-08-22T18:08:04",
+        "upload_time_iso_8601": "2021-08-22T18:08:04.806222Z",
+        "url": "https://files.pythonhosted.org/packages/bc/c4/d783d9c8298d386a2967d03ee2fe1699c7d0ed928f36f3fbcc98ab9d2ed1/revlib-1.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de15f3ac0adcdecaac25c16df7f4accd9017bcf0b375a5374dd635bc2fce0afc",
+          "md5": "70bae6621988669e9f58a360c5344f17",
+          "sha256": "10505677217685a4146dfdca522fffc9bd82017cecea5cc68b51b437181f32c5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "70bae6621988669e9f58a360c5344f17",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6110,
+        "upload_time": "2021-08-29T05:08:02",
+        "upload_time_iso_8601": "2021-08-29T05:08:02.584045Z",
+        "url": "https://files.pythonhosted.org/packages/de/15/f3ac0adcdecaac25c16df7f4accd9017bcf0b375a5374dd635bc2fce0afc/revlib-1.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d284f00e6422610e3cc9429ec1aee775006d129e6c8a62b7efaa30094b512047",
+          "md5": "5eff2f6ab7b8afe52ece0e79cf819a39",
+          "sha256": "106ae32e36a006c0e4fad6bb034499feafe0ec4ab9b510f6ef2c27584719fd23"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5eff2f6ab7b8afe52ece0e79cf819a39",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6027,
+        "upload_time": "2021-08-29T05:08:04",
+        "upload_time_iso_8601": "2021-08-29T05:08:04.335131Z",
+        "url": "https://files.pythonhosted.org/packages/d2/84/f00e6422610e3cc9429ec1aee775006d129e6c8a62b7efaa30094b512047/revlib-1.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c0f4f0f2419db60abfb6c510a1fd43b82311d1dc318644b47ae3ba190be69c57",
+          "md5": "fd27fcca703033badf12d93ab1256ea5",
+          "sha256": "db96be4f32ea84ec6bcb8a0ddf8dd8ce1954f74db523573152b1ee8d6749fa02"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd27fcca703033badf12d93ab1256ea5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6111,
+        "upload_time": "2021-08-29T05:09:24",
+        "upload_time_iso_8601": "2021-08-29T05:09:24.888976Z",
+        "url": "https://files.pythonhosted.org/packages/c0/f4/f0f2419db60abfb6c510a1fd43b82311d1dc318644b47ae3ba190be69c57/revlib-1.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba5d43302984fb971dd98881325aa122d2d43b36b7c14e1879274ff6d3c5dae2",
+          "md5": "ed0ce94dd7e549312041d588c0db89cd",
+          "sha256": "9907f2c5c7c554189e4ad054017376ac0584b5810285a7644349166ab8689f47"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "ed0ce94dd7e549312041d588c0db89cd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6014,
+        "upload_time": "2021-08-29T05:09:26",
+        "upload_time_iso_8601": "2021-08-29T05:09:26.314167Z",
+        "url": "https://files.pythonhosted.org/packages/ba/5d/43302984fb971dd98881325aa122d2d43b36b7c14e1879274ff6d3c5dae2/revlib-1.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32903d8ca425810277b8c5bbb4901b53138b7667a521ec553e1062a70160b5f5",
+          "md5": "1348a00ff04b9bac920dec58b7d8cd9b",
+          "sha256": "630a9d83921629a21bd61e359351729dfa081e854d0b40c2a9c9641b7ed1acc8"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1348a00ff04b9bac920dec58b7d8cd9b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 6106,
+        "upload_time": "2021-08-29T05:12:33",
+        "upload_time_iso_8601": "2021-08-29T05:12:33.723554Z",
+        "url": "https://files.pythonhosted.org/packages/32/90/3d8ca425810277b8c5bbb4901b53138b7667a521ec553e1062a70160b5f5/revlib-1.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e5ca77658c5adb405db63de139a97fd7aa0a4f223349d27213df0ac5dc93ea7",
+          "md5": "b53e6f7bc12c4376d8cf1d5489e090a6",
+          "sha256": "ecfd29710d157a0a12cf0a6615ed72c4af06ff95843d0b5d45e4488d19532f56"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b53e6f7bc12c4376d8cf1d5489e090a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 6012,
+        "upload_time": "2021-08-29T05:12:35",
+        "upload_time_iso_8601": "2021-08-29T05:12:35.481393Z",
+        "url": "https://files.pythonhosted.org/packages/3e/5c/a77658c5adb405db63de139a97fd7aa0a4f223349d27213df0ac5dc93ea7/revlib-1.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30020f7da810379526b99bc5ca97a0fc868354786264ad0cf593cbd8fbfc424b",
+          "md5": "07910e807a922683bce0a1188b1bd4d9",
+          "sha256": "adbd9fa41817be03c1961ed308b88e49e686bc99081fa75d5a4ff085747c0752"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "07910e807a922683bce0a1188b1bd4d9",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 8290,
+        "upload_time": "2021-09-16T23:07:05",
+        "upload_time_iso_8601": "2021-09-16T23:07:05.743973Z",
+        "url": "https://files.pythonhosted.org/packages/30/02/0f7da810379526b99bc5ca97a0fc868354786264ad0cf593cbd8fbfc424b/revlib-1.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da247c80de9108cbebcc1b3179c07952a13cafb243c4284bfbdfe5c99d16f99a",
+          "md5": "35b4000e14fec2a23af845b789171edc",
+          "sha256": "732893dedc199d0535a9b4527a74772b5810a510eed9aae8a60eb281f3edbc40"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "35b4000e14fec2a23af845b789171edc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 8636,
+        "upload_time": "2021-09-16T23:07:07",
+        "upload_time_iso_8601": "2021-09-16T23:07:07.318431Z",
+        "url": "https://files.pythonhosted.org/packages/da/24/7c80de9108cbebcc1b3179c07952a13cafb243c4284bfbdfe5c99d16f99a/revlib-1.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "516c7d8c5586e434ed0ed75717d9c5bdc8c55c7a3ae0daf5ac92d89d4df4f7e1",
+          "md5": "ffa8006642761bc44c44e498a2f8d928",
+          "sha256": "7168a5697b17d9e5838fbfc2f936f56dc4c606daf0d78a0889f75eb1f7ed7f4e"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ffa8006642761bc44c44e498a2f8d928",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 9231,
+        "upload_time": "2021-10-27T17:19:01",
+        "upload_time_iso_8601": "2021-10-27T17:19:01.658555Z",
+        "url": "https://files.pythonhosted.org/packages/51/6c/7d8c5586e434ed0ed75717d9c5bdc8c55c7a3ae0daf5ac92d89d4df4f7e1/revlib-1.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "417b8896772914fbe5caa1c8c41c9a0b898bfcb8c88c3377c45ef8c356d1217f",
+          "md5": "2a08e7b19b7acdd6238c942853f8cee1",
+          "sha256": "24216aba4dc50eafdb9c30dba0dbe9131f3663ffc585825b0396805969c5e508"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2a08e7b19b7acdd6238c942853f8cee1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 9526,
+        "upload_time": "2021-10-27T17:19:03",
+        "upload_time_iso_8601": "2021-10-27T17:19:03.936423Z",
+        "url": "https://files.pythonhosted.org/packages/41/7b/8896772914fbe5caa1c8c41c9a0b898bfcb8c88c3377c45ef8c356d1217f/revlib-1.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba86b22db82d502b00e40a011aca94f6a2d2c9e237f4a5d53306c2302ed7d8b0",
+          "md5": "b1e51c85983c8b753fa8ec086ec40ed7",
+          "sha256": "7b1aeff59e4946156251a2a878f150b158229788005e4f5437f9521cb1154d41"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b1e51c85983c8b753fa8ec086ec40ed7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12243,
+        "upload_time": "2021-12-29T22:11:18",
+        "upload_time_iso_8601": "2021-12-29T22:11:18.852892Z",
+        "url": "https://files.pythonhosted.org/packages/ba/86/b22db82d502b00e40a011aca94f6a2d2c9e237f4a5d53306c2302ed7d8b0/revlib-1.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc0320495341e0210d7f575630b6102b63c3e8f5054ef5b03f1f5d30030b33df",
+          "md5": "d30392ac53aff65b9ddea91142d609c3",
+          "sha256": "43855ed2980f2045805bd5d78cd8435a21ac0488963bd96299991a61e2a8c335"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d30392ac53aff65b9ddea91142d609c3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 17025,
+        "upload_time": "2021-12-29T22:11:20",
+        "upload_time_iso_8601": "2021-12-29T22:11:20.854657Z",
+        "url": "https://files.pythonhosted.org/packages/cc/03/20495341e0210d7f575630b6102b63c3e8f5054ef5b03f1f5d30030b33df/revlib-1.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5b60ead2125d5db2aa1dc7b08eca8737f2048d38a47b8d7af52594949600a1d2",
+          "md5": "0ab0038df8afab9d792343b6ebc62d99",
+          "sha256": "c29803bbe816369d82c7ba736c905b2de243f96c714701f7b42b237ee5c6815f"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0ab0038df8afab9d792343b6ebc62d99",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12809,
+        "upload_time": "2021-12-30T18:33:13",
+        "upload_time_iso_8601": "2021-12-30T18:33:13.381020Z",
+        "url": "https://files.pythonhosted.org/packages/5b/60/ead2125d5db2aa1dc7b08eca8737f2048d38a47b8d7af52594949600a1d2/revlib-1.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c5230222cd9293912b711debd7bfbd25154fd4b461ca27985f6d6dfa8c21327",
+          "md5": "41b18a640635361add924de8253600c8",
+          "sha256": "2cfcf881546e0455c0a0cebef9d83a98c397c1d045d6790ae1c9ab75014ee575"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "41b18a640635361add924de8253600c8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 18073,
+        "upload_time": "2021-12-30T18:33:15",
+        "upload_time_iso_8601": "2021-12-30T18:33:15.125620Z",
+        "url": "https://files.pythonhosted.org/packages/0c/52/30222cd9293912b711debd7bfbd25154fd4b461ca27985f6d6dfa8c21327/revlib-1.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1d7b840a1d147a62c0d05a9204adb54ad61f54979a83129a4b5aa4b2e24ef8fd",
+          "md5": "b5f357dca202876139ef5e32c715cf6e",
+          "sha256": "016b8777a201e23e09e73b1504f5c056eab8a71c5cf74016bdd7854b01f61a1c"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b5f357dca202876139ef5e32c715cf6e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12748,
+        "upload_time": "2022-01-01T03:36:26",
+        "upload_time_iso_8601": "2022-01-01T03:36:26.010566Z",
+        "url": "https://files.pythonhosted.org/packages/1d/7b/840a1d147a62c0d05a9204adb54ad61f54979a83129a4b5aa4b2e24ef8fd/revlib-1.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d6014ca2dfc8e72312fcca6b64e610ed2234e1309235f7de6644542ff2935582",
+          "md5": "0348fee0262a25a7c52fedb8b6ae36c4",
+          "sha256": "1ab56fcb3785120547639ba128f3f656fbd6b29b1be2d93acc33b8be08d141f5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0348fee0262a25a7c52fedb8b6ae36c4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 17595,
+        "upload_time": "2022-01-01T03:36:28",
+        "upload_time_iso_8601": "2022-01-01T03:36:28.107698Z",
+        "url": "https://files.pythonhosted.org/packages/d6/01/4ca2dfc8e72312fcca6b64e610ed2234e1309235f7de6644542ff2935582/revlib-1.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.3.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7ee4d6d0b5a24c789a79f8cd8e0c8e8bf93c4d33f6ac932aeab515b7b88a26d1",
+          "md5": "2fbf86c96eb0c2cc2ee8989d0e7e42ee",
+          "sha256": "b6ce3886af13d7a0b372edb3a3b3a80442514fc50cd249705701003ca08927c4"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2fbf86c96eb0c2cc2ee8989d0e7e42ee",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 12974,
+        "upload_time": "2022-01-03T19:42:21",
+        "upload_time_iso_8601": "2022-01-03T19:42:21.959823Z",
+        "url": "https://files.pythonhosted.org/packages/7e/e4/d6d0b5a24c789a79f8cd8e0c8e8bf93c4d33f6ac932aeab515b7b88a26d1/revlib-1.3.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32ee2eb94adcddc8a71e42e7d5919092f5e7bcd4107ffe9eab01518c02b1264e",
+          "md5": "c1f6afa2bddad1e1e6c57a5af1d1a413",
+          "sha256": "88e8c1effa3dc47d56059505a3903a5be4e44126d69618516733839c5d6b0cb5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.3.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c1f6afa2bddad1e1e6c57a5af1d1a413",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 21564,
+        "upload_time": "2022-01-03T19:42:24",
+        "upload_time_iso_8601": "2022-01-03T19:42:24.507509Z",
+        "url": "https://files.pythonhosted.org/packages/32/ee/2eb94adcddc8a71e42e7d5919092f5e7bcd4107ffe9eab01518c02b1264e/revlib-1.3.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fa806819dcc9cb238efdf81e2e855be7b332fbbdbbb208867f8d0c473eee0bc7",
+          "md5": "2e785eaf4af1d6ca8b600e9c4676c172",
+          "sha256": "c72b626c7707961b1548b91f3fe2314e304a2dd79b3e0d1129c0147e245b2559"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e785eaf4af1d6ca8b600e9c4676c172",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13055,
+        "upload_time": "2022-01-03T19:43:16",
+        "upload_time_iso_8601": "2022-01-03T19:43:16.558396Z",
+        "url": "https://files.pythonhosted.org/packages/fa/80/6819dcc9cb238efdf81e2e855be7b332fbbdbbb208867f8d0c473eee0bc7/revlib-1.4.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98d931d7695c266723376e84252b12c634200f38ed815bb733cf87339a0db46e",
+          "md5": "d03677d77e064beaed2d2568c2318493",
+          "sha256": "8aec71ce405abf08627e9a9b75d8aa485fccfd894249dca716f7d6770bba5cf2"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d03677d77e064beaed2d2568c2318493",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 21658,
+        "upload_time": "2022-01-03T19:43:18",
+        "upload_time_iso_8601": "2022-01-03T19:43:18.696656Z",
+        "url": "https://files.pythonhosted.org/packages/98/d9/31d7695c266723376e84252b12c634200f38ed815bb733cf87339a0db46e/revlib-1.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e60fbb5be4990554b71fb046ac222277276e08a6d0fe778fe571f229aaf4133",
+          "md5": "e0a28c596543a598eeb9feca0446d213",
+          "sha256": "f463a0f6ea53042d6a6680fc00ec01142f60857fe5ddbd6299fc5693bbe4a4d5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0a28c596543a598eeb9feca0446d213",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13052,
+        "upload_time": "2022-01-04T16:11:39",
+        "upload_time_iso_8601": "2022-01-04T16:11:39.413561Z",
+        "url": "https://files.pythonhosted.org/packages/2e/60/fbb5be4990554b71fb046ac222277276e08a6d0fe778fe571f229aaf4133/revlib-1.4.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ad57bfe8066bfbf8705fe5b06103856efe700fad1b4a569fde861d5d0882e1bb",
+          "md5": "f92c66e17cb3f4c0adcae965c8e47be7",
+          "sha256": "2c98cd7da83c15df2b0a59005d4ebbc485dc83917592d90dc1be3d4ae4c42fc9"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f92c66e17cb3f4c0adcae965c8e47be7",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 21672,
+        "upload_time": "2022-01-04T16:11:41",
+        "upload_time_iso_8601": "2022-01-04T16:11:41.251498Z",
+        "url": "https://files.pythonhosted.org/packages/ad/57/bfe8066bfbf8705fe5b06103856efe700fad1b4a569fde861d5d0882e1bb/revlib-1.4.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1e9654bae2017a1073fda1bf0cabfbb3dbc5cf22c81b9738959a838004f7ddf6",
+          "md5": "80556d3bdb915e5358e11b335a38b2a1",
+          "sha256": "4fa68a4da3b5801f68853b7939c6d9a60fedd669b4090c476a63ba1bddd8aa92"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "80556d3bdb915e5358e11b335a38b2a1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13054,
+        "upload_time": "2022-01-04T21:25:00",
+        "upload_time_iso_8601": "2022-01-04T21:25:00.383222Z",
+        "url": "https://files.pythonhosted.org/packages/1e/96/54bae2017a1073fda1bf0cabfbb3dbc5cf22c81b9738959a838004f7ddf6/revlib-1.4.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0796e965d3eafc3b677f9eec3c885651002f49a6b042dd25d5fd2f658f7beb67",
+          "md5": "5cd79ee9b84961013c61ba875bfbfa2a",
+          "sha256": "e6c0f32de58faefa2cb4912aec6c4041c2a3df588b191348d858fe309e8c10f6"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5cd79ee9b84961013c61ba875bfbfa2a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 21676,
+        "upload_time": "2022-01-04T21:25:02",
+        "upload_time_iso_8601": "2022-01-04T21:25:02.960885Z",
+        "url": "https://files.pythonhosted.org/packages/07/96/e965d3eafc3b677f9eec3c885651002f49a6b042dd25d5fd2f658f7beb67/revlib-1.4.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f2bcebe516c8d680a961ebae886aee57438aa28d8952584ad59355dc538b46c",
+          "md5": "2e409457d0f8e587ccbe60f64d8de40e",
+          "sha256": "074a21634ea78438071496d1d462ea2dd7594ad1b49ba05595c8b7fb2ae06c98"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2e409457d0f8e587ccbe60f64d8de40e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13089,
+        "upload_time": "2022-01-05T13:09:58",
+        "upload_time_iso_8601": "2022-01-05T13:09:58.044376Z",
+        "url": "https://files.pythonhosted.org/packages/4f/2b/cebe516c8d680a961ebae886aee57438aa28d8952584ad59355dc538b46c/revlib-1.4.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "69609da62447d33942e0be526227bda1bcde5a0fce220a473b9d579367f67c8e",
+          "md5": "cbc80527377a3893ec3ab7ac8c152f04",
+          "sha256": "f9e2bff14879e6d95f88c0b159e9c71db713040b74bfc2bf71686967d57b22eb"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cbc80527377a3893ec3ab7ac8c152f04",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 18199,
+        "upload_time": "2022-01-05T13:09:59",
+        "upload_time_iso_8601": "2022-01-05T13:09:59.721954Z",
+        "url": "https://files.pythonhosted.org/packages/69/60/9da62447d33942e0be526227bda1bcde5a0fce220a473b9d579367f67c8e/revlib-1.4.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.4.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "03057ad693ee3cacf07635edcfa810966fd35d77fa4b505ccf7d3016398b2733",
+          "md5": "da14a715d91edd020c9e86f87d4ef21a",
+          "sha256": "b451faa77da55a6c7b419b38b0eda54ef17c8fdac26372b3092d2afe1f9d14a2"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "da14a715d91edd020c9e86f87d4ef21a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 13057,
+        "upload_time": "2022-01-09T15:06:17",
+        "upload_time_iso_8601": "2022-01-09T15:06:17.898239Z",
+        "url": "https://files.pythonhosted.org/packages/03/05/7ad693ee3cacf07635edcfa810966fd35d77fa4b505ccf7d3016398b2733/revlib-1.4.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b90a178c44d06e5f5327c0b8ba99c622a34fbc18afa3a5f0c9c7a5297c540b84",
+          "md5": "843671577495315dd901757321486f4f",
+          "sha256": "9210e6b699b28a7cd2ce51b5bc6419d49594d75ccaf0295d588e1f33a5eac37a"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.4.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "843671577495315dd901757321486f4f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 21675,
+        "upload_time": "2022-01-09T15:06:20",
+        "upload_time_iso_8601": "2022-01-09T15:06:20.210149Z",
+        "url": "https://files.pythonhosted.org/packages/b9/0a/178c44d06e5f5327c0b8ba99c622a34fbc18afa3a5f0c9c7a5297c540b84/revlib-1.4.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4913b0ce045ddb11a9b5aefb123b54f74e7da066c746e9295840448ecf02d6c3",
+          "md5": "053af53505c9b5fa52bb6b6fd538aaae",
+          "sha256": "90d824570210670abdea6fe82abf7ad55ab04265441d2d571fffdb97788fc88e"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "053af53505c9b5fa52bb6b6fd538aaae",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 14486,
+        "upload_time": "2022-02-18T21:49:31",
+        "upload_time_iso_8601": "2022-02-18T21:49:31.369598Z",
+        "url": "https://files.pythonhosted.org/packages/49/13/b0ce045ddb11a9b5aefb123b54f74e7da066c746e9295840448ecf02d6c3/revlib-1.6.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b158017bd0ba9e6534c947db1aaaa7048c2915a50fb113e32f35f961bdb7b5f",
+          "md5": "58708a16b0d91fb4e668e8d6ea4d8fdc",
+          "sha256": "fefa8a8f54a49313d8e2b2a48772377bc247f327138cbcdae6bc3fa1a6229c35"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "58708a16b0d91fb4e668e8d6ea4d8fdc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 20801,
+        "upload_time": "2022-02-18T21:49:33",
+        "upload_time_iso_8601": "2022-02-18T21:49:33.431320Z",
+        "url": "https://files.pythonhosted.org/packages/9b/15/8017bd0ba9e6534c947db1aaaa7048c2915a50fb113e32f35f961bdb7b5f/revlib-1.6.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "30bdbd36e7ac6a6b89e1bcc9aa17d13e30ee82faf0aaabe4c934ed4efeb09b57",
+          "md5": "023e35a8a19738f0edd07ed733e0df80",
+          "sha256": "b73f71123af0ef685ce4be4e3c1f9ebf368d0b1857071dd807e0aa2d8b78c22f"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "023e35a8a19738f0edd07ed733e0df80",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 14561,
+        "upload_time": "2022-02-20T12:05:37",
+        "upload_time_iso_8601": "2022-02-20T12:05:37.590693Z",
+        "url": "https://files.pythonhosted.org/packages/30/bd/bd36e7ac6a6b89e1bcc9aa17d13e30ee82faf0aaabe4c934ed4efeb09b57/revlib-1.6.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6437916d7354126e0ab0bade4c05dd3ece8192cace6fc70e451013efe993e353",
+          "md5": "6a8e519f189df7a5c7510d73e2398fc6",
+          "sha256": "c40e906d331cef9e9159f5cd8f15b797c16800215fa797f23952276ba5f017b5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6a8e519f189df7a5c7510d73e2398fc6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 24980,
+        "upload_time": "2022-02-20T12:05:40",
+        "upload_time_iso_8601": "2022-02-20T12:05:40.050186Z",
+        "url": "https://files.pythonhosted.org/packages/64/37/916d7354126e0ab0bade4c05dd3ece8192cace6fc70e451013efe993e353/revlib-1.6.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.6.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aa5146ed52c1ee92ae81ec8f7b1e0a67319b21a63a4fafb3e6763acaf5b0b5df",
+          "md5": "2cfcc57735d65a7813dc3602417a3380",
+          "sha256": "3aa8fb6deb3d46dcf79268e865677ee99f5cc3d669bfc7c791bbdce438e509a2"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2cfcc57735d65a7813dc3602417a3380",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 18237,
+        "upload_time": "2022-02-20T14:12:33",
+        "upload_time_iso_8601": "2022-02-20T14:12:33.323979Z",
+        "url": "https://files.pythonhosted.org/packages/aa/51/46ed52c1ee92ae81ec8f7b1e0a67319b21a63a4fafb3e6763acaf5b0b5df/revlib-1.6.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a3289c3403a226dd767e148aafd4972eeb279e656c1835ed2480dfa845336e9",
+          "md5": "2954e9755e6ef86bd9301de1bf0f4984",
+          "sha256": "f398790c2e36132b18a058d43dcf993e3637d64f14a71521d4d3d73c662ffc6b"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.6.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2954e9755e6ef86bd9301de1bf0f4984",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 27431,
+        "upload_time": "2022-02-20T14:12:38",
+        "upload_time_iso_8601": "2022-02-20T14:12:38.236822Z",
+        "url": "https://files.pythonhosted.org/packages/9a/32/89c3403a226dd767e148aafd4972eeb279e656c1835ed2480dfa845336e9/revlib-1.6.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.7.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a54589243a66f2ef856d9be45d7e7730aa78e03eb4c295b4aa5dbbe6581412fe",
+          "md5": "6c52881eea92bf6fa2d0d20e1a00c616",
+          "sha256": "61d5a245f7d6fa569cca4e3abd1b92f2f5a673dc997435c6b08744ca1bb7c65f"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6c52881eea92bf6fa2d0d20e1a00c616",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 20427,
+        "upload_time": "2022-02-27T04:18:00",
+        "upload_time_iso_8601": "2022-02-27T04:18:00.032643Z",
+        "url": "https://files.pythonhosted.org/packages/a5/45/89243a66f2ef856d9be45d7e7730aa78e03eb4c295b4aa5dbbe6581412fe/revlib-1.7.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "61abf18fea370a8fd26c6bafea62b401e23ea7d0fada4c53aacac77f94b6e200",
+          "md5": "0e79af972c9fbdabfb0311f903c648a6",
+          "sha256": "fbcdcc102364854f233c4cb7dc5f946c3997ca4b84515149d8463d8f951d77f5"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0e79af972c9fbdabfb0311f903c648a6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31399,
+        "upload_time": "2022-02-27T04:18:03",
+        "upload_time_iso_8601": "2022-02-27T04:18:03.239624Z",
+        "url": "https://files.pythonhosted.org/packages/61/ab/f18fea370a8fd26c6bafea62b401e23ea7d0fada4c53aacac77f94b6e200/revlib-1.7.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.7.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b7c1c8be68026d19c55fba2b4f440c8b5662b43a83aec8dd8c6a29312c7f3340",
+          "md5": "2ddd62e0879e6d049baa20da94502ebd",
+          "sha256": "f83ab97386d7091af79bc2930544ac9f03b82254396d8a921b9bb98528a679bc"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2ddd62e0879e6d049baa20da94502ebd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 20807,
+        "upload_time": "2022-08-06T18:28:04",
+        "upload_time_iso_8601": "2022-08-06T18:28:04.381024Z",
+        "url": "https://files.pythonhosted.org/packages/b7/c1/c8be68026d19c55fba2b4f440c8b5662b43a83aec8dd8c6a29312c7f3340/revlib-1.7.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aec0c69baca1810cc8c2034d91716b33602b7a84021d341d71dac6c4c443cd7b",
+          "md5": "06751ead7e86077dc6f41ceab6e6b438",
+          "sha256": "83567fbcd5a03c8547e7b88df9c02faad55665966002da497d655d6c2e4afe1c"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06751ead7e86077dc6f41ceab6e6b438",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31716,
+        "upload_time": "2022-08-06T18:28:07",
+        "upload_time_iso_8601": "2022-08-06T18:28:07.210038Z",
+        "url": "https://files.pythonhosted.org/packages/ae/c0/c69baca1810cc8c2034d91716b33602b7a84021d341d71dac6c4c443cd7b/revlib-1.7.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.7.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d9228f37871e66089af182154bd37689fa9fae85dbab354f36815d0eda69f1a",
+          "md5": "f5a85ffa32bdd5c349082b8e089c4424",
+          "sha256": "10659986f1c6164f8412b6d282b3df55f3d0bc74c481e8497f24460f6ffef219"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f5a85ffa32bdd5c349082b8e089c4424",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 20722,
+        "upload_time": "2022-08-06T18:48:47",
+        "upload_time_iso_8601": "2022-08-06T18:48:47.937085Z",
+        "url": "https://files.pythonhosted.org/packages/2d/92/28f37871e66089af182154bd37689fa9fae85dbab354f36815d0eda69f1a/revlib-1.7.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "16eb9baa5b87bd2b930a635323dc5d51112128c42b8f83ba24eacaf6b93e3f8e",
+          "md5": "9a37bd486f8faf763bcd9aefe9d0e292",
+          "sha256": "9cbbeb8aa720f79e9d68e41012d734beddb9d7cd6740c43e88795b5d4be235ea"
+        },
+        "downloads": -1,
+        "filename": "revlib-1.7.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9a37bd486f8faf763bcd9aefe9d0e292",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 31591,
+        "upload_time": "2022-08-06T18:48:50",
+        "upload_time_iso_8601": "2022-08-06T18:48:50.707628Z",
+        "url": "https://files.pythonhosted.org/packages/16/eb/9baa5b87bd2b930a635323dc5d51112128c42b8f83ba24eacaf6b93e3f8e/revlib-1.7.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2d9228f37871e66089af182154bd37689fa9fae85dbab354f36815d0eda69f1a",
+        "md5": "f5a85ffa32bdd5c349082b8e089c4424",
+        "sha256": "10659986f1c6164f8412b6d282b3df55f3d0bc74c481e8497f24460f6ffef219"
+      },
+      "downloads": -1,
+      "filename": "revlib-1.7.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "f5a85ffa32bdd5c349082b8e089c4424",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 20722,
+      "upload_time": "2022-08-06T18:48:47",
+      "upload_time_iso_8601": "2022-08-06T18:48:47.937085Z",
+      "url": "https://files.pythonhosted.org/packages/2d/92/28f37871e66089af182154bd37689fa9fae85dbab354f36815d0eda69f1a/revlib-1.7.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "16eb9baa5b87bd2b930a635323dc5d51112128c42b8f83ba24eacaf6b93e3f8e",
+        "md5": "9a37bd486f8faf763bcd9aefe9d0e292",
+        "sha256": "9cbbeb8aa720f79e9d68e41012d734beddb9d7cd6740c43e88795b5d4be235ea"
+      },
+      "downloads": -1,
+      "filename": "revlib-1.7.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9a37bd486f8faf763bcd9aefe9d0e292",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 31591,
+      "upload_time": "2022-08-06T18:48:50",
+      "upload_time_iso_8601": "2022-08-06T18:48:50.707628Z",
+      "url": "https://files.pythonhosted.org/packages/16/eb/9baa5b87bd2b930a635323dc5d51112128c42b8f83ba24eacaf6b93e3f8e/revlib-1.7.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

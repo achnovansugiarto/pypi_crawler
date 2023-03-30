@@ -1,0 +1,216 @@
+{
+  "info": {
+    "author": "bao xie",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# redis-limiter\n基于redis的限流器\n\n## install\npip install redis-limiter\n\n## intro\n陆陆续续写过不少基于redis的限流逻辑，看似简单，实际写下来还是有不少要留意的问题\n\n以一个简单的功能为例：\n\n    限制每个用户一天内只能修改昵称3次\n    \n直观的想法很简单,伪代码如下：\n    \n    key=user_id + date\n    if redis.get(key) >= 3:\n        return False\n        \n    ... operation logic ...\n    \n    redis.incr(key)\n    \n然而仔细想下，事情没那么简单，上面的逻辑在并发请求的情况下，用户操作很容易会超出3个的限制；为解决这个问题，我们换个思路：\n    \n    key = user_id + date\n    if redis.incr(key) > 3:\n        return False\n    \n    ...operation logic....\n    \n嗯，并发情况下不会超额了，问题是如果operation logic执行失败了呢，用户是不是就丢失了操作的配额？ 这种情况是不是要把INCR的数值给减回来呢？\n\n还有其他可能出现的问题：\n\n* 执行中间出现了异常，已经执行的redis操作是不是要回滚？\n* 3个限额，如果6个并发请求操作，前面3个进入operation logic处理中，后面3个返回失败，还是要等待？ 难道要加个分布式锁，保证业务串行执行？\n* 如果并发请求，后面的请求要block住等前面的处理结果的话，block怎么实现？\n* 上面的例子是限额1天内，可以用当天的日志做key，如果限额周期不是1天呢，比如是100分钟，比如是10天，用什么做key?\n\n嗯，基于redis的限流并没有直观的看上去那么简单\n\nredis-limiter致力于解决上面的所有问题，提供一个通用的基于redis的限流器功能\n\n使用redis-limiter实现上面的例子：\n\n```\nimport redis-limiter\n\nquota = 3\nkey_prefix = \"operation_limit\"\nconfig = redis_limiter.Config(redis)\nlimiter = redis_limiter.FixedWindowLimiter(config, key_prefix, quota, '1d')\n\nlimit_key = user_id\ntarget = limiter.target(limit_key)\n\ntarget.acquire()\nis_suc = False\ntry:\n    ...operation logic...\n    is_suc = True\nfinally:\n    if is_suc:\n        target.apply()\n    else:\n        target.release()\n```\n\n留意上面的acquire，表示预扣一个限额指标，业务逻辑执行成功，则执行apply使用掉改指标，如果失败则release释放该指标；\n如果acquire之后什么都不做，则经过一定的超时时间自动释放\n\nacquire会先检查已扣的数量是否满额，如果是，则raise redis_limiter.AcquireFullException\nacquire之后会检查已扣的数量 + 预扣的数据，看是否满额，如果是，则raise redis_limiter.AcquirePendingFullException\n\n对于raise redis_limiter.AcquirePendingFullException，还可以加上指定的block time, 即等待其他现成release指标，等待超过指定block time，才raise该异常;\n在limiter对象创建时，使用block参数指定超时时间，单位是秒：\n\n```\nlimiter = redis_limiter.FixedWindowLimiter(config, key_prefix, quota, '1d', block=10)\n```\n\n需要留意的时，block功能是使用redis的stream数据结构实现的，需要redis server的版本>=5.0；\n如果使用的版本低于5.0则无法使用block功能，并在需要指定config参数: support_blocking=False\n\neg:\n\n```\nconfig = redis_limiter.Config(redis, support_blocking=False)\n```\n\nlimiter支持使用with语句, 上面的demo中acquire之后的代码，可以改为如下写法:\n\n```\nwith limiter.target(limit_key) as target:\n    ...opeation logic...\n```\n\n这种写法，执行无异常会自动apply，异常则自动release，也可以在with的代码块中，手动apply/release:\n\n```\nwith limiter.target(limit_key) as target:\n    is_suc = ...opeation logic...\n    if is_suc:\n        target.apply()\n    else:\n        target.release()\n```\n\nredis-limiter实现了4种类型的限流器\n\n* IntervalLimiter\n* FixedWindowLimiter\n* SlideWindowLimiter\n* Semaphore\n\n## 时间周期Period\n\n除了Semaphore，其他几种限流器都需要指定一个时间周期，比如10秒、1天。。。\nreids_limiter使用了统一的字符串格式指定时间周期：数字+单位后缀，比如\"10s\"表示10秒，\"10min\"表示10分钟，所有的后缀如下：\n\n* s: 秒\n* min: 分钟\n* h: 小时\n* d: 天\n* mo: 月\n* y: 年\n* w: 周\n\n## IntervalLimiter\n\ninit函数：\n\n```\ndef __init__(self, config, key_prefix, quota, period, block=0, pending_ex=20)\n```\n\nIntervalLimiter实现指定时间间隔内不超过某限额的功能，时间精确到秒；\n比如指定 period=\"1d\", quota=3, 不是表示1个自然日内的限额是3，而是表示任何24*3600秒的时间段内限额为3\n\n## FixedWindowLimiter\n\ninit函数：\n\n```\ndef __init__(self, config, key_prefix, quota, period, block=0, pending_ex=20)\n```\nFixedWindowLimiter实现基于固定时间窗口计数的限流功能；\nperiod统一按照自然时间，比“1min\"表示每自然分钟，\"1d\"表示每自然日，\"1mo\"表示每个自然月，所以period会有些限制；\n比如日期单位的数量只能是1，即只能是\"1d\", 不能是\"2d\", \"10d\"或其他任意大于1的数量，因为每月或每年的天数是不固定的，没法取key；\n而秒单位的则可以取，\"5s\", \"10s\"... ， 单要求必须是60(1分钟60秒)的约数\nperiod数量完整的约束如下：\n\n* s: 必须是60的约数\n* min: 必须是60的约数\n* h: 必须是24的约数\n* d: 只能是1\n* m: 必须是12的约数\n* y: 只能是1\n* w: 只能是1\n\n## SlideWindowLimiter\n\ninit函数：\n\n```\ndef __init__(self, config, key_prefix, quota, period, block=0, pending_ex=20)\n```\nSlideWindowLimiter实现了基于滑动窗口计数的限流功能，计数的窗口数量不需要在参数中自定，而是自动计算: 取<=10并且最接近10的值\n\n类似FixedWindowLimiter，period也会有一些约束, 假定我们把period数量值表示为$v，则规则如下表示：\n\n* s: $v和60存在一个公约数，并且 $v/该公约数<=10\n* min: $v和60存在一个公约数，并且 $v/该公约数<=10\n* h: $v和24存在一个公约数，并且 $v/该公约数<=10\n* d: $v取1-10\n* mo: $v必须和12存在一个公约数，并且$v/该公约数<=10\n* y: $v取1-10\n* w: $v取1-10\n\n## Semaphore\n\ninit函数：     \n\n```\ndef __init__(self, config, key_prefix, quota, block=0, pending_ex=20)\n```\n\nSemaphore用于限定同一时间的并发处理数量，相比其他限流器有些不同： \n* 不需要指定时间周期\n* 没有apply操作，acquire之后只能release\n* 不会 raise redis_limiter.AcquireFullException, 只会 raise redis_limiter.AcquirePendingFullException\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/laobaox/redis-limiter",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "redis-limiter",
+    "package_url": "https://pypi.org/project/redis-limiter/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/redis-limiter/",
+    "project_urls": {
+      "Homepage": "https://github.com/laobaox/redis-limiter"
+    },
+    "release_url": "https://pypi.org/project/redis-limiter/0.0.3/",
+    "requires_dist": null,
+    "requires_python": ">=2.7.9",
+    "summary": "A Redis based rate limiter implementation for Python",
+    "version": "0.0.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13969876,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b381d9c900c766d178821b9d6988028e21544964e55c7152b91141a160a040a",
+          "md5": "8606af4d72d19be9f8d2c9d50a0c48a6",
+          "sha256": "d3e35578b4e05ad93bcd5c031292e95dbe6c9e2176d9361f481956c4ae362bf5"
+        },
+        "downloads": -1,
+        "filename": "redis_limiter-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8606af4d72d19be9f8d2c9d50a0c48a6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=2.7.9",
+        "size": 6918,
+        "upload_time": "2022-05-29T11:33:45",
+        "upload_time_iso_8601": "2022-05-29T11:33:45.409558Z",
+        "url": "https://files.pythonhosted.org/packages/1b/38/1d9c900c766d178821b9d6988028e21544964e55c7152b91141a160a040a/redis_limiter-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "33398200c4967c06634cf7aabe080ac65f2bd7718a2c98fe0ed23790ef2e1cd3",
+          "md5": "03e1fd89f5f292bef0c2c98210cea832",
+          "sha256": "21c1816018e1d82d67f6f548b235a4c2d1f99a11eba907c9f12649c45d4bdf51"
+        },
+        "downloads": -1,
+        "filename": "redis-limiter-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "03e1fd89f5f292bef0c2c98210cea832",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7.9",
+        "size": 9567,
+        "upload_time": "2022-05-29T11:33:47",
+        "upload_time_iso_8601": "2022-05-29T11:33:47.028910Z",
+        "url": "https://files.pythonhosted.org/packages/33/39/8200c4967c06634cf7aabe080ac65f2bd7718a2c98fe0ed23790ef2e1cd3/redis-limiter-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "824aae1969ff099036233538ee7f83965515c10d7d381fc6b5c22604fe5edcf8",
+          "md5": "8d6aff72c085982d6825a0f3c507b23f",
+          "sha256": "ed597d0b220282fd4fc3f138ca58ebeaf0fb7ca5c5d7aece9313e28fc64914aa"
+        },
+        "downloads": -1,
+        "filename": "redis_limiter-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8d6aff72c085982d6825a0f3c507b23f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=2.7.9",
+        "size": 9689,
+        "upload_time": "2022-05-29T11:46:38",
+        "upload_time_iso_8601": "2022-05-29T11:46:38.705827Z",
+        "url": "https://files.pythonhosted.org/packages/82/4a/ae1969ff099036233538ee7f83965515c10d7d381fc6b5c22604fe5edcf8/redis_limiter-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f27116922a0519e9858b89ee99030bedeb2f0e819f9513b31951bfc80e023e3b",
+          "md5": "aef30a323751d59c751899b7cf7921db",
+          "sha256": "9b1f9d1f6bc4b2163f32c42cfd736f89402b0cda99c615d744d943cb3b50598a"
+        },
+        "downloads": -1,
+        "filename": "redis-limiter-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aef30a323751d59c751899b7cf7921db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7.9",
+        "size": 12494,
+        "upload_time": "2022-05-29T11:46:40",
+        "upload_time_iso_8601": "2022-05-29T11:46:40.246481Z",
+        "url": "https://files.pythonhosted.org/packages/f2/71/16922a0519e9858b89ee99030bedeb2f0e819f9513b31951bfc80e023e3b/redis-limiter-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6ced2f197e44c0757ecae730c778b36a8f5eff6ef056fd63df4cc3bfbe149f62",
+          "md5": "5eb2a32f2fe37e26a6e6aecbf4b61900",
+          "sha256": "89c7f14439f009939eee4b914a0655a0cad27c16a454fea07632821622daa2eb"
+        },
+        "downloads": -1,
+        "filename": "redis_limiter-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5eb2a32f2fe37e26a6e6aecbf4b61900",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=2.7.9",
+        "size": 9688,
+        "upload_time": "2022-05-29T14:55:23",
+        "upload_time_iso_8601": "2022-05-29T14:55:23.469851Z",
+        "url": "https://files.pythonhosted.org/packages/6c/ed/2f197e44c0757ecae730c778b36a8f5eff6ef056fd63df4cc3bfbe149f62/redis_limiter-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "89dbeff7ec9bf512c803eac0d34e0576c0f121885b4a956cfea5a35d1fb52b2c",
+          "md5": "da27e1b30dbf886748ed08ccafd9c757",
+          "sha256": "a9ce997aa0dcd43ec17bb2f4d326831644370dcc24ba9a7b02ec59e825cdceb3"
+        },
+        "downloads": -1,
+        "filename": "redis-limiter-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "da27e1b30dbf886748ed08ccafd9c757",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=2.7.9",
+        "size": 12481,
+        "upload_time": "2022-05-29T14:55:25",
+        "upload_time_iso_8601": "2022-05-29T14:55:25.477025Z",
+        "url": "https://files.pythonhosted.org/packages/89/db/eff7ec9bf512c803eac0d34e0576c0f121885b4a956cfea5a35d1fb52b2c/redis-limiter-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "6ced2f197e44c0757ecae730c778b36a8f5eff6ef056fd63df4cc3bfbe149f62",
+        "md5": "5eb2a32f2fe37e26a6e6aecbf4b61900",
+        "sha256": "89c7f14439f009939eee4b914a0655a0cad27c16a454fea07632821622daa2eb"
+      },
+      "downloads": -1,
+      "filename": "redis_limiter-0.0.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "5eb2a32f2fe37e26a6e6aecbf4b61900",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=2.7.9",
+      "size": 9688,
+      "upload_time": "2022-05-29T14:55:23",
+      "upload_time_iso_8601": "2022-05-29T14:55:23.469851Z",
+      "url": "https://files.pythonhosted.org/packages/6c/ed/2f197e44c0757ecae730c778b36a8f5eff6ef056fd63df4cc3bfbe149f62/redis_limiter-0.0.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "89dbeff7ec9bf512c803eac0d34e0576c0f121885b4a956cfea5a35d1fb52b2c",
+        "md5": "da27e1b30dbf886748ed08ccafd9c757",
+        "sha256": "a9ce997aa0dcd43ec17bb2f4d326831644370dcc24ba9a7b02ec59e825cdceb3"
+      },
+      "downloads": -1,
+      "filename": "redis-limiter-0.0.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "da27e1b30dbf886748ed08ccafd9c757",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=2.7.9",
+      "size": 12481,
+      "upload_time": "2022-05-29T14:55:25",
+      "upload_time_iso_8601": "2022-05-29T14:55:25.477025Z",
+      "url": "https://files.pythonhosted.org/packages/89/db/eff7ec9bf512c803eac0d34e0576c0f121885b4a956cfea5a35d1fb52b2c/redis-limiter-0.0.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

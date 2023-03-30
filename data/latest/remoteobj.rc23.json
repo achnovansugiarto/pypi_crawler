@@ -1,0 +1,592 @@
+{
+  "info": {
+    "author": "Bea Steers",
+    "author_email": "bea.steers@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# remoteobj\nInteracting with objects across processes.\n\nThis uses multiprocessing pipes to send messages and operations from the main process to the remote process and send back the return value.\n\nBasically this lets do things like call `.close()` or `.pause()`, or `.ready` on an object that was sent to another process. But it also supports more than that!\n\nWhat's included:\n - [Proxy](#example): remote proxy for communicating with forked objects. This was the initial purpose of this package\n    ```python\n    class Blah:\n        def __init__(self):\n            self.remote = remoteobj.Proxy(self)\n        def say_hi(self):\n            print('hi from', mp.current_process().name)\n        def run(self):  # remote process function\n            with self.remote.listen_():\n                while True:\n                    ... # do other stuff\n                    self.remote.process_requests()\n\n    obj = Blah()\n    mp.Process(target=obj.run).start()\n    obj.remote.wait_until_listening()\n    obj.remote.say_hi()\n    # hi from Process-1\n    ...\n    ```\n - [util.process](#enhanced-processes): `multiprocessing.Process` but with fewer hurdles. Makes it more like you're writing normal python. Handles remote exceptions and return/yield values.\n     ```python\n     def func(x):\n         yield from range(x)\n         raise ValueError('error from {}'.format(\n            mp.current_process().name))\n\n    try:\n        with remoteobj.util.process(func, 4) as p:\n            for i in p.result:\n                print(i)\n    except ValueError as e:\n        print('woah!!', e)\n    # prints 0, 1, 2, 3, woah!! error from Process-1\n     ```\n - [Except](#sending-process-exceptions): context manager for capturing remote exceptions, assigning them to different groups, and sending them back to the main process\n    ```python\n    exc = remoteobj.Except()\n\n    def remote_func(exc):\n        with exc(raises=False):\n            try:\n                with exc('init'):\n                    do_init()\n                with exc('work'):\n                    do_work()\n            finally:\n                with exc('cleanup'):\n                    do_cleanup()\n\n    p = mp.Process(target=remote_func, args=(exc,))\n    p.start()\n    ...\n    p.join()\n    exc.raise_any('work')  # if none, its a noop\n    exc.raise_any('cleanup')\n    exc.raise_any()  # will raise the last caught exception\n    ```\n - [LocalExcept](#local-exceptions): the same context manager interface but without the inter-process communication\n     ```python\n     exc = remoteobj.LocalExcept()\n\n     with exc(raises=False):\n         try:\n             with exc('init'):\n                 do_init()\n             do_other_stuff()\n             with exc('work'):\n                 do_work()\n         finally:\n             with exc('cleanup'):\n                 do_cleanup()\n\n     exc.raise_any('work')\n     exc.raise_any('cleanup')\n     exc.raise_any()\n     ```\n\n> **NOTE:** This is still in alpha and the interface is still evolving (though things are starting to stabilize) so be sure to pin a version or stay up to date with changes. Also, let me know if you have thoughts/suggestions/requests! For info on how this works, see [here](#how-proxy-works)\n\n## Install\n\n```bash\npip install remoteobj\n```\n\n## Full Example (Proxy)\nHere we have an object that we want to run in a separate process. We want to be able to get/set the object's state as it's running so we wrap the object in a remote `Proxy` object which will run in the background of the remote process and execute the calls that we make in the main process.\n```python\nimport time\nimport remoteobj\nimport multiprocessing as mp\n\nclass Object:\n    '''Remote object to do some counting.'''\n    def __init__(self):\n        self.remote = remoteobj.Proxy(self)\n\n    count = 0\n    on, stop = False, False\n    def toggle(self, state=True):\n        self.on = state\n\n    def run(self):\n        '''Remote process'''\n        # starts thread to execute requests\n        with self.remote.listen_(bg=True):\n            while not self.stop and self.remote.listening_:\n                if self.on:\n                    self.count += 1\n                time.sleep(0.1)\n\n# start process\n\nobj = Object()\n\np = mp.Process(target=obj.run)\np.start()\n# make sure we've started up\n# pass p so we aren't left hanging if the process dies\nobj.remote.wait_until_listening(p)\n\n# turn on, get starting count, count should be increasing\n\nobj.remote.toggle(True)\nx = obj.remote.count.get_()\ntime.sleep(1)\nassert obj.remote.count.get_() > x  # 10 > 1\n\n# turn off, count should stay the same\n\nobj.remote.toggle(False)\nx = obj.remote.count.get_()\ntime.sleep(1)\nassert obj.remote.count.get_() == x  # 10 == 10\n\n# turn back on, count should increase again\n\nobj.remote.toggle(True)\nx = obj.remote.count.__  # alias for get_()\ntime.sleep(1)\nassert obj.remote.count.__ > x  # 20 > 10\n\n# set the remote stop attribute to exit and join\nobj.remote.stop = True  # you can set attrs too?? (ﾟﾛﾟ*)\np.join()\n```\n\n## Basic Usage\n\n### Proxy\nThis explains the mechanics that are going on in more detail.\n\n> **NOTE:** to avoid name conflicts many of the proxy methods use underscore suffixes (i.e. `get_()`). This also applies to `util.process` arguments. See below.\n```python\nimport remoteobj\n\n# building some arbitrary object\nclass Idk(list):\n    something = 5\n    another = []\n\nobj = Idk()\n\n# creating a remote proxy to interact with\n# we want to make sure that the proxy gets\n# sent along with it so we can handle remote\n# requests.\nr_obj = obj.remote = remoteobj.Proxy(obj)\n\n# ... now send obj to mp.Process and start listener thread ...\n\n# then meanwhile back in the *main* process\n\n# call a method\nr_obj.append(5)\n# now the remote object has 5 appended to it\nassert len(r_obj) == 1\n\n# getting an attribute returns a proxy so you can chain\nassert isinstance(r_obj.another.append, remoteobj.Proxy)\n\n# calling will automatically resolve a proxy\nr_obj.another.append(6)\n# now another == [6]\n\n# you can access keys, but we still allow chaining\n# so they're proxies too\nassert isinstance(r_obj[0], remoteobj.Proxy)\nassert isinstance(r_obj.another[0], remoteobj.Proxy)\n\n# to make the request and get the value, do\n\nassert remoteobj.get( r_obj[0] ) == 5\n# or more concisely\nassert r_obj[0].__ == 5\n# or if you prefer a less witch-y way\nassert r_obj[0].get_() == 5\n\n# you can even set keys and attributes on remote objects\nr_obj[0] = 6\nr_obj.something = 10\n\n\n# len() is a special case, but in most cases, you can't\n# just blindly pass a remote object to a function and\n# expect it to work all the time.\nassert str(r_obj) == <Remote <Idk object at ...> : (?)>\nassert r_obj.passto(str) == <Idk object at ...>\n# the first is the local instance, while the second is the\n# remote instance. To pass an object to a function to execute\n# on the remote side, use `passto` which will pickle the function\n# reference.\n# So you probably wouldn't want to pass an object method like that\n# because it would pickle and unpickle the object instance which\n# is most likely **not** what you want.\n# but I'm not your mom.\n```\n\n>**NOTE:** you cannot get/set attributes that begin with an underscore. All underscore attributes reference the proxy object itself.\n\nNow on the remote side:\n\n```python\ndef run(obj):\n    # indicate that we're listening\n    with obj.remote:\n        # do whatever nonsense you need\n        value = 0\n        while True:  # do nonsense\n            for x in obj:\n                value = x * obj.something\n            for x, y in zip(obj, obj.another):\n                value -= y / x * obj.something\n            time.sleep(0.4)\n            # this will make the requests\n            obj.remote.process_requests()\n    # after exiting, listening is set to false,\n    # clients will fail or return their default\n    # immediately because we have notified that\n    # we will not be processing any more requests.\n\n# Here's how to run the listener in a background thread\n\ndef run(obj):\n    # start background thread to listen.\n    with obj.remote.listen_():\n        while obj.remote.listening_:\n            ...\n            # don't need to call obj.remote.process_requests()\n\n```\n\n#### Proxy Operations\nThese are the operations that a remote view can handle, which covers the main ways of accessing information from an object. Let me know if there are others that I'm missing.\n\n>**NOTE:** Any operation that says it returns a `Proxy` can be chained.\nIf a remote method returns `self`, that will be caught and a remote proxy will be returned to allow for chaining as well.\n\n - **__call\\__** (`obj(*a, **kw)`): retrieves return value.\n    - to return a proxy instead, do either:\n        - `Proxy(obj, eager_proxy=True)` to get all as proxies or\n        - `obj.method(_proxy=True)` for a one-time thing\n - **__getitem\\__** (`obj[key]`): returns proxy\n - **__getattr\\__** (`obj.attr`): returns proxy\n - **__setitem\\__** (`obj[key] = value`): evaluates\n - **__setattr\\__** (`obj.attr = value`): evaluates\n - **__delitem\\__** (`del obj[key]`): evaluates\n - **__delattr\\__** (`del obj.attr`): evaluates\n - **__contains\\__** (`x in obj`): evaluates\n - **len** (`len(obj)`): evaluates\n - **passto** (`func(obj)`): pass object to a function\n    - e.g. `obj.passto(str)` is equivalent to `str(obj)`\n    - you can also pass args: `obj.passto(func, *a, **kw)`\n\nTo resolve a proxy, you can do one of three equivalent styles:\n - `remoteobj.get(obj.attr, default=False)` - makes it clearer that `obj.attr` is being sent to the main process\n - `obj.attr.get_(default='asdf')` - access via chaining - convenient, somewhat clear\n - `obj.attr.__` - an attempt at a minimalist interface, doesn't handle default value, not super clear. it's the easiest on the eyes once you know what it means, but I agree that the obscurity is a bit of an issue.\n\n### Enhanced Processes\nSometimes the `multiprocessing.Process` is a bit lacking in terms of interface so I wrote a lightweight wrapper that:\n - has a cleaner signature - `process(func, *a, **kw)` => `func(*a, **kw)`\n    - other arguments, such as `name`, `group` have a underscore suffix (e.g. `name_`, `group_`, `daemon_`)\n - can be used as a context manager `with process(...):` which will join upon exiting.\n - pulls the process name from the function name by default\n - defaults to `daemon_=True`\n - will raise the remote exception (using `remoteobj.Except()`)\n - sends back `return` and `yield` values via `p.result`\n```python\ndef remote_func(x, y):\n    time.sleep(1)\n    return 10\n\nwith remoteobj.util.process(remote_func, 5, 2) as p:\n    assert p.name == 'remote_func-1'\n    assert p.result == None  # called before return\n    ... # do some other stuff\n\n# now the process has joined\n# and we can access the return value of the process!\nassert p.result == 10\n\n\n# now...\n# wait for it....\n\ndef remote_func(x, y):\n    for i in range(x, y):\n        yield i\n\nwith remoteobj.util.process(remote_func, 5, 10) as p:\n    # p.result returns a generator which will yield the values from the\n    # remote side\n    a_generator = p.result\n    assert list(a_generator) == list(range(5, 10))\n```\n\n### Sending Process Exceptions\nSending exceptions back from another process is always such a pain because you have to deal with all of the inter-process communication scaffolding, setting up queues, etc. and it can make your code messy.\n\nThe `Except` class lets you catch exceptions and add them to different named groups. This is useful if you need to separate out exceptions for setup errors, processing errors, or clean up errors.\n\nHow it works: Define an `Except` object. In your remote process use `catch` as a context manager and any matching exceptions raised in that context will be pickled with its traceback and appended to its queue.\n\n```python\n# define an exception handler\ncatch = remoteobj.Except()\n# or be more specific\ncatch = remoteobj.Except(ValueError, TypeError)\n\ndef remote_process(catch):\n    with catch:\n        raise ValueError('!!!')\n    with catch('hi'):  # named exception contexts\n        raise TypeError('hi')\n\np = mp.Process(target=remote_process, args=(catch,))\np.start()\np.join()\ncatch.raise_any('hi')  # will raise hi\n# or\ncatch.raise_any()  # will raise any exception\n# or\ncatch.raise_any(None)  # will raise any exception in the default context\n```\n### Local Exceptions\nWe can use the same syntax and context mechanics without the inter-process communication to catch errors locally.\n```python\n# define an exception handler\ncatch = remoteobj.LocalExcept(raises=True)\n\ntry:\n    with catch:\n        raise ValueError('!!!')\nexcept:\n    with catch('hi', raises=False):\n        raise TypeError('hello')\n\ncatch.raise_any('hi')\ncatch.raise_any()\n```\n\n### How `Proxy` works\n\nWe override basic python operators so that they return an object that represents a chain of operations (`Proxy`, `View` objects).\n - `View` objects represents a chain of operations - this is mainly an internal interface.\n - `Proxy` objects represents a chain of operations linked to an object.\n\nWhen we go to resolve a chain of operations, we\n - first acquire a lock so that the listening state can't change and no other requests can be made at the same time.\n - check if the remote instance is listening\n - we send the set of operations over a pipe and then wait for the value to come out the other side\n - once it returns we check the return values, raise any exception, and return.\n\nOn the remote side, we:\n - poll the connection checking for op requests and once we find one:\n - acquire a write lock\n - evaluate the view on the proxy object\n - handle exceptions then place the result and exception in the pipe to be sent back\n\nIf there is no listening process, either a default value will be returned (if you provided one via `get_(default=False)`) or a `RuntimeError` will be raised.\n\nIt is useful to call `proxy.wait_until_listening()` while the remote process is starting up so that you don't get a `RuntimeError` due to the listener not having started up yet.\n\nIf a remote object gets called from the same process as the listening process then it will bypass the pipes and evaluate it directly. This means that if you use threads instead of processes, no data will be sent over pipes.\n\n### Advanced\n\n```python\nimport remoteobj\n\nclass A:\n    def __init__(self):\n        self.remote = remoteobj.Proxy(self)\n\n    def asdf(self):\n        return 5\n\nclass B(A):\n    x = 0\n    def asdf(self):\n        return 6\n\n    def chain(self):\n        x += 1\n        return self\n\nobj = B()\n```\n\n#### Accessing super()\n```python\n# call super method\nassert obj.remote.asdf() == 6\nassert obj.remote.super.asdf() == 6\n# is equivalent to: super(type(obj), obj).asdf()\n```\n\n#### Remote methods that chain\nA common pattern is to have a function return self so that you can chain methods together. But that doesn't work when you're sending an object back from another process because it'll get pickled and it'll no longer be the same object.\n\nSo there is a special-case - if the return value is self, it will mark it as such and on the other end, it will return the base proxy object.\n```python\n# remote chaining\nassert obj.remote.x.__ == 0  # check start value\nassert obj.remote.chain().chain().chain().x.__ == 3\n\n# equivalent to doing this locally\nassert obj.x == 0\nassert obj.chain().chain().chain().x == 3\n```\n\n#### Deadlocks\nWhen dealing with concurrent programming, you always have to be concerned about dead-locking your program.\n\nOne area where deadlocking could be a problem is if a client process starts to request an operation as the listening process starts to clean up.\n\nTo prevent that, when the listening process is closing, it will either fulfill outstanding requests (default behavior) or refuse them (`Proxy(fulfill_final=False)`).",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/beasteers/remoteobj",
+    "keywords": "multiprocessing process except raise exception handling proxy remote ops result yield",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "remoteobj",
+    "package_url": "https://pypi.org/project/remoteobj/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/remoteobj/",
+    "project_urls": {
+      "Homepage": "https://github.com/beasteers/remoteobj"
+    },
+    "release_url": "https://pypi.org/project/remoteobj/0.4.0/",
+    "requires_dist": null,
+    "requires_python": "",
+    "summary": "Facilitating cross-process programming.",
+    "version": "0.4.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10507338,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe5eb8cec5b07620066f39bc8faa1321bee1a8e17d93de2bf679e689200f05d7",
+          "md5": "30fcaf731635a72ed08e5a75e58634a1",
+          "sha256": "153bf9d5b14be5489e40a66dc5fcc76c3d0be6fe89b84f7158f5e479ab21b777"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "30fcaf731635a72ed08e5a75e58634a1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7094,
+        "upload_time": "2020-09-20T18:34:14",
+        "upload_time_iso_8601": "2020-09-20T18:34:14.402731Z",
+        "url": "https://files.pythonhosted.org/packages/fe/5e/b8cec5b07620066f39bc8faa1321bee1a8e17d93de2bf679e689200f05d7/remoteobj-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "07973f71e7940cee47527fb9ba20eb29a73b8e2c387cba72c7d2de29f1a73443",
+          "md5": "0d5eddb384e011d44e37eab88f8880e3",
+          "sha256": "c93a6cb9a33c78a836aae371539a85a5547c29a612f2ccbcfca1ad49b09d1c9c"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0d5eddb384e011d44e37eab88f8880e3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9375,
+        "upload_time": "2020-09-23T15:03:49",
+        "upload_time_iso_8601": "2020-09-23T15:03:49.842645Z",
+        "url": "https://files.pythonhosted.org/packages/07/97/3f71e7940cee47527fb9ba20eb29a73b8e2c387cba72c7d2de29f1a73443/remoteobj-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3dee4aa5374e77e9c1f8b5cc24d7a18bedec1570f0b2b3e4433fae7749181e0f",
+          "md5": "71a1eddfb1e15018a17b5f66ba0bffd3",
+          "sha256": "afa47cc957ef592f67c2f000f60e1a43046fe162ba7bf165b55b48d5fe6e4184"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "71a1eddfb1e15018a17b5f66ba0bffd3",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 10495,
+        "upload_time": "2020-09-24T02:09:45",
+        "upload_time_iso_8601": "2020-09-24T02:09:45.905394Z",
+        "url": "https://files.pythonhosted.org/packages/3d/ee/4aa5374e77e9c1f8b5cc24d7a18bedec1570f0b2b3e4433fae7749181e0f/remoteobj-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "236e4f4e378484c8bc8ec1035a21bc7864950b1c85816a526fcee0fe1658b2c3",
+          "md5": "b2a4b3ddee2651bd4a089256a2a35556",
+          "sha256": "a63aa35644ca9a7ccae0fda67e637113d96fd58670a30fd0d8899b7b35d5c73e"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b2a4b3ddee2651bd4a089256a2a35556",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13049,
+        "upload_time": "2020-09-24T15:09:41",
+        "upload_time_iso_8601": "2020-09-24T15:09:41.066226Z",
+        "url": "https://files.pythonhosted.org/packages/23/6e/4f4e378484c8bc8ec1035a21bc7864950b1c85816a526fcee0fe1658b2c3/remoteobj-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3c8ff926df8b8c337ddafec42b26bc58e1f54c3913b10d4abfde9f52d6b59db3",
+          "md5": "6f0eb9c125a24f5d3f1cb8c129705a18",
+          "sha256": "bcf8ebeb8cc0abf39ff7d19fe619f461c4e40cf8eb3ed4ac9e5085f548a02b04"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6f0eb9c125a24f5d3f1cb8c129705a18",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13722,
+        "upload_time": "2020-09-24T19:57:02",
+        "upload_time_iso_8601": "2020-09-24T19:57:02.823482Z",
+        "url": "https://files.pythonhosted.org/packages/3c/8f/f926df8b8c337ddafec42b26bc58e1f54c3913b10d4abfde9f52d6b59db3/remoteobj-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "522cd656528d7daa2cd61e74f04a0df6e6715a577d5b5212709accee45d155f0",
+          "md5": "7ffd431f57335f8dd32a8ebb4c543753",
+          "sha256": "39d1e259fd123567c6ff1d5f8cb66d2df202c902e393c6fe6cd5d69520673b0a"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7ffd431f57335f8dd32a8ebb4c543753",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13803,
+        "upload_time": "2020-09-24T20:28:01",
+        "upload_time_iso_8601": "2020-09-24T20:28:01.387472Z",
+        "url": "https://files.pythonhosted.org/packages/52/2c/d656528d7daa2cd61e74f04a0df6e6715a577d5b5212709accee45d155f0/remoteobj-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bd38de3b3170e3eed89ff1d5d8cc10b239367baa1199668cc1814678a5a8347e",
+          "md5": "15be33ac8e10f5c7fbf1fc0e99c95854",
+          "sha256": "65b34fd472a195dfd4a28fd1d70caa716933190dc01d611a7880933231defbaf"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "15be33ac8e10f5c7fbf1fc0e99c95854",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 13792,
+        "upload_time": "2020-09-25T16:51:25",
+        "upload_time_iso_8601": "2020-09-25T16:51:25.557266Z",
+        "url": "https://files.pythonhosted.org/packages/bd/38/de3b3170e3eed89ff1d5d8cc10b239367baa1199668cc1814678a5a8347e/remoteobj-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "057d11b15df6462aebacba554f62438b2a7cc176ad24fef4e05b88305fabf299",
+          "md5": "700d8b3d93b7c2b3ce23512f42d89903",
+          "sha256": "e2e7b37d07f436f526b0c6103a2100657ef2dbbddcb33d03b900903e18634fdf"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "700d8b3d93b7c2b3ce23512f42d89903",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18912,
+        "upload_time": "2020-09-28T15:20:09",
+        "upload_time_iso_8601": "2020-09-28T15:20:09.373651Z",
+        "url": "https://files.pythonhosted.org/packages/05/7d/11b15df6462aebacba554f62438b2a7cc176ad24fef4e05b88305fabf299/remoteobj-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "973fb91354aaf7e4a1ab4e78bb6ea5fb02a6d9f5427c1ae72187ef0321e63314",
+          "md5": "b79337d7755955e61c20c5c14ff26ea8",
+          "sha256": "12d8a4d0a28e0f554797ac4683c05843b09582a3eb2bdca3828e9fa832401a32"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b79337d7755955e61c20c5c14ff26ea8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18927,
+        "upload_time": "2020-09-28T15:30:37",
+        "upload_time_iso_8601": "2020-09-28T15:30:37.518786Z",
+        "url": "https://files.pythonhosted.org/packages/97/3f/b91354aaf7e4a1ab4e78bb6ea5fb02a6d9f5427c1ae72187ef0321e63314/remoteobj-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5fef1d67a2ac89b52e9e4791f4cd507b5f2dab7ffc5d97ca4a8eadceafed064e",
+          "md5": "378e9f85361fc5a955c03f4a29bd199f",
+          "sha256": "d4d7b0b51ed162690e1e939b8659d493a4d1c272042d18fa479d20c040761999"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "378e9f85361fc5a955c03f4a29bd199f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18919,
+        "upload_time": "2020-09-28T15:34:09",
+        "upload_time_iso_8601": "2020-09-28T15:34:09.321745Z",
+        "url": "https://files.pythonhosted.org/packages/5f/ef/1d67a2ac89b52e9e4791f4cd507b5f2dab7ffc5d97ca4a8eadceafed064e/remoteobj-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fcb4616b850738a4289abd9097749d768db44ca5d8d07cd9c83695023c5f2669",
+          "md5": "aeeb429c5b520a8e74b605969492bccf",
+          "sha256": "ff3b3ab11c071d860cc17952d214eb9f92ef36769d2ed342c418beda52ea4151"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "aeeb429c5b520a8e74b605969492bccf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 20871,
+        "upload_time": "2020-09-30T19:42:49",
+        "upload_time_iso_8601": "2020-09-30T19:42:49.366894Z",
+        "url": "https://files.pythonhosted.org/packages/fc/b4/616b850738a4289abd9097749d768db44ca5d8d07cd9c83695023c5f2669/remoteobj-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6c328d4411e1a4651e35a1d9fd8ee3782c74ebbe6f50712366345a0326bc4c17",
+          "md5": "2608ad9f5911a21b27e4f5d8700a26ca",
+          "sha256": "8dfd88171a5f87e464851e7013966e56d7cd1d937313b504c1d3d66a61fc08ca"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2608ad9f5911a21b27e4f5d8700a26ca",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21490,
+        "upload_time": "2020-10-13T17:38:11",
+        "upload_time_iso_8601": "2020-10-13T17:38:11.251680Z",
+        "url": "https://files.pythonhosted.org/packages/6c/32/8d4411e1a4651e35a1d9fd8ee3782c74ebbe6f50712366345a0326bc4c17/remoteobj-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "31677f880afe83287bb09d11dbe7fb36672f42b521128e442805f41b61310ce1",
+          "md5": "8fdfb0a82d704ccc7194ca480062a3af",
+          "sha256": "88e77b1849efa4ebf317abb60af808d8423ee8dd1daf68ba82342fae2298d11d"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8fdfb0a82d704ccc7194ca480062a3af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21218,
+        "upload_time": "2020-10-21T21:36:00",
+        "upload_time_iso_8601": "2020-10-21T21:36:00.963529Z",
+        "url": "https://files.pythonhosted.org/packages/31/67/7f880afe83287bb09d11dbe7fb36672f42b521128e442805f41b61310ce1/remoteobj-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "249608c4a41c1693d53a7a46cee14ab2f91ef9e3dc4d12f228281de9fdb0747c",
+          "md5": "cab8dfe2fc9515b60d6a1ec0a1fc5e64",
+          "sha256": "a99fd877191a685050698c7fc5626ac42c45917d1d5ad9e5d64ba405a3160aa5"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cab8dfe2fc9515b60d6a1ec0a1fc5e64",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21669,
+        "upload_time": "2020-10-22T15:31:38",
+        "upload_time_iso_8601": "2020-10-22T15:31:38.418547Z",
+        "url": "https://files.pythonhosted.org/packages/24/96/08c4a41c1693d53a7a46cee14ab2f91ef9e3dc4d12f228281de9fdb0747c/remoteobj-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "290cb8ba561a9ed8078d088a3107a8ff7a045b288516a6ab936caad676fd6e6a",
+          "md5": "3fb05d06f109ba394217c9483a681372",
+          "sha256": "a8b7b0a289036283ef5bf3b04b8ac47cb661e2407a20772d9672edeb424db2c4"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.6a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3fb05d06f109ba394217c9483a681372",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21313,
+        "upload_time": "2020-10-21T21:57:15",
+        "upload_time_iso_8601": "2020-10-21T21:57:15.675823Z",
+        "url": "https://files.pythonhosted.org/packages/29/0c/b8ba561a9ed8078d088a3107a8ff7a045b288516a6ab936caad676fd6e6a/remoteobj-0.2.6a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6a2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21608d324bc29ffde3649d7f17da2e7459e05fd375affc46c366dd2a5d09d42a",
+          "md5": "3dcecb5922d92e8e5d9c79e16066f384",
+          "sha256": "c5250cd1bcdd5e3e9f37b6b16c528d7a728d12da06610edaf8db344aba9643db"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.6a2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3dcecb5922d92e8e5d9c79e16066f384",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21334,
+        "upload_time": "2020-10-21T22:04:11",
+        "upload_time_iso_8601": "2020-10-21T22:04:11.364473Z",
+        "url": "https://files.pythonhosted.org/packages/21/60/8d324bc29ffde3649d7f17da2e7459e05fd375affc46c366dd2a5d09d42a/remoteobj-0.2.6a2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6a3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9d72ae22866cbf62199b379d714afa8aa3528d72cf80a49be0e70b69f2bbdad1",
+          "md5": "c02067c5188867e894b993d8e5196ddd",
+          "sha256": "7b3ad633f965559da360d6ae6159be3eb5686e10f4ec9dd5789728aa12df6ca8"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.6a3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c02067c5188867e894b993d8e5196ddd",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21399,
+        "upload_time": "2020-10-22T00:51:14",
+        "upload_time_iso_8601": "2020-10-22T00:51:14.043785Z",
+        "url": "https://files.pythonhosted.org/packages/9d/72/ae22866cbf62199b379d714afa8aa3528d72cf80a49be0e70b69f2bbdad1/remoteobj-0.2.6a3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6a4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f85fd4b2d44c950e53a02ad591938491fd8668b29d3ec097b9d4ef306a0df718",
+          "md5": "2bcf693db107d45f3e0b4669efeff747",
+          "sha256": "faa1c1a237bd88a15a3bf60b405f63f2c031c636b98660840fa23e6ffada4748"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.6a4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2bcf693db107d45f3e0b4669efeff747",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 21398,
+        "upload_time": "2020-10-22T05:57:23",
+        "upload_time_iso_8601": "2020-10-22T05:57:23.680683Z",
+        "url": "https://files.pythonhosted.org/packages/f8/5f/d4b2d44c950e53a02ad591938491fd8668b29d3ec097b9d4ef306a0df718/remoteobj-0.2.6a4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f21af9d2651278d0f2038002d6986fa93720630655c583d1cd146db4a1eb3a5",
+          "md5": "bf596e3509340e3f79e01126146eda46",
+          "sha256": "e77794da48ac03c51d5420b7564122a95a62ba74ccb1f8c5ce21217fd712ed34"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.2.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "bf596e3509340e3f79e01126146eda46",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23151,
+        "upload_time": "2020-12-17T20:03:44",
+        "upload_time_iso_8601": "2020-12-17T20:03:44.731537Z",
+        "url": "https://files.pythonhosted.org/packages/3f/21/af9d2651278d0f2038002d6986fa93720630655c583d1cd146db4a1eb3a5/remoteobj-0.2.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "275d772691d7d6c76398b24695c402441880a4b066734be5a07cd2d04ae80f02",
+          "md5": "5bed7f8c8f2bb8b8586e12e336d766af",
+          "sha256": "28d1b1c1bd3ac578506557d6cea52a51e48d534ee8ded2a4060baeb05d2b536f"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5bed7f8c8f2bb8b8586e12e336d766af",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23306,
+        "upload_time": "2021-02-18T17:23:32",
+        "upload_time_iso_8601": "2021-02-18T17:23:32.516821Z",
+        "url": "https://files.pythonhosted.org/packages/27/5d/772691d7d6c76398b24695c402441880a4b066734be5a07cd2d04ae80f02/remoteobj-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "98b398f53d38516635990c166b54522d51b1bee564a28e0e1a6febfacd921ccd",
+          "md5": "48bd79f7a3e5ac71e579ada44de4391c",
+          "sha256": "2206905234fe9d5813c77b25450f3eb3237c23323a26d83774a4501d8b9651c2"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "48bd79f7a3e5ac71e579ada44de4391c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23368,
+        "upload_time": "2021-02-18T17:53:01",
+        "upload_time_iso_8601": "2021-02-18T17:53:01.099811Z",
+        "url": "https://files.pythonhosted.org/packages/98/b3/98f53d38516635990c166b54522d51b1bee564a28e0e1a6febfacd921ccd/remoteobj-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2d6a55f1df8c244c6df3ef85211c985798b1747f703d3e1c7c93cd2cc5c1ddbf",
+          "md5": "676539dbad5acdb6ec4fc63eb5450f53",
+          "sha256": "f90d0fd773a8cb35f8f1ed08a860a7496983973e6b519a67f2d1611ac281d4bf"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "676539dbad5acdb6ec4fc63eb5450f53",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23100,
+        "upload_time": "2021-05-06T20:19:56",
+        "upload_time_iso_8601": "2021-05-06T20:19:56.967593Z",
+        "url": "https://files.pythonhosted.org/packages/2d/6a/55f1df8c244c6df3ef85211c985798b1747f703d3e1c7c93cd2cc5c1ddbf/remoteobj-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.4.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94cbbaf4dac069db6caa35a2cb575152e87928dc1a4822e3f7ec56cb1aa11fb2",
+          "md5": "8e3fa158a7f07944f3e1134406537e34",
+          "sha256": "40fe9e36bf3c2a976e29a020c7bb460662b9d90dbeb8edd0ad67f538fe76ce75"
+        },
+        "downloads": -1,
+        "filename": "remoteobj-0.4.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8e3fa158a7f07944f3e1134406537e34",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24457,
+        "upload_time": "2021-05-29T16:53:44",
+        "upload_time_iso_8601": "2021-05-29T16:53:44.217533Z",
+        "url": "https://files.pythonhosted.org/packages/94/cb/baf4dac069db6caa35a2cb575152e87928dc1a4822e3f7ec56cb1aa11fb2/remoteobj-0.4.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "94cbbaf4dac069db6caa35a2cb575152e87928dc1a4822e3f7ec56cb1aa11fb2",
+        "md5": "8e3fa158a7f07944f3e1134406537e34",
+        "sha256": "40fe9e36bf3c2a976e29a020c7bb460662b9d90dbeb8edd0ad67f538fe76ce75"
+      },
+      "downloads": -1,
+      "filename": "remoteobj-0.4.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "8e3fa158a7f07944f3e1134406537e34",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 24457,
+      "upload_time": "2021-05-29T16:53:44",
+      "upload_time_iso_8601": "2021-05-29T16:53:44.217533Z",
+      "url": "https://files.pythonhosted.org/packages/94/cb/baf4dac069db6caa35a2cb575152e87928dc1a4822e3f7ec56cb1aa11fb2/remoteobj-0.4.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

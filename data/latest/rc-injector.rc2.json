@@ -1,0 +1,180 @@
+{
+  "info": {
+    "author": "Guillermo Perez",
+    "author_email": "bisho@revenuecat.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# rc-injector\nPython dependency injector.\n\n# Usage:\n\n## Install:\n```\npip install rc-injector\n```\n## Example usage:\nSuppose you have your app with blueprints, and the blueprints can use a bunch of helpers like ConfigurationProvider, CacheClient, DBClient, Events, Jobs...\n\nIf you want to use dependency injection, you will have:\n\n```python:\nclass App:\n    def __init__(self, foo: FooBluePrint, bar: BarBluePrint) -> None:\n        self.foo = foo\n        self.bar = bar\n\n    def do_foo_action(self) -> ...:\n        return self.foo.action()\n\nclass FooBluePrint(BluePrint):\n    def __init__(self, db: DBClient) -> None:\n        self.db = db\n\n    def action(self) -> ...:\n        self.db.query...\n        return ...\n```\n\nThis architecture is great, but is cumbersome to use, because building the whole dependency tree by hand is tedious.\n\nWith rc-injector, this can be as simple as:\n\n```python:\nfrom rc_injector import Configuration, Injector\n\nconfiguration = Configuration()\n\ninjector = Injector(configuration)\ninjector.get(App)\n```\n\nThe injector can figure out how to build the dependency tree from the type hints.\n\nOf course, this only works with classes that do not require configuration. It will more likely configure a few of the low level dependencies that need to be configured. For example:\n\n```python:\nfrom rc_injector import Configuration, Injector\n\nprod_configuration_manager = ConfiguratioManager(...)\n\ndef build_prod_db_client() -> DBClient:\n    ...\n\nclass CacheClient:\n    def __init__(self, cfg: ConfigurationProvider, pool: str) -> None:\n        ...\n\nconfiguration = Configuration()\nconfiguration.bind(ConfigurationProvider).globally().to_instance(prod_configuration_manager)\nconfiguration.bind(DBClient).globally().to_constructor(build_prod_db_client)\nconfiguration.bind(CacheClient).globally().with_kwargs(pool=CachePools.DEFAULT)\nconfiguration.bind(Events).globally().to_class(KafkaEvents)\nconfiguration.bind(KafkaEvents).globally().with_kwargs(queue=\"default\")\n\ninjector = Injector(configuration)\ninjector.get(App)\n```\n\nA few observations:\n1. We use `to_instance` to bind `ConfigurationProvider` to an specific instance that will act as singleton.\n2. `to_constructor` helps us use a function helper to build the instance. Note that the instance will still behave as singleton, the functions will not be called for each usage.\n3. `with_kwargs` allows us to define the value of some of the parameters of the class. This `CacheClient` might have a signature `__init__(self, cfg: ConfigurationProvider, pool: str)`. The `cfg` variable can be injected, but pool is a scalar so needs to be set to a particular value.\n4. We use `to_class` to bind `Events` that is an abstract class with the interface to `KafkaEvents` that implements it using Kafka. We also define the queue name to use using `with_kwargs` to override the `queue` param.\n\nNow imagine that `FooBluePrint` from the example now needs `CacheClient` due to some new features. You would just modify the signature with the new dependency:\n\n```patch:\nclass FooBluePrint(BluePrint):\n-    def __init__(self, db: DBClient) -> None:\n+    def __init__(self, db: DBClient, cache: CacheClient) -> None:\n```\n\nSince the dependency is already configured, no changes to dependency injection are needed. The cache client will be ready to use!\n\nFurthermore, tests will also use an injector. Integration tests might bind the real CacheClient to a local instance. Unit tests might mock it or provided a local implementation. So in this blueprint you won't need to worry about mocking cache client, worried about the test using production, etc.\n\nNow imagine is time for a refactor, we are going to split `FooBluePrint` into a few components and also use `Events`. Again, as long as there are no new low-level classes that require configuration, no changes to the injection are needed!\n\n```patch:\n+class FooDataAccess:\n+    def __init__(self, db: DBClient, cache: CacheClient) -> None:\n+        ...\n+\n+class FooEventSender:\n+    def __init__(self, events: Events) -> None:\n+        ...\n\nclass FooBluePrint(BluePrint):\n-    def __init__(self, db: DBClient, cache: CacheClient) -> None:\n+    def __init__(self, data: FooDataAccess, events: FooEventSender) -> None:\n```\n\nThe cache pool usage is growing. `FooDataAccess` caches a lot of data and items are being evicted, causing a drop in hit rate. We want to move `FooDataAccess` cache to the best-effort pool. This is a configuration change, should not require complex changes to our application, and yeah, injector can help:\n\n```patch:\nconfiguration.bind(CacheClient).globally().with_kwargs(pool=CachePools.DEFAULT)\n+ configuration.bind(CacheClient).for_parent(FooDataAccess).with_kwargs(pool=CachePools.BEST_EFFORT)\n```\n\n## API\nThe bindinds and behavior of the injector are controlled with the `Configuration` class.\n\n### Initialize\nTo initialize the injector, a config is needed:\n```python:\nconfiguration = Configuration()\ninjector = Injector(configuration)\n```\n\n### Global bindinds:\nBind the given class to the configured type resolver.\n\n```python:\nconfiguration.bind(Foo).globally()\n```\n\nThis returns a `TypeResolver[Foo]`, that can be further configured. See `TypeResolver` api below.\n\n### Scoped bindings:\nBind the given class to the configured type resolver only for the given parent class.\n\n```python:\n\nclass Bar:\n    def __init__(self, foo: Foo) -> None:\n        ...\n\nclass Baz:\n    def __init__(self, foo: Foo) -> None:\n        ...\n\nconfiguration.bind(Foo).for_parent(Bar)\n```\nThis binding will only take effect for `Bar`. `Baz` will continue to see the default instantiation for `Foo`.\n\nThis returns a `TypeResolver[Foo]`, that can be further configured. See `TypeResolver` api below.\n\n### Type resolver\nOnce created the bind and set the scope (`bind(Foo).globally()` or `bind(Foo).for_parent(Bar)`) you will get a `TypeResolver` that allows to configure how the binded value will be resolved.\n\n* `to_instance(instance)`: Binds to an specific instance. Useful for wiring globals into DI or when building the object is complicated and you prefer to control that.\n* `to_class(Bar)`: Binds to a class. Useful to inject a comparible subclass, the concrete implementation of an abstract class or a class that implements a Protocol.\n* `to_constructor(constructor_fn)`: The function will build the object. Note that the function will be also injected, so the function might use a configuration class and the injector will provide it. Useful for objects complicated to build.\n* No `to_*` invoked: Binds to the class itself (it will use its `__init__()` as constructor). This makes sense, for example to control the behavior of singletons (See cache and singletons section), to revert a global bind to the original for a parent class, or for the test-specific configurations that expect explicit bindings.\n\nAdditionally, for the default and `to_constructor` resolutions, this extra configuration can be set:\n* `with_kwargs(foo=bar)`: Overrides the value of given param in the constructor.\n* `with_arg_types(foo=Foo)`: Overrides the type that will be used for the param. Similar to `for_parent(...).to_class(...)` that can also override the class, but it can work when you have two args with the same type (imagine `Processor(in: Queue, out: Queue)`) and will also work for constructor functions.\n\n### Cache and singletons\nThe injector will cache **ALL** types, both specifically binded and those injected using the default. This means that **ALL classes will be singletons**.\n\nNote that when binding the same class globally / for specific parents, obviously each one will get a different singleton.\n\nWhile this is generally the preferred choice, there can be situations where this is not desired.\n\nYou can avoid this by:\na) Binding for each parent class:\n```python:\nconfiguration.bind(Container).for_parent(Foo)\nconfiguration.bind(Container).for_parent(Bar)\n```\nWith this, `Foo` and `Bar` will use different containers. Note that still all `Foo` instantiated with the injector will be the same instance, and will obviously also have the same `Container`.\n\nb) Make your code build the instances by default:\n```python: \nclass Foo:\n    def __init__(self, container: Optional[Foo] = None) -> None:\n        self.container = container or Container()\n```\nThe code is still testable, `Container` can be injected for tests (the test injector can even bind `Optional[Container]` to a mock), but it is clear that each class will use a different `Container` instance by default.\n\n## Default values\nThe injector recognizes default values and will use them unless there is an specific binding for the class.\n\nFor example:\n```python:\nclass A:\n    def __init__(self, foo: str=\"foo\") -> None:\n        ...\n```\n\nWill just work as expected, and the default value will be used. If you would want to override this value with the injector, you will need to use:\n\n```python:\nconfiguration.bind(A).globally().with_kwargs(foo=\"override\")\n```\n\nWhile having static instances as default values is not recommended, this will also work:\n\n```python:\ndefault_foo = Foo(\"static\")\nclass A:\n    def __init__(self, foo: Foo = default_foo) -> None:\n        ...\n```\n\nBy default, `A` will receive `default_foo` as parameter. To override, you will do:\n\n```python:\nconfiguration.bind(Foo).globally().to_instance(override_foo)\n# Or just for A:\nconfiguration.bind(Foo).for_parent(A).to_instance(override_foo)\n```\n\n## Optional and Unions\nThe injector will refuse to build `Optional` and `Union` types by default, as it doesn't know what of the multiple choices to injects.\n\nFor `Optional[Foo]` and `Union[Foo, Bar]` types binding just `Foo` will not work. You can `bind(Optional[Foo])` and `bind[Foo, Bar]` and map them normally to a instance, concrete class or constructor.\n\n## Best practices\n* Keep configuration settings out of your application-level classes' constructors, so more of them can be built automatically. You can use a `ConfigurationProvider` dependency to provide configuration settings to your app.\n* Avoid Union for dependencies when possible, use Protocol or Abstract as they should have compatible apis.\n* If is ok to have low-level dependencies (data access, ...) with configuration or as abstract / Protocol classes that force injecting a concrete instance and/or configuration.\n* Build a production entry point separated from test and local envs, that is the only one that configures the injector for production.\n* Prepare a shared test-specific injector. Specially for integration tests so the plumbing of configuring dependencies for test environment is only done once.\n  \n## Testing-specific configurations\nThis injector will try to build all classes not binded, and as long as no scalar or primitive values are needed, it will travered the dependency tree and boild all objects.\n\nFor testing it might be interesting to mock by default or fail if a dependency is needed and not specifically binded in the test, so two configuration sub-classes are provided:\n\n### ErrorOnNotExplicitConfiguration\nWill throw `ErrorOnNotExplicitConfiguration` for any class not binded.\n\n```python:\n    class Dependency:\n        pass\n\n    class ClassToTest:\n        def __init__(self, dep: Dependency):\n            self.dep = dep\n\n    configuration = ErrorOnNotExplicitConfiguration()\n    configuration.bind(ClassToTest).globally()\n    injector = Injector(configuration)\n    with pytest.raises(InjectorConfigurationError):\n        injector.get(ClassToTest)\n\n    configuration = ErrorOnNotExplicitConfiguration()\n    configuration.bind(ClassToTest).globally()\n    configuration.bind(Dependency).globally().to_instance(Mock())\n    injector = Injector(configuration)\n    assert isinstance(injector.get(ClassToTest).dep, Mock)\n```\n\n### MockOnNotExplicitConfiguration\nWill mock any classes not specifically binded.\n\n```python:\n    class Dependency:\n        def some_method(self) -> str:\n            return \"PRODUCTION_VALUE\"\n\n    class ClassToTest:\n        def __init__(self, dep: Dependency):\n            self.dep = dep\n\n    configuration = MockOnNotExplicitConfiguration()\n    configuration.bind(ClassToTest).globally()\n    injector = Injector(configuration)\n    assert isinstance(injector.get(ClassToTest).dep, Mock)\n\n    # We can access the mock to configure it just\n    # asking the injector for the dependency\n    injector.get(Dependency).some_method.return_value = \"TEST_VALUE\"  # type: ignore\n    assert injector.get(ClassToTest).dep.some_method() == \"TEST_VALUE\"\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/RevenueCat/rc-injector",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "rc-injector",
+    "package_url": "https://pypi.org/project/rc-injector/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/rc-injector/",
+    "project_urls": {
+      "Homepage": "https://github.com/RevenueCat/rc-injector",
+      "Repository": "https://github.com/RevenueCat/rc-injector"
+    },
+    "release_url": "https://pypi.org/project/rc-injector/0.0.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.8,<4.0",
+    "summary": "Python dependency injector",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17430107,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f444bada457346683770a2e81f9c8dcd30eca81464b6e8f4d80fe8da70dc575a",
+          "md5": "4c0df6bdbca596ec31b8cbbad79c68c7",
+          "sha256": "7cb02cae93198e3bbbf0ebf901a00f23efe2ee116348525bd0abf19c068d0556"
+        },
+        "downloads": -1,
+        "filename": "rc_injector-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4c0df6bdbca596ec31b8cbbad79c68c7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10607,
+        "upload_time": "2023-03-21T14:01:32",
+        "upload_time_iso_8601": "2023-03-21T14:01:32.663283Z",
+        "url": "https://files.pythonhosted.org/packages/f4/44/bada457346683770a2e81f9c8dcd30eca81464b6e8f4d80fe8da70dc575a/rc_injector-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "85cf7db2780cfd52ba51424c729a043fa224b5bb963c3e58c6ccd9a2dc9b4679",
+          "md5": "b8b34c4019aa31ab1b15f7252144f4db",
+          "sha256": "5251f381688b8e5651be3addd304e452a284cdbc735e7603bb7be93c03b1490e"
+        },
+        "downloads": -1,
+        "filename": "rc_injector-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8b34c4019aa31ab1b15f7252144f4db",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14363,
+        "upload_time": "2023-03-21T14:01:34",
+        "upload_time_iso_8601": "2023-03-21T14:01:34.085638Z",
+        "url": "https://files.pythonhosted.org/packages/85/cf/7db2780cfd52ba51424c729a043fa224b5bb963c3e58c6ccd9a2dc9b4679/rc_injector-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d51bb7c6e8340469143746230bbf0f73f4a2e3232ea2e6fcc3ec496e7abbe46b",
+          "md5": "ec41ff2101b63f85ae8c02f66a10de9e",
+          "sha256": "8c69ed4c459dc4f15d5daee1991538fa2461e85282fda1f1aa65282908fc5776"
+        },
+        "downloads": -1,
+        "filename": "rc_injector-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ec41ff2101b63f85ae8c02f66a10de9e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8,<4.0",
+        "size": 10777,
+        "upload_time": "2023-03-24T11:17:50",
+        "upload_time_iso_8601": "2023-03-24T11:17:50.235718Z",
+        "url": "https://files.pythonhosted.org/packages/d5/1b/b7c6e8340469143746230bbf0f73f4a2e3232ea2e6fcc3ec496e7abbe46b/rc_injector-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "985b5650b31ee39316979b70becbf477d6927494372588884975ef6bb3b76085",
+          "md5": "af799b2afb064f5f2f499eb7a6a84ace",
+          "sha256": "0a1e725d4f86ddfa3dc877658d95d6e34dfc328fddcc8974d463b243bc650e8c"
+        },
+        "downloads": -1,
+        "filename": "rc_injector-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af799b2afb064f5f2f499eb7a6a84ace",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8,<4.0",
+        "size": 14537,
+        "upload_time": "2023-03-24T11:17:52",
+        "upload_time_iso_8601": "2023-03-24T11:17:52.201690Z",
+        "url": "https://files.pythonhosted.org/packages/98/5b/5650b31ee39316979b70becbf477d6927494372588884975ef6bb3b76085/rc_injector-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d51bb7c6e8340469143746230bbf0f73f4a2e3232ea2e6fcc3ec496e7abbe46b",
+        "md5": "ec41ff2101b63f85ae8c02f66a10de9e",
+        "sha256": "8c69ed4c459dc4f15d5daee1991538fa2461e85282fda1f1aa65282908fc5776"
+      },
+      "downloads": -1,
+      "filename": "rc_injector-0.0.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "ec41ff2101b63f85ae8c02f66a10de9e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8,<4.0",
+      "size": 10777,
+      "upload_time": "2023-03-24T11:17:50",
+      "upload_time_iso_8601": "2023-03-24T11:17:50.235718Z",
+      "url": "https://files.pythonhosted.org/packages/d5/1b/b7c6e8340469143746230bbf0f73f4a2e3232ea2e6fcc3ec496e7abbe46b/rc_injector-0.0.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "985b5650b31ee39316979b70becbf477d6927494372588884975ef6bb3b76085",
+        "md5": "af799b2afb064f5f2f499eb7a6a84ace",
+        "sha256": "0a1e725d4f86ddfa3dc877658d95d6e34dfc328fddcc8974d463b243bc650e8c"
+      },
+      "downloads": -1,
+      "filename": "rc_injector-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "af799b2afb064f5f2f499eb7a6a84ace",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8,<4.0",
+      "size": 14537,
+      "upload_time": "2023-03-24T11:17:52",
+      "upload_time_iso_8601": "2023-03-24T11:17:52.201690Z",
+      "url": "https://files.pythonhosted.org/packages/98/5b/5650b31ee39316979b70becbf477d6927494372588884975ef6bb3b76085/rc_injector-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
