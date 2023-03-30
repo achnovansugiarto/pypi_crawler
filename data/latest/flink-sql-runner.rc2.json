@@ -1,0 +1,110 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "# Table of contents\n\n- [flink-sql-runner](#flink-sql-runner)\n    * [SQL job definition](#sql-job-definition)\n        + [DataStream API](#datastream-api)\n        + [Job output](#job-output)\n            - [Job output example](#job-output-example)\n    * [Deployment](#deployment)\n        + [Infrastructure](#infrastructure)\n            - [Session Mode](#session-mode)\n        + [Prerequisites](#prerequisites)\n        + [Running deployment scripts](#running-deployment-scripts)\n        + [Procedure](#procedure)\n        + [Job manifest](#job-manifest)\n        + [S3 structure](#s3-structure)\n        + [Query update](#query-update)\n        + [Deployment scripts internals](#deployment-scripts-internals)\n    * [Troubleshooting](#troubleshooting)\n    * [Known issues](#known-issues)\n\n---\n\n# flink-sql-runner\n\n_flink-sql-runner_ is a framework for scheduling streaming SQL queries on\n[Apache Hadoop YARN](https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/YARN.html) and on a standalone\nFlink cluster. It simplifies defining and executing\n[Flink SQL](https://nightlies.apache.org/flink/flink-docs-master/docs/dev/table/sql/overview/) jobs.\nThe user has only to declare job's manifest YAML file which contains the query to be executed and basic metadata.\nJobs lifecycle is managed by the framework.\n\nThe module has the following structure:\n\n- `/flink_sql_runner/` - contains deployment scripts.\n- `/flink_sql_runner/runner/` - contains Flink job runners.\n\nFuture improvements:\n\n- Improve schema management. Avoid using static files if possible.\n- Flink session cluster management should be improved and be the part of this module.\n\n---\n\n## SQL job definition\n\nEach job should be defined in a separate YAML manifest file. The manifest has the following structure:\n\n```yaml\n---\nname: query-unique-name\ndescription: \"Some description.\"\ntarget-table: \"`kafka`.`some-kafka-table-name`\"\nsql: >-\n  SELECT\n      `column_a`,\n      `column_b`,\n      `column_c`,\n      `record_time`\n  FROM\n      `kafka`.`some-kafka-input-table`\n  WHERE\n      `column_d` = 'SOME_VALUE'\nflinkProperties: { }\n```\n\n- `name`: The unique name of the query. This value is used to identify the job in monitoring, in internal state storage\n  etc.\n- `description`: Query description.\n- `target-table`: Flink SQL table where the query results are put into. See [Job output](#job-output).\n- `sql`: Flink SQL query that will be run by flink-sql-runner.\n- `flinkProperties`: Flink properties specific for the query. Default properties are defined in `job-template.yaml`\n  file. The defaults can be overwritten if needed.\n  See [Flink Configuration](https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/config/).\n\n### DataStream API\n\nSome use cases cannot be implemented using pure SQL approach. One can define `code` instead of `sql` as shown in the\nexample below:\n\n```yaml\n---\nname: query-unique-name\ndescription: \"Some description.\"\ntarget-table: \"`kafka`.`some-kafka-table-name`\"\ncode: >\n  from pyflink.common.typeinfo import Types\n\n  execution_output = stream_env.from_collection(\n    collection=[(1, 'aaa'), (2, 'bb'), (3, 'cccc')],\n    type_info=Types.ROW([Types.INT(), Types.STRING()])\n  )\nflinkProperties: { }\n```\n\n### Job output\n\nEach job manifest contains `target-table` field, which is the name of the output Flink SQL table. Currently, the output\ntable definition has to be created manually.\n\nIt is worth mentioning that the framework adds basic metadata to the query outputs:\n\n- `__create_timestamp` - datetime when the event was created.\n- `__query_name` - query unique name taken from the job manifest.\n- `__query_description` - query description taken from the job manifest.\n- `__query_id` - query auto-generated UUID.\n- `__query_version` - query version. See [Query update](#query-update).\n- `__query_create_timestamp` - datetime when the query was scheduled.\n\n#### Job output example\n\nLet's consider the following example.\n\nFor query:\n\n```sql\nSELECT\n    `column_a`,\n    `column_b`,\n    `column_c`,\n    `record_time`\nFROM\n    `kafka`.`some-kafka-input-table`\nWHERE\n    `column_d` = 'SOME_VALUE'\n```\n\nthe output table may have the following definition:\n\n```sql\ncreate table `kafka`.`some-flink-table-name` (\n    `column_a` STRING,\n    `column_b` INT,\n    `column_c` STRING,\n    `record_time` TIMESTAMP(3),\n    `__create_timestamp` TIMESTAMP(3),\n    `__query_name` STRING,\n    `__query_description` STRING,\n    `__query_id` STRING,\n    `__query_version` INT,\n    `__query_create_timestamp` TIMESTAMP(3)\n) with (\n    'connector' = 'kafka',\n    'format' = 'json',\n    'topic' = 'some-topic-name',\n    'sink.delivery-guarantee' = 'at-least-once',\n    'properties.bootstrap.servers' = 'example.com:9092'\n)\n;\n```\n\n---\n\n## Deployment\n\n### Infrastructure\n\nCurrently, the framework supports only deployment on a standalone Flink Session Cluster or a Flink Session Cluster\nrunning on YARN.\n\n#### Session Mode\n\nThere are two deployment modes in Flink to\nconsider: [Application Mode](https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/overview/#application-mode)\nand [Session Mode](https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/overview/#session-mode)\n(Per-Job Mode is deprecated).\n\n- `Application Mode` - a dedicated Flink cluster is created for each Flink application.\n- `Session Mode` - multiple Flink jobs shares the same Flink cluster.\n\nEssentially, Application Mode provides higher resource isolation (separate cluster per job, that is, dedicated\nJobManager, or two if HA is enabled) in comparison to Session Mode, but more resources are utilized. If there are tens\nor hundreds of small jobs running, having a Session Cluster running all the jobs should save a lot of resources.\n\n_Decision_: Flink jobs are deployed on a shared Flink Session Cluster.\n\n### Prerequisites\n\n- Session cluster is up and running.\n- All necessary Flink dependencies are available on the classpath on the EMR master node.\n- Python virtualenv with all necessary python dependencies is created on each EMR node.\n  ```bash\n  python3 -m pip install \\\n      -r flink-sql-runner/deployment-scripts/jobs-deployment/requirements.txt \\\n      -r flink-sql-runner/python/requirements.txt\n  ```\n- An S3 bucket for storing YAML manifests file is created. See [Job manifest](#job-manifest) section.\n\n### Running deployment scripts\n\nSample command to trigger deployment of all queries on YARN:\n\n```bash\npython3 flink_sql_runner/deploy.py \\\n    --path /some/path/to/sql/queries/ \\\n    --template-file flink-sql-runner/deployment-scripts/job-template.yaml \\\n    --pyflink-runner-dir flink_sql_runner/runner/ \\\n    --pyexec-path /home/hadoop/flink-sql-runner/venv/bin/python3 \\\n    --external-job-config-bucket some-s3-bucket \\\n    --external-job-config-prefix flink-sql-runner/manifests/ \\\n    --table-definition-path /some/path/to/sql/schemas/kafka-input-tables.sql \\\n                            /some/path/to/sql/schemas/kafka-output-tables.sql \\\n    --deployment-target yarn\n```\n\nSample command to trigger deployment of a single query:\n\n```bash\npython3 flink_sql_runner/deploy_job.py \\\n    --job-config-path some/path/some-query-name.yaml \\\n    --pyflink-runner-dir flink_sql_runner/runner/ \\\n    --pyexec-path /home/hadoop/flink-sql-runner/venv/bin/python3 \\\n    --external-job-config-bucket some-s3-bucket \\\n    --external-job-config-prefix flink-sql-runner/manifests/ \\\n    --table-definition-path /some/path/to/sql/schemas/kafka-input-tables.sql \\\n                            /some/path/to/sql/schemas/kafka-output-tables.sql \\\n    --deployment-target yarn\n```\n\nIf your deployment target is a standalone cluster, please specify `--deployment-target remote`\nand `--jobmanager-address <host>:<port`.\n\nPlease note that `job-config-path` points to a file which is the final manifest of the job, that is, already contains\nquery definition merged with the template file containing defaults.\n\n### Procedure\n\n`flink-sql-runner/deployment-scripts/jobs-deployment/deploy.py` script deploys all available jobs\nsequentially. The procedure applied for each query is shown in the diagram below.\n\n```mermaid\n  graph TD;\n      START[Deploy jobs] --> IS_NEW_JOB{Is this a new job?};\n      IS_NEW_JOB -- yes --> START_CLEAN_STATE[Start the job with a clean state];\n      IS_NEW_JOB -- no --> IS_JOB_RUNNING{Is the job running?};\n      IS_JOB_RUNNING -- yes --> HAS_CONF_CHANGED_1{Has configuration changed?};\n      IS_JOB_RUNNING -- no --> HAS_CONF_CHANGED_2{Has configuration changed?};\n      HAS_CONF_CHANGED_1 -- yes --> STOP[Stop the job with a savepoint];\n      HAS_CONF_CHANGED_1 -- no --> DO_NOTHING[Do nothing];\n      STOP --> HAS_QUERY_CHANGED{Has query changed?};\n      HAS_QUERY_CHANGED -- yes --> START_CLEAN_STATE[Start the job with a clean state];\n      HAS_QUERY_CHANGED -- no --> START_FROM_SAVEPOINT[Start the job from the savepoint];\n      HAS_CONF_CHANGED_2 -- yes --> HAS_QUERY_CHANGED;\n      HAS_CONF_CHANGED_2 -- no --> FIND_STATE{Find latest savepoint or checkpoint};\n      FIND_STATE -- state not found --> ERROR[Error];\n      FIND_STATE -- state found --> START_LATEST_STATE[Start the job from the latest state];\n```\n\n### Job manifest\n\nTo determine if the job is new or not, if the configuration or query has changed, we need to keep the job manifest in a\npersistent store (S3). When deployment process starts, the framework compares the new and the old configuration and\nexecutes deployment steps accordingly. After each successful job deployment, the manifest is updated and uploaded into\nS3. The manifest has the following structure:\n\n```yaml\ndescription: \"Some description.\"\nflinkProperties:\n  execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION\n  execution.checkpointing.interval: 60s\n  execution.checkpointing.min-pause: 60s\n  execution.checkpointing.mode: EXACTLY_ONCE\n  execution.checkpointing.timeout: 1h\n  pipeline.name: query-unique-name\n  pipeline.object-reuse: 'true'\n  restart-strategy: fixed-delay\n  restart-strategy.fixed-delay.attempts: '2147483647'\n  restart-strategy.fixed-delay.delay: 60s\n  state.backend: rocksdb\n  state.backend.incremental: 'true'\n  state.backend.rocksdb.localdir: /mnt/flink\n  state.checkpoints.dir: s3://some-s3-bucket/flink-sql-runner/checkpoints/query-unique-name/\n  state.checkpoints.num-retained: '3'\n  state.savepoints.dir: s3://some-s3-bucket/flink-sql-runner/savepoints/query-unique-name/\nmeta:\n  query-create-timestamp: '2022-12-07 08:57:42'\n  query-id: 35d3d720-760d-11ed-bfeb-02e547cf7baa\n  query-version: 1\nname: query-unique-name\nsql: SELECT  `column_a`,  `column_b`,  `column_c`,  `record_time`  FROM  `kafka`.`some-kafka-input-table`  WHERE  `column_d` = 'SOME_VALUE'\ntarget-table: \"`kafka`.`some-flink-table-name`\"\n```\n\nPlease note that `flinkProperties` section is a list of flink default properties defined in `job-template.yaml` in\naddition to those defined in files in `--path` directory.\n\nWhat is more, `meta` section is generated automatically.\n\n### S3 structure\n\nThe typical S3 structure for a job looks as follows:\n\n```\n2022-12-08 09:13:18       1418 flink-sql-runner/checkpoints/<query-name>/1/19b9a1d6bd3502b22ff6759a2b684b2e/chk-1416/_metadata\n2022-12-08 09:13:17          0 flink-sql-runner/checkpoints/<query-name>/1/19b9a1d6bd3502b22ff6759a2b684b2e/chk-1416_$folder$\n2022-12-08 09:11:17          0 flink-sql-runner/checkpoints/<query-name>/1/19b9a1d6bd3502b22ff6759a2b684b2e/shared_$folder$\n2022-12-08 09:11:17          0 flink-sql-runner/checkpoints/<query-name>/1/19b9a1d6bd3502b22ff6759a2b684b2e/taskowned_$folder$\n2022-12-08 09:11:17          0 flink-sql-runner/checkpoints/<query-name>/1/19b9a1d6bd3502b22ff6759a2b684b2e_$folder$\n2022-12-07 08:57:52          0 flink-sql-runner/checkpoints/<query-name>/1_$folder$\n2022-12-07 08:57:51          0 flink-sql-runner/checkpoints/<query-name>_$folder$\n2022-12-07 08:57:51          0 flink-sql-runner/checkpoints_$folder$\n2022-12-08 09:11:08       1405 flink-sql-runner/savepoints/<query-name>/1/savepoint-ac8dd3-bab3bbd81f7a/_metadata\n2022-12-08 09:11:08          0 flink-sql-runner/savepoints/<query-name>/1/savepoint-ac8dd3-bab3bbd81f7a_$folder$\n2022-12-08 09:11:08          0 flink-sql-runner/savepoints/<query-name>/1_$folder$\n2022-12-08 09:11:08          0 flink-sql-runner/savepoints/<query-name>_$folder$\n2022-12-08 09:11:07          0 flink-sql-runner/savepoints_$folder$\n2022-12-08 09:11:20       1256 flink-sql-runner/manifests/<query-name>.yaml\n```\n\n- Job manifest is stored as a YAML file in `flink-sql-runner/manifests/<query-name>.yaml` file.\n- Savepoints are stored in `flink-sql-runner/savepoints/<query-name>/<query-version>/` location.\n- Checkpoints are stored in `flink-sql-runner/checkpoints/<query-name>/<query-version>/<flink-job-id>/` location.\n\n### Query update\n\nAccording to the documentation, Flink SQL query is translated into a graph of operators based on the table planner\noutput. As a result, any change on the query or Flink version may lead to state incompatibility and update failure.\nWhen SQL is changed in an incompatible way, we need to cancel the existing job first, then start a new one with a\nclear state. There is an initiative to address the\nproblem [FLIP-190](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=191336489).\n\nThe current `query-version` is kept in `meta` section. The version is a monotonously increasing number, starting from 1.\nIn order to avoid loading obsolete state, each savepoint's and checkpoint's path contains query version, for example:\n\n```\n$ aws s3 ls s3://some-s3-bucket/flink-sql-runner/ --recursive\n2022-12-07 13:57:36       1417 flink-sql-runner/checkpoints/query-unique-name/1/09bd95b5c7edecda260318e47f539c47/chk-297/_metadata\n2022-12-07 13:57:35          0 flink-sql-runner/checkpoints/query-unique-name/1/09bd95b5c7edecda260318e47f539c47/chk-297_$folder$\n2022-12-07 08:57:52          0 flink-sql-runner/checkpoints/query-unique-name/1/09bd95b5c7edecda260318e47f539c47/shared_$folder$\n2022-12-07 08:57:52          0 flink-sql-runner/checkpoints/query-unique-name/1/09bd95b5c7edecda260318e47f539c47/taskowned_$folder$\n2022-12-07 08:57:52          0 flink-sql-runner/checkpoints/query-unique-name/1/09bd95b5c7edecda260318e47f539c47_$folder$\n2022-12-07 08:57:52          0 flink-sql-runner/checkpoints/query-unique-name/1_$folder$\n2022-12-07 08:57:51          0 flink-sql-runner/checkpoints/query-unique-name_$folder$\n```\n\nWhen the query changes, the framework stops currently running job and starts a new one with a fresh state. In\nconsequence, the new job reads all available data once again, which may lead to duplicates in the output.\n\n### Deployment scripts internals\n\nThe deployment scripts are written in Python. YARN and Flink interactions are executed using CLI commands:\n\n- [YARN Commands](https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/YarnCommands.html)\n- [Flink Command-Line Interface](https://nightlies.apache.org/flink/flink-docs-master/docs/deployment/cli/)\n\n## Troubleshooting\n\n- How to check if Flink Session Cluster is running?\n    ```bash\n    # ssh to the EMR master node\n    $ yarn application -list\n    2022-12-08 12:15:00,599 INFO client.RMProxy: Connecting to ResourceManager at ip-172-31-136-243.eu-central-1.compute.internal/172.31.136.243:8032\n    2022-12-08 12:15:00,846 INFO client.AHSProxy: Connecting to Application History server at ip-172-31-136-243.eu-central-1.compute.internal/172.31.136.243:10200\n    Total number of applications (application-types: [], states: [SUBMITTED, ACCEPTED, RUNNING] and tags: []):1\n                    Application-Id\t    Application-Name\t    Application-Type\t      User\t     Queue\t             State\t       Final-State\t       Progress\t                       Tracking-URL\n    application_1669805938272_0011\tFlink session cluster\t        Apache Flink\t    hadoop\t   default\t           RUNNING\t         UNDEFINED\t           100%\t         http://172.31.136.21:43963\n    ```\n\n- How to list running Flink jobs and their status? There are two ways - via console or in Flink UI Dashboard.\n    ```bash\n    # ssh to the EMR master node\n    # Extract Flink Session Cluster YARN application ID (as shown above).\n    $ flink list -t yarn-session -Dyarn.application.id=application_1669805938272_0011\n    ------------------ Running/Restarting Jobs -------------------\n    08.12.2022 09:11:15 : 19b9a1d6bd3502b22ff6759a2b684b2e : some-query-name (RUNNING)\n    --------------------------------------------------------------\n    ```\n\n## Known issues\n\n- Property `state.checkpoints.num-retained` is ignored when specified via `flink run` command.\n  ```bash\n  flink run -t yarn-session -Dyarn.application.id=<appId> -Dstate.checkpoints.num-retained=3 ...\n  ```",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "flink-sql-runner",
+    "package_url": "https://pypi.org/project/flink-sql-runner/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/flink-sql-runner/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/flink-sql-runner/0.0.2/",
+    "requires_dist": null,
+    "requires_python": ">=3.7",
+    "summary": "Framework for scheduling streaming SQL queries on Apache Hadoop YARN and on a standalone Flink cluster.",
+    "version": "0.0.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17187786,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "616b85a320e29953455ce638c9ccbbd1f7313e175f4c5beb360ba8b8c90f568b",
+          "md5": "5cf4b5a24401fa6b4b6488e524f72e80",
+          "sha256": "f7abce786bd3a86ccc5bb13ccdefda2b2526bb7b2246716cd2f839356a95c499"
+        },
+        "downloads": -1,
+        "filename": "flink-sql-runner-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5cf4b5a24401fa6b4b6488e524f72e80",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 9334,
+        "upload_time": "2023-03-01T14:06:44",
+        "upload_time_iso_8601": "2023-03-01T14:06:44.302569Z",
+        "url": "https://files.pythonhosted.org/packages/61/6b/85a320e29953455ce638c9ccbbd1f7313e175f4c5beb360ba8b8c90f568b/flink-sql-runner-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a292f42c6b1dd00e7a62dfa2b7d942340227ba362098a26518dc87a52974e9d",
+          "md5": "90cd2183c717fbc59fb79c11e50a27e6",
+          "sha256": "2dc8b450c202e56f517991129e003d2dff6091a6013c37da27810323b5f5875a"
+        },
+        "downloads": -1,
+        "filename": "flink-sql-runner-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "90cd2183c717fbc59fb79c11e50a27e6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 26329,
+        "upload_time": "2023-03-07T08:30:54",
+        "upload_time_iso_8601": "2023-03-07T08:30:54.812741Z",
+        "url": "https://files.pythonhosted.org/packages/5a/29/2f42c6b1dd00e7a62dfa2b7d942340227ba362098a26518dc87a52974e9d/flink-sql-runner-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5a292f42c6b1dd00e7a62dfa2b7d942340227ba362098a26518dc87a52974e9d",
+        "md5": "90cd2183c717fbc59fb79c11e50a27e6",
+        "sha256": "2dc8b450c202e56f517991129e003d2dff6091a6013c37da27810323b5f5875a"
+      },
+      "downloads": -1,
+      "filename": "flink-sql-runner-0.0.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "90cd2183c717fbc59fb79c11e50a27e6",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 26329,
+      "upload_time": "2023-03-07T08:30:54",
+      "upload_time_iso_8601": "2023-03-07T08:30:54.812741Z",
+      "url": "https://files.pythonhosted.org/packages/5a/29/2f42c6b1dd00e7a62dfa2b7d942340227ba362098a26518dc87a52974e9d/flink-sql-runner-0.0.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

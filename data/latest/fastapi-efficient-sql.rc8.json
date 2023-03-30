@@ -1,0 +1,420 @@
+{
+  "info": {
+    "author": "BryanLee",
+    "author_email": "bryanlee@126.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "# fastapi-efficient-sql\n\nInstalled as package by `pip install fastapi-efficient-sql`\n\nInstall developing requirements by `pipenv install --skip-lock --dev` or `pip install -r requirements-dev.txt`\n\nRun unittest by `pytest -sv`\n\n## Some preparations before using efficient sql\n```python\nfrom fastapi_esql import AppMetaclass, BaseManager, BaseModel\n\n\nclass DemoMetaclass(AppMetaclass):\n\n    def get_ro_conn(self):\n        return Tortoise.get_connection(\"demo_ro\")\n\n    def get_rw_conn(self):\n        return Tortoise.get_connection(\"demo_rw\")\n\n\nclass Account(BaseModel):\n    id = fields.IntField(pk=True)\n    active = fields.BooleanField(null=False, default=True)\n    gender = fields.IntEnumField(GenderEnum, null=False, default=GenderEnum.unknown)\n    name = fields.CharField(max_length=32, null=False, default=\"\")\n    locale = fields.CharEnumField(LocaleEnum, max_length=5, null=False)\n\n\nclass AccountMgr(BaseManager, metaclass=DemoMetaclass):\n    model = Account\n```\n\n## Some supported efficient sql\n### **select_custom_fields**\n**basic example**\n```python\naids = [1, 2, 3]\n\nawait AccountMgr.select_custom_fields(\n    fields=[\n        \"id\", \"extend ->> '$.last_login.ipv4' ipv4\",\n        \"extend ->> '$.last_login.start_datetime' start_datetime\",\n        \"CAST(extend ->> '$.last_login.online_sec' AS SIGNED) online_sec\"\n    ],\n    wheres=f\"id IN ({','.join(map(str, aids))}) AND gender=1\",  # These 4 types of `wheres` are equal\n    # wheres=Q(Q(id__in=aids), Q(gender=1), join_type=\"AND\"),\n    # wheres={\"id__in\": aids, \"gender\": 1},\n    # wheres=[Q(id__in=aids), Q(gender=1)],\n)\n```\nGenerate sql and execute\n```sql\n    SELECT\n      id, extend ->> '$.last_login.ipv4' ipv4, extend ->> '$.last_login.start_datetime' start_datetime, CAST(extend ->> '$.last_login.online_sec' AS SIGNED) online_sec\n    FROM account\n    WHERE id IN (1,2,3) AND gender=1\n```\n\n**complex example**\n```python\nawait AccountMgr.select_custom_fields(\n    fields=[\n        \"locale\", \"gender\", \"COUNT(1) cnt\"\n    ],\n    wheres=Q(id__range=[1, 12]),\n    groups=[\"locale\", \"gender\"],\n    having=\"cnt > 0\",\n    orders=[\"locale\", \"-gender\"],\n    offset=0,\n    limit=10,\n)\n```\nGenerate sql and execute\n```sql\n    SELECT\n      locale, gender, COUNT(1) cnt\n    FROM account\n    WHERE `id` BETWEEN 1 AND 12\n    GROUP BY locale, gender\n    HAVING cnt > 0\n    ORDER BY locale ASC, gender DESC\n    LIMIT 0, 10\n```\n\n### **update_json_field**\n```python\nawait AccountMgr.update_json_field(\n    json_field=\"extend\",\n    wheres=Q(id=8),\n    merge_dict={\n        \"updated_at\": \"2022-10-30 21:34:15\",\n        \"info\": {\n            \"online_sec\": 636,\n        }\n    },\n    path_value_dict={\n        \"$.last_login\": {\n            \"ipv4\": \"209.182.101.161\",\n        },\n        \"$.uuid\": \"fd04f7f2-24fc-4a73-a1d7-b6e99a464c5f\",\n    },\n    remove_paths=[\"$.deprecated\"],\n    json_type=dict,\n)\n```\nGenerate sql and execute\n```sql\n    UPDATE account SET extend =\n    JSON_MERGE_PATCH(JSON_SET(JSON_REMOVE(COALESCE(extend, '{}'), '$.deprecated'), '$.last_login',CAST('{\"ipv4\": \"209.182.101.161\"}' AS JSON), '$.uuid','fd04f7f2-24fc-4a73-a1d7-b6e99a464c5f'), '{\"updated_at\": \"2022-10-30 21:34:15\", \"info\": {\"online_sec\": 636}}')\n    WHERE `id`=8\n```\n\n### **upsert_on_duplicate**\n```python\nawait AccountMgr.upsert_on_duplicate(\n    [\n        {'id': 7, 'gender': 1, 'name': '斉藤 修平', 'locale': 'ja_JP', 'extend': {}},\n        {'id': 8, 'gender': 1, 'name': 'Ojas Salvi', 'locale': 'en_IN', 'extend': {}},\n        {'id': 9, 'gender': 1, 'name': '羊淑兰', 'locale': 'zh_CN', 'extend': {}}\n    ],\n    insert_fields=[\"id\", \"gender\", \"name\", \"locale\", \"extend\"],\n    upsert_fields=[\"name\", \"locale\"],\n    using_values=False,\n)\n```\nGenerate sql and execute\n```sql\n    INSERT INTO account\n      (id, gender, name, locale, extend)\n    VALUES\n      (7, 1, '斉藤 修平', 'ja_JP', '{}'),\n      (8, 1, 'Ojas Salvi', 'en_IN', '{}'),\n      (9, 1, '羊淑兰', 'zh_CN', '{}')\n    AS `new_account` ON DUPLICATE KEY UPDATE name=`new_account`.name, locale=`new_account`.locale\n```\n\n### **insert_into_select**\n```python\nawait AccountMgr.insert_into_select(\n    wheres=Q(id__in=[4, 5, 6]),\n    remain_fields=[\"gender\"],\n    assign_field_dict={\n        \"locale\": Cases(\"id\", {3: LocaleEnum.zh_CN, 4: LocaleEnum.en_US, 5: LocaleEnum.fr_FR}, default=\"\"),\n        \"active\": False,\n        \"name\": RawSQL(\"CONCAT(LEFT(name, 26), ' [NEW]')\"),\n        \"extend\": {},\n    },\n    to_table=\"account_bak\",\n)\n```\nGenerate sql and execute\n```sql\n    INSERT INTO account_bak\n      (gender, locale, active, name, extend)\n    SELECT gender, CASE id WHEN 3 THEN 'zh_CN' WHEN 4 THEN 'en_US' WHEN 5 THEN 'fr_FR' ELSE '' END locale, False active, CONCAT(LEFT(name, 26), ' [NEW]') name, '{}' extend\n    FROM account\n    WHERE `id` IN (4,5,6)\n```\n\n### **bulk_update_from_dicts**\n```python\nawait AccountMgr.bulk_update_from_dicts(\n    [\n        {'id': 7, 'active': False, 'gender': GenderEnum.male},\n        {'id': 15, 'active': True, 'gender': GenderEnum.unknown}\n    ],\n    join_fields=[\"id\"],\n    update_fields=[\"active\", \"gender\"],\n    using_values=True,\n)\n```\nGenerate sql and execute\n```sql\n    UPDATE account\n    JOIN (\n        SELECT * FROM (\n          VALUES\n          ROW(7, False, 1),\n          ROW(15, True, 0)\n        ) AS fly_table (id, active, gender)\n    ) tmp ON account.id=tmp.id\n    SET account.active=tmp.active, account.gender=tmp.gender\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/NightMarcher/fastapi-efficient-sql",
+    "keywords": "sql,fastapi,tortoise-orm,mysql8,bulk-operation",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "fastapi-efficient-sql",
+    "package_url": "https://pypi.org/project/fastapi-efficient-sql/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/fastapi-efficient-sql/",
+    "project_urls": {
+      "Homepage": "https://github.com/NightMarcher/fastapi-efficient-sql"
+    },
+    "release_url": "https://pypi.org/project/fastapi-efficient-sql/0.0.8/",
+    "requires_dist": [
+      "tortoise-orm"
+    ],
+    "requires_python": "",
+    "summary": "Generate bulk DML SQL and execute them based on tortoise-orm and mysql8.0+, and integrated with fastapi.",
+    "version": "0.0.8",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 16854020,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "87a18a6fd896b044a88ff0f833668e9d607a7b7333aac32d0587b187bfcf7b66",
+          "md5": "7453dbb62782833b3bc78e48b5ab06a8",
+          "sha256": "984240ebe3b2020150a2664b370eba8de48e2d99dffec783519db973d5dcb72f"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7453dbb62782833b3bc78e48b5ab06a8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 4623,
+        "upload_time": "2022-11-07T15:08:56",
+        "upload_time_iso_8601": "2022-11-07T15:08:56.423827Z",
+        "url": "https://files.pythonhosted.org/packages/87/a1/8a6fd896b044a88ff0f833668e9d607a7b7333aac32d0587b187bfcf7b66/fastapi_efficient_sql-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c474e85d401bb736bbc6547d468adf369dc50b408fb2f93e10f1582f6822ee75",
+          "md5": "151d48c94f73bd12dc095a98c1eb4569",
+          "sha256": "01ca94c5052eb8711208ac30d5f1ae3109e1e4cdcb998ab9ac627c5885d15bd6"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "151d48c94f73bd12dc095a98c1eb4569",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11335,
+        "upload_time": "2022-11-10T08:07:34",
+        "upload_time_iso_8601": "2022-11-10T08:07:34.775310Z",
+        "url": "https://files.pythonhosted.org/packages/c4/74/e85d401bb736bbc6547d468adf369dc50b408fb2f93e10f1582f6822ee75/fastapi_efficient_sql-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1f9e57c218d6b2e074ec41fe85d76b5be3d6d99796230f1517c7418ba4e99e10",
+          "md5": "451e6455e8553eb985337251ca917cf5",
+          "sha256": "4430443ef1e4c3ce44fca1145cefbcd68f94b090a459b04f4a40412df1a71ee9"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "451e6455e8553eb985337251ca917cf5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8161,
+        "upload_time": "2022-11-10T08:07:37",
+        "upload_time_iso_8601": "2022-11-10T08:07:37.188468Z",
+        "url": "https://files.pythonhosted.org/packages/1f/9e/57c218d6b2e074ec41fe85d76b5be3d6d99796230f1517c7418ba4e99e10/fastapi-efficient-sql-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e6f7c51f126e7806aa4c2f025a70f865eac48059d0057c02e4a111e5a71406a",
+          "md5": "e0f1cfa55297fe10c98f105f4c50e3a2",
+          "sha256": "6bc839da56f895015193c2c1d372f8f830e10ddcb65f8171ccaa56faa686b738"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e0f1cfa55297fe10c98f105f4c50e3a2",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11338,
+        "upload_time": "2022-11-11T10:24:27",
+        "upload_time_iso_8601": "2022-11-11T10:24:27.203896Z",
+        "url": "https://files.pythonhosted.org/packages/3e/6f/7c51f126e7806aa4c2f025a70f865eac48059d0057c02e4a111e5a71406a/fastapi_efficient_sql-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f78dd872b82f76f0828678aa34a1d258ea43b6479646bf83f82632c61f0908f0",
+          "md5": "9246d0fe78bf695ef762fd74a0a8014c",
+          "sha256": "61cb88af9545a2f54ac5a3666b85c3f553d88701d17a1a8d4a852b472d4986ea"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9246d0fe78bf695ef762fd74a0a8014c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8169,
+        "upload_time": "2022-11-11T10:24:29",
+        "upload_time_iso_8601": "2022-11-11T10:24:29.661562Z",
+        "url": "https://files.pythonhosted.org/packages/f7/8d/d872b82f76f0828678aa34a1d258ea43b6479646bf83f82632c61f0908f0/fastapi-efficient-sql-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ffeb082d09876c7d4898c64fbbeb9de990ce5a27f89ebc1dfe8dda2f4f697881",
+          "md5": "9108cedf87685010d4c44ce19e6635c5",
+          "sha256": "04cb21015300159ba24114403c9ba40ede2cacf59ba7cf9900b9a2f96930df14"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9108cedf87685010d4c44ce19e6635c5",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11649,
+        "upload_time": "2022-11-18T02:57:32",
+        "upload_time_iso_8601": "2022-11-18T02:57:32.569564Z",
+        "url": "https://files.pythonhosted.org/packages/ff/eb/082d09876c7d4898c64fbbeb9de990ce5a27f89ebc1dfe8dda2f4f697881/fastapi_efficient_sql-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e40591ea102d6714fa2ba451e959935c45d6ac33e0b8ef6104dd1c1ebc5b3ba6",
+          "md5": "b8409959f04b2cb859dea4fc20f84b8f",
+          "sha256": "903fce9b2083d94edb9d92c23f65ae094d43ac872f9d979e8d5dafde91f5d321"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b8409959f04b2cb859dea4fc20f84b8f",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8485,
+        "upload_time": "2022-11-18T02:57:35",
+        "upload_time_iso_8601": "2022-11-18T02:57:35.269920Z",
+        "url": "https://files.pythonhosted.org/packages/e4/05/91ea102d6714fa2ba451e959935c45d6ac33e0b8ef6104dd1c1ebc5b3ba6/fastapi-efficient-sql-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "da5e70f63154a751cebdbae196aa89d94337b9fe9c69864d76144f8fb980a15e",
+          "md5": "2a77c9b215ada61eeedb2b51710de03e",
+          "sha256": "5d43d229dc753c9a032a47d3db2cef9f478525e73628ef944854d660fc68cd49"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "2a77c9b215ada61eeedb2b51710de03e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11666,
+        "upload_time": "2022-11-18T07:44:16",
+        "upload_time_iso_8601": "2022-11-18T07:44:16.601028Z",
+        "url": "https://files.pythonhosted.org/packages/da/5e/70f63154a751cebdbae196aa89d94337b9fe9c69864d76144f8fb980a15e/fastapi_efficient_sql-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4b8fba83c37a493a97fd083cdbdf411608cedb612093e070bba86bdd2a3aad44",
+          "md5": "76d4a2ba048387b952cc2b62c7f79f01",
+          "sha256": "25b9dd7587cfd175401ad1ee466061e9f20f29f6778d5a3214797579faea60ea"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "76d4a2ba048387b952cc2b62c7f79f01",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8501,
+        "upload_time": "2022-11-18T07:44:18",
+        "upload_time_iso_8601": "2022-11-18T07:44:18.456919Z",
+        "url": "https://files.pythonhosted.org/packages/4b/8f/ba83c37a493a97fd083cdbdf411608cedb612093e070bba86bdd2a3aad44/fastapi-efficient-sql-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a8b3e4d9908aa3c9d39651c362522806c0ef4b1a495e6ca89c04835f43c3f3d",
+          "md5": "63456fb452e86694a586f451e7ea3046",
+          "sha256": "69b6f30830ff41699d26161f5c760a1426e87a513b1cf170c8646179f6f8dbec"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "63456fb452e86694a586f451e7ea3046",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11804,
+        "upload_time": "2022-11-21T03:08:18",
+        "upload_time_iso_8601": "2022-11-21T03:08:18.442350Z",
+        "url": "https://files.pythonhosted.org/packages/0a/8b/3e4d9908aa3c9d39651c362522806c0ef4b1a495e6ca89c04835f43c3f3d/fastapi_efficient_sql-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9c6715eb82e900fefb09e718e572854757fefa6aa2371089ff5c965bb9f203e3",
+          "md5": "92b85a5e377345ab016535daa2a5a217",
+          "sha256": "4ebd6ec588df6063f24f5b86528e477694367942d0a2d02557f790c12c791ce5"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "92b85a5e377345ab016535daa2a5a217",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 8842,
+        "upload_time": "2022-11-21T03:08:21",
+        "upload_time_iso_8601": "2022-11-21T03:08:21.324478Z",
+        "url": "https://files.pythonhosted.org/packages/9c/67/15eb82e900fefb09e718e572854757fefa6aa2371089ff5c965bb9f203e3/fastapi-efficient-sql-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cc8c7e41a2ba86e71dc399b4e068888d204130b1f5fb9ef769b9c234573c73d9",
+          "md5": "a8b3a3c5eb704b21abc7af956113809c",
+          "sha256": "6c6e76b309e7d5591c7a6b20c2586cd9109ec4ad0a5936954b843e0bc91e8c41"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a8b3a3c5eb704b21abc7af956113809c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 12276,
+        "upload_time": "2022-12-02T10:00:24",
+        "upload_time_iso_8601": "2022-12-02T10:00:24.346589Z",
+        "url": "https://files.pythonhosted.org/packages/cc/8c/7e41a2ba86e71dc399b4e068888d204130b1f5fb9ef769b9c234573c73d9/fastapi_efficient_sql-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0094560f9cde05db71f73186a88d0b69d6648f128fbe7be423350abcf310d2d0",
+          "md5": "564992d2685053cdf8f21449049557f5",
+          "sha256": "83c1028200592a2cfebd1f5ba84c3fa984e2e4d0d1b82e8c93a12d8b54181570"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "564992d2685053cdf8f21449049557f5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9086,
+        "upload_time": "2022-12-02T10:00:26",
+        "upload_time_iso_8601": "2022-12-02T10:00:26.897681Z",
+        "url": "https://files.pythonhosted.org/packages/00/94/560f9cde05db71f73186a88d0b69d6648f128fbe7be423350abcf310d2d0/fastapi-efficient-sql-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3b58dca65bfb6f0b0dfa636ccbe6f395b47130728c91935b4a568b7b0a1a2d90",
+          "md5": "6503e261ae179b493aa695e7e68fdcb3",
+          "sha256": "0f4312d13b7e04b1c4a787cb352225b58f5f3f06893d915f3f71a577900f3c8b"
+        },
+        "downloads": -1,
+        "filename": "fastapi_efficient_sql-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "6503e261ae179b493aa695e7e68fdcb3",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 17546,
+        "upload_time": "2023-02-14T10:02:36",
+        "upload_time_iso_8601": "2023-02-14T10:02:36.210962Z",
+        "url": "https://files.pythonhosted.org/packages/3b/58/dca65bfb6f0b0dfa636ccbe6f395b47130728c91935b4a568b7b0a1a2d90/fastapi_efficient_sql-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "62a25f3a96c1c1ca3d613241ebad146f943d5aa467e0366ddb593b9fe3ce04c0",
+          "md5": "6caa96c3b365ddd606f94315bc4bccd9",
+          "sha256": "e2aac8a9554f9cd7ecd6473047133c371bcf51946161033cad688f14aeb8ab8b"
+        },
+        "downloads": -1,
+        "filename": "fastapi-efficient-sql-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "6caa96c3b365ddd606f94315bc4bccd9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 12647,
+        "upload_time": "2023-02-14T10:02:38",
+        "upload_time_iso_8601": "2023-02-14T10:02:38.597004Z",
+        "url": "https://files.pythonhosted.org/packages/62/a2/5f3a96c1c1ca3d613241ebad146f943d5aa467e0366ddb593b9fe3ce04c0/fastapi-efficient-sql-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3b58dca65bfb6f0b0dfa636ccbe6f395b47130728c91935b4a568b7b0a1a2d90",
+        "md5": "6503e261ae179b493aa695e7e68fdcb3",
+        "sha256": "0f4312d13b7e04b1c4a787cb352225b58f5f3f06893d915f3f71a577900f3c8b"
+      },
+      "downloads": -1,
+      "filename": "fastapi_efficient_sql-0.0.8-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "6503e261ae179b493aa695e7e68fdcb3",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 17546,
+      "upload_time": "2023-02-14T10:02:36",
+      "upload_time_iso_8601": "2023-02-14T10:02:36.210962Z",
+      "url": "https://files.pythonhosted.org/packages/3b/58/dca65bfb6f0b0dfa636ccbe6f395b47130728c91935b4a568b7b0a1a2d90/fastapi_efficient_sql-0.0.8-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "62a25f3a96c1c1ca3d613241ebad146f943d5aa467e0366ddb593b9fe3ce04c0",
+        "md5": "6caa96c3b365ddd606f94315bc4bccd9",
+        "sha256": "e2aac8a9554f9cd7ecd6473047133c371bcf51946161033cad688f14aeb8ab8b"
+      },
+      "downloads": -1,
+      "filename": "fastapi-efficient-sql-0.0.8.tar.gz",
+      "has_sig": false,
+      "md5_digest": "6caa96c3b365ddd606f94315bc4bccd9",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 12647,
+      "upload_time": "2023-02-14T10:02:38",
+      "upload_time_iso_8601": "2023-02-14T10:02:38.597004Z",
+      "url": "https://files.pythonhosted.org/packages/62/a2/5f3a96c1c1ca3d613241ebad146f943d5aa467e0366ddb593b9fe3ce04c0/fastapi-efficient-sql-0.0.8.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

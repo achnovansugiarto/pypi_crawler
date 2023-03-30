@@ -1,0 +1,190 @@
+{
+  "info": {
+    "author": "Elad Rosenheim, Avshalom Manevich",
+    "author_email": "elad@dynamicyield.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "<p align=\"left\">\n  <a href=\"#\">\n    <img alt=\"Tests status\" src=\"https://github.com/DynamicYieldProjects/funnel-rocket/workflows/Tests/badge.svg\" />\n  </a>\n</p>\n\n<p align=\"center\">\n  <img alt=\"Funnel Rocket logo\" src=\"https://github.com/DynamicYieldProjects/funnel-rocket/blob/main/docs/logo-blue.svg?raw=true\" width=\"350\">\n</p>\n\n# Funnel Rocket\n\n## Intro\n\nFunnel Rocket is a query engine built to efficiently run a specific type of query:\n\nGiven a large dataset of user activity (pageviews, events, clicks, etc.), find the users whose activities meet a specific\ncondition set, optionally with a **specific order of events and time constraints**, and return multiple metrics on the matching group.\n\nThe engine can also perform a full funnel analysis, in which user counts and aggregations are returned for each step in the sequence.\n\n### The Challenge\n\nIf you're a vendor offering analytics, personalization, content or product recommendations, etc. you may wish to offer such query capability\nto each of your customers, allowing ad-hoc data exploration to better understand user behavior and define audience groups. \n\nHowever, such queries are still a challenge to build with existing tools (SQL or NoSQL). These are not only tricky to get right, but are pretty hard to optimize for performance and cost. \nExecuting such a query requires you to first perform a high cardinality grouping first (100 million users => 100 million groups), \nthen run multiple passes over each of these groups to execute all conditions in the desired order. \nAn alternative method is to \"pre-bake\" results by batch processing, limiting your users in freely exploring the data.\n\n### Project Scope\n\nThe original aim of this tool was very specific: replacing an aging Elasticsearch-based solution at Dynamic Yield.\nHowever, it can be easily extended to perform many more use-cases around large scale user-centric data processing (or other entities, of course). \n\nFunnel Rocket certainly does not match the expressiveness and flexibility of mature query engines or batch processing frameworks. \nFor what it does offer, though, we've found it to be very fast to scale, with a low management overhead. This amounts to significantly lower TCO. \n\n## The Technology Used (or: Clusters are Hard)\n\nFunnel Rocket is essentially bringing together a few excellent, proven components which do most of the heavy lifting.\n\n### 1. Pandas\nThe concept of the *DataFrame* doesn't need much introduction. DataFrames allow running complex transformations at ease with\ngood performance - if you're mindful enough (and *Numba* can help at some performance-critical points). \nCoupled with *Apache Arrow* (also by the industrious @wesm) you also get great Parquet support. \n\nPandas itself is a library running within a single process, but tools such as *Dask* and *PySpark* have brought either the library itself \nor its core abstractions to the distributed domain. \n\nHowever, operating a distributed cluster for data processing gets pretty tricky as you grow. Deploying, scaling and fixing the \ninevitable periodic issues can get very time-consuming. When something breaks, it can be hard to tell what's going on. As data and needs grow, \nvirtually any technology would reach some unexpected size/load threshold and start performing poorly or behaving erratically,\nneeding yet more time invested to overcome.\n\nScaling usually leaves a lot to be desired: the cluster either has \"too much\" resources sitting idle, or not enough to handle\ntemporal load spikes. That inefficiency translates into a lot of money at scale. \n\nThere's no no silver bullet, of course, but we can take a stab at the problem from another angle: serverless.\n\n### 2. Serverless\n*Currently supporting AWS Lambda, other integrations welcome.*\n\nPeople tend to be split on serverless, for a bunch of reasons. \nWe've found AWS Lambda to be mature, reliable and (yes) fast enough service which can scale to hundreds or thousands of cores almost immediately. \n\nThe cost of compute per GB/second (or vCPU/second) is indeed higher in this model, but you pay only for actual processing time: from the time your handler starts till it ends. \nYou're billed in millisecond granularity, excluding the time it took your process to load and reach the state where the handler starts its work. \nThus, it is very fitting for bursty on-demand jobs. You also spend relatively very little time on operations.\n\nFor a use case that's measured in seconds rather than milliseconds, Lambda turned up to be good enough even when aiming for the low single digits. \nIn many cases, queries such as the ones the Funnel Rocket servers are run by intermediate- to advanced-level customers, \nwho tend to progressively tweak their queries over the same underlying dataset. \nSuch subsequent queries are significantly faster - down to 2-3 seconds in total, as they benefit from a combination of *warm* Lambda instances and local data caching.\n\nYou can always 'pre-bake' some default/common queries beforehand using the *non-serverless mode* - see below.\n\nFunnel Rocket uses the *asynchronous* Lambda invocation API, making it easier to launch hundreds of jobs (or more) quickly. \nAt the cloud provider level, async. invocation requests are put into a queueing mechanism which adds no meaningful latency in normal operation, yet prevents most cases of rate limiting.\n\nOf course, having multiple distributed jobs and tasks in flight, handling retries, etc. still takes some management infrastructure. \nLuckily, there's Redis.\n\n### 3. Redis and the Lightweight Cluster Option\nThe versatility of Redis data structures makes it a natural choice for handling lightweight metadata, work queues, real-time \nstatus tracking and more, and there's a range of managed offerings to choose from. \nThis use case only requires a modest amount of RAM, meaning that using a managed solution won't break the bank.\n\nOther than for managing metadata on available datasets, Redis is used in two more ways:\n\n1. As noted above, the invoker (server) does not rely on synchronous responses. \n   Instead, it always uses Redis for tracking the status and outputs of all individual tasks.\n1. **To support a non-serverless deployment option where Redis also acts as a work queue** from which \n   long-running worker processes fetch tasks. \n\nThis latter option is a pretty easy to set up: each worker is a simple single-threaded process anonymously \nfetching work from a shared queue. There is no additional cluster management or load balancing required. \nProcesses take tasks off a Redis list at their own pace, based on what scale you currently have.\n\nYou can combine both deployment modes, using this mode for pre-baking default/common queries on cheap spot instances (in AWS jargon), storing the results and scaling down to zero. \nThat way, you only utilize lambdas when users start exploring beyond the default view.\n\nBoth deployment options push much of the complexity into battle-tested tools. Both depend on Redis as their single stateful component.\nThus, running a multi-zone Redis setup is recommended in production. In the worst case, you'd need to re-register all active datasets.\n\n## Preparing Data for Querying\n\nFunnel Rocket currently supports Parquet files only, with all files in a dataset located under the same base path. \nLocally-mounted filesystems and S3 or compatible object stores (e.g. MinIO) are supported. \n\n*(TBD: add more storage systems and file formats.)*\n\n### Required Columns\n\n1. A **group ID** column: a string or numeric column with the user ID / user hash / other group ID, with no null values. \n   All query conditions are performed in the scope of each group. This column's name is set by the client per each dataset.\n1. A **timestamp** column: either int or float, typically a Unix timestamp in the granularity of your data (e.g. int64 of seconds\n   or milliseconds, or a float of seconds.microseconds, etc.). Currently, Funnel Rocket does not impose a specific format as long as it's consistent.\n\n### Partitioning by the Group ID Column\n\nFor Funnel Rocket to be fast and simple, the data should be organized so that each file includes a unique set of users, \nwith all rows for a specific user located in the same file. This means an expensive shuffle step can be avoided at query time. \n\nAssuming your dataset isn't naturally partitioned that way, you can use (Py)Spark or similar tools to perform it. \nFor example, with PySpark call [DataFrame.repartition()](https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.sql.DataFrame.repartition.html)\nand save the resulting dataset.\n\nA standalone utility for data repartitioning is [included in this repo](./dataprep_example/repartition.py).\nIt is non-distributed but can use all available CPUs, so you can use it to partition datasets up to a reasonable size on larger machines.\n\nAim to have files sized in the range of 20-150mb. See the [Operations Guide](./docs/operating.md) for more.\n\n## Running Locally\n\n### Run with docker-compose\n\nThis is the most complete option, as it includes a local S3-based object store, an AWS Lambda-like environment and Redis.\n\n#### Launching Services\n\nClone this repo and `cd` into it.\n\nTo have the Funnel Rocket image based on the source code in the local repository instead of being downloaded from Docker Hub, build it locally: \n`docker build -f docker/all-in-one.Dockerfile . -t frocket/all-in-one:latest`.\n\nRun `docker-compose up`. This will start the following services:\n\n* _Redis_ as the datastore, available to the host at localhost port 6379.\n  * If you already have Redis running locally on that port, change the port for this Redis container by setting \n    `export FROCKET_REDIS_PORT=<x>` before running `docker-compose up`.\n\n* _MinIO_ to test S3-based datasets locally. Its admin UI is available to the host at http://localhost:9000.\n\n* _frocket-queue-worker_ and _frocket-apiserver_ are both based on the **frocket/all-in-one** multi-role image. \n  The API server will be available at http://localhost:5000, while the worker connects to Redis waiting for work.\n\n* _frocket-lambda-worker_ based on the **frocket/local-lambda** image. This image is always built locally as it's aimed at local testing purposes only. \n  The image wraps a Funnel Rocket worker within an AWS Lambda-compatible environment based on lambci/lambda:python3.8. \n  This worker type is not used by default by the API server, but this can be modified by uncommenting `- FROCKET_INVOKER=aws_lambda` in the `docker-compose.yml` file. \n  It is also called directly by unit tests.\n\nThe empty local sub-directory `./data` on the host is mapped to Funnel Rocket's containers (the API Server and both worker types) at the same location: as `./data` under the container's `WORKDIR`.\nThis allows you to register and query local datasets with the Docker-based setup\n\nTo make jobs run faster, you can scale up the number of workers, e.g. `docker-compose up --scale frocket-queue-worker=4`. Workers only take about 50-60mb RAM each.\n\n#### Testing the Setup\n\nTest files are included in the `frocket/all-in-one` Docker image under `/app/tests`. However, these files are not under `PYTHONPATH`,\nnor are the required packages installed by default.\n\nTo run tests inside the running API Server container:\n1. Install required packages: `docker exec -it frocket-apiserver pip install -r test-requirements.txt --user`.\n1. Run: `docker exec -it frocket-apiserver /home/frocket/.local/bin/pytest -p no:cacheprovider tests/ -vv`\n\nIf you also have Funnel Rocket installed as a package on the host, \nyou can also run `pip install -r test-requirements.txt && pytest` from the repository root dir.\n\n### Run on the Host\n\n#### Installing\n\nTo install the latest package from PyPI:\n\nIn a Python 3.8+ based environment (preferably an isolated one with _virtualenv_ or _conda_), run `pip install funnel-rocket`\n\nTo install from source code:\n\nClone this repository, `cd` into it and `pip install -e .`. To install test requirements run `pip install -r test-requirements.txt`.\n\n#### Running Redis\n\nMake sure you have Redis running locally. This is usually easy to do with your preferred package manager. \n\nAll keys written by Funnel Rocket are prefixed by 'frocket:'. To configure this prefix and for more settings [see here](./docs/operating.md).\n\nFunnel Rocket can also be configured to use a non-default logical DB for further namespace separation (meaning, db number > 0) by setting `export FROCKET_REDIS_DB=<logical db number>`. \n\n#### Running the Worker and API Server\nTo run a worker waiting on the Redis queue for tasks: `python -m frocket.worker.impl.queue_worker`.\nYou should see the following output:\n```\nfrocket.datastore.registered_datastores INFO Initialized RedisStore(role datastore, host localhost:6379, db 0)\n__main__ INFO Waiting for work...\n```\nYou can launch a few of these in the background, to speed up jobs.\n\nTo run the API server with the Flask built-in webserver: `FLASK_APP=frocket.apiserver python -m flask run` (not for production use; the Docker image uses gunicorn with multiple processes).\n\n#### Testing the Setup\n\nMost tests require an S3-compatible store for testing. You can start a stand-alone MinIO instance via `docker-compose start mock-s3` (it's pretty lightweight), or other alternatives. \n\nTo set S3 credentials to the local S3 service for tests only, set `MOCK_S3_USER` and `MOCK_S3_SECRET` to the service credentials.\nYou may also need to set `MOCK_S3_URL` if the S3 endpoint differs from `http://localhost:9000`\n\nFinally, run `pytest tests/ -vv`.\n\n## Creating & Querying an Example Dataset\n\nYou're strongly encouraged to follow [this guide](./docs/example-dataset.md) to learn more on preparing, registering and querying an example dataset.\n\n## Running in Production\n\nFor detailed instructions on how to configure, deploy and monitor Funnel Rocket in a production AWS environment, see the [Operations Guide](./docs/operating.md).\n\n## Benchmarks\n\nSee [this blog post](https://elad-rosenheim.medium.com/funnel-rocket-a-cloud-native-query-engine-30bc142163b1).\n\n## High Level Roadmap\n\n* **Functionality**: Extend support for column types: datetime, lists of primitives, lookup in delimited string fields.\n* **Functionality**: Implement gaps in conditions, mostly around sequences/funnels: step *did not happen*, min/max duration between steps.\n* **Data preparation/Performance**: \n  * Support re-partitioning by group ID as a job. Consider incremental re-partitioning as new data comes in. \n  * Preparing the data by Funnel Rocket also allows applying some important performance optimizations, which are currently experimental:\n    * Encode list columns as bitsets for superfast conditions, transparent to the client (up to limited cardinality; requires storing a value->bitnumber hashmap in the Parquet custom metadata of each file)\n    * Ensure any columns which are good candidates for categorical representation are stored as such (i.e. have dictionary compression in the Parquet file)\n    * Convert non-optimized file formats to Parquet (or Apache Arrow's Feather file format).\n* **Deployment**: Automated method/s for AWS Lambda deployment.\n* **Deployment**: Provide k8s chart/operator and scaling best practices for a non-serverless deployment.\n* **Deployment**: Support more cloud providers.\n* **Performance**: Integrate currently-experimental Numba code for critical points in code such as isin().\n  * Numba-based functions should be AOT-compiled to work well in Lambda. This makes packages arch-dependent. Keep the Python-only fallback if native module is missing.\n* **Nicety**: Provide a basic UI for running a query with schema validation. Potentially ad-hoc schema generation per a given dataset.\n\n## Maintenance\n\nThis project is actively developed by Elad Rosenheim and Avshalom Manevich. Special thanks to Omri Keefe (@omrisk) for CI work and Gidi Vigo for the logo.\n\nFunnel Rocket is licensed under Apache License 2.0.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/DynamicYieldProjects/funnel-rocket-oss",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "funnel-rocket",
+    "package_url": "https://pypi.org/project/funnel-rocket/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/funnel-rocket/",
+    "project_urls": {
+      "Homepage": "https://github.com/DynamicYieldProjects/funnel-rocket-oss"
+    },
+    "release_url": "https://pypi.org/project/funnel-rocket/0.5.3/",
+    "requires_dist": [
+      "pyarrow (>=2.0.0)",
+      "pandas (>=1.2.0)",
+      "boto3 (>=1.16.0)",
+      "redis (>=3.5.0)",
+      "tabulate (>=0.8.0)",
+      "prometheus-client (>=0.9.0)",
+      "flask (>=1.1.0)",
+      "jsonschema (>=3.2.0)",
+      "dataclasses-json (>=0.5.2)",
+      "inflection (>=0.5.0)",
+      "parsimonious (>=0.8.0)",
+      "gunicorn (>=20.0.0)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Cloud native distributed funnel queries",
+    "version": "0.5.3",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 10332907,
+  "releases": {
+    "0.5.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e9186169e4bc1e0110c8b28c7fbc5c574f746434ff0809ff9f85c84d9228cba",
+          "md5": "88102aafeb2133f726e97160a82b1318",
+          "sha256": "b6a6c52fe39953b90fa1f48f9005737d9f0e4848ee1023421df5a6494fbaaa24"
+        },
+        "downloads": -1,
+        "filename": "funnel_rocket-0.5.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "88102aafeb2133f726e97160a82b1318",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 165487,
+        "upload_time": "2021-04-01T20:22:41",
+        "upload_time_iso_8601": "2021-04-01T20:22:41.143201Z",
+        "url": "https://files.pythonhosted.org/packages/2e/91/86169e4bc1e0110c8b28c7fbc5c574f746434ff0809ff9f85c84d9228cba/funnel_rocket-0.5.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3f7960008edaba183cab9d96265be599a930f5ee717cd0356193b0740a755753",
+          "md5": "093a025de3ee8acccb5844cfd8a4af62",
+          "sha256": "eb9c13025b2d1ab349cabda8fc535a43fa9a16a9be0f1f15efa58231de4faa95"
+        },
+        "downloads": -1,
+        "filename": "funnel-rocket-0.5.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "093a025de3ee8acccb5844cfd8a4af62",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 137957,
+        "upload_time": "2021-04-01T20:22:42",
+        "upload_time_iso_8601": "2021-04-01T20:22:42.468345Z",
+        "url": "https://files.pythonhosted.org/packages/3f/79/60008edaba183cab9d96265be599a930f5ee717cd0356193b0740a755753/funnel-rocket-0.5.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "781824e4f60e38cf739f64d0c1cb0f7559b31da90c1dc679f58aef202993088b",
+          "md5": "73c4a084d2fc9f914bc3e93693580cb7",
+          "sha256": "068b15eabf51780172c1106fb92f260ca844d8a78ffcb0c86e0810a8b689da47"
+        },
+        "downloads": -1,
+        "filename": "funnel_rocket-0.5.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "73c4a084d2fc9f914bc3e93693580cb7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 193798,
+        "upload_time": "2021-05-12T11:53:33",
+        "upload_time_iso_8601": "2021-05-12T11:53:33.873417Z",
+        "url": "https://files.pythonhosted.org/packages/78/18/24e4f60e38cf739f64d0c1cb0f7559b31da90c1dc679f58aef202993088b/funnel_rocket-0.5.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7d7334941aed337c3111a99bb1663dad51918c9a100350dd3d988670ad9b44f1",
+          "md5": "d57a226d7accabe4f7e483e200226032",
+          "sha256": "cc6b65b6a1abf45ae7884b46336e4892c6e566331cdd06261d611c815c04b0e7"
+        },
+        "downloads": -1,
+        "filename": "funnel-rocket-0.5.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d57a226d7accabe4f7e483e200226032",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 140009,
+        "upload_time": "2021-05-12T11:53:35",
+        "upload_time_iso_8601": "2021-05-12T11:53:35.412716Z",
+        "url": "https://files.pythonhosted.org/packages/7d/73/34941aed337c3111a99bb1663dad51918c9a100350dd3d988670ad9b44f1/funnel-rocket-0.5.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "781824e4f60e38cf739f64d0c1cb0f7559b31da90c1dc679f58aef202993088b",
+        "md5": "73c4a084d2fc9f914bc3e93693580cb7",
+        "sha256": "068b15eabf51780172c1106fb92f260ca844d8a78ffcb0c86e0810a8b689da47"
+      },
+      "downloads": -1,
+      "filename": "funnel_rocket-0.5.3-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "73c4a084d2fc9f914bc3e93693580cb7",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 193798,
+      "upload_time": "2021-05-12T11:53:33",
+      "upload_time_iso_8601": "2021-05-12T11:53:33.873417Z",
+      "url": "https://files.pythonhosted.org/packages/78/18/24e4f60e38cf739f64d0c1cb0f7559b31da90c1dc679f58aef202993088b/funnel_rocket-0.5.3-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7d7334941aed337c3111a99bb1663dad51918c9a100350dd3d988670ad9b44f1",
+        "md5": "d57a226d7accabe4f7e483e200226032",
+        "sha256": "cc6b65b6a1abf45ae7884b46336e4892c6e566331cdd06261d611c815c04b0e7"
+      },
+      "downloads": -1,
+      "filename": "funnel-rocket-0.5.3.tar.gz",
+      "has_sig": false,
+      "md5_digest": "d57a226d7accabe4f7e483e200226032",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 140009,
+      "upload_time": "2021-05-12T11:53:35",
+      "upload_time_iso_8601": "2021-05-12T11:53:35.412716Z",
+      "url": "https://files.pythonhosted.org/packages/7d/73/34941aed337c3111a99bb1663dad51918c9a100350dd3d988670ad9b44f1/funnel-rocket-0.5.3.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

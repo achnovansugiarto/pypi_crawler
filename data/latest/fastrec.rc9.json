@@ -1,0 +1,485 @@
+{
+  "info": {
+    "author": "Devin DAngelo",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# FastRec\n\nGraph neural networks are capable of capturing the structure and relationships between nodes in a graph as dense vectors. \nWith these dense vectors, we can identify pairs of nodes that are similar, identify communities and clusters, or train\na linear classification model with the dense vectors as inputs. \n\nThis project automates the entire pipeline from node/edge graph data to generate embeddings, train and fine tune those embeddings, create and train a [Facebook AI Similarity Search Index](https://ai.facebook.com/tools/faiss/) (faiss), and deploy a recommender API to query the index over the network. FastRec handles all of the boilerplate code, handling gpu/cpu memory management, and passing data between pytorch, Deep Graph Library (DGL), faiss, and fastapi. \n\nThe code is intended to be as scalable as possible, with the only limitation being the memory available to store the graph. The code adapts the implementation of [GraphSage](https://cs.stanford.edu/people/jure/pubs/graphsage-nips17.pdf) from the [DGL reference implementation](https://github.com/dmlc/dgl/tree/master/examples/pytorch/graphsage). FastRec has been tested on graphs with up to 1 million nodes and 100 million edges and was able to generate and train embeddings, train a faiss index, and begin answering api queries in minutes. With sufficient memory, it should be able to scale to billions of nodes and edges. Distributed training is not currently implemented, but could further improve scalability. \n\n## Installation\n\nThe quickest way to get started is with a cpu only installation with conda.  \n\n```bash\nconda install -c ddangelo fastrec -c pytorch -c dglteam -c conda-forge\n```\n\nTo install for gpu, you will need to manually install dgl and pytorch with gpu support. Then, you can pip install fastrec.\n\n```bash\nconda install pytorch torchvision cudatoolkit=10.0 faiss-gpu -c pytorch\nconda install -c dglteam dgl-cuda10.0\npip install fastrec\n```\n\nNote that currently there are only conda builds of faiss for linux and OSX systems. If you are on windows, you might be able to install from source.\n\n## Basic Usage: Karate Club Communities\n\nAs an example, we can generate embeddings for [Zachary's karate club](https://en.wikipedia.org/wiki/Zachary%27s_karate_club) graph. See [karateclub.py](https://github.com/devinjdangelo/FastRec/blob/master/examples/karateclub.py) for the full script to replicate the below.\n\nFirst, convert the graph into a node and edgelist format.\n\n```python\nimport networkx as nx\ng = nx.karate_club_graph()\nnodes = list(g.nodes)\ne1,e2 = zip(*g.edges)\nattributes = pd.read_csv('./karate_attributes.csv')\n```\n\nThen we can initialize a recommender, add the data, and generate node embeddings.\n\n```python\nfrom fastrec import GraphRecommender\n#initialize our recommender to embed into 2 dimensions and \n#use euclidan distance as the metric for similarity.\nsage = GraphRecommender(2,distance='l2')\nsage.add_nodes(nodes)\nsage.add_edges(e1,e2)\nsage.add_edges(e2,e1)\nsage.update_labels(attributes.community)\nuntrained_embeddings =  sage.embeddings\n```\nHow do the embeddings look? Even with no training of the graph neural network weights, the embeddings don't do a terrible job  dividing the two communities. The nodes in the Instructor community are blue and the nodes in the Administrator community are red.\n\n<img src=\"https://github.com/devinjdangelo/FastRec/blob/master/examples/graphics/untrained_example_supervised.png\" alt=\"drawing\" width=\"600\"/>\n\nWith one command, we can improve the embeddings with supervised learning with a triplet loss. \n\n```python\nepochs, batch_size = 150, 15\nsage.train(epochs, batch_size)\n```\n<img src=\"https://github.com/devinjdangelo/FastRec/blob/master/examples/graphics/supervised.gif\" alt=\"drawing\" width=\"600\"/>\n\nThe trained embeddings much more neatly divide the communities. But what about the more realistic scenario where we did not know the labels of all of the nodes in advance? We can instead train the embeddings in a fully unsupervised manner.\n\n```python\nepochs, batch_size = 150, 15\nsage.train(epochs, batch_size, unsupervised=True)\n```\n\n<img src=\"https://github.com/devinjdangelo/FastRec/blob/master/examples/graphics/unsupervised.gif\" alt=\"drawing\" width=\"600\"/>\n\nIn this case, the unsupervised training actually seems to do a slightly better job of dividing the two communities.\n\nWhat if we have a very large graph which is expensive and slow to train? Often, the untrained performance of the embeddings will improve if we increase the size of our graph neural network (in terms of width and # of parameters).  \n\n```python\nsage = GraphRecommender(2,distance='l2',feature_dim=512,hidden_dim=512)\nuntrained_embeddings_large = sage.embeddings\n```\n\n<img src=\"https://github.com/devinjdangelo/FastRec/blob/master/examples/graphics/untrained_example_large.png\" alt=\"drawing\" width=\"600\"/>\n\nThis looks nearly as good as the trained version of the small network, but no training was required! \n\nOnce we have embeddings that we are happy with, we can query a specific node or nodes to get its nearest neighbors in a single line.\n\n```python\n#what are the 5 nearest neighbors of node 0, the Admin, and 33, the Instructor?\nsage.query_neighbors(['0','33'],k=5)\n{'0': {'neighbors': ['0', '13', '16', '6', '5'], 'distances': [0.0, 0.001904212054796517, 0.005100540816783905, 0.007833012379705906, 0.008420777507126331]}, '33': {'neighbors': ['33', '27', '31', '28', '32'], 'distances': [0.0, 0.0005751167191192508, 0.0009900123113766313, 0.001961079193279147, 0.006331112235784531]}}\n```\nEach node's nearest neighbor is itself with a distance of 0. The Admin is closest to nodes 13, 16, 6, and 5, all of which are in fact part of the Admin community. The Instructor is closest to 27, 31, 28, and 32, all of which are part of the Instructor community. \n\n## Reddit Post Recommender\n\nIn under 5 minutes and with just 10 lines of code, we can create and deploy a Reddit post recommender based on a graph dataset with over 100m edges. We will use the Reddit post dataset from the [GraphSage](https://cs.stanford.edu/people/jure/pubs/graphsage-nips17.pdf) paper. Each node represets a post and an edge between posts represents one user who commented on both posts. Each node is labeled with one of 41 subreddits, which group the posts by theme or user interest. The original paper focused on correctly classifying the subreddit of each post. Here, we will simply say that a post recommendation is reasonable if it is in the same subreddit as the query post. See [reddit.py](https://github.com/devinjdangelo/FastRec/blob/master/examples/reddit.py) for the full script to replicate the below.\n\nFirst, we download the Reddit Dataset. \n\n```python\nimport pandas as pd\nimport numpy as np\nfrom dgl.data import RedditDataset\ndata = RedditDataset(self_loop=True)\ne1, e2 = data.graph.all_edges()\ne1, e2 = e1.numpy(), e2.numpy()\nnodes = pd.DataFrame(data.labels,dtype=np.int32,columns=['labels'])\n```\n\nNow we can set up our recommender. For larger graphs, it will be much faster to use gpu for both torch and faiss computations.\n\n```python\nfrom fastrec import GraphRecommender\nsage = GraphRecommender(128, feature_dim=512, hidden_dim=256, \n    torch_device='cuda', faiss_gpu=True, distance='cosine')\nsage.add_nodes(nodes.index.to_numpy())\nsage.add_edges(e1,e2)\nsage.update_labels(nodes.labels)\n```\n\nFinally, we can evaluate our untrained embedding and deploy our API.\n\n```python\nperf = sage.evaluate(test_levels=[10,5])\nprint(perf)\n{'Top 10 neighbors': {'Share >=1 correct neighbor': 0.9517867490824802, 'Share of correct neighbors': 0.8623741763784262}, 'Top 5 neighbors': {'Share >=1 correct neighbor': 0.9417079818856909, 'Share of correct neighbors': 0.8764973279247956}}\nsage.start_api()\n```\n\nThe performance stats indicate that on average 86% of the top 10 recommendations for a post are in the same subreddit. About 95% of all posts have at least 1 recommendation in the same subreddit among its top 10 recommendations. We could optionally train our embeddings with supervised or unsupervised learning from here, but for now this performance is good enough. We can now query our API over the network.\n\n## Recommender API\n\nWe can share the recommender system as an API in a single line. No args are needed to test over localhost, but we can optionally pass in any args accepted by [uvicorn](https://www.uvicorn.org/deployment/).\n\n```python\nhost, port = 127.0.0.1, 8000\nsage.start_api(host=host,port=port)\n```\n\nThis method of starting the API is convenient but has some downsides in the current implementation. Some data will be duplicated in memory, so if your graph is taking up most of your current memory this deployment may fail. You can avoid this issue by instead using the included deployment script. Simply save your GraphRecommender and point the deployment script to the saved location. Just like with the previous method, all args are passed along to uvicorn. \n\n```bash\nfastrec-deploy /example/directory --host 127.0.0.1 --port 8000\n```\n\nNow we can query the recommender from any other script on the network.\n\n```python\nimport requests\n#configure url, default is localhost\napiurl = 'http://127.0.0.1:8000/knn/{}?k={}'\nexample_node = '0'\nk = 10\nr = requests.get(apiurl.format('knn',example_node,k))\nr.json()\n{0: {'neighbors': [0, 114546, 118173, 123258, 174705, 99438, 51354, 119874, 203176, 101864], 'distances': [0.9999998807907104, 0.9962959289550781, 0.9962303042411804, 0.9961680173873901, 0.9961460828781128, 0.9961054921150208, 0.9961045980453491, 0.9960995316505432, 0.9960215091705322, 0.9960126280784607]}}\n```\n\nBecause we use a trained faiss index for our deployed API backend, requests should be returned very quickly even for large graphs. For the Reddit post recommender described above, the default API responds in about 82ms.\n\n```python\nimport random\n%timeit r = requests.get(apiurl.format('knn',random.randint(0,232964),k))\n82.3 ms ± 5.42 ms per loop (mean ± std. dev. of 7 runs, 10 loops each)\n```\n\n## Save and Load\n\nIf you are creating a very large graph (millions of nodes and edges), you will want to save your created graph and model weights to disk, so that you will not have to process the raw edge data or train the embeddings again. You can save and load all of the necessary information to restore your GraphRecommeder in a single line. \n\n```python\nsage.save('/example/directory')\n```\nYou can likewise restore your session in a single line. \n\n```python\nsage = GraphRecommender.load('/example/directory')\n```\n\nNote that the loading method is a classmethod, so you do not need to initialize a new instance of GraphRecommeder to restore from disk. The save and load functionality keeps track of the args you used to initialize the class for you.\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/devinjdangelo/FastRec",
+    "keywords": "recommender graph neural network gnn deployment deploy",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "fastrec",
+    "package_url": "https://pypi.org/project/fastrec/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/fastrec/",
+    "project_urls": {
+      "Homepage": "https://github.com/devinjdangelo/FastRec"
+    },
+    "release_url": "https://pypi.org/project/fastrec/0.0.4/",
+    "requires_dist": [
+      "fastapi",
+      "uvicorn",
+      "tqdm",
+      "pandas"
+    ],
+    "requires_python": "",
+    "summary": "Rapidly deployed gnn based recommender",
+    "version": "0.0.4",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7724202,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2555b589f46aa0caa2219aa3bf230d73b70740302ea38e09577577c0d6edc91e",
+          "md5": "5c8f3d9f7e65683d366ab84bf1ad32ed",
+          "sha256": "81f56e14f7f33e2c1339ae1987550cbc31cef67438b2849d8b6bb4adadad2df4"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5c8f3d9f7e65683d366ab84bf1ad32ed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 16185,
+        "upload_time": "2020-07-14T00:16:53",
+        "upload_time_iso_8601": "2020-07-14T00:16:53.449915Z",
+        "url": "https://files.pythonhosted.org/packages/25/55/b589f46aa0caa2219aa3bf230d73b70740302ea38e09577577c0d6edc91e/fastrec-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3e947a7d67c3e91e25803a5a7da747fbc12c94031f9c69905caa3beff7ee29fe",
+          "md5": "e3e6a310df334009aa64fdbd87667cb9",
+          "sha256": "3f87a02b33950c5e2e7f184bfda73566072e92885f14cd011616efbbb95590eb"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "e3e6a310df334009aa64fdbd87667cb9",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 18364,
+        "upload_time": "2020-07-14T00:16:55",
+        "upload_time_iso_8601": "2020-07-14T00:16:55.179950Z",
+        "url": "https://files.pythonhosted.org/packages/3e/94/7a7d67c3e91e25803a5a7da747fbc12c94031f9c69905caa3beff7ee29fe/fastrec-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5885580514621b8773343c02220d9c728c0bf19787ba30ed396d0d6c3bfdd849",
+          "md5": "7b57ad737f138462a4b3af98530b1535",
+          "sha256": "a9c579687bcfa5659a231e212c40ff5177ab516ea89319fc31c42ce8a61d09d1"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7b57ad737f138462a4b3af98530b1535",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20596,
+        "upload_time": "2020-07-14T00:36:36",
+        "upload_time_iso_8601": "2020-07-14T00:36:36.207330Z",
+        "url": "https://files.pythonhosted.org/packages/58/85/580514621b8773343c02220d9c728c0bf19787ba30ed396d0d6c3bfdd849/fastrec-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "530a2e0adcac67ebe8fb529fd970f18ae0818018bc208d25b932a80867808baa",
+          "md5": "fcb9cc4bf9f00aef5ee8ced2290ababf",
+          "sha256": "c5b52400ccd72e3ec0e0a3b022eb6267243d472e22f89bb671082c65b4137d3e"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "fcb9cc4bf9f00aef5ee8ced2290ababf",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22929,
+        "upload_time": "2020-07-14T00:36:37",
+        "upload_time_iso_8601": "2020-07-14T00:36:37.044513Z",
+        "url": "https://files.pythonhosted.org/packages/53/0a/2e0adcac67ebe8fb529fd970f18ae0818018bc208d25b932a80867808baa/fastrec-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2.post1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a889edad5c4c3257dca93760aca45dfaab7c2ce57abd4bef3c0afc1671f5f037",
+          "md5": "8e445684bb4d306d5f0cec38a7869655",
+          "sha256": "826b4fad5f016a402385082f802eeba5f77db07c3feb0156c2e9fa7dcb7fb358"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "8e445684bb4d306d5f0cec38a7869655",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20922,
+        "upload_time": "2020-07-14T17:20:23",
+        "upload_time_iso_8601": "2020-07-14T17:20:23.528381Z",
+        "url": "https://files.pythonhosted.org/packages/a8/89/edad5c4c3257dca93760aca45dfaab7c2ce57abd4bef3c0afc1671f5f037/fastrec-0.0.2.post1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a59a0b5f220110e0f3263dfee1b292a4a088442f012ceae68779357bf1f5ec0",
+          "md5": "af7ae44e4ec2633e552594eea24aa245",
+          "sha256": "dd7616304d27f0b3bf21c54718fac959be56df1afc489d524b957178beb2263b"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "af7ae44e4ec2633e552594eea24aa245",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 22990,
+        "upload_time": "2020-07-14T17:20:26",
+        "upload_time_iso_8601": "2020-07-14T17:20:26.352098Z",
+        "url": "https://files.pythonhosted.org/packages/0a/59/a0b5f220110e0f3263dfee1b292a4a088442f012ceae68779357bf1f5ec0/fastrec-0.0.2.post1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2.post2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5d6574e38a33fa8a19dd9b464ea2f7852a9cebe55a9a7bdb3c0cb1a43481ddb7",
+          "md5": "68a1198a007a43e94138c1ea2a617d8b",
+          "sha256": "994c56ebddb1fbb9e28d08283e5bf6ce465279a6f1253e91fcd7a58e6c296a86"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "68a1198a007a43e94138c1ea2a617d8b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20921,
+        "upload_time": "2020-07-14T17:20:24",
+        "upload_time_iso_8601": "2020-07-14T17:20:24.627521Z",
+        "url": "https://files.pythonhosted.org/packages/5d/65/74e38a33fa8a19dd9b464ea2f7852a9cebe55a9a7bdb3c0cb1a43481ddb7/fastrec-0.0.2.post2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c4760ef6b82c708138b1dded3e0520d36a0b602bbb3676ab79b5ae831f5d0867",
+          "md5": "25c2b37ca4e4dd489093311db6148dd2",
+          "sha256": "7cd6ac40e4f90653addb04ccbe9a4499eedf7f138ccc92d204196944af55edc5"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "25c2b37ca4e4dd489093311db6148dd2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23019,
+        "upload_time": "2020-07-14T17:20:27",
+        "upload_time_iso_8601": "2020-07-14T17:20:27.502877Z",
+        "url": "https://files.pythonhosted.org/packages/c4/76/0ef6b82c708138b1dded3e0520d36a0b602bbb3676ab79b5ae831f5d0867/fastrec-0.0.2.post2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2.post3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8e261802308c66fef1b0ad14f1b4c061f3adb7b699af3146b942d72acbcb5fca",
+          "md5": "cc61142daa714df00bf1ab91b6de6be4",
+          "sha256": "2956fdaf4d5474a60300cae81655a1364e4cd2dca465a143540b36b62664d28f"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cc61142daa714df00bf1ab91b6de6be4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 20939,
+        "upload_time": "2020-07-14T17:38:26",
+        "upload_time_iso_8601": "2020-07-14T17:38:26.910778Z",
+        "url": "https://files.pythonhosted.org/packages/8e/26/1802308c66fef1b0ad14f1b4c061f3adb7b699af3146b942d72acbcb5fca/fastrec-0.0.2.post3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9f759c2e3cb5053961eb004323e9520a698699e41b08c95647bb47535d3cd1b1",
+          "md5": "c8db82302ad921562189168de9832cb1",
+          "sha256": "318e45bc17a351ccf66aa85ed97b0d2e062f345e505dce21dfcf2d9af6275887"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c8db82302ad921562189168de9832cb1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23029,
+        "upload_time": "2020-07-14T17:38:29",
+        "upload_time_iso_8601": "2020-07-14T17:38:29.842780Z",
+        "url": "https://files.pythonhosted.org/packages/9f/75/9c2e3cb5053961eb004323e9520a698699e41b08c95647bb47535d3cd1b1/fastrec-0.0.2.post3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2.post4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b8991577e46bc4d589951843fe806007fd368dfc57364dfdb0de07bba0f0a585",
+          "md5": "e8d4f4b963a7eaf96bde069e59afcd10",
+          "sha256": "03ef3ad62b77680549cfefb3f28d3a257cad9c80d3d6bafd9c0cbc9cf757c5fb"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e8d4f4b963a7eaf96bde069e59afcd10",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21150,
+        "upload_time": "2020-07-16T17:05:39",
+        "upload_time_iso_8601": "2020-07-16T17:05:39.405006Z",
+        "url": "https://files.pythonhosted.org/packages/b8/99/1577e46bc4d589951843fe806007fd368dfc57364dfdb0de07bba0f0a585/fastrec-0.0.2.post4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "50647bfb8f13114a117959ed349612f038ceea0db61a12d0378319eb0fa88024",
+          "md5": "a84616447de414639015281e5d920b7a",
+          "sha256": "09d2248a1252e899ef645e352e136118d2e74566bc9327d50120392e19f0a577"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a84616447de414639015281e5d920b7a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24080,
+        "upload_time": "2020-07-16T17:05:42",
+        "upload_time_iso_8601": "2020-07-16T17:05:42.526782Z",
+        "url": "https://files.pythonhosted.org/packages/50/64/7bfb8f13114a117959ed349612f038ceea0db61a12d0378319eb0fa88024/fastrec-0.0.2.post4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2.post5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "fe3ce84f2ecdc10f3e7bbc666b29634c5158a0925b53e72eb27625cf0713b073",
+          "md5": "c7b3d6e30d0f22839cd4c4522fa4246d",
+          "sha256": "a9437d24169d4f1820f63ce43fa87c2433942bb9e98d5440626f22f7d83a1c81"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c7b3d6e30d0f22839cd4c4522fa4246d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21103,
+        "upload_time": "2020-07-16T17:09:10",
+        "upload_time_iso_8601": "2020-07-16T17:09:10.369207Z",
+        "url": "https://files.pythonhosted.org/packages/fe/3c/e84f2ecdc10f3e7bbc666b29634c5158a0925b53e72eb27625cf0713b073/fastrec-0.0.2.post5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86e957c677706619fbec3e4d55aaa6c143cfa03ef7cb66a97beee7e02861e8e6",
+          "md5": "d29c1cb5dc3fd8f251cb98c5bdf69154",
+          "sha256": "0bc4ba7dcb99441688f0e6bd65c52407da74f6116619a9bf7eefda14d53ab228"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.2.post5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d29c1cb5dc3fd8f251cb98c5bdf69154",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23982,
+        "upload_time": "2020-07-16T17:09:14",
+        "upload_time_iso_8601": "2020-07-16T17:09:14.167068Z",
+        "url": "https://files.pythonhosted.org/packages/86/e9/57c677706619fbec3e4d55aaa6c143cfa03ef7cb66a97beee7e02861e8e6/fastrec-0.0.2.post5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02c26d40b77a4acccf27ce33337fe97338e861e32eb3f381e4068ad7b49b08ea",
+          "md5": "670e1e1540f67c67bb5a1f2f5a24c5ef",
+          "sha256": "51e1ea772279db229c524e748313aa3a592a2c481a82accbcbf1a65d3ab429f0"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "670e1e1540f67c67bb5a1f2f5a24c5ef",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21343,
+        "upload_time": "2020-07-16T20:52:03",
+        "upload_time_iso_8601": "2020-07-16T20:52:03.423341Z",
+        "url": "https://files.pythonhosted.org/packages/02/c2/6d40b77a4acccf27ce33337fe97338e861e32eb3f381e4068ad7b49b08ea/fastrec-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2f47caf54e3c685e16d429dd9a19dec4c34960d26938b3e0e1f5f61f8d89c6c4",
+          "md5": "71bf5260e445df01ae355933f39c20aa",
+          "sha256": "50ac3e87333c324ad05d7849371351f54ec9982a108301c2115987cbc09df83f"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "71bf5260e445df01ae355933f39c20aa",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 23780,
+        "upload_time": "2020-07-16T20:52:07",
+        "upload_time_iso_8601": "2020-07-16T20:52:07.246780Z",
+        "url": "https://files.pythonhosted.org/packages/2f/47/caf54e3c685e16d429dd9a19dec4c34960d26938b3e0e1f5f61f8d89c6c4/fastrec-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "472709c6dd056d3401d1158af31ec8415f5079a71b95e7c6e6f57e286a7bcd3a",
+          "md5": "1b2931e5329b6e7d7cd4dccade8bc91b",
+          "sha256": "dfe7fb3f1174ef18b5c0e4dc7e81aa6427787007313dc404997ebe0b2707cb28"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "1b2931e5329b6e7d7cd4dccade8bc91b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 21816,
+        "upload_time": "2020-07-17T18:45:36",
+        "upload_time_iso_8601": "2020-07-17T18:45:36.619879Z",
+        "url": "https://files.pythonhosted.org/packages/47/27/09c6dd056d3401d1158af31ec8415f5079a71b95e7c6e6f57e286a7bcd3a/fastrec-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab8d497b695a2142ca67361d61342229e203a7ea5d10072b9c41b9336e4bb004",
+          "md5": "20bb10bb52f47963ac071e10a826263e",
+          "sha256": "f505068862687520ca5786ba8761fe11d686d781266d8ecd49ab0421d56351b0"
+        },
+        "downloads": -1,
+        "filename": "fastrec-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20bb10bb52f47963ac071e10a826263e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 24744,
+        "upload_time": "2020-07-17T18:45:41",
+        "upload_time_iso_8601": "2020-07-17T18:45:41.089311Z",
+        "url": "https://files.pythonhosted.org/packages/ab/8d/497b695a2142ca67361d61342229e203a7ea5d10072b9c41b9336e4bb004/fastrec-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "472709c6dd056d3401d1158af31ec8415f5079a71b95e7c6e6f57e286a7bcd3a",
+        "md5": "1b2931e5329b6e7d7cd4dccade8bc91b",
+        "sha256": "dfe7fb3f1174ef18b5c0e4dc7e81aa6427787007313dc404997ebe0b2707cb28"
+      },
+      "downloads": -1,
+      "filename": "fastrec-0.0.4-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "1b2931e5329b6e7d7cd4dccade8bc91b",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 21816,
+      "upload_time": "2020-07-17T18:45:36",
+      "upload_time_iso_8601": "2020-07-17T18:45:36.619879Z",
+      "url": "https://files.pythonhosted.org/packages/47/27/09c6dd056d3401d1158af31ec8415f5079a71b95e7c6e6f57e286a7bcd3a/fastrec-0.0.4-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ab8d497b695a2142ca67361d61342229e203a7ea5d10072b9c41b9336e4bb004",
+        "md5": "20bb10bb52f47963ac071e10a826263e",
+        "sha256": "f505068862687520ca5786ba8761fe11d686d781266d8ecd49ab0421d56351b0"
+      },
+      "downloads": -1,
+      "filename": "fastrec-0.0.4.tar.gz",
+      "has_sig": false,
+      "md5_digest": "20bb10bb52f47963ac071e10a826263e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 24744,
+      "upload_time": "2020-07-17T18:45:41",
+      "upload_time_iso_8601": "2020-07-17T18:45:41.089311Z",
+      "url": "https://files.pythonhosted.org/packages/ab/8d/497b695a2142ca67361d61342229e203a7ea5d10072b9c41b9336e4bb004/fastrec-0.0.4.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

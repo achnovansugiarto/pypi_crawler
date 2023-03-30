@@ -1,0 +1,438 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# FastAPI Cloud Tasks\n\nStrongly typed background tasks with FastAPI and Google CloudTasks.\n\n## Installation\n\n```\npip install fastapi-cloud-tasks\n```\n\n## Key features\n\n- Strongly typed tasks.\n  - Fail at invocation site to make it easier to develop and debug.\n  - Breaking schema changes between versions will fail at task runner with Pydantic.\n- Familiar and simple public API\n  - `.delay` method that takes same arguments as the task.\n  - `.scheduler` method to create recurring job.\n- Tasks are regular FastAPI endpoints on plain old HTTP.\n  - `Depends` just works!\n  - All middlewares, telemetry, auth, debugging etc solutions for FastAPI work as is.\n  - Host task runners independent of GCP. If CloudTasks can reach the URL, it can invoke the task.\n- Save money.\n  - Task invocation with GCP is [free for first million, then costs $0.4/million](https://cloud.google.com/tasks/pricing).\n    That's almost always cheaper than running a RabbitMQ/Redis/SQL backend for celery.\n  - Jobs cost [$0.1 per job per month irrespective of invocations. 3 jobs are free.](https://cloud.google.com/scheduler#pricing)\n    Either free or almost always cheaper than always running beat worker.\n  - If somehow, this cost ever becomes a concern, the `client` can be overriden to call any gRPC server with a compatible API.\n    [Here's a trivial emulator implementation that we will use locally](https://github.com/aertje/cloud-tasks-emulator)\n- Autoscale.\n  - With a FaaS setup, your task workers can autoscale based on load.\n  - Most FaaS services have free tiers making it much cheaper than running a celery worker.\n\n## How it works\n\n### Delayed job\n\n```python\nfrom fastapi_cloud_tasks import DelayedRouteBuilder\n\ndelayed_router = APIRouter(route_class=DelayedRouteBuilder(...))\n\nclass Recipe(BaseModel):\n    ingredients: List[str]\n\n@delayed_router.post(\"/{restaurant}/make_dinner\")\nasync def make_dinner(restaurant: str, recipe: Recipe):\n    # Do a ton of work here.\n\n\napp.include_router(delayed_router)\n```\n\nNow we can trigger the task with\n\n```python\nmake_dinner.delay(restaurant=\"Taj\", recipe=Recipe(ingredients=[\"Pav\",\"Bhaji\"]))\n```\n\nIf we want to trigger the task 30 minutes later\n\n```python\nmake_dinner.options(countdown=1800).delay(...)\n```\n\n### Scheduled Task\n```python\nfrom fastapi_cloud_tasks import ScheduledRouteBuilder\n\nscheduled_router = APIRouter(route_class=ScheduledRouteBuilder(...))\n\nclass Recipe(BaseModel):\n    ingredients: List[str]\n\n@scheduled_router.post(\"/home_cook\")\nasync def home_cook(recipe: Recipe):\n    # Make my own food\n\napp.include_router(scheduled_router)\n\n# If you want to make your own breakfast every morning at 7AM IST.\nhome_cook.scheduler(name=\"test-home-cook-at-7AM-IST\", schedule=\"0 7 * * *\", time_zone=\"Asia/Kolkata\").schedule(recipe=Recipe(ingredients=[\"Milk\",\"Cereal\"]))\n```\n\n## Concept\n\n[`Cloud Tasks`](https://cloud.google.com/tasks) allows us to schedule a HTTP request in the future.\n\n[FastAPI](https://fastapi.tiangolo.com/tutorial/body/) makes us define complete schema and params for an HTTP endpoint.\n\n[`Cloud Scheduler`](https://cloud.google.com/scheduler) allows us to schedule recurring HTTP requests in the future.\n\nFastAPI Cloud Tasks works by putting the three together:\n\n- GCP's Cloud Tasks + FastAPI = Partial replacement for celery's async delayed tasks.\n- GCP's Cloud Scheduler + FastAPI = Replacement for celery beat.\n- FastAPI Cloud Tasks + Cloud Run = Autoscaled delayed tasks.\n\n\n\n## Running\n\n### Local\n\nPre-requisites:\n- `pip install fastapi-cloud-tasks`\n- Install [cloud-tasks-emulator](https://github.com/aertje/cloud-tasks-emulator)\n  - Alternatively install ngrok and forward the server's port\n\nStart running the emulator in a terminal\n```sh\ncloud-tasks-emulator\n```\n\nStart running the task runner on port 8000 so that it is accessible from cloud tasks.\n\n```sh\nuvicorn examples.simple.main:app --reload --port 8000\n```\n\nIn another terminal, trigger the task with curl\n\n```\ncurl http://localhost:8000/trigger\n```\n\nCheck the logs on the server, you should see\n\n```\nWARNING:  Hello task ran with payload: Triggered task\n```\n\nImportant bits of code:\n\n```python\n# complete file: examples/simple/main.py\n\n# For local, we connect to the emulator client\nclient = None\nif IS_LOCAL:\n client = emulator_client()\n\n# Construct our DelayedRoute class with all relevant settings\n# This can be done once across the entire project\nDelayedRoute = DelayedRouteBuilder(\n    client=client,\n    base_url=\"http://localhost:8000\"\n    queue_path=queue_path(\n        project=\"gcp-project-id\",\n        location=\"asia-south1\",\n        queue=\"test-queue\",\n    ),\n)\n\n# Override the route_class so that we can add .delay method to the endpoints and know their complete URL\ndelayed_router = APIRouter(route_class=DelayedRoute, prefix=\"/delayed\")\n\nclass Payload(BaseModel):\n    message: str\n\n@delayed_router.post(\"/hello\")\nasync def hello(p: Payload = Payload(message=\"Default\")):\n    logger.warning(f\"Hello task ran with payload: {p.message}\")\n\n\n# Define our app and add trigger to it.\napp = FastAPI()\n\n@app.get(\"/trigger\")\nasync def trigger():\n    # Trigger the task\n    hello.delay(p=Payload(message=\"Triggered task\"))\n    return {\"message\": \"Hello task triggered\"}\n\napp.include_router(delayed_router)\n\n```\n\nNote: You can read complete working source code of the above example in [`examples/simple/main.py`](examples/simple/main.py)\n\nIn the real world you'd have a separate process for task runner and actual task.\n\n### Deployed environment / Cloud Run\n\nRunning on Cloud Run with authentication needs us to supply an OIDC token. To do that we can use a `hook`.\n\nPre-requisites:\n\n- Create a task queue. Copy the project id, location and queue name.\n- Deploy the worker as a service on Cloud Run and copy it's URL.\n- Create a service account in cloud IAM and add `Cloud Run Invoker` role to it.\n\n\n```python\n# URL of the Cloud Run service\nbase_url = \"https://hello-randomchars-el.a.run.app\"\n\nDelayedRoute = DelayedRouteBuilder(\n    base_url=base_url,\n    # Task queue, same as above.\n    queue_path=queue_path(...),\n    pre_create_hook=oidc_task_hook(\n        token=tasks_v2.OidcToken(\n            # Service account that you created\n            service_account_email=\"fastapi-cloud-tasks@gcp-project-id.iam.gserviceaccount.com\",\n            audience=base_url,\n        ),\n    ),\n)\n```\n\nCheck the fleshed out example at [`examples/full/tasks.py`](examples/full/tasks.py)\n\nIf you're not running on CloudRun and want to an OAuth Token instead, you can use the `oauth_task_hook` instead.\n\nCheck [fastapi_cloud_tasks/hooks.py](fastapi_cloud_tasks/hooks.py) to get the hang od hooks and how you can use them.\n\n## Configuration\n\n### DelayedRouteBuilder\n\nUsage:\n\n```python\nDelayedRoute = DelayedRouteBuilder(...)\ndelayed_router = APIRouter(route_class=DelayedRoute)\n\n@delayed_router.get(\"/simple_task\")\ndef simple_task():\n    return {}\n```\n\n- `base_url` - The URL of your worker FastAPI service.\n\n- `queue_path` - Full path of the Cloud Tasks queue. (Hint: use the util function `queue_path`)\n\n- `task_create_timeout` - How long should we wait before giving up on creating cloud task.\n\n- `pre_create_hook` - If you need to edit the `CreateTaskRequest` before sending it to Cloud Tasks (eg: Auth for Cloud Run), you can do that with this hook. See hooks section below for more.\n\n- `client` - If you need to override the Cloud Tasks client, pass the client here. (eg: changing credentials, transport etc)\n\n#### Task level default options\n\nUsage:\n\n```python\n@delayed_router.get(\"/simple_task\")\n@task_default_options(...)\ndef simple_task():\n    return {}\n```\n\nAll options from above can be passed as `kwargs` to the decorator.\n\nAdditional options:\n\n- `countdown` - Seconds in the future to schedule the task.\n- `task_id` - named task id for deduplication. (One task id will only be queued once.)\n\nExample:\n\n```python\n# Trigger after 5 minutes\n@delayed_router.get(\"/simple_task\")\n@task_default_options(countdown=300)\ndef simple_task():\n    return {}\n```\n\n#### Delayer Options\n\nUsage:\n\n```python\nsimple_task.options(...).delay()\n```\n\nAll options from above can be overriden per call (including DelayedRouteBuilder options like `base_url`) with kwargs to the `options` function before calling delay.\n\nExample:\n\n```python\n# Trigger after 2 minutes\nsimple_task.options(countdown=120).delay()\n```\n\n### ScheduledRouteBuilder\n\nUsage:\n\n```python\nScheduledRoute = ScheduledRouteBuilder(...)\nscheduled_router = APIRouter(route_class=ScheduledRoute)\n\n@scheduled_router.get(\"/simple_scheduled_task\")\ndef simple_scheduled_task():\n    return {}\n\n\nsimple_scheduled_task.scheduler(name=\"simple_scheduled_task\", schedule=\"* * * * *\").schedule()\n```\n\n\n## Hooks\n\nWe might need to override things in the task being sent to Cloud Tasks. The `pre_create_hook` allows us to do that.\n\nSome hooks are included in the library.\n\n- `oidc_delayed_hook` / `oidc_scheduled_hook` - Used to pass OIDC token (for Cloud Run etc).\n- `deadline_delayed_hook` / `deadline_scheduled_hook` - Used to change the timeout for the worker of a task. (PS: this deadline is decided by the sender to the queue and not the worker)\n- `chained_hook` - If you need to chain multiple hooks together, you can do that with `chained_hook(hook1, hook2)`\n\n## Helper dependencies\n\n### max_retries\n\n```python\n@delayed_router.post(\"/fail_twice\", dependencies=[Depends(max_retries(2))])\nasync def fail_twice():\n    raise Exception(\"nooo\")\n```\n\n### CloudTasksHeaders\n\n```python\n@delayed_router.get(\"/my_task\")\nasync def my_task(ct_headers: CloudTasksHeaders = Depends()):\n    print(ct_headers.queue_name)\n```\n\nCheck the file [fastapi_cloud_tasks/dependencies.py](fastapi_cloud_tasks/dependencies.py) for details.\n\n## Contributing\n\n- Run `pre-commit install` on your local to get pre-commit hook.\n- Make changes and raise a PR!\n- If the change is massive, open an issue to discuss it before writing code.\n\nNote: This project is neither affiliated with, nor sponsored by Google.\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "fastapi-cloud-tasks",
+    "package_url": "https://pypi.org/project/fastapi-cloud-tasks/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/fastapi-cloud-tasks/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/fastapi-cloud-tasks/0.1.1/",
+    "requires_dist": [
+      "google-cloud-tasks",
+      "google-cloud-scheduler",
+      "fastapi"
+    ],
+    "requires_python": "",
+    "summary": "Trigger delayed Cloud Tasks from FastAPI",
+    "version": "0.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 13745004,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5767c40750969bb17fcb298adc9663c32013c5545da49c53dd8a2d930f2ee47d",
+          "md5": "d94c2ef0d716d564588e540f11286859",
+          "sha256": "36c99ee8c000227d853eb83e324e0676625fc3f384d1ab3a6061fd68f0636199"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.0.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d94c2ef0d716d564588e540f11286859",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 6436,
+        "upload_time": "2021-11-25T05:42:20",
+        "upload_time_iso_8601": "2021-11-25T05:42:20.106491Z",
+        "url": "https://files.pythonhosted.org/packages/57/67/c40750969bb17fcb298adc9663c32013c5545da49c53dd8a2d930f2ee47d/fastapi_cloud_tasks-0.0.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bad229071f348d08a9d834ad9ab83c6d99c92d15bf9ba6d760f54083102ebd4c",
+          "md5": "01419542a52ec648afb9b04a0e517cf6",
+          "sha256": "9d7a7a089cd13bb27864f2a6ac6bba40235d88fcd60d672a29764957bd728345"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.0.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "01419542a52ec648afb9b04a0e517cf6",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 7345,
+        "upload_time": "2021-11-25T05:42:21",
+        "upload_time_iso_8601": "2021-11-25T05:42:21.314767Z",
+        "url": "https://files.pythonhosted.org/packages/ba/d2/29071f348d08a9d834ad9ab83c6d99c92d15bf9ba6d760f54083102ebd4c/fastapi-cloud-tasks-0.0.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "aaea852922df617cf08f1cae964498499700488e2fd7407065b8353472762e3b",
+          "md5": "7c7379ab0e3ec70639ec8e2308f2a1fe",
+          "sha256": "34fd862e318105b5bc92211a877b0316a43e6296fc630811fc78dc37a647021b"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7c7379ab0e3ec70639ec8e2308f2a1fe",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 9159,
+        "upload_time": "2021-11-25T08:03:48",
+        "upload_time_iso_8601": "2021-11-25T08:03:48.201251Z",
+        "url": "https://files.pythonhosted.org/packages/aa/ea/852922df617cf08f1cae964498499700488e2fd7407065b8353472762e3b/fastapi_cloud_tasks-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "42fd7729d5537f95e38098608d12a5d9b5eff9ae49f8b079e07cb237588107e3",
+          "md5": "77fc1e513770c8e92f5b2b9296b7c79b",
+          "sha256": "7eef9f5eeffccb92be4839ac65039b227a340ba5369d8764f782d1eff0599f23"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "77fc1e513770c8e92f5b2b9296b7c79b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 9739,
+        "upload_time": "2021-11-25T08:03:49",
+        "upload_time_iso_8601": "2021-11-25T08:03:49.153943Z",
+        "url": "https://files.pythonhosted.org/packages/42/fd/7729d5537f95e38098608d12a5d9b5eff9ae49f8b079e07cb237588107e3/fastapi-cloud-tasks-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3b1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3acee2e83c984267f82859faabded070a45cac3973d8a0a7c06b7c2d090de78e",
+          "md5": "a08aa11084a207fe812f8468c9526825",
+          "sha256": "5ed71614df424040fbdb10abe6b8bcba08e2c6148d043276c185dd990b1966fd"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.0.3b1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a08aa11084a207fe812f8468c9526825",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11452,
+        "upload_time": "2021-12-16T15:54:29",
+        "upload_time_iso_8601": "2021-12-16T15:54:29.974370Z",
+        "url": "https://files.pythonhosted.org/packages/3a/ce/e2e83c984267f82859faabded070a45cac3973d8a0a7c06b7c2d090de78e/fastapi_cloud_tasks-0.0.3b1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dfe673ddda8cc4b994579c0c8ca8c0063e21e4e829b476d51efb9df45ce78a1b",
+          "md5": "93d4faad2174b0d59a3c18a9f98e09e1",
+          "sha256": "8ab1b8cf3062c903693c8073214f636e0c0827e23b7aa4fbeefa98683029c1ab"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.0.3b1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "93d4faad2174b0d59a3c18a9f98e09e1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11486,
+        "upload_time": "2021-12-16T15:54:31",
+        "upload_time_iso_8601": "2021-12-16T15:54:31.408379Z",
+        "url": "https://files.pythonhosted.org/packages/df/e6/73ddda8cc4b994579c0c8ca8c0063e21e4e829b476d51efb9df45ce78a1b/fastapi-cloud-tasks-0.0.3b1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3b2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f6d40b5d24427b5208e839f84e48793412a415cd109796aec068aafd82a15afa",
+          "md5": "c7f1d9e55d6fd19e6cad4124a0a86ea6",
+          "sha256": "9ea32657cc57432a20a76af60352ff178b028f71443cf9e002d49adb5650474e"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.0.3b2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c7f1d9e55d6fd19e6cad4124a0a86ea6",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 11677,
+        "upload_time": "2021-12-16T18:15:52",
+        "upload_time_iso_8601": "2021-12-16T18:15:52.379776Z",
+        "url": "https://files.pythonhosted.org/packages/f6/d4/0b5d24427b5208e839f84e48793412a415cd109796aec068aafd82a15afa/fastapi_cloud_tasks-0.0.3b2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "76690967d01020f65bba67f725865d7a2571c568b0a6838873fe170600b9b1e5",
+          "md5": "81b9043594c22b576f4d7b910509d95e",
+          "sha256": "9b933b296640a3e56d4e5ce4ebb9b2efc4df026690d86c253bf72d800cf56348"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.0.3b2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "81b9043594c22b576f4d7b910509d95e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11672,
+        "upload_time": "2021-12-16T18:15:53",
+        "upload_time_iso_8601": "2021-12-16T18:15:53.301014Z",
+        "url": "https://files.pythonhosted.org/packages/76/69/0967d01020f65bba67f725865d7a2571c568b0a6838873fe170600b9b1e5/fastapi-cloud-tasks-0.0.3b2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb81d3b4922384a854cb0ad897216da35fea91bd13ea6293875999c1d1c39948",
+          "md5": "b477ba04046602b12fb5dfc09f905607",
+          "sha256": "7d75c4bc9e2c065e975b7e09f90c12b1da0256c42c518bcbd23a5165633a3fae"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b477ba04046602b12fb5dfc09f905607",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 12310,
+        "upload_time": "2021-12-23T06:44:24",
+        "upload_time_iso_8601": "2021-12-23T06:44:24.723606Z",
+        "url": "https://files.pythonhosted.org/packages/bb/81/d3b4922384a854cb0ad897216da35fea91bd13ea6293875999c1d1c39948/fastapi_cloud_tasks-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a8d4c337fcd2b2d30160d2cd043eb59c9d3aeeb2affb75c93c0ee51b5630e75",
+          "md5": "a865eceaba17a04e076de531d1b71b72",
+          "sha256": "02a2528984f2494eb2c1413bd796143192373a3978d1208d895a51d55ca1caf9"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "a865eceaba17a04e076de531d1b71b72",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11887,
+        "upload_time": "2021-12-23T06:44:26",
+        "upload_time_iso_8601": "2021-12-23T06:44:26.586999Z",
+        "url": "https://files.pythonhosted.org/packages/9a/8d/4c337fcd2b2d30160d2cd043eb59c9d3aeeb2affb75c93c0ee51b5630e75/fastapi-cloud-tasks-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.0rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "99bbb0196a225bfe0fe781c447eeceebfc8080aa3929351cf8f548f7024e4125",
+          "md5": "d651332406fef27e21fb4e80178df29b",
+          "sha256": "2d1117d73a1ee465e8387925b41f5353b103ca5b7f0fab07f3ea47799d493d14"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.1.0rc1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d651332406fef27e21fb4e80178df29b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 12340,
+        "upload_time": "2021-12-17T14:30:25",
+        "upload_time_iso_8601": "2021-12-17T14:30:25.929000Z",
+        "url": "https://files.pythonhosted.org/packages/99/bb/b0196a225bfe0fe781c447eeceebfc8080aa3929351cf8f548f7024e4125/fastapi_cloud_tasks-0.1.0rc1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d4b72b6ccc337736b3914ba30653b03bb518d3c587ef32a50828dc893ddf2b2d",
+          "md5": "5ade26498dd29c75dc3f0046ddca5c8c",
+          "sha256": "4db763e2088ad686a3f907908bd6f9c4d79088ecde0c1cab69ea881f66324f44"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.1.0rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5ade26498dd29c75dc3f0046ddca5c8c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 11892,
+        "upload_time": "2021-12-17T14:30:27",
+        "upload_time_iso_8601": "2021-12-17T14:30:27.264469Z",
+        "url": "https://files.pythonhosted.org/packages/d4/b7/2b6ccc337736b3914ba30653b03bb518d3c587ef32a50828dc893ddf2b2d/fastapi-cloud-tasks-0.1.0rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3af6bc876ab048c43a499bde62faf3799f58a6778e70f042bdb31ecd01d50be4",
+          "md5": "0ced75a4bb755b5adbe5611c218e230f",
+          "sha256": "a7d02e4ce7ecd56832d8300f8c1751442d1bc5a6922e1d57620f65c2b94d044c"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0ced75a4bb755b5adbe5611c218e230f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 15301,
+        "upload_time": "2022-05-07T18:29:06",
+        "upload_time_iso_8601": "2022-05-07T18:29:06.953332Z",
+        "url": "https://files.pythonhosted.org/packages/3a/f6/bc876ab048c43a499bde62faf3799f58a6778e70f042bdb31ecd01d50be4/fastapi_cloud_tasks-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0af4dd63e9abbe974fbaeb17ab5c3b04982b474dd93070ba75baef6327dd0c88",
+          "md5": "1d8aa840ea060dea875dd4692f7440ee",
+          "sha256": "e63f7d6da1e7a371279945bcc9fa4ad61dc64587f19a63269e68c7b997f8914c"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1d8aa840ea060dea875dd4692f7440ee",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14845,
+        "upload_time": "2022-05-07T18:29:08",
+        "upload_time_iso_8601": "2022-05-07T18:29:08.472411Z",
+        "url": "https://files.pythonhosted.org/packages/0a/f4/dd63e9abbe974fbaeb17ab5c3b04982b474dd93070ba75baef6327dd0c88/fastapi-cloud-tasks-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1rc1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9bfb572ec877b72b50f8fc189f3ad4ecef0a67ccfdd77e5979452d19034c8a26",
+          "md5": "fd087cb086ca713631a2ae778b6ff392",
+          "sha256": "a4db58bda7aee97b7d651c34f6f5df742336c894724700144127f542fc9e6585"
+        },
+        "downloads": -1,
+        "filename": "fastapi_cloud_tasks-0.1.1rc1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "fd087cb086ca713631a2ae778b6ff392",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": null,
+        "size": 15258,
+        "upload_time": "2022-05-07T09:03:11",
+        "upload_time_iso_8601": "2022-05-07T09:03:11.481410Z",
+        "url": "https://files.pythonhosted.org/packages/9b/fb/572ec877b72b50f8fc189f3ad4ecef0a67ccfdd77e5979452d19034c8a26/fastapi_cloud_tasks-0.1.1rc1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7a7d784103c4f098bfb978358781e54a62ab89b3c7d3138750cd3250afa75947",
+          "md5": "b9f38a6fa412186064e7cc057f592bfc",
+          "sha256": "5cffc2e45481a21322138c8fc693387c243c84d4cf013f78b07b18553c41a4c2"
+        },
+        "downloads": -1,
+        "filename": "fastapi-cloud-tasks-0.1.1rc1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b9f38a6fa412186064e7cc057f592bfc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 14683,
+        "upload_time": "2022-05-07T09:03:12",
+        "upload_time_iso_8601": "2022-05-07T09:03:12.816513Z",
+        "url": "https://files.pythonhosted.org/packages/7a/7d/784103c4f098bfb978358781e54a62ab89b3c7d3138750cd3250afa75947/fastapi-cloud-tasks-0.1.1rc1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "3af6bc876ab048c43a499bde62faf3799f58a6778e70f042bdb31ecd01d50be4",
+        "md5": "0ced75a4bb755b5adbe5611c218e230f",
+        "sha256": "a7d02e4ce7ecd56832d8300f8c1751442d1bc5a6922e1d57620f65c2b94d044c"
+      },
+      "downloads": -1,
+      "filename": "fastapi_cloud_tasks-0.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "0ced75a4bb755b5adbe5611c218e230f",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 15301,
+      "upload_time": "2022-05-07T18:29:06",
+      "upload_time_iso_8601": "2022-05-07T18:29:06.953332Z",
+      "url": "https://files.pythonhosted.org/packages/3a/f6/bc876ab048c43a499bde62faf3799f58a6778e70f042bdb31ecd01d50be4/fastapi_cloud_tasks-0.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "0af4dd63e9abbe974fbaeb17ab5c3b04982b474dd93070ba75baef6327dd0c88",
+        "md5": "1d8aa840ea060dea875dd4692f7440ee",
+        "sha256": "e63f7d6da1e7a371279945bcc9fa4ad61dc64587f19a63269e68c7b997f8914c"
+      },
+      "downloads": -1,
+      "filename": "fastapi-cloud-tasks-0.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1d8aa840ea060dea875dd4692f7440ee",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 14845,
+      "upload_time": "2022-05-07T18:29:08",
+      "upload_time_iso_8601": "2022-05-07T18:29:08.472411Z",
+      "url": "https://files.pythonhosted.org/packages/0a/f4/dd63e9abbe974fbaeb17ab5c3b04982b474dd93070ba75baef6327dd0c88/fastapi-cloud-tasks-0.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

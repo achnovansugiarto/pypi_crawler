@@ -1,0 +1,156 @@
+{
+  "info": {
+    "author": "Tim Hatch",
+    "author_email": "tim@timhatch.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "# fastzip\n\nThis project lets you efficiently create and combine zip files.\n\n\n## What is \"fast\" in \"faszip\"?\n\nMainly two things:\n\n1. Multithreaded compression (DEFLATE), similar to `pigz`\n2. The ability to copy/merge zips without recompressing, similar to `zipmerge`\n\nIt's also pure python, able to stream the input (without needing the central\ndirectory to be present), and features a rules-based compression method chooser,\nto avoid _increasing_ the size of tiny files.\n\n\n## Demo\n\nSimilar API to ZipFile\n\n```py\nfrom pathlib import Path\nfrom fastzip.write import WZip\nwith WZip(Path(\"out.zip\")) as z:\n    z.write(Path(\"a\"))\n```\n\nMerging existing files\n\n```py\nfrom fastzip.read import RZipStream\nfrom fastzip.write import WZip\nwith WZip(Path(\"out.zip\")) as z:\n    for entry in RZipStream(\"zip1.zip\").entries():\n        z.enqueue_precompressed(*entry)\n    for entry in RZipStream(\"zip2.zip\").entries():\n        z.enqueue_precompressed(*entry)\n```\n\nIf you'd like to customize the number of threads, choice of compression,\nfilename within the archive, etc those are all possible.  Right now look at the\nsource, but the basic gist is:\n\n```py\nfrom io import BytesIO\nfrom pathlib import Path\nfrom fastzip.write import WZip\nfrom fastzip.chooser import CompressionChooser\n\nforce_store = CompressionChooser(default=\"store\")\nwith WZip(Path(\"out.zip\"), threads=2, chooser=force_store) as z:\n    z.write(Path(\"a\"), archive_path=Path(\"inzipname\"), synthetic_mtime=0, fobj=BytesIO(b\"foo\"))\n```\n\n## Benchmark\n\nTested on 8- and 12-core xeons, it's able to use about 7.5 and 11 cores,\nrepsectively for sufficiently large workloads.  See the next section about bottlenecks.\n\n```sh\n$ dd if=/dev/urandom of=a bs=1M count=512\n512+0 records in\n512+0 records out\n536870912 bytes (537 MB, 512 MiB) copied, 2.17395 s, 247 MB/s\n\n$ ./demo.sh\n+ rm -f a.zip a1.zip a2.zip\n+ cat a\n+ /usr/bin/time zip -o a.zip a\n  adding: a (deflated 0%)\n11.35user 0.24system 0:11.60elapsed 99%CPU (0avgtext+0avgdata 2892maxresident)k\n24inputs+1048752outputs (1major+205minor)pagefaults 0swaps\n+ /usr/bin/time python -m zipfile -c a1.zip a\n12.61user 0.44system 0:14.53elapsed 89%CPU (0avgtext+0avgdata 11360maxresident)k\n0inputs+1048920outputs (0major+1623minor)pagefaults 0swaps\n+ /usr/bin/time python -m fastzip -c -o a2.zip a\n20.39user 0.56system 0:02.78elapsed 753%CPU (0avgtext+0avgdata 1079140maxresident)k\n0inputs+1048968outputs (0major+149864minor)pagefaults 0swaps\n+ ls -l a.zip a1.zip a2.zip\n-rw-r--r-- 1 tim tim 537034782 Nov 16 13:47 a1.zip\n-rw-r--r-- 1 tim tim 537037407 Nov 16 13:47 a2.zip\n-rw-r--r-- 1 tim tim 536957493 Nov 16 13:01 a.zip\n```\n\n## Performance Bottlenecks\n\nThere are potentially many.  Some that I've observed include:\n\n1. Slow overwrite performance (on ext4); this is why WZip only opens in 'xb' mode.\n2. Small files\n   a. Slow stat (~0.5mS even on a ramdisk)\n   b. zlib.crc32 doesn't release the gil < 5KiB\n   c. small files use up the file budget without making much forward progress\n      (reordering to have one large file every (file\\_budget-1) may reduce\n      stalls\n3. Small output buffer (WZip opens with 1MB now)\n4. Seeks (which require flushing output buffer)\n5. ThreadPoolExecutor giant lock (submitting a future requires grabbing two\n   locks but one of them is a global lock to detect interpreter shutdown?)\n5. Deflate chunk size (smaller chunks means better parallelism on medium sized\n   files and less blocking on IO, but also scheduling many more futures, crc32\n   calls, and crc32\\_combine).  Larger chunk size also means a slightly better\n   compression ratio.\n6. Garbage collection (some recent changes to increase parallelism seem to\n   increase the quantity of GC)\n7. Mixing deflate and zstd -- although the number of threads is generally\n   shared between them, there are going to be stalls and overruns when\n   switching.\n\nWhen in doubt, generate a trace, and look for bottlenecks (either blank time,\nwhich is not doing useful work, or basically anything besides a compress itself\nthat seems to take a long time.\n\n## Sample Traces\n\nThis one only really performs well for the section in the middle marked\n\"acquire\" -- that is where it's run out of some resource to be able to queue\nmore data, but also the compression threads are fully working.  The gold\nseemingly-unlabeled events are GC, and you can see the cpu graph is generally\nquite low.\n\n![Trace 1](doc/chrome_trace.png)\n\nThis is that middle section zoomed in, and you can see more clearly that the\ncompression threads are busy and the IO threads have some idle time.  The gaps\nin MainThread imply that there is some hidden work.\n\n![Trace 2](doc/chrome_trace_zoomed.png)\n\n\n## Future plans (from drawbacks)\n\nNear-term problems:\n\n1. Errors that happen in threads aren't always reported in the obvious way.\n2. Adding directories (rather than files) is serial.\n3. Files must be MMAP-able, and on a 32-bit system this will probably run out\n   of process address space.\n4. There is an open-file budget, but there is no formal memory budget; the\n   output futures are likely to buffer about 2x the size of the largest file,\n   in memory.  For example, the 512MB file above has a peak memory of about\n   1GB.\n5. `WZip` is too complicated and has many complicated methods.  This makes it\n   hard to refactor, and hard to extend.\n6. Not enough validation (e.g. duplicate filenames, filenames with \"..\" in\n   them), and not totally sure the archive name code is solid.\n\nNOTE: The API is expected to change several times before version 1.0; if adding\na dep edge to this project (e.g. if you use a hypothetical version `0.4` make\nsure you specify `>=0.4, <0.5`.\n\n\n# License\n\nfastzip is copyright [Tim Hatch](https://timhatch.com/), and licensed under\nthe MIT license.  I am providing code in this repository to you under an open\nsource license.  This is my personal repository; the license you receive to\nmy code is from me and not from my employer. See the `LICENSE` file for details.\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/fastzip/fastzip/",
+    "keywords": "",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "fastzip",
+    "package_url": "https://pypi.org/project/fastzip/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/fastzip/",
+    "project_urls": {
+      "Homepage": "https://github.com/fastzip/fastzip/"
+    },
+    "release_url": "https://pypi.org/project/fastzip/0.5.0/",
+    "requires_dist": [
+      "click (>=7.0)",
+      "keke (<0.2.0,>=0.1.1)",
+      "zstandard (>=0.10.0) ; extra == 'all'",
+      "pywildcard (>=1.0.10) ; extra == 'all'"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Simple, quick zip file creation",
+    "version": "0.5.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15803548,
+  "releases": {
+    "0.0.0a1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b945bbed3b8d606c768b3e03a6c0764be30540c7b5abbc34f50b4252155a61dd",
+          "md5": "80cf11f6b84b2c544e22edda7116d692",
+          "sha256": "fe593ba5061da4927fc2a4abd57a6602800eeef54138f2a468533ae891ded620"
+        },
+        "downloads": -1,
+        "filename": "fastzip-0.0.0a1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "80cf11f6b84b2c544e22edda7116d692",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 754,
+        "upload_time": "2022-08-14T16:07:07",
+        "upload_time_iso_8601": "2022-08-14T16:07:07.476294Z",
+        "url": "https://files.pythonhosted.org/packages/b9/45/bbed3b8d606c768b3e03a6c0764be30540c7b5abbc34f50b4252155a61dd/fastzip-0.0.0a1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.5.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5de5ce64e288cadcc7bdc9cf5ef4a1693bde732dc08fdc8875ec83c755811ea6",
+          "md5": "64c0e26c98dac1f770ea49a13af59155",
+          "sha256": "2538eef401fbc544431bbf20f901de550c1090cdc7d8e1d12f12018b0bbe6118"
+        },
+        "downloads": -1,
+        "filename": "fastzip-0.5.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "64c0e26c98dac1f770ea49a13af59155",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 19812,
+        "upload_time": "2022-11-17T15:58:58",
+        "upload_time_iso_8601": "2022-11-17T15:58:58.749593Z",
+        "url": "https://files.pythonhosted.org/packages/5d/e5/ce64e288cadcc7bdc9cf5ef4a1693bde732dc08fdc8875ec83c755811ea6/fastzip-0.5.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b26b20e8d337c69098a384c738149dcc7d9101c419704b75b6770db6ffba1062",
+          "md5": "70f7b961fd576e1cbf09e99176eca62b",
+          "sha256": "e6f435a69b07a740fb179b87d6b6d234abc98195661df044114e34bda6d8cb3b"
+        },
+        "downloads": -1,
+        "filename": "fastzip-0.5.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "70f7b961fd576e1cbf09e99176eca62b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 374309,
+        "upload_time": "2022-11-17T15:59:01",
+        "upload_time_iso_8601": "2022-11-17T15:59:01.101450Z",
+        "url": "https://files.pythonhosted.org/packages/b2/6b/20e8d337c69098a384c738149dcc7d9101c419704b75b6770db6ffba1062/fastzip-0.5.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5de5ce64e288cadcc7bdc9cf5ef4a1693bde732dc08fdc8875ec83c755811ea6",
+        "md5": "64c0e26c98dac1f770ea49a13af59155",
+        "sha256": "2538eef401fbc544431bbf20f901de550c1090cdc7d8e1d12f12018b0bbe6118"
+      },
+      "downloads": -1,
+      "filename": "fastzip-0.5.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "64c0e26c98dac1f770ea49a13af59155",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 19812,
+      "upload_time": "2022-11-17T15:58:58",
+      "upload_time_iso_8601": "2022-11-17T15:58:58.749593Z",
+      "url": "https://files.pythonhosted.org/packages/5d/e5/ce64e288cadcc7bdc9cf5ef4a1693bde732dc08fdc8875ec83c755811ea6/fastzip-0.5.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b26b20e8d337c69098a384c738149dcc7d9101c419704b75b6770db6ffba1062",
+        "md5": "70f7b961fd576e1cbf09e99176eca62b",
+        "sha256": "e6f435a69b07a740fb179b87d6b6d234abc98195661df044114e34bda6d8cb3b"
+      },
+      "downloads": -1,
+      "filename": "fastzip-0.5.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "70f7b961fd576e1cbf09e99176eca62b",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 374309,
+      "upload_time": "2022-11-17T15:59:01",
+      "upload_time_iso_8601": "2022-11-17T15:59:01.101450Z",
+      "url": "https://files.pythonhosted.org/packages/b2/6b/20e8d337c69098a384c738149dcc7d9101c419704b75b6770db6ffba1062/fastzip-0.5.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

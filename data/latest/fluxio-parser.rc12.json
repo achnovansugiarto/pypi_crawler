@@ -1,0 +1,621 @@
+{
+  "info": {
+    "author": "Jonathan Drake",
+    "author_email": "jdrake@narrativescience.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: BSD License",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9"
+    ],
+    "description": "# Fluxio Parser\n\nFluxio is a framework for building workflows using Python. This is the parser component. Its job is to parse a Fluxio project's Python DSL into an in-memory representation. Other components translate the parsed project into deployable artifacts.\n\n- [Fluxio DSL](#fluxio-dsl)\n- [Input Data](#input-data)\n- [States](#states)\n- [Task](#task)\n  - [Definition](#definition)\n  - [Adding to the state machine](#adding-to-the-state-machine)\n  - [Passing data to tasks](#passing-data-to-tasks)\n  - [Stopping the execution](#stopping-the-execution)\n  - [Working with the State Data Client](#working-with-the-state-data-client)\n  - [Error Handling](#error-handling)\n  - [Retries](#retries)\n  - [Choice](#choice)\n  - [Map](#map)\n  - [Parallel](#parallel)\n  - [Pass](#pass)\n  - [Succeed](#succeed)\n  - [Fail](#fail)\n  - [Wait](#wait)\n- [Decorators](#decorators)\n  - [schedule](#schedule)\n  - [subscribe](#subscribe)\n  - [export](#export)\n  - [process_events](#process_events)\n\n## Fluxio DSL\n\nFluxio employs a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) written in Python syntax; this means a file's [abstract syntax tree (AST)](https://docs.python.org/3/library/ast.html) is parsed from source code instead of the module being executed directly by the Python interpreter.\n\nAn Fluxio project file contains:\n\n- A module-level function named \"main\" that defines the state machine logic. This function will be parsed later transpiled to [Amazon States Language (ASL)](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-amazon-states-language.html).\n  - The function should define a single positional arg, data, for explicitness but technically it doesn't matter. This variable represents the input data to the state machine execution, referenced as $ in ASL.\n  - See the [States](#states) section below for how to define the various states in Fluxio syntax\n- If the state machine needs any task states, then one or more module-level classes should be defined.\n  - Each class must have a unique, PascalCased name.\n    - Each class must inherit from [`Task`](#task).\n    - Each class should define a `run` method that takes the following positional arguments:\n      - `event` will be the input data\n      - `context` contains clients, functions, and attributes related to task metadata\n\n## [Input Data](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-input-output-filtering.html)\n\nWithin the main function, the data variable is the state input and is referenced as $ in ASL. We used it to pass parameters into and store data resulting from Task states. You can also set static values or transform the input data with a Pass state. The data variable is a dictionary.\n\n## States\n\nThe `states` subpackage has modules that roughly correspond to the actual state machine states. There is a base class called `StateMachineFragment` that represents some chunk of the state machine. The base `State` class only really exists to provide a more conceptually readable parent to the various subclasses in the states subpackage. State machine fragments that are not states include `ChoiceBranch`, parallel's `Branch`, and task's `Catch`.\n\nThe `tasks` subpackage within `states` contains different types of task states that resolve differently depending on the service specified in the Fluxio file. We have a task state that works with sync Lambda Functions and sync ECS tasks. A factory function in the subpackage's `__init__.py` determines the relevant task state class.\n\nThe following subsections explain how to represent a given ASL State in a Fluxio file. Click on each section heading to learn about each state's purpose.\n\n## [Task](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-task-state.html)\n\n### Definition\n\nTo define a task, add a Task subclass with a run method:\n\n```python\nclass Bar(Task):\n    async def run(event, context):\n        event.update({\"bar\": 456})\n        return event\n```\n\n#### `run` method\n\nThe run method should be async for consistency. The Lambda/ECS entry point code will get the current event loop and run the method.\n\nThe run method will be extracted **as-is** and used to replace a module in the generated Python package before the package is built for deployment. This means any import statements should go in the body of this method. You can include any application code you want. However, if your run method is more than ~50 LOC, you should probably create a separate library package then import and execute it in the run method.\n\nThe `ecs:worker` service type does not use the `run` method.\n\n#### `service` attribute\n\nBy default, the task will be deployed as a Lambda Function. To explicitly set the service (the runtime of the task), add a class attribute:\n\n```python\nclass Bar(Task):\n    service = \"ecs\"\n    async def run(event, context):\n        from ns_ml_runtime_thing import do_ml\n\n        do_ml(event)\n```\n\nOptions currently include:\n\n| Service               | Description                                                                                                                                                                                                                                           |\n| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |\n| `lambda`              | Default service if not specified. Lambdas invoke quickly and can return structured data. Use `lambda` wherever possible.                                                                                                                              |\n| `lambda:container`    | Runs a Lambda function using the container integration introduced in December 2020. This is handy when your code bundle exceeds 250 MB or you have a custom runtime. Beware of cold start times though, since pulling the container image takes time. |\n| `ecs`                 | Runs an ECS task and waits for the task to complete. This is useful for tasks that take longer than Lambda's timeout of 15 minutes. Bootstap times are slow however, so low-latency tasks should not use the `ecs` service.                           |\n| `ecs:worker`          | See below for specifics                                                                                                                                                                                                                               |\n| `lambda:pexpm-runner` | __DEPRECATED:__ PEXPM Runner is a Lambda function that downloads a PEX binary to /tmp and executes it in a subprocess at runtime. This should only be used to get around the 250MB artifact limit. Use `lambda:container` instead.                    |\n\n##### ECS Worker\n\n__NOTE:__ If your task takes less than 15 minutes to run, you are more than likely better served by the `lambda:container` service option. The ECS Worker pattern is more operationally complex.\n\nThe `ecs:worker` service type uses the [\"Wait for Task Token\" service integration pattern in Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html#connect-wait-token). This means instead of directly running a task, like a Lambda Function or ECS task, a message is sent to an SQS queue for processing by an external system. In Fluxio, the external system is an ECS Fargate service. The tasks in the service are queue workers; they poll the SQS queue and execute business logic based on the message. All the SQS and ECS infrastructure is managed by Fluxio (via CloudFormation) just like other service types.\n\nThis service type is a good fit if your use case:\n\n- Needs to use ECS: maybe your package artifact size is too big for Lambda or you need to run a task for longer than 15 minutes\n- Exceeds the [maximum number of tasks that can be launched per RunTask API action](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-quotas.html)\n\nThe ECS worker pattern allows to run one or more workers in the background to support long-running tasks as well as limit the number of API requests that Step Functions makes to ECS.\n\nTo get started, first extend the `TaskWorker` class and put your code in a regular package. For example, we'll define a new class called `TestWorker` in the `ns_worker_test` package in the `worker.py` module:\n\n```python\n\"\"\"Contains TestWorker class\"\"\"\n\nimport logging\nfrom typing import Dict\n\nimport aioredis\n\nfrom ns_sfn_task_entry_points.ecs_worker_app import TaskContext, TaskWorker\n\nlogger = logging.getLogger()\n\n\nclass TestWorker(TaskWorker):\n    \"\"\"Test worker\"\"\"\n\n    async def on_startup(self):\n        \"\"\"Initialize global application state\"\"\"\n        await super().on_startup()\n        self.cache_client_engine = await aioredis.create_redis_pool(...)\n\n    async def on_cleanup(self) -> None:\n        \"\"\"Tear down the worker context\"\"\"\n        await super().on_cleanup()\n        self.cache_client_engine.close()\n        await self.cache_client_engine.wait_closed()\n\n    async def run(self, event: Dict, context: TaskContext):\n        \"\"\"Run the task, i.e. handle a single queue message\n\n        This method exists for compatibility with other Fluxio tasks.\n\n        Args:\n            event: Event/input data unpacked from the queue message\n            context: Task context object containing clients, functions, and metadata\n\n        \"\"\"\n        item = context.state_data_client.get_item_for_map_iteration(event)\n        logger.info(item)\n```\n\nNote that you can define `on_startup` and `on_cleanup` lifecycle methods. These allow you to create database engines and API clients once when the application launches instead of with every message.\n\nNext, define a Task in your `project.py` file and at least the `spec` attribute:\n\n```python\nclass GenerateItems(Task):\n    async def run(event, context):\n        return context.state_data_client.put_items(\n            \"items\",\n            [{\"name\": \"sue\"}, {\"name\": \"jae\"}, {\"name\": \"levi\"}]\n        )\n\nclass Worker(Task):\n    service = \"ecs:worker\"\n    spec = \"ns_worker_test.worker:TestWorker\"\n    timeout = 600\n    concurrency = 10\n    heartbeat_interval = 60\n    autoscaling_min = 1\n    autoscaling_max = 2\n\ndef process_item(data):\n    Worker()\n\ndef main(data):\n    data[\"items\"] = GenerateItems()\n    map(data[\"items\"], process_item)\n```\n\nAvailable attributes:\n\n- `spec`: reference the path to your new class in the format `package.module:Class`\n- `concurrency` (default: 1): maximum number of messages to concurrently process within each task. Value must be in range 1-100. If the message handler does CPU-intensive work, this should be set to 1. The memory/CPU allotted to the task will determine how high this number can go. For I/O-intensive work, this number can generally be set to 10 per GB of memory but your mileage may vary.\n- `heartbeat_interval` (default: None): interval in seconds between heartbeat events sent to SQS. This value must be below the task timeout value. If the value is None, the task will not send heartbeats and the message timeout will default to the queue's timeout. A heartbeat \"resets the clock\" on an individual message's visibility timeout. Once a heartbeat happens, then the message will become visible in `<interval> * 2` seconds unless another heartbeat occurs in `<interval>` seconds. If the task stops (like during a deployment), the timeout will expire and another task can receive the message. See the docs at [Amazon SQS visibility timeout\n](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) for more details.\n- `autoscaling_min` (default: 1): minimum number of ECS tasks. Setting this to 1 means the service will always run at least one worker\n- `autoscaling_max` (default: 1): maximum number of ECS tasks\n\n#### `timeout` attribute\n\nBy default the task will timeout after 300 seconds. To change that value, set a class attribute:\n\n```python\nclass Bar(Task):\n    timeout = 600  # 10 minutes\n    async def run(event, context):\n        # ...\n```\n\nYou also need to provide that new timeout value as a keyword argument when you use the task:\n\n```python\ndef main(data):\n    Bar(key=\"Bar\", timeout=600)\n```\n\n#### `cpu` and `memory` attributes\n\nThe `memory` attribute is only used by Lambda and ECS tasks. The `cpu` attribute is only used by ECS tasks.\n\nBy default the `cpu` is set to 1024 and the `memory` is set to 2048. To change those values, set class attributes:\n\n```python\nclass Bar(Task):\n    cpu = 2048  # 2 vCPU\n    memory = 4096  # 4 GB\n    async def run(event, context):\n        # ...\n```\n\nFor ECS:\n\n- The available CPU values are 256, 512, 1024, 2048, 4096\n- The memory value is tied to the CPU but should generally be set to at least 2 times greater than the CPU value\n\nFor Lambda:\n\n- The available memory values are 128, 512, 1024, 1536, 2048, 3008\n\n### Adding to the state machine\n\nTo add a Task state, instantiate the Task class within the main function. You can either:\n\n- Instantiate the class and assign the result to a key in the input data (recommended).\n  - This is supported for services that can return a result from the task. Only Lambda can do this. This means that returning a result in the run method will not do anything if the service is set to \"ecs\".\n- Instantiate the class and do not assign its result.\n  - This means that the result of the task will be discarded, i.e. it won't show up on the input data object and therefore won't be available to downstream states.\n\nTo set an explicit key for the task state (recommended), pass a value for the key keyword argument. Otherwise, the key in the States dictionary will be generated automatically.\n\n```python\ndata[\"foo_result\"] = Foo(key=\"Do a foo\")  # this will update the input data\nFoo(key=\"Do a foo\")  # this will not update the input data\n```\n\n### Passing data to tasks\n\nBy default, the input path to a task is the full data dict ($). If you want to pass part of the data to a task, provide a positional argument to the task constructor.\n\n```python\ndata[\"foo_result\"] = Foo(key=\"Do a foo\")\ndata[\"bar_result\"] = Bar(data[\"foo_result\"], key=\"Do the bar\")\n```\n\n### Stopping the execution\n\nIf you need to stop/cancel/abort the execution from within a task, you can use the  `context.stop_execution` method within your task's `run` method. A common use case is if you need to check the value of a feature flag at the beginning of the execution and abort if it's false. For example:\n\n```python\nif not some_condition:\n    return await context.stop_execution()\n```\n\nYou can provide extra detail by passing `error` and `cause` keyword arguments to the `stop_execution` method. The `error` is a short string like a code or enum value whereas `cause` is a longer description.\n\n### Working with the State Data Client\n\nOne of the stated Step Functions best practices is to avoid passing large payloads between states; the input data limit is only 32K characters. To get around this, you can choose to store data from your task code in a DynamoDB table. With DynamoDB, we have an item limit of 400KB to work with. When you put items into the table you receive a pointer to the DynamoDB item which you can return from your task so it gets includes in the input data object. From there, since the pointer is in the `data` dict, you can reload the stored data in a downstream task. There is a library, `ns_sfn_tools`, with a State Data Client instance for putting and getting items from this DynamoDB table. It's available in your task's `run` method as `context.state_data_client`.\n\nThe client methods are split between \"local\" and \"global\" variants. Local methods operate on items stored within the project whereas global methods can operate on items that were stored from any project. Global methods require a fully-specified partition key (primary key, contains the execution ID) and table name to locate the item whereas local methods only need a simple key because the partition key and table name can be infered from the project automatically. The `put_*` methods return a dict with metadata about the location of the item, including the `key`, `partition_key`, and `table_name`. If you return this metadata object from a task, it will get put on the `data` object and you can call a `get_*` method later in the state machine.\n\nMany methods also accept an optional `index` argument. This argument needs to be provided when getting/putting an item that was originally stored as part of a `put_items` or `put_global_items` call. Providing the `index` is usually only done within a map iteration task.\n\nBelow are a few of the more common methods:\n\n#### `put_item`/`put_items`\n\nThe `put_item` method puts an item in the state store. It takes `key`, `data`, and `index` arguments. For example:\n\n```python\ncontext.state_data_client.put_item(\"characters\", {\"name\": \"jerry\"})\ncontext.state_data_client.put_item(\"characters\", {\"name\": \"elaine\"}, index=24)\n```\n\nNote that the item at the given array index doesn't actually have to exist in the table before you call `put_item`. However, if it doesn't exist then you may have a fan-out logic bug upstream in your state machine.\n\nThe `put_items` method puts an entire list of items into the state store. Each item will be stored separately under its corresponding array index. For example:\n\n```python\ncontext.state_data_client.put_items(\"characters\", [{\"name\": \"jerry\"}, {\"name\": \"elaine\"}])\n```\n\n#### `get_item`\n\nThe `get_item` method gets the data attribute from an item in the state store. It takes `key` and `index` arguments. For example:\n\n```python\ncontext.state_data_client.get_item(\"characters\")  # -> {\"name\": \"jerry\"}\ncontext.state_data_client.get_item(\"characters\", index=24)  # -> {\"name\": \"elaine\"}\n```\n\n#### `get_item_for_map_iteration`/`get_global_item_for_map_iteration`\n\nThe `get_item_for_map_iteration` method gets the data attribute from an item in the state store using the `event` object. This method only works when called within a map iterator task. For example, if the `put_items` example above was called in a task, and its value was given to a map state to fan out, we can use the `get_item_for_map_iteration` method within our iterator task to fetch each item:\n\n```python\n# Iteration 0:\ncontext.state_data_client.get_item_for_map_iteration(event)  # -> {\"name\": \"jerry\"}\n# Iteration 1:\ncontext.state_data_client.get_item_for_map_iteration(event)  # -> {\"name\": \"elaine\"}\n```\n\nThis works because the map iterator state machine receives an input data object with the schema:\n\n```json\n{\n  \"items_result_table_name\": \"<DynamoDB table for the project>\",\n  \"items_result_partition_key\": \"<execution ID>:characters\",\n  \"items_result_key\": \"characters\",\n  \"context_index\": \"<array index>\",\n  \"context_value.$\": \"1\"\n}\n```\n\nThe `get_item_for_map_iteration` is a helper method that uses that input to locate the right item. The `get_global_item_for_map_iteration` method has the same signature. It should be called when you know that the array used to fan out could have come from another project (e.g. the map state is the first state in a state machine triggered by a subscription).\n\n### Error Handling\n\nTo handle an error in the task state, wrap it in a try/except statement. This will translate to an array of Catch objects within the rendered Task state.\n\n```python\ntry:\n    Foo()\nexcept (KeyError, States.Timeout):\n    TaskWhenFooHasErrored()\nexcept:\n    GenericTask()\n```\n\n```python\n{\n    \"Type\": \"Task\",\n    \"Resource\": \"...\",\n    \"Catch\": [\n        {\n            \"Next\": \"foo_fail\",\n            \"ErrorEquals\": [\"KeyError\", \"States.Timeout\"],\n        },\n        {\"Next\": \"foo_general\", \"ErrorEquals\": [\"States.ALL\"]},\n    ]\n}\n```\n\n### Retries\n\nTo retry a task when it fails, use the retry context manager:\n\n```python\nwith retry():\n    MyTask()\n```\n\nYou can configure the retry behavior by passing keyword arguments:\n\n- `on_exceptions`: A list of Exception classes that will trigger another attempt (all exceptions by default)\n- `interval`: An integer that represents the number of seconds before the first retry attempt (1 by default)\n- `max_attempts`: A positive integer that represents the maximum number of retry attempts (3 by default)\n- `backoff_rate`: The multiplier by which the retry interval increases during each attempt (2.0 by default)\n\nFor example:\n\n```python\nwith retry(\n    on_exceptions=[CustomError],\n    interval=10,\n    max_attempts=5,\n    backoff_rate=1.0\n):\n    MyTask()\n```\n\nThe retry context manager can only wrap a single task. If you want to also include error handling, the try statement should have the retry context manager as the one and only item in its body. For example:\n\n```python\ntry:\n    with retry():\n        Foo()\nexcept:\n    GenericTask()\n```\n\n### [Choice](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-choice-state.html)\n\nTo conditionally choose which logical path to traverse next in the state machine you can use Python boolean expressions.\n\nSince the ASL form of the Choice state requires type-specific keys like StringEquals and NumericLessThan, but Python is an untyped language, we need a way to figure out the data types of the operands within conditional statements. One approach is to explicitly cast references to the data variable with the built-in function str, int, float, or bool. This enables Fluxio to generate type-appropriate configuration. If a reference to data isn't wrapped, Fluxio will assume it's a string for the boolean expression.\n\nHowever, most of the time you don't need to explicitly wrap data values; Fluxio will automatically infer types from static, scalar values. This means that if you're comparing a value from data and a scalar value, Fluxio will use the scalar value type to pick the right ASL configuration. For example, for the comparison `data[\"foo\"] > 0`, we know that 0 is a number and will pick the NumericGreaterThan operation.\n\nWithin the body of the conditional, you can include state code just like the main function. This will be translated to the Next key of the Choice branch.\n\nThe body of the else clause is translated to the Default key in the configuration.\n\n```python\nif data[\"foo\"] > 0 and data[\"foo\"] < 100:\n    raise Bad(\"nope\")\nelif not bool(data[\"empty\"]):\n    return\nelif data[\"empty\"][\"inner\"] == \"something\":\n    return\nelif data[\"empty\"][\"inner\"] == 4.25:\n    parallel(branch1, branch2)\n    if data[\"done\"] != 10:\n        raise DoneButNot()\nelif data[\"array\"][5] == 5:\n    Bar()\n    Baz()\nelse:\n    raise Wrong(\"mmk\")\n```\n\n```python\n{\n    \"Type\": \"Choice\",\n    \"Choices\": [\n        {\n            \"Next\": \"Fail-...\",\n            \"And\": [\n                {\"Variable\": \"$['foo']\", \"NumericGreaterThan\": 0},\n                {\"Variable\": \"$['foo']\", \"NumericLessThan\": 100},\n            ],\n        },\n        {\n            \"Next\": \"Success-...\",\n            \"Not\": {\n                \"Variable\": \"$['empty']\",\n                \"BooleanEquals\": True,\n            },\n        },\n        {\n            \"Next\": \"Success-...\",\n            \"Variable\": \"$['empty']['inner']\",\n            \"StringEquals\": \"something\",\n        },\n        {\n            \"Next\": \"Parallel-...\",\n            \"Variable\": \"$['empty']['inner']\",\n            \"NumericEquals\": 4.25,\n        },\n        {\n            \"Next\": \"bar2\",\n            \"Variable\": \"$['array'][5]\",\n            \"NumericEquals\": 5,\n        },\n    ],\n    \"Default\": \"Fail-...\"\n}\n```\n\n**Note:** Timestamp comparison operators are not currently supported.\n\n### [Map](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-map-state.html)\n\nTo execute a dynamic number of nested state machines in parallel, you can use the Map state. First you need to define a module-level function that contains state machine logic in the body of the function just as you would in `main`. The function names are arbitrary as long as they're unique.\n\nThen, within the main function, call the map function, passing a reference to an array in data and the iterator function as positional arguments:\n\n```python\ndef item_iterator(data):\n    Baz()\n\ndef main(data):\n    map(data[\"items\"], item_iterator)\n```\n\nIf you want to limit the number of concurrently running items, provide a max_concurrency keyword arg:\n\n```python\nmap(data[\"items\"], item_iterator, max_concurrency=3)\n```\n\n### [Parallel](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-parallel-state.html)\n\nTo execute multiple branches in parallel, you first need to define the branch states. Add a module-level function and include state machine logic in the body of the function just as you would in a main function. The function names are arbitrary as long as they're unique.\n\nThen, within the main function, call the `parallel` function and pass it the branch function references as positional arguments:\n\n```python\ndef branch1():\n    Baz()\n\ndef branch2():\n    Foo()\n\ndef main(data):\n    parallel(branch1, Task2)\n```\n\nNote that the number of branches must be defined statically. If you need dynamic fan-out, use the Map state.\n\n### [Pass](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-pass-state.html)\n\nUse this state to set static keys on the data variable. You can use subscript notation or the update method:\n\n```python\n# Set the key \"debug\" on the input data dict to be a static dictionary\ndata[\"debug\"] = {\"level\": \"INFO\"}\n# Set the key \"more\" on the input data dict to equal a static value\ndata.update({\"more\": 123})\n\n# Not currently supported:\ndata[\"debug\"].update({\"level\": \"INFO\"})\n```\n\n```python\n{\n    \"Type\": \"Pass\",\n    \"Result\": {\"level\": \"INFO\"},\n    \"ResultPath\": \"$['debug']\"\n}\n{\n    \"Type\": \"Pass\",\n    \"Result\": {\"more\": 123},\n    \"ResultPath\": \"$\"\n}\n```\n\n### [Succeed](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-succeed-state.html)\n\nTo end the state machine execution and indicate a successful completion, include the return keyword within the main function.\n\n### [Fail](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-fail-state.html)\n\nTo end the state machine execution and indicate a failure, raise an exception. The exception class name will be used as the Error key and the optional string you pass to the exception constructor will b used as the Cause key.\n\n```python\nraise Wrong(\"mmk\")\n```\n\n```python\n{\n    \"Type\": \"Fail\",\n    \"Error\": \"Wrong\",\n    \"Cause\": \"mmk\"\n}\n```\n\n### [Wait](https://docs.aws.amazon.com/step-functions/latest/dg/amazon-states-language-wait-state.html)\n\nIf you want to pause the execution of the state machine, you can call a function called wait with either a seconds or timestamp keyword argument. The value of the argument can be a static value or input data reference:\n\n```python\n# Wait 10 seconds\nwait(seconds=10)\nwait(seconds=data[\"wait_in_seconds\"])\n\n# Wait until a future time\nwait(timestamp=\"2020-08-18T17:33:00Z\")\nwait(timestamp=data[\"timestamp\"])\n```\n\n## Decorators\n\nFluxio supports additional configuration of the state machine via Python decorators. These are meant to configure pre- and post-execution hooks (i.e. something \"outside\" the execution), like a schedule trigger or notification topic.\n\n### schedule\n\nTo trigger an execution on a recurring schedule, wrap the main function in a schedule decorator:\n\n```python\n@schedule(expression=\"rate(1 hour)\")\ndef main(data):\n    MyTask()\n```\n\nThe expression keyword argument can either be a cron or rate expression. See the [documentation for ScheduledEvents](https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html) for more details on the expression format.\n\n### subscribe\n\nTo trigger an execution when a message is published to an SNS topic from another project, wrap the function in a subscribe decorator:\n\n```python\n@subscribe(project=\"other-project\")\ndef main(data):\n    MyTask()\n```\n\nBy default, this will subscribe to successful execution events published for the main state machine in the project named other-project. The project keyword argument refers to the folder name of another project.\n\nOther keyword arguments:\n\n- `state_machine`: The identifier of a state machine function in the source project. By default this is \"main\", but this allows subscriptions to other exported state machines.\n- `status`: One of \"success\" (default) or \"failure\". This represents the execution status of the source state machine execution. It will be used to select which of the two SNS topics from the source project to subscribe to.\n\nFluxio will take the project and state_machine arguments and pick the right ImportValue based on the CloudFormation stack and environment.\n\nIf you want to subscribe to an explicit SNS topic that has been exported from another stack outside of Fluxio, you can provide the `topic_arn_import_value` keyword argument instead:\n\n```python\n@subscribe(topic_arn_import_value=\"${Environment}-my-topic-arn\")\ndef main(data):\n    MyTask()\n```\n\nThe value for this argument can be a simple string but can also include any CloudFormation substitution variables that you have access to in the template since the string will be wrapped in [`!Sub`](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/intrinsic-function-reference-sub.html). These include parameters and resources references.\n\n### export\n\nTo explicitly \"export\" a state machine, wrap the function in an `export` decorator:\n\n```python\n@export()\ndef some_state_machine(data):\n    MyTask()\n```\n\nAn \"exported\" state machine gets its own CloudFormation template and can be directly executed.\n\nYou only need to use the export decorator if:\n\n- You have multiple state machines in a project.py file\n- AND one of them is nested in another\n- AND you want to be able to directly execute the nested state machine\n- AND the nested state machine function isn't already wrapped in schedule or subscribe (those decorators cause the state machine to be exported automatically)\n\n### process_events\n\nState machines generate events during executions. Example event types include ExecutionStarted, TaskFailed, ExecutionSucceeded, etc. Check out the [full list](https://docs.aws.amazon.com/step-functions/latest/apireference/API_HistoryEvent.html#StepFunctions-Type-HistoryEvent-type). Fluxio automatically configures each state machine to log these events to a CloudWatch log group. You can subscribe to these logs in order to take actions like update a database record or send telemetry data to an APM.\n\nTo process state machine execution events, wrap the state machine function in a `process_events` decorator:\n\n```python\n@process_events()\ndef some_state_machine(data):\n    MyTask()\n```\n\nWithout providing any keyword arguments, this will set up a default event processor. The default event processor will track the following event types:\n\n- ExecutionStarted\n- ExecutionSucceeded\n- ExecutionFailed\n\nThe action taken for each event is defined by the `EventProcessor` task entry point class. Currently, this class is configured to send telemetry data to New Relic. For each event type, we send an event that includes tags for:\n\n- execution name\n- state machine name\n- trace ID and source\n- flattened execution input data (e.g. `{\"foo\": {\"bar\": 123}}` is flattened to `{\"foo.bar\": 123}`)\n- errors, if applicable\n\nFor the ExecutionSucceeded and ExecutionFailed events, we also send a tracing span. The spans have a duration tag as well as the parent span ID if the execution was nested.\n\n#### Custom event processing\n\nTo include custom tags in the New Relic events, you can define your own custom processor:\n\n1. Define a new class that extends `EventProcessor` within the `project.sfn` file.\n2. Define at least one `get_custom_tags_<event_type>` method. Within these methods, you can import packages just like a task's `run` method.\n3. Where you include the `process_events` decorator, call the decorator with a `processor` keyword argument. The value of the `processor` argument should be a reference to your new `EventProcessor` subclass.\n\nThe method signatures and example are below:\n\n```python\nclass SomeEventProcessor(EventProcessor):\n    \"\"\"Custom event processor for the some_state_machine state machine\"\"\"\n\n    async def get_custom_tags_ExecutionStarted(\n        message: Dict[str, Any],\n        input_data: Dict[str, Any],\n        state_data_client: StateDataClient,\n    ) -> Dict[str, Any]:\n        \"\"\"Get custom tags for the ExecutionStarted event\n\n        Args:\n            message: Log message with the schema:\n                * id -- int of the event\n                * type -- \"ExecutionStarted\"\n                * details -- dict with keys:\n                    * input -- JSON string\n                    * inputDetails -- dict with keys:\n                        * truncated -- bool\n                    * roleArn -- IAM role ARN\n                * previous_event_id -- int of the previous event\n                * event_timestamp -- int, timestamp in ms since epoch\n                * execution_arn -- ARN of the execution\n            input_data: Input data provided to the execution when it started\n            state_data_client: State data client for resolving input values if needed\n\n        Returns:\n            dict of tags\n\n        \"\"\"\n        # This is a static dict, but you can reach out to a database or external resource to generate more.\n        return {\"custom.tag\": True}\n\n    async def get_custom_tags_ExecutionSucceeded(\n        message: Dict[str, Any],\n        input_data: Dict[str, Any],\n        state_data_client: StateDataClient,\n    ) -> Dict[str, Any]:\n        \"\"\"Get custom tags for the ExecutionSucceeded event\n\n        Args:\n            message: Log message with the schema:\n                * id -- int of the event\n                * type -- \"ExecutionSucceeded\"\n                * details -- dict with keys:\n                    * output -- JSON string\n                    * outputDetails -- dict with keys:\n                        * truncated -- bool\n                * previous_event_id -- int of the previous event\n                * event_timestamp -- int, timestamp in ms since epoch\n                * execution_arn -- ARN of the execution\n            input_data: Input data provided to the execution when it started\n            state_data_client: State data client for resolving input values if needed\n\n        Returns:\n            dict of tags\n\n        \"\"\"\n        # This is a static dict, but you can reach out to a database or external resource to generate more.\n        return {\"custom.tag\": True}\n\n    async def get_custom_tags_ExecutionFailed(\n        message: Dict[str, Any],\n        input_data: Dict[str, Any],\n        state_data_client: StateDataClient,\n    ) -> Dict[str, Any]:\n        \"\"\"Get custom tags for the ExecutionFailed event\n\n        Args:\n            message: Log message with the schema:\n                * id -- int of the event\n                * type -- \"ExecutionFailed\"\n                * details -- dict with keys:\n                    * cause -- Optional[str], A more detailed explanation of the cause of the failure\n                    * error -- str, The error code of the failure\n                * previous_event_id -- int of the previous event\n                * event_timestamp -- int, timestamp in ms since epoch\n                * execution_arn -- ARN of the execution\n            input_data: Input data provided to the execution when it started\n            state_data_client: State data client for resolving input values if needed\n\n        Returns:\n            dict of tags\n\n        \"\"\"\n        # This is a static dict, but you can reach out to a database or external resource to generate more.\n        return {\"custom.tag\": True}\n\n\n@process_events(processor=SomeEventProcessor)\ndef some_state_machine(data):\n    MyTask()\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "BSD-3-Clause",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "fluxio-parser",
+    "package_url": "https://pypi.org/project/fluxio-parser/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/fluxio-parser/",
+    "project_urls": null,
+    "release_url": "https://pypi.org/project/fluxio-parser/1.0.0/",
+    "requires_dist": [
+      "astor (>=0.8.1,<1)",
+      "black (>=22.3.0,<23.0.0)",
+      "networkx (>=2.8.7,<3.0.0)"
+    ],
+    "requires_python": ">=3.8",
+    "summary": "Fluxio parser library",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 15415847,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "94d2a21876a2b8eec0be804f48459f19d79ece1d34a539d4266d5d3af6f4ecfa",
+          "md5": "cd55b43dd06929b0565842f7fd74908f",
+          "sha256": "a8d11a1b0407db54b7df7ac6cef18b30b550d54c1c5e542224bcf0ac9828ec39"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.1.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "cd55b43dd06929b0565842f7fd74908f",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 40363,
+        "upload_time": "2021-02-28T17:57:57",
+        "upload_time_iso_8601": "2021-02-28T17:57:57.478285Z",
+        "url": "https://files.pythonhosted.org/packages/94/d2/a21876a2b8eec0be804f48459f19d79ece1d34a539d4266d5d3af6f4ecfa/fluxio_parser-0.1.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1defa4e3b81bafe74b68291889381df15912fd72c302e2929122bab3cef3250a",
+          "md5": "28558bb32bbd0d9faec7db2798ce39f8",
+          "sha256": "99c1319c951747c7c689bcee4137cc59fbb83aeb3a162c639f4a85a50a8676d2"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "28558bb32bbd0d9faec7db2798ce39f8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 25839,
+        "upload_time": "2021-02-28T17:57:55",
+        "upload_time_iso_8601": "2021-02-28T17:57:55.852494Z",
+        "url": "https://files.pythonhosted.org/packages/1d/ef/a4e3b81bafe74b68291889381df15912fd72c302e2929122bab3cef3250a/fluxio-parser-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4be8fc0857f1a1ac6e522a2f6934bd03b313d5c900c8f4907da99519f879f5b2",
+          "md5": "65658d89392b16bb050b2feb8bd8276b",
+          "sha256": "f4cd28bd86bd6bbcdd3859500844191b28ccd6c307aec400e177a8184b9b56b7"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "65658d89392b16bb050b2feb8bd8276b",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 50251,
+        "upload_time": "2021-02-28T23:35:24",
+        "upload_time_iso_8601": "2021-02-28T23:35:24.855315Z",
+        "url": "https://files.pythonhosted.org/packages/4b/e8/fc0857f1a1ac6e522a2f6934bd03b313d5c900c8f4907da99519f879f5b2/fluxio_parser-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5646749659b3add8dc957d6eb611a12417d98c2b7fdfb405de5a37e2e47f7e08",
+          "md5": "20c5cc9cc59f328083d10cce4c0c07d1",
+          "sha256": "02df140306eb6032b459f3392b33f91e0b88ee3f23a73843226d6296a89fadeb"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "20c5cc9cc59f328083d10cce4c0c07d1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 45801,
+        "upload_time": "2021-02-28T23:35:23",
+        "upload_time_iso_8601": "2021-02-28T23:35:23.510742Z",
+        "url": "https://files.pythonhosted.org/packages/56/46/749659b3add8dc957d6eb611a12417d98c2b7fdfb405de5a37e2e47f7e08/fluxio-parser-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "060f672345f2d397b39be330aad8a0c1956168148625a52e6fdd6f2b21f83efd",
+          "md5": "ffa22d7520df18746afcd2e6f7c5f428",
+          "sha256": "dfd11859297f586d4f69636dc3518e893036ea4e563843ba0eb7dbd277ac6d99"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ffa22d7520df18746afcd2e6f7c5f428",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51593,
+        "upload_time": "2021-03-17T17:30:09",
+        "upload_time_iso_8601": "2021-03-17T17:30:09.678784Z",
+        "url": "https://files.pythonhosted.org/packages/06/0f/672345f2d397b39be330aad8a0c1956168148625a52e6fdd6f2b21f83efd/fluxio_parser-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "993388790923f6a6b1dff4a46bc3ad3d447f626f9b2f5fd9510b2341196b4dca",
+          "md5": "4c9c87c971e1834d62864ccea1360d23",
+          "sha256": "a11e7b6e24762c88eb41daf59c669fb893375a7a1056170bcdb4a913da67a121"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4c9c87c971e1834d62864ccea1360d23",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46786,
+        "upload_time": "2021-03-17T17:30:07",
+        "upload_time_iso_8601": "2021-03-17T17:30:07.250789Z",
+        "url": "https://files.pythonhosted.org/packages/99/33/88790923f6a6b1dff4a46bc3ad3d447f626f9b2f5fd9510b2341196b4dca/fluxio-parser-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c36a0647f1a7ce3c7f0dbcc914342712d0718c65dff03be923f744d4dd196aac",
+          "md5": "a600c7c0fa83dcbadde1003be1cdddb7",
+          "sha256": "847e3319f29aa2274d4196f56d0876271f6c813d923c2747140411a62b4a0e65"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.0.dev1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a600c7c0fa83dcbadde1003be1cdddb7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51221,
+        "upload_time": "2021-03-12T01:27:37",
+        "upload_time_iso_8601": "2021-03-12T01:27:37.644722Z",
+        "url": "https://files.pythonhosted.org/packages/c3/6a/0647f1a7ce3c7f0dbcc914342712d0718c65dff03be923f744d4dd196aac/fluxio_parser-0.2.0.dev1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "40951b183dfef58accc9e8be177e5e820c2f50a5a566a7086209d64941995d9a",
+          "md5": "2f13a6799178add83d8a5260de78299a",
+          "sha256": "7b93794406359df7b6f11cc00158fc3d32062f729e0c94bb86d8c4d08f7db1a3"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.0.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2f13a6799178add83d8a5260de78299a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46435,
+        "upload_time": "2021-03-12T01:27:35",
+        "upload_time_iso_8601": "2021-03-12T01:27:35.732292Z",
+        "url": "https://files.pythonhosted.org/packages/40/95/1b183dfef58accc9e8be177e5e820c2f50a5a566a7086209d64941995d9a/fluxio-parser-0.2.0.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0.dev2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3c0d998a7bf45c4638618eeb823c3de1ecc95c70a902f63bbbd51efa3c080a5b",
+          "md5": "e27f9180bef8c4f3f17e0a5b7147a4eb",
+          "sha256": "17cdef7a1bef9f61791ad119fe7bb6278c1510b029db44e76c10d55def81d333"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.0.dev2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "e27f9180bef8c4f3f17e0a5b7147a4eb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51633,
+        "upload_time": "2021-03-15T22:28:31",
+        "upload_time_iso_8601": "2021-03-15T22:28:31.124144Z",
+        "url": "https://files.pythonhosted.org/packages/3c/0d/998a7bf45c4638618eeb823c3de1ecc95c70a902f63bbbd51efa3c080a5b/fluxio_parser-0.2.0.dev2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba796cb476631467de7921c4cd9baaed931335778525cda2fd3a14664c29b1f5",
+          "md5": "5c0f6f2d70bd37358a6118ccd51e2149",
+          "sha256": "a827161024a81d11bad9e361304ef0a9006d1cb863ef07ff823ab3f9906871bc"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.0.dev2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "5c0f6f2d70bd37358a6118ccd51e2149",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46776,
+        "upload_time": "2021-03-15T22:28:29",
+        "upload_time_iso_8601": "2021-03-15T22:28:29.350817Z",
+        "url": "https://files.pythonhosted.org/packages/ba/79/6cb476631467de7921c4cd9baaed931335778525cda2fd3a14664c29b1f5/fluxio-parser-0.2.0.dev2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0.dev3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f059e57c56c87c0cadb9e389cd72a15fa806a3c574d5741394acb631b72af83",
+          "md5": "d2d481e8cdb0bcff21c357dc140a7602",
+          "sha256": "a6f1e90178a414b773eb48fa65fc4f7f6fcac557063bee892f923cf2c65e7557"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.0.dev3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d2d481e8cdb0bcff21c357dc140a7602",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51635,
+        "upload_time": "2021-03-15T22:39:55",
+        "upload_time_iso_8601": "2021-03-15T22:39:55.446557Z",
+        "url": "https://files.pythonhosted.org/packages/7f/05/9e57c56c87c0cadb9e389cd72a15fa806a3c574d5741394acb631b72af83/fluxio_parser-0.2.0.dev3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba81ff7c59cf6112173098341afed8ed2edb02288edb92db605b5065e4b9a9b7",
+          "md5": "96e62a358ac9972a0321285a5c856445",
+          "sha256": "30872f8eaf6575b18de58e9ff5fec27d22adc11451161af38bb0cacee8549869"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.0.dev3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "96e62a358ac9972a0321285a5c856445",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46794,
+        "upload_time": "2021-03-15T22:39:53",
+        "upload_time_iso_8601": "2021-03-15T22:39:53.750826Z",
+        "url": "https://files.pythonhosted.org/packages/ba/81/ff7c59cf6112173098341afed8ed2edb02288edb92db605b5065e4b9a9b7/fluxio-parser-0.2.0.dev3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0.dev4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9941038a326fa69438d760d5fccd008bb92ae277452b6eb8a7997382b77b2950",
+          "md5": "a5ad71cf3b351d0dd32a652f5e42c66a",
+          "sha256": "42b4343fb48c95d210bb3d5522368f98c839a1c0f8cf14342aa9eb1b127c4493"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.0.dev4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a5ad71cf3b351d0dd32a652f5e42c66a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51638,
+        "upload_time": "2021-03-17T03:10:56",
+        "upload_time_iso_8601": "2021-03-17T03:10:56.906006Z",
+        "url": "https://files.pythonhosted.org/packages/99/41/038a326fa69438d760d5fccd008bb92ae277452b6eb8a7997382b77b2950/fluxio_parser-0.2.0.dev4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "06743a1696cc1c0a2d5c98dd6996cd810cc82caa3cbaf2e3c80db5c2eff61809",
+          "md5": "750114f574cfe48122db2159b866ca2a",
+          "sha256": "4fbee0155eba5a5a717e417283b363e92521ab1a38b5f76e51169b67a45dfb0e"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.0.dev4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "750114f574cfe48122db2159b866ca2a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46793,
+        "upload_time": "2021-03-17T03:10:55",
+        "upload_time_iso_8601": "2021-03-17T03:10:55.686576Z",
+        "url": "https://files.pythonhosted.org/packages/06/74/3a1696cc1c0a2d5c98dd6996cd810cc82caa3cbaf2e3c80db5c2eff61809/fluxio-parser-0.2.0.dev4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dea2880b1a5d107ec45b1f6f012e86575819cca54b415c9e5185969a5f76a9e5",
+          "md5": "bc4c35cd5b0a5a30f096ffb06efd5bee",
+          "sha256": "4da48d3cd9d3d002b11f412ebafe144c6ea0936d059e051bf71ab9204f75e1de"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "bc4c35cd5b0a5a30f096ffb06efd5bee",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6,<4.0",
+        "size": 51683,
+        "upload_time": "2021-03-19T17:51:37",
+        "upload_time_iso_8601": "2021-03-19T17:51:37.050493Z",
+        "url": "https://files.pythonhosted.org/packages/de/a2/880b1a5d107ec45b1f6f012e86575819cca54b415c9e5185969a5f76a9e5/fluxio_parser-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff38b908babedfb4043f08f31ad3c11e3316479a9875f42379d9b445bcd87998",
+          "md5": "2fbea642516f27adbcc62263f60abf90",
+          "sha256": "d8002849739b450fd27e8fff42c614c5a37f902f100c02fac591dedeeab7a2a3"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2fbea642516f27adbcc62263f60abf90",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6,<4.0",
+        "size": 46744,
+        "upload_time": "2021-03-19T17:51:35",
+        "upload_time_iso_8601": "2021-03-19T17:51:35.076190Z",
+        "url": "https://files.pythonhosted.org/packages/ff/38/b908babedfb4043f08f31ad3c11e3316479a9875f42379d9b445bcd87998/fluxio-parser-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c5ed5b13695e9fc03a81f1c9269d16b8bbe804a771cb2a7b9c074504bf534415",
+          "md5": "af07800d34e7d16951e0300da6e9bccc",
+          "sha256": "29c1b157535686b2a2194691acfe73098188dcbc3a1cdf645aa8db7ef7594d57"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "af07800d34e7d16951e0300da6e9bccc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 53038,
+        "upload_time": "2021-03-19T20:45:53",
+        "upload_time_iso_8601": "2021-03-19T20:45:53.711127Z",
+        "url": "https://files.pythonhosted.org/packages/c5/ed/5b13695e9fc03a81f1c9269d16b8bbe804a771cb2a7b9c074504bf534415/fluxio_parser-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9ca3a3171eb7e9dd40e1af3c10e5060788df6720be152ad204451cb4aedad660",
+          "md5": "2c6eb8d846d48396ab770c84a6e2cffb",
+          "sha256": "b8672d1c43b403bb923e35924e2e867ee181252df137f606c550f53b9f0708cd"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2c6eb8d846d48396ab770c84a6e2cffb",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 47498,
+        "upload_time": "2021-03-19T20:45:52",
+        "upload_time_iso_8601": "2021-03-19T20:45:52.379076Z",
+        "url": "https://files.pythonhosted.org/packages/9c/a3/a3171eb7e9dd40e1af3c10e5060788df6720be152ad204451cb4aedad660/fluxio-parser-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "09b9c86a159c66c249d1ff6c044ab7af9e3bf86c1d33f4e5b221f88e227ff440",
+          "md5": "f9104f772bfcad957683a1ed07a5b161",
+          "sha256": "ade8b020f29d2a14d8c3093dac7c6aee83a0801a90bf39769a8cc6dd6deca134"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "f9104f772bfcad957683a1ed07a5b161",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 53626,
+        "upload_time": "2021-03-30T01:56:22",
+        "upload_time_iso_8601": "2021-03-30T01:56:22.944179Z",
+        "url": "https://files.pythonhosted.org/packages/09/b9/c86a159c66c249d1ff6c044ab7af9e3bf86c1d33f4e5b221f88e227ff440/fluxio_parser-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb50e8f61d98f3e81ee6bba8c0df76c4b843de112277af5dfb1b6ad2510b75d5",
+          "md5": "602121ee4bc2e1f1ae7c0b9b13f05ee4",
+          "sha256": "66fdb3cc88e53f40b8d248f3ba39e4a2e95457b4c0a96a9eae4b40ef6afda620"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "602121ee4bc2e1f1ae7c0b9b13f05ee4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 47593,
+        "upload_time": "2021-03-30T01:56:21",
+        "upload_time_iso_8601": "2021-03-30T01:56:21.533469Z",
+        "url": "https://files.pythonhosted.org/packages/bb/50/e8f61d98f3e81ee6bba8c0df76c4b843de112277af5dfb1b6ad2510b75d5/fluxio-parser-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1.dev1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0a54ddfc24afd8440e0c94c930956d5c4332cde92ccb3575a82659adda2a29a3",
+          "md5": "898538e7d4dc9db29aafbdc39aaf3612",
+          "sha256": "c6f544b7330b6e63f2c4a044de68c811194b8e7ed2b51f945757209743e772b8"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-0.3.1.dev1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "898538e7d4dc9db29aafbdc39aaf3612",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 53131,
+        "upload_time": "2021-03-29T22:43:39",
+        "upload_time_iso_8601": "2021-03-29T22:43:39.592464Z",
+        "url": "https://files.pythonhosted.org/packages/0a/54/ddfc24afd8440e0c94c930956d5c4332cde92ccb3575a82659adda2a29a3/fluxio_parser-0.3.1.dev1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0029a35451eb6e2e1217a4814218cc46bbe071b23a0ce7201d05ff94137c5c18",
+          "md5": "2e8d82fedf06eeea41f2c078d70012fc",
+          "sha256": "30130d91ed009fbaff5124f7c71d2baddd4c305e24afc470084d77c8931c8a4f"
+        },
+        "downloads": -1,
+        "filename": "fluxio-parser-0.3.1.dev1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "2e8d82fedf06eeea41f2c078d70012fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6.5,<4.0.0",
+        "size": 48026,
+        "upload_time": "2021-03-29T22:43:37",
+        "upload_time_iso_8601": "2021-03-29T22:43:37.837759Z",
+        "url": "https://files.pythonhosted.org/packages/00/29/a35451eb6e2e1217a4814218cc46bbe071b23a0ce7201d05ff94137c5c18/fluxio-parser-0.3.1.dev1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "1.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b59be430b70ea6eb44e4f686b8d5a1ca9de075b3a54d5f0347ff507df70965b7",
+          "md5": "a33fd87d54392a9bc072deabfd6002f1",
+          "sha256": "5c7a22171bd3dc6e0dd28028f03e45658e3652d6666fcd7a217430f10b8ee4ae"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-1.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "a33fd87d54392a9bc072deabfd6002f1",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.8",
+        "size": 55241,
+        "upload_time": "2022-10-14T19:50:38",
+        "upload_time_iso_8601": "2022-10-14T19:50:38.960343Z",
+        "url": "https://files.pythonhosted.org/packages/b5/9b/e430b70ea6eb44e4f686b8d5a1ca9de075b3a54d5f0347ff507df70965b7/fluxio_parser-1.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b1400297e6409d1bb9b1dcb0847c147f754989058a15b76036bc847781dbcc8",
+          "md5": "903a04113870ed0f23af08a7b7fac8b4",
+          "sha256": "61245e76d9320f3c21fa99ad8346bcd81e1d21439070acc95b3de1fbc9bf7c5e"
+        },
+        "downloads": -1,
+        "filename": "fluxio_parser-1.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "903a04113870ed0f23af08a7b7fac8b4",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.8",
+        "size": 59013,
+        "upload_time": "2022-10-14T19:50:40",
+        "upload_time_iso_8601": "2022-10-14T19:50:40.706354Z",
+        "url": "https://files.pythonhosted.org/packages/1b/14/00297e6409d1bb9b1dcb0847c147f754989058a15b76036bc847781dbcc8/fluxio_parser-1.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b59be430b70ea6eb44e4f686b8d5a1ca9de075b3a54d5f0347ff507df70965b7",
+        "md5": "a33fd87d54392a9bc072deabfd6002f1",
+        "sha256": "5c7a22171bd3dc6e0dd28028f03e45658e3652d6666fcd7a217430f10b8ee4ae"
+      },
+      "downloads": -1,
+      "filename": "fluxio_parser-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "a33fd87d54392a9bc072deabfd6002f1",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.8",
+      "size": 55241,
+      "upload_time": "2022-10-14T19:50:38",
+      "upload_time_iso_8601": "2022-10-14T19:50:38.960343Z",
+      "url": "https://files.pythonhosted.org/packages/b5/9b/e430b70ea6eb44e4f686b8d5a1ca9de075b3a54d5f0347ff507df70965b7/fluxio_parser-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1b1400297e6409d1bb9b1dcb0847c147f754989058a15b76036bc847781dbcc8",
+        "md5": "903a04113870ed0f23af08a7b7fac8b4",
+        "sha256": "61245e76d9320f3c21fa99ad8346bcd81e1d21439070acc95b3de1fbc9bf7c5e"
+      },
+      "downloads": -1,
+      "filename": "fluxio_parser-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "903a04113870ed0f23af08a7b7fac8b4",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.8",
+      "size": 59013,
+      "upload_time": "2022-10-14T19:50:40",
+      "upload_time_iso_8601": "2022-10-14T19:50:40.706354Z",
+      "url": "https://files.pythonhosted.org/packages/1b/14/00297e6409d1bb9b1dcb0847c147f754989058a15b76036bc847781dbcc8/fluxio_parser-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

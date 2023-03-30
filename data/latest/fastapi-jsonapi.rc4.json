@@ -1,0 +1,282 @@
+{
+  "info": {
+    "author": "Team MTS AI",
+    "author_email": "a.nekrasov@mts.ru",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 4 - Beta",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3.10",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Utilities"
+    ],
+    "description": "# FastAPI-JSONAPI\n\nFastAPI-JSONAPI is a FastAPI extension for building REST APIs.\nImplementation of a strong specification [JSONAPI 1.0](http://jsonapi.org/).\nThis framework is designed to quickly build REST APIs and fit the complexity\nof real life projects with legacy data and multiple data storages.\n\n## Architecture\n![docs/img/schema.png](docs/img/schema.png)\n\n## Install\n\n```bash\npip install FastAPI-JSONAPI\n```\n\n## A minimal API\n\nCreate a test.py file and copy the following code into it\n\n```python\nimport sys\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Union, Optional\n\nimport uvicorn\nfrom fastapi import APIRouter, Depends, FastAPI\nfrom pydantic import BaseModel\nfrom sqlalchemy import Column, Text, Integer, select\nfrom sqlalchemy.engine import make_url\nfrom sqlalchemy.ext.asyncio import AsyncSession, create_async_engine\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.orm import sessionmaker\nfrom sqlalchemy.sql import Select\n\nfrom fastapi_jsonapi import RoutersJSONAPI\nfrom fastapi_jsonapi import SqlalchemyEngine\nfrom fastapi_jsonapi.data_layers.orm import DBORMType\nfrom fastapi_jsonapi.openapi import custom_openapi\nfrom fastapi_jsonapi.querystring import QueryStringManager\nfrom fastapi_jsonapi.schema import JSONAPIResultListSchema\nfrom fastapi_jsonapi.schema import collect_app_orm_schemas\n\nCURRENT_FILE = Path(__file__).resolve()\nCURRENT_DIR = CURRENT_FILE.parent\nPROJECT_DIR = CURRENT_DIR.parent.parent\n\nsys.path.append(str(PROJECT_DIR))\n\nBase = declarative_base()\n\n\ndef async_session() -> sessionmaker:\n    uri = \"sqlite+aiosqlite:///db.sqlite3\"\n    engine = create_async_engine(url=make_url(uri))\n    _async_session = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)\n    return _async_session\n\n\nclass Connector:\n\n    @classmethod\n    async def get_session(cls):\n        \"\"\"\n        Getting a session to the database.\n\n        :return:\n        \"\"\"\n        async_session_ = async_session()\n        async with async_session_() as db_session:\n            async with db_session.begin():\n                yield db_session\n\n\nclass User(Base):\n    __tablename__ = \"users\"\n    id = Column(Integer, primary_key=True, autoincrement=True)\n    first_name: str = Column(Text, nullable=True)\n\n\nclass UserBaseSchema(BaseModel):\n    \"\"\"User base schema.\"\"\"\n\n    class Config:\n        \"\"\"Pydantic schema config.\"\"\"\n        orm_mode = True\n\n    first_name: Optional[str] = None\n\n\nclass UserPatchSchema(UserBaseSchema):\n    \"\"\"User PATCH schema.\"\"\"\n\n\nclass UserInSchema(UserBaseSchema):\n    \"\"\"User input schema.\"\"\"\n\n\nclass UserSchema(UserInSchema):\n    \"\"\"User item schema.\"\"\"\n\n    class Config:\n        \"\"\"Pydantic model config.\"\"\"\n        orm_mode = True\n        model = \"users\"\n\n    id: int\n\n\nclass UserDetail:\n\n    @classmethod\n    async def get(cls, obj_id: int, session: AsyncSession = Depends(Connector.get_session)) -> UserSchema:\n        user: User = (await session.execute(select(User).where(User.id == obj_id))).scalar_one()\n        return UserSchema.from_orm(user)\n\n    @classmethod\n    async def patch(cls, obj_id: int, data: UserPatchSchema, session: AsyncSession = Depends(Connector.get_session)) -> UserSchema:\n        user: User = (await session.execute(select(User).where(User.id == obj_id))).scalar_one()\n        user.first_name = data.first_name\n        await session.commit()\n        return UserSchema.from_orm(user)\n\n    @classmethod\n    async def delete(cls, obj_id: int, session: AsyncSession = Depends(Connector.get_session)) -> None:\n        user: User = (await session.execute(select(User).where(User.id == obj_id))).scalar_one()\n        await session.delete(user)\n        await session.commit()\n\n\nclass UserList:\n    @classmethod\n    async def get(\n            cls, query_params: QueryStringManager, session: AsyncSession = Depends(Connector.get_session)\n    ) -> Union[Select, JSONAPIResultListSchema]:\n        user_query = select(User)\n        dl = SqlalchemyEngine(query=user_query, schema=UserSchema, model=User, session=session)\n        count, users_db = await dl.get_collection(qs=query_params)\n        total_pages = count // query_params.pagination.size + (count % query_params.pagination.size and 1)\n        users: List[UserSchema] = [UserSchema.from_orm(i_user) for i_user in users_db]\n        return JSONAPIResultListSchema(\n            meta={\"count\": count, \"totalPages\": total_pages},\n            data=[{\"id\": i_obj.id, \"attributes\": i_obj.dict(), \"type\": \"user\"} for i_obj in users],\n        )\n\n    @classmethod\n    async def post(cls, data: UserInSchema, session: AsyncSession = Depends(Connector.get_session)) -> UserSchema:\n        user = User(first_name=data.first_name)\n        session.add(user)\n        await session.commit()\n        return UserSchema.from_orm(user)\n\n\ndef add_routes(app: FastAPI) -> List[Dict[str, Any]]:\n    tags = [\n        {\n            \"name\": \"User\",\n            \"description\": \"\",\n        },\n    ]\n\n    routers: APIRouter = APIRouter()\n    RoutersJSONAPI(\n        routers=routers,\n        path=\"/user\",\n        tags=[\"User\"],\n        class_detail=UserDetail,\n        class_list=UserList,\n        schema=UserSchema,\n        type_resource=\"user\",\n        schema_in_patch=UserPatchSchema,\n        schema_in_post=UserInSchema,\n        model=User,\n        engine=DBORMType.sqlalchemy,\n    )\n\n    app.include_router(routers, prefix=\"\")\n    return tags\n\n\nasync def sqlalchemy_init() -> None:\n    uri = \"sqlite+aiosqlite:///db.sqlite3\"\n    engine = create_async_engine(url=make_url(uri))\n    async with engine.begin() as conn:\n        await conn.run_sync(Base.metadata.drop_all)\n        await conn.run_sync(Base.metadata.create_all)\n\n\ndef create_app() -> FastAPI:\n    \"\"\"\n    Create app factory.\n\n    :return: app\n    \"\"\"\n    app = FastAPI(\n        title=\"FastAPI and SQLAlchemy\",\n        debug=True,\n        openapi_url=\"/openapi.json\",\n        docs_url=\"/docs\",\n    )\n    add_routes(app)\n    app.on_event(\"startup\")(sqlalchemy_init)\n    custom_openapi(app, title=\"API for SQLAlchemy\")\n    collect_app_orm_schemas(app)\n    return app\n\n\napp = create_app()\n\n\nif __name__ == \"__main__\":\n    uvicorn.run(\n        \"test:app\",\n        host=\"0.0.0.0\",\n        port=8084,\n        reload=True,\n        app_dir=str(CURRENT_DIR),\n    )\n\n```\n\nThis example provides the following API structure:\n\n| URL               | method | endpoint      | Usage                     |\n|-------------------|--------|---------------|---------------------------|\n| /user             | GET    | user_list     | Get a collection of users |\n| /user             | POST   | user_list     | Create a user             |\n| /user/< int:int > | GET    | user_detail   | Get user details          |\n| /user/< int:int > | PATCH  | person_detail | Update a user             |\n| /user/< int:int > | DELETE | person_detail | Delete a user             |\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/mts-ai/FastAPI-JSONAPI",
+    "keywords": "fastapi jsonapi mts ai",
+    "license": "MIT",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "FastAPI-JSONAPI",
+    "package_url": "https://pypi.org/project/FastAPI-JSONAPI/",
+    "platform": "any",
+    "project_url": "https://pypi.org/project/FastAPI-JSONAPI/",
+    "project_urls": {
+      "Homepage": "https://github.com/mts-ai/FastAPI-JSONAPI"
+    },
+    "release_url": "https://pypi.org/project/FastAPI-JSONAPI/0.2.2/",
+    "requires_dist": [
+      "SQLAlchemy (<2.0.0,>=1.4.39)",
+      "pydantic (>=1.9.1)",
+      "fastapi (>=0.79.0)",
+      "uvicorn (>=0.18.2)",
+      "simplejson (>=3.17.6)",
+      "tortoise-orm (>=0.19.2)",
+      "pytest ; extra == 'all'",
+      "sphinx ; extra == 'all'",
+      "tortoise-orm (>=0.19.2) ; extra == 'all'",
+      "SQLAlchemy (<2.0.0,>=1.4.39) ; extra == 'all'",
+      "sphinx ; extra == 'docs'",
+      "SQLAlchemy (<2.0.0,>=1.4.39) ; extra == 'sqlalchemy'",
+      "pytest ; extra == 'tests'",
+      "tortoise-orm (>=0.19.2) ; extra == 'tortoise-orm'"
+    ],
+    "requires_python": "",
+    "summary": "FastAPI extension to create REST web api according to JSON:API 1.0 specification with FastAPI, Pydantic and data provider of your choice (SQLAlchemy, Tortoise ORM)",
+    "version": "0.2.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17253601,
+  "releases": {
+    "0.1.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "02c7b8ba84575d2a9071932b6a06300615ff677169f1bba3a8457245acef6980",
+          "md5": "4cbc36b8ab0c4073ed6f971ed5f0bcc8",
+          "sha256": "d773dca9eda16a57bc1a6b3e8df11af4e6736552675eb5a62d14862d2ffa6c6d"
+        },
+        "downloads": -1,
+        "filename": "FastAPI_JSONAPI-0.1.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "4cbc36b8ab0c4073ed6f971ed5f0bcc8",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 70331,
+        "upload_time": "2023-03-10T13:56:10",
+        "upload_time_iso_8601": "2023-03-10T13:56:10.648408Z",
+        "url": "https://files.pythonhosted.org/packages/02/c7/b8ba84575d2a9071932b6a06300615ff677169f1bba3a8457245acef6980/FastAPI_JSONAPI-0.1.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ab1029eb335e2f8a21df3a6970cd72469bcda7a62746b542b36561c4df2104b5",
+          "md5": "cc8eb47d9123dbd5143a359533e01e65",
+          "sha256": "291acde225b5609f0292ddab21e676734b14c834ba59def1bddf239284ab73de"
+        },
+        "downloads": -1,
+        "filename": "FastAPI-JSONAPI-0.1.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "cc8eb47d9123dbd5143a359533e01e65",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46619,
+        "upload_time": "2023-03-10T13:56:11",
+        "upload_time_iso_8601": "2023-03-10T13:56:11.887043Z",
+        "url": "https://files.pythonhosted.org/packages/ab/10/29eb335e2f8a21df3a6970cd72469bcda7a62746b542b36561c4df2104b5/FastAPI-JSONAPI-0.1.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7c75d96bb08859c31d6bd6bd738b51f03813fb58e2a18bde840e61c638e73b31",
+          "md5": "ff91ea613f3cc65566bd2782b0ee5dde",
+          "sha256": "4c9c170a5a7f81d3624aa0c55a1ff880c223a4f974ec96997b062904a5429251"
+        },
+        "downloads": -1,
+        "filename": "FastAPI_JSONAPI-0.2.0-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "ff91ea613f3cc65566bd2782b0ee5dde",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 69936,
+        "upload_time": "2023-03-10T23:37:39",
+        "upload_time_iso_8601": "2023-03-10T23:37:39.810162Z",
+        "url": "https://files.pythonhosted.org/packages/7c/75/d96bb08859c31d6bd6bd738b51f03813fb58e2a18bde840e61c638e73b31/FastAPI_JSONAPI-0.2.0-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "21f4eaeb71feece28d2958244cfbf69a6991a38a4aebe29801167dfd2fd72bed",
+          "md5": "89825c5640818e19430ac904df774189",
+          "sha256": "5cc44163ea1561831524f6977e2ca600ad51a3215cc06934030ac9fe85b1deb6"
+        },
+        "downloads": -1,
+        "filename": "FastAPI-JSONAPI-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "89825c5640818e19430ac904df774189",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46687,
+        "upload_time": "2023-03-10T23:37:41",
+        "upload_time_iso_8601": "2023-03-10T23:37:41.591042Z",
+        "url": "https://files.pythonhosted.org/packages/21/f4/eaeb71feece28d2958244cfbf69a6991a38a4aebe29801167dfd2fd72bed/FastAPI-JSONAPI-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c708acfd785ab571f0c63404f161928b0d784c2545d696a7d1948f1405794f72",
+          "md5": "0c26826b7033718255743f41f5c591ab",
+          "sha256": "f189e17791feb55157711f3a1abfacbd00b38f84f6938c706774b9c8bae5d755"
+        },
+        "downloads": -1,
+        "filename": "FastAPI_JSONAPI-0.2.1-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "0c26826b7033718255743f41f5c591ab",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 72085,
+        "upload_time": "2023-03-10T23:59:51",
+        "upload_time_iso_8601": "2023-03-10T23:59:51.184378Z",
+        "url": "https://files.pythonhosted.org/packages/c7/08/acfd785ab571f0c63404f161928b0d784c2545d696a7d1948f1405794f72/FastAPI_JSONAPI-0.2.1-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5a4569af268f870b1f236749b123fc3c37821ff0be93ff33b0c2b78b55f2416d",
+          "md5": "8699a41fe7dd4f3667873a92ffb68ac2",
+          "sha256": "f1427bcc139ce0376da139763c9edd51f82b08804b4124e8e7f30e644e61d005"
+        },
+        "downloads": -1,
+        "filename": "FastAPI-JSONAPI-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8699a41fe7dd4f3667873a92ffb68ac2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46862,
+        "upload_time": "2023-03-10T23:59:53",
+        "upload_time_iso_8601": "2023-03-10T23:59:53.012631Z",
+        "url": "https://files.pythonhosted.org/packages/5a/45/69af268f870b1f236749b123fc3c37821ff0be93ff33b0c2b78b55f2416d/FastAPI-JSONAPI-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "bb85cb449970318dc083b2794369137b8f4e1d10c43387d346111dde7039d9e1",
+          "md5": "c53916c07d4384bcfb5b130eb5ad3d5e",
+          "sha256": "ab176e657518fdd4272021ce4db592e24e2bde47ba764716642eac2a7d49f7b1"
+        },
+        "downloads": -1,
+        "filename": "FastAPI_JSONAPI-0.2.2-py2.py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c53916c07d4384bcfb5b130eb5ad3d5e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py2.py3",
+        "requires_python": null,
+        "size": 72091,
+        "upload_time": "2023-03-11T14:07:07",
+        "upload_time_iso_8601": "2023-03-11T14:07:07.843217Z",
+        "url": "https://files.pythonhosted.org/packages/bb/85/cb449970318dc083b2794369137b8f4e1d10c43387d346111dde7039d9e1/FastAPI_JSONAPI-0.2.2-py2.py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "93ab9c8aa17c50e83bce67b886e231ec9a2237c0ba5ad5615ceaede8d14fb146",
+          "md5": "f8113dbe245e7a737945ffc467b37f1d",
+          "sha256": "a8158fbae12f7fd7265ffc12f408c7d427743bcfc7a770fbf8908a279267dc15"
+        },
+        "downloads": -1,
+        "filename": "FastAPI-JSONAPI-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "f8113dbe245e7a737945ffc467b37f1d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": null,
+        "size": 46844,
+        "upload_time": "2023-03-11T14:07:09",
+        "upload_time_iso_8601": "2023-03-11T14:07:09.207536Z",
+        "url": "https://files.pythonhosted.org/packages/93/ab/9c8aa17c50e83bce67b886e231ec9a2237c0ba5ad5615ceaede8d14fb146/FastAPI-JSONAPI-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "bb85cb449970318dc083b2794369137b8f4e1d10c43387d346111dde7039d9e1",
+        "md5": "c53916c07d4384bcfb5b130eb5ad3d5e",
+        "sha256": "ab176e657518fdd4272021ce4db592e24e2bde47ba764716642eac2a7d49f7b1"
+      },
+      "downloads": -1,
+      "filename": "FastAPI_JSONAPI-0.2.2-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "c53916c07d4384bcfb5b130eb5ad3d5e",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": null,
+      "size": 72091,
+      "upload_time": "2023-03-11T14:07:07",
+      "upload_time_iso_8601": "2023-03-11T14:07:07.843217Z",
+      "url": "https://files.pythonhosted.org/packages/bb/85/cb449970318dc083b2794369137b8f4e1d10c43387d346111dde7039d9e1/FastAPI_JSONAPI-0.2.2-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "93ab9c8aa17c50e83bce67b886e231ec9a2237c0ba5ad5615ceaede8d14fb146",
+        "md5": "f8113dbe245e7a737945ffc467b37f1d",
+        "sha256": "a8158fbae12f7fd7265ffc12f408c7d427743bcfc7a770fbf8908a279267dc15"
+      },
+      "downloads": -1,
+      "filename": "FastAPI-JSONAPI-0.2.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "f8113dbe245e7a737945ffc467b37f1d",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 46844,
+      "upload_time": "2023-03-11T14:07:09",
+      "upload_time_iso_8601": "2023-03-11T14:07:09.207536Z",
+      "url": "https://files.pythonhosted.org/packages/93/ab/9c8aa17c50e83bce67b886e231ec9a2237c0ba5ad5615ceaede8d14fb146/FastAPI-JSONAPI-0.2.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
