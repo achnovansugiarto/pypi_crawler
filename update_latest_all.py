@@ -17,9 +17,9 @@ def update_all(index, split_cnt=10):
   subprocess.run(['split', '-l', str(pkg_cnt_per_file),
                        PATH, SPLIT_PATH + '/'])
   files = os.listdir(SPLIT_PATH)
-  print(f"split files: {files})
+  print(f"split files: {files}")
   file = files[index]
-  print(f"selected file: {file})
+  print(f"selected file: {file}")
   # Do update
   with open(file, 'r') as f:
     for pkg in map(lambda x: x.strip(), f):
