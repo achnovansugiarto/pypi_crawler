@@ -21,7 +21,7 @@ def update_all(index, split_cnt=10):
   file = files[index]
   print(f"selected file: {file}")
   # Do update
-  with open(file, 'r') as f:
+  with open(f'{SPLIT_PATH}/{file}', 'r') as f:
     for pkg in map(lambda x: x.strip(), f):
       print(f"=============\t\t\t {pkg} \t\t\t================")
       update(pkg)
