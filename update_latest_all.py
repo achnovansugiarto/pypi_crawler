@@ -3,7 +3,7 @@ import os
 import subprocess
 from update_latest_json import update
 PATH = 'data/package_names.txt'
-SPLIT_PATH = '/tmp'
+SPLIT_PATH = 'tmp'
 def update_all(index, split_cnt=10):
   # Get total package count
   out = subprocess.check_output(['wc', '-l', PATH])
