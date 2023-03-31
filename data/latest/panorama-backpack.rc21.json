@@ -1,0 +1,1023 @@
+{
+  "info": {
+    "author": "Janos Tolgyesi",
+    "author_email": "janos.tolgyesi@neosperience.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3.7"
+    ],
+    "description": "# Backpack\n\n![pipeline](https://s3.eu-west-1.amazonaws.com/github-ci.experiments.neosperience.com/Neosperience/backpack/build/pipeline.svg?)\n[![coverage](https://s3.eu-west-1.amazonaws.com/github-ci.experiments.neosperience.com/Neosperience/backpack/build/coverage.svg?)](https://s3.eu-west-1.amazonaws.com/github-ci.experiments.neosperience.com/Neosperience/backpack/build/coverage/index.html)\n[![pylint](https://s3.eu-west-1.amazonaws.com/github-ci.experiments.neosperience.com/Neosperience/backpack/build/pylint.svg?)](https://s3.eu-west-1.amazonaws.com/github-ci.experiments.neosperience.com/Neosperience/backpack/build/lint/pylint.txt)\n\n> Your hiking equipment for an enjoyable Panorama development experience\n\nYou can read also the [structured and extended version of this documentation](https://panorama-backpack.readthedocs.io/).\n\nBackpack is a toolset that makes development for AWS Panorama hopefully more enjoyable. AWS Panorama is a machine learning appliance and software development kit that can be used to develop intelligent video analytics and computer vision applications deployed on an edge device. For more information, refer to the [Panorama page](https://aws.amazon.com/panorama/) on the AWS website.\n\nBackpack provides the following modules:\n\n- *AutoIdentity* allows your application to learn more about itself and the host device. It gives access to the Panorama device id, application instance id, application name and description, and other similar information.\n- *Timepiece* is a collection of timing and profiling classes that allows you to efficiently measure the frame processing time of your app, time profile different stages of frame processing (preprocessing, model invocation, postprocessing), and send a selected subset of these metrics to AWS CloudWatch to monitor your application in real-time, and even create CloudWatch alarms if your app stops processing frames.\n- *SkyLine* provides a framework to re-stream the processed video (annotated by your application) to media endpoints supported by *GStreamer*. *KVSSkyLine* is an implementation of a SkyLine pipeline that lets you send the processed video to AWS Kinesis Video Streams.\n- *Annotation* is a unified API for drawing on different backends like the core `panoramasdk.media` class or OpenCV images.\n\n## Installation\n\nBackpack consists of several loosely coupled components, each solving a specific task. Backpack python package is expected to be installed in the docker container of your Panorama application with pip, so you would add the following line to your `Dockerfile`:\n\n```docker\nRUN pip install git+https://github.com/neosperience/backpack.git\n```\n\nSome components have particular dependencies that can not be installed with the standard pip dependency resolver. For example, if you want to use `KVSSkyLine` to re-stream the output video of your machine learning model to AWS Kinesis Video Streams, you should have several particularly configured libraries in the docker container to make everything work correctly. You will find detailed instructions and `Dockerfile` snippets in the rest of this documentation that will help you put together all dependencies.\n\n## Permissions\n\nSeveral components of Backpack call AWS services in the account where your Panorama appliance is provisioned. To use these components, you should grant permissions to the Panorama Application IAM Role to use these services. Please refer to [AWS Panorama documentation](https://docs.aws.amazon.com/panorama/latest/dev/permissions-application.html) for more information. For each component, we will list the services required by the component. For example, `AutoIdentity` needs permission to execute the following AWS service operations:\n\n- `panorama:ListApplicationInstances`\n\nTo make this component work correctly, you should include the following inline policy in the Panorama Application Role:\n\n```yaml\n  Policies:\n    - PolicyName: panorama-listapplicationinstances\n      PolicyDocument:\n        Version: 2012-10-17\n        Statement:\n          - Effect: Allow\n            Action: 'panorama:ListApplicationInstances'\n            Resource: '*'\n```\n\nThe rest of this readme discusses the different components in Backpack.\n\n## AutoIdentity\n\nWhen your application's code is running in a Panorama application, there is no official way to know which device is running your app or which deployment version of your app is currently running. `AutoIdentity` queries these details directly by calling AWS Panorama management services based on the UID of your Application that you typically can find in the `AppGraph_Uid` environment variable. When instantiating the `AutoIdentity` object, you should pass the AWS region name where you provisioned the Panorama appliance. You can pass the region name, for example, as an application parameter.\n\nTo successfully use AutoIdentity, you should grant the execution of the following operations to the Panorama Application IAM Role:\n\n- `panorama:ListApplicationInstances`\n\nExample usage:\n\n```python\nfrom backpack.autoidentity import AutoIdentity\n\nauto_identity = AutoIdentity(device_region='us-east-1')\nprint(auto_identity)\n```\n\nThe code above prints details of the running application in the CloudWatch log stream of your Panorama app, something similar to:\n\n```text\n<AutoIdentity\n    application_created_time=\"2022-02-17 16:38:05.510000+00:00\"\n    application_description=\"Sample application description\"\n    application_instance_id=\"applicationInstance-0123456789abcdefghijklmn\"\n    application_name=\"sample_app\"\n    application_status=\"RUNNING\"\n    application_tags={\"foo\": \"bar\"}\n    device_id=\"device-0123456789abcdefghijklmn\"\n    device_name=\"my_panorama\"\n>\n```\n\nYou can access all these details as the properties of the `AutoIdentity` object, for example, with `auto_identity.application_description`.\n\n## Timepiece\n\nTimepiece component includes classes that allow you to quickly time profile the video processing pipeline. For detailed information, please check the API documentation.\n\n### Ticker\n\n`Ticker` allows you to calculate statistics of the time intervals between recurring events. You can use a ticker, for example, to get statistics about how much time the application spends to process frames.\n\nExample usage:\n\n```python\nimport time\nimport random\nfrom backpack.timepiece import Ticker\n\nticker = Ticker(max_intervals=5)\nfor i in range(10):\n    ticker.tick()\n    time.sleep(random.random() / 10)\nprint(ticker)\n```\n\nThis code returns the time interval (in seconds) between the last five `tick()` calls, as well as some basic statistics of them:\n\n```text\n<Ticker intervals=[0.0899, 0.0632, 0.0543, 0.0713, 0.0681] min=0.0543 mean=0.0694 max=0.0899>\n```\n\n### StopWatch\n\nWith `StopWatch`, you can measure the execution time of a code block, even repeatedly, and get statistics about the time spent on different invocations. You can use `StopWatch`, for example, to profile the inference time of your machine learning model or your preprocessing or postprocessing functions. Stopwatches can be organized in a hierarchy, where the parent watch measures the summary of the time of child watches.\n\nExample usage:\n\n```python\nimport time\nimport random\n\nwith StopWatch('root') as root:\n    with root.child('task1', max_intervals=5) as task1:\n        time.sleep(0.01)\n        with task1.child('subtask1_1') as subtask1_1:\n            time.sleep(0.03)\n        with task1.child('subtask1_2'):\n            time.sleep(0.07)\n        with task1.child('subtask1_3'):\n            time.sleep(0.09)\n        with subtask1_1:\n            time.sleep(0.05)\n    for i in range(5)\n        with root.child('task2') as task2:\n            time.sleep(random.random() / 10)\nprint(root)\n```\n\nResults:\n\n```text\n<StopWatch name=root intervals=[0.5416] min=0.5416 mean=0.5416 max=0.5416 children=[\n    <StopWatch name=task1 intervals=[0.2505] min=0.2505 mean=0.2505 max=0.2505 children=[\n        <StopWatch name=subtask1_1 intervals=[0.0301, 0.0501] min=0.0301 mean=0.0401 max=0.0501>,\n        <StopWatch name=subtask1_2 intervals=[0.0701] min=0.0701 mean=0.0701 max=0.0701>,\n        <StopWatch name=subtask1_3 intervals=[0.0901] min=0.0901 mean=0.0901 max=0.0901>\n    ]>,\n    <StopWatch name=task2 intervals=[0.0275, 0.0825, 0.0334, 0.0843, 0.0633] min=0.0275 mean=0.0582 max=0.0843>\n]>\n```\n\nYou can access all interval data, as well as the statistical values using `StopWatch` properties.\n\n### Schedules\n\nSchedules allow you to schedule the execution of a function at a later time.\n\nIt is important to note that `Schedule` instances do not intrinsically have an event loop or use kernel-based timing operations. Instead, call regularly the `tick()` method of the `Schedule`, and the scheduled function will be executed when the next `tick()` is called after the scheduled time. When developing Panorama applications, you typically call the `tick()` function in the frame processing loop.\n\nYou can also specify a [python executor](https://docs.python.org/3/library/concurrent.futures.html) when creating `Schedule` objects. If an executor is specified, the scheduled function will be called asynchronously using that executor, the `tick()` method can immediately return, and the scheduled function will be executed in another thread.\n\nThe following Schedules are available to you:\n\n- `AtSchedule`: executes a function at a given time in the future\n- `IntervalSchedule`: executes a function repeatedly at given intervals\n- `OrdinalSchedule`: executes a function once in each *n* invocation of `tick()`\n\nFinally, `AlarmClock` allows you to handle a collection of `Schedule` instances with the invocation of a single `tick()` method.\n\nExample usage:\n\n```python\nimport datetime\nfrom concurrent.futures import ThreadPoolExecutor\nfrom backpack.timepiece import (\n    local_now, AtSchedule, IntervalSchedule, AlarmClock, OrdinalSchedule\n)\n\ncb = lambda name: print(f'{name} was called at {datetime.datetime.now()}')\nexecutor = ThreadPoolExecutor()\n\nat = local_now() + datetime.timedelta(seconds=3)\natschedule = AtSchedule(at=at, callback=cb, cbkwargs={'name': 'AtSchedule'}, executor=executor)\n\niv = datetime.timedelta(seconds=1.35)\nivschedule = IntervalSchedule(interval=iv, callback=cb, cbkwargs={'name': 'IntervalSchedule'},\n                              executor=executor)\n\nordinalschedule = OrdinalSchedule(ordinal=17, callback=cb, cbkwargs={'name': 'OrdinalSchedule'},\n                                  executor=executor)\n\nalarmclock = AlarmClock([atschedule, ivschedule, ordinalschedule])\n\nfor i in range(25*5):\n    alarmclock.tick()\n    time.sleep(1/25)\n```\n\nResults:\n\n```text\nIntervalSchedule was called at 2022-02-18 13:08:27.025772+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:27.669900+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:28.354350+00:00\nIntervalSchedule was called at 2022-02-18 13:08:28.395027+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:29.039454+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:29.724104+00:00\nIntervalSchedule was called at 2022-02-18 13:08:29.764723+00:00\nAtSchedule was called at 2022-02-18 13:08:30.046814+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:30.409206+00:00\nIntervalSchedule was called at 2022-02-18 13:08:31.093138+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:31.093451+00:00\nOrdinalSchedule was called at 2022-02-18 13:08:31.776985+00:00\n```\n\n### Tachometer\n\nA `Tachometer` combines a `Ticker` and an `IntervalSchedule` to measure the time interval of a recurring event and periodically report statistics about it. You can use it, for example, to report the frame processing time statistics to an external service. You can specify the reporting interval and a callback function that will be called with the timing statistics. You should consider using an *executor*, as your reporting callback can take a considerable amount of time to finish, and you might not want to hold up the processing loop synchronously meanwhile.\n\nExample usage:\n\n```python\nimport datetime\nimport random\nfrom concurrent.futures import ThreadPoolExecutor\nfrom backpack.timepiece import Tachometer\n\ndef stats_callback(timestamp, min_proc_time, max_proc_time, sum_proc_time, num_events):\n    print('timestamp:', timestamp)\n    print(f'min: {min_proc_time:.4f}, max: {max_proc_time:.4f}, '\n          f'sum: {sum_proc_time:.4f}, num: {num_events}')\n\ntach = Tachometer(stats_callback, datetime.timedelta(seconds=2))\n\nfor i in range(200):\n    tach.tick()\n    time.sleep(random.random() / 10)\n\n```\n\nResults:\n\n```text\ntimestamp: 2022-02-18 13:08:34.074238+00:00\nmin: 0.0003, max: 0.0979, sum: 2.0156, num: 36\ntimestamp: 2022-02-18 13:08:36.102133+00:00\nmin: 0.0005, max: 0.0998, sum: 2.0279, num: 40\ntimestamp: 2022-02-18 13:08:38.105702+00:00\nmin: 0.0005, max: 0.0984, sum: 2.0036, num: 43\ntimestamp: 2022-02-18 13:08:40.083832+00:00\nmin: 0.0028, max: 0.0975, sum: 1.9781, num: 39\n```\n\n### CWTachometer\n\n`CWTachometer` is a `Tachometer` subclass that reports frame processing time statistics to [AWS CloudWatch Metrics](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/working_with_metrics.html) service. You can use this class as a drop-in to your frame processing loop. It will give you detailed statistics about the behavior the timing of your application and you can mount [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) on this metric to receive email or SMS notifications when your application stops processing the video for whatever reason.\n\nTo successfully use `CWTachometer`, you should grant the execution of the following operations to the Panorama Application IAM Role:\n\n- `cloudwatch:PutMetricData`\n\nThe following example (a snippet from a Panorama Application implementation) shows you how you can combine together `AutoIdentity` and `CWTachometer` to get frame processing time metrics in the CloudWatch service of your AWS account:\n\n```python\nfrom concurrent.futures import ThreadPoolExecutor\nimport boto3\nfrom backpack.autoidentity import AutoIdentity\nfrom backpack.cwtacho import CWTachometer\n\n# You might want to read these values from Panorama application parameters\nservice_region = 'us-east-1'\ndevice_region = 'us-east-1'\n\nclass Application(panoramasdk.node):\n\n    def __init__(self):\n        super().__init__()\n        self.session = boto3.Session(region_name=service_region)\n        self.executor = ThreadPoolExecutor()\n        self.auto_identity = AutoIdentity(device_region=device_region)\n        self.tacho = CWTachometer(\n            namespace='MyPanoramaMetrics',\n            metric_name='frame_processing_time',\n            dimensions={\n                'application_name': self.auto_identity.application_name or 'unknown',\n                'device_id': self.auto_identity.device_id or 'unknown',\n                'application_instance_id': self.auto_identity.application_instance_id or 'unknown'\n            },\n            executor=self.executor,\n            boto3_session=self.session\n        )\n\n    def process_streams(self):\n\n        # call Tachometer\n        self.tacho.tick()\n\n        # this  will block until next frame is available\n        streams = self.inputs.video_in.get()\n\n        for stream in streams:\n            # process stream.image here ...\n            pass\n\n        self.outputs.video_out.put(streams)\n\ndef main():\n    try:\n        app = Application()\n        while True:\n            app.process_streams()\n    except Exception:\n        print('Exception during processing loop.')\n\nmain()\n```\n\n## SkyLine\n\nAs you may know, the only official way to get visual feedback on the correct functionality of your Panorama application is to physically connect a display to the HDMI port of the Panorama appliance. When connected, the display will show the output video stream of a single application deployed on the device. However, physically accessing the appliance is not always feasible. SkyLine allows you to re-stream the output video of your Panorama application to an external service, for example to [AWS Kinesis Video Streams](https://docs.aws.amazon.com/kinesisvideostreams/latest/dg/what-is-kinesis-video.html). This can be very convenient to remotely monitor your application.\n\n### Warning notes about using SkyLine\n\nEven if SkyLine is a very helpful tool, using it might arise two concerns that you should consider carefully. For the same reason we discourage using SkyLine in a production environment: it is principally a development aid or at most a debugging tool.\n\nThe first concern is of technical nature. Currently the application code in a Panorama app does not have direct access to the onboard GPU, thus all video encoding codecs used by SkyLine run on the CPU of the device. This could take precious computing time from the CPUs that occupy with streaming the output instead of processing the video. We measured that streaming a single output stream with SkyLine could require anything between 10-30% of the CPU capacity of the device.\n\nThe second concern regards data protection. The Panorama appliance is designed so to strongly protect the video streams being processed: it has even two ethernet interfaces to physically separate the network of the video cameras (typically a closed-circuit local area network) and the Internet access of the device. Using SkyLine you might effectively relay the video stream from the protected, closed-circuit camera network to the public Internet. For this reason, you should carefully examine the data protection requirements of your application and the camera network before integrating SkyLine.\n\n### How does it work?\n\nTechnically speaking, SkyLine instantiates a [GStreamer pipeline](https://gstreamer.freedesktop.org/documentation/application-development/introduction/basics.html) with an [appsrc](https://gstreamer.freedesktop.org/documentation/app/appsrc.html) element at the head. An [OpenCV VideoWriter](https://docs.opencv.org/4.5.5/dd/d43/tutorial_py_video_display.html) is configured to write to the `appsrc` element: instead of saving the consecutive frames to a video file, it streams to the output sink. When opening the `VideoWriter` instance, the user should specify the frame width and height, as well as the frame rate of the output stream. You can manually specify these parameters or let SkyLine infer these values from the input dimensions and the frequency you send new frames to it. If using this auto-configuration feature, some frames (by default 100) will be discarded at the beginning of the streaming, as they will be used to calculate statistics of the frame rate and measure the frame dimensions. This phase is referred to as the \"warmup\" state of SkyLine. If later on, you send frames of different dimensions compared to the expected width and height, SkyLine will redimension the input, but this has a performance penalty of the pipeline. You are also expected to send new frames to SkyLine with the frequency specified in the frame-per-second parameter. If you send frames slower or faster, the KVS video fragments get out of sync and you won't be able to play back the video continuously.\n\n### Configuring the Panorama Application Docker container\n\nSkyLine depends on a set of custom compiled external libraries. You should have all these libraries compiled and configured correctly in your application's docker container in order to make `SkyLine` work correctly. These libraries include:\n\n- GStreamer 1.0 installed with standard plugins pack, libav, tools, and development libraries\n- OpenCV 4.2.0, compiled with GStreamer support and Python bindings\n- numpy (it is typically installed by the base docker image of your Panorama application)\n\nFurthermore, if you want to use `KVSSkyLine`, the `SkyLine` implementation that streams the video to Kinesis Video Streams, you will need also the following libraries:\n\n- Amazon Kinesis Video Streams (KVS) Producer SDK compiled with GStreamer plugin support\n- Environment variable GST_PLUGIN_PATH configured to point to the directory where the compiled\n  binaries of KVS Producer SDK GStreamer plugin is placed\n- Environment variable LD_LIBRARY_PATH including the open-source third-party dependencies\n  compiled by KVS Producer SDK\n- boto3 (it is typically installed by the base docker image of your Panorama application)\n\nWe provide a sample Dockerfile in the examples folder that shows you how to install correctly these libraries in your Docker container. In most cases, it should be enough to copy the relevant sections from the sample to your application's Dockerfile. The first time you compile the docker container, it might take up to one hour to correctly compile all libraries.\n\n### Using KVSSkyLine\n\nCompared to the `SkyLine` base class, `KVSSkyLine` adds an additional element to the pipeline: the Amazon Kinesis Video Streams (KVS) Producer library, wrapped in a GStreamer sink element. KVS Producer needs AWS credentials to function correctly: it does not use automatically the credentials associated with the Panorama Application Role. You have different options to provide credentials using `KVSCredentialsHandler` subclasses, provided in the `kvs` module. For testing purposes, you can create an IAM user in your AWS account that has the privileges only to the following operations to write media to KVS:\n\n- `kinesisvideo:DescribeStream`\n- `kinesisvideo:GetStreamingEndpoint`\n- `kinesisvideo:PutMedia`\n\nYou should configure this user to have programmatic access to AWS resources, and get the AWS Access Key and Secret Key pair of the user. These are so-called static credentials that do not expire. You can create a `KVSInlineCredentialsHandler` or `KVSEnvironmentCredentialsHandler` instance to pass these credentials to KVS Producer Plugin directly in the GStreamer pipeline definition, or as environment variables. However as these credentials do not expire, it is not recommended to use this setting in a production environment. Even in a development and testing environment, you should take the appropriate security measures to protect these credentials: never hard code them in the source code. Instead, use AWS Secret Manager or a similar service to provision these parameters.\n\n`KVSSkyLine` can use also the Panorama Application Role to pass the application's credentials to KVS Producer. These credentials are temporary, meaning that they expire within a couple of hours, and they should be renewed. The Producer library expects temporary credentials in a text file. `KVSFileCredentialsHandler` takes manages the renewal of the credentials and periodically updates the text file with the new credentials. You should always test your Panorama application - KVS integration that it still works when the credentials are refreshed. This means letting run your application for several hours and periodically checking if it still streams the video to KVS. You will also find diagnostic information in the CloudWatch logs of your application when the credentials were renewed.\n\n`KvsSkyLine` needs also two correctly configured environment variables to make GStreamer find the KVS Producer plugin. The name of these variables are `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH`. They point to the folder where the KVS Producer binary and its 3rd party dependencies can be found. If you've used the example Dockerfile provided, the correct values of these variables are written to a small configuration file at `/panorama/.env`. You should pass the path of this file to `KvsSkyLine` or otherwise ensure that these variables contain the correct value.\n\nAt instantiation time, you should pass at least the AWS region name where your stream is created, the name of the stream, and a credentials handler instance. If you want to configure manually the frame rate and the dimensions of the frames, you should also pass them here: if both are specified, the warmup period will be skipped and your first frame will be sent directly to KVS. When you are ready to send the frames, you should call the `start_streaming` method: this will open the GStreamer pipeline. After this method is called, you are expected to send new frames to the stream calling the `put` method periodically, with the frequency of the frame rate specified, or inferred by `KvsSkyLine`. You can stop and restart streaming any number of times on the same `KvsSkyLine` instance.\n\nExample usage:\n\n```python\nimport panoramasdk\nfrom backpack.kvs import KVSSkyLine, KVSFileCredentialsHandler\n\n# You might want to read these values from Panorama application parameters\nstream_region = 'us-east-1'\nstream_name = 'panorama-video'\n\n# The example Dockerfile writes static configuration variables to this file\n# If you change the .env file path in the Dockerfile, you should change it also here\nDOTENV_PATH = '/panorama/.env'\n\nclass Application(panoramasdk.node):\n\n    def __init__(self):\n        super().__init__()\n        # ...\n        credentials_handler = KVSFileCredentialsHandler()\n        self.skyline = KVSSkyLine(\n            stream_region=stream_region,\n            stream_name=stream_name,\n            credentials_handler=credentials_handler,\n            dotenv_path=DOTENV_PATH\n        )\n        # This call opens the streaming pipeline:\n        self.skyline.start_streaming()\n\n    # called from video processing loop:\n    def process_streams(self):\n        streams = self.inputs.video_in.get()\n\n        for idx, stream in enumerate(streams):\n\n            # Process the stream, for example with:\n            # self.process_media(stream)\n\n            # TODO: eventually multiplex streams to a single frame\n            if idx == 0:\n                self.skyline.put(stream.image)\n```\n\nIf everything worked well, you can watch the restreamed video in the [Kinesis Video Streams page](https://console.aws.amazon.com/kinesisvideo/home) of the AWS console.\n\n## Annotations\n\n*Annotations* and *annotation drivers* provide a unified way to draw annotations on different rendering backends. Currently, two annotation drivers are implemented:\n\n- `PanoramaMediaAnnotationDriver` allows you to draw on `panoramasdk.media` object, and\n- `OpenCVImageAnnotationDriver` allows you to draw on an OpenCV image (numpy array) object.\n\nTwo types of annotations can be drawn: labels and rectangles. Not all annotation drivers necessarily implement all features specified by annotations, for example, one driver might decide to ignore colors.\n\n### Using annotations\n\nYou can create one or more annotation driver instances at the beginning of the video frame processing loop, depending on the available backends. During the process of a single frame, you are expected to collect all annotations to be drawn on the frame in a python collection (for example, in a `list`). When the processing is finished, you can call the `render` method on any number of drivers, passing the same collection of annotations. All coordinates used in annotation are normalized to the range of `[0; 1)`.\n\nExample usage:\n\n```python\nimport panoramasdk\nfrom backpack.geometry import Point\nfrom backpack.annotation import (\n    LabelAnnotation, RectAnnotation, TimestampAnnotation,\n)\n\nfrom backpack.annotation.opencv import OpenCVImageAnnotationDriver\nfrom backpack.annotation.panorama import PanoramaMediaAnnotationDriver\n\nclass Application(panoramasdk.node):\n\n    def __init__(self):\n        super().__init__()\n        # self.skyline = ...\n        self.panorama_driver = PanoramaMediaAnnotationDriver()\n        self.cv2_driver = OpenCVImageAnnotationDriver()\n\n    # called from video processing loop:\n    def process_streams(self):\n        streams = self.inputs.video_in.get()\n        for idx, stream in enumerate(streams):\n            annotations = [\n                TimestampAnnotation(),\n                RectAnnotation(point1=Point(0.1, 0.1), point2=Point(0.9, 0.9)),\n                LabelAnnotation(point=Point(0.5, 0.5), text='Hello World!')\n            ]\n            self.panorama_driver.render(annotations, stream)\n\n            # TODO: eventually multiplex streams to a single frame\n            if idx == 0:\n                rendered = self.cv2_driver.render(annotations, stream.image.copy())\n                # self.skyline.put(rendered)\n```\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "https://github.com/Neosperience/backpack/archive/refs/tags/v0.3.2.tar.gz",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/Neosperience/backpack",
+    "keywords": "aws,panorama,video-analysis",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "panorama-backpack",
+    "package_url": "https://pypi.org/project/panorama-backpack/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/panorama-backpack/",
+    "project_urls": {
+      "Download": "https://github.com/Neosperience/backpack/archive/refs/tags/v0.3.2.tar.gz",
+      "Homepage": "https://github.com/Neosperience/backpack"
+    },
+    "release_url": "https://pypi.org/project/panorama-backpack/0.3.2/",
+    "requires_dist": [
+      "boto3 (~=1.26.102)",
+      "botocore (~=1.29.102)",
+      "jmespath (~=1.0.1)",
+      "numpy (~=1.21.6)",
+      "pydantic (~=1.10.7)",
+      "python-dateutil (~=2.8.2)",
+      "python-dotenv (~=0.21.1)",
+      "s3transfer (~=0.6.0)",
+      "six (~=1.9.0)",
+      "urllib3 (~=1.26.15)",
+      "opencv-headless ; extra == 'opencv'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Tools for AWS Panorama development",
+    "version": "0.3.2",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17517464,
+  "releases": {
+    "0.0.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6dd92862c4ef82b8bffdee67038c3d84d9306a496a0a03917b2f9fcfaba1d2a4",
+          "md5": "5798bd8903536890cd1898b754da892c",
+          "sha256": "337cb2e4b5156cf7b9e75d7fce6d1c0aea6cb753e82d6a604e6e5b64e5f9dfe3"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.0.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5798bd8903536890cd1898b754da892c",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 51263,
+        "upload_time": "2022-11-17T15:10:51",
+        "upload_time_iso_8601": "2022-11-17T15:10:51.860542Z",
+        "url": "https://files.pythonhosted.org/packages/6d/d9/2862c4ef82b8bffdee67038c3d84d9306a496a0a03917b2f9fcfaba1d2a4/panorama_backpack-0.0.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9850c9714177af4c4ac120980d47a081099b39e3f696cd66955ade3d085bf23e",
+          "md5": "d60c916ff81a77d3c96f624915f5e694",
+          "sha256": "664de6e7821789d9c1ba63db23ada21bc8d27eea95e193160b4a4553597b7e32"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.0.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d60c916ff81a77d3c96f624915f5e694",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 52154,
+        "upload_time": "2022-11-17T15:11:01",
+        "upload_time_iso_8601": "2022-11-17T15:11:01.674311Z",
+        "url": "https://files.pythonhosted.org/packages/98/50/c9714177af4c4ac120980d47a081099b39e3f696cd66955ade3d085bf23e/panorama-backpack-0.0.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "11a42a3dc24de0801b9d888952ee767eefabb02696c89a6382f81ec388c33d1b",
+          "md5": "9a6009740c07d83aa256f660647ac7dc",
+          "sha256": "6cb67a6308d118554c810cfffff3611cd171b96288df22d7ad72f018657e5119"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9a6009740c07d83aa256f660647ac7dc",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 35307,
+        "upload_time": "2022-08-08T16:09:45",
+        "upload_time_iso_8601": "2022-08-08T16:09:45.508178Z",
+        "url": "https://files.pythonhosted.org/packages/11/a4/2a3dc24de0801b9d888952ee767eefabb02696c89a6382f81ec388c33d1b/panorama_backpack-0.1.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9e5fdfb025d4511aeb4d3c3c7d0c7b60c68580b6f353cb6affda0c47e5c5d392",
+          "md5": "759d472f61b9fcb54cf9c94887f1a28a",
+          "sha256": "5038427490985382e62314c506aba7223f2ee65e848a206882f5883d97d286c5"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "759d472f61b9fcb54cf9c94887f1a28a",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53554,
+        "upload_time": "2022-08-08T16:09:47",
+        "upload_time_iso_8601": "2022-08-08T16:09:47.651035Z",
+        "url": "https://files.pythonhosted.org/packages/9e/5f/dfb025d4511aeb4d3c3c7d0c7b60c68580b6f353cb6affda0c47e5c5d392/panorama-backpack-0.1.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "0c80bda3c5640feb2047004cf0d9b8b36bbd26089fb8f18dd1d0d78949919ac7",
+          "md5": "da3eea493cccfc8c952c5d632638086e",
+          "sha256": "97c597fcc65978d936ff510cb79aeb278aa0711c9e93191774076f139afe6825"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "da3eea493cccfc8c952c5d632638086e",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 27983,
+        "upload_time": "2022-08-10T15:41:20",
+        "upload_time_iso_8601": "2022-08-10T15:41:20.387888Z",
+        "url": "https://files.pythonhosted.org/packages/0c/80/bda3c5640feb2047004cf0d9b8b36bbd26089fb8f18dd1d0d78949919ac7/panorama_backpack-0.1.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "32e84e798e9357e5095dd578b502769d98d018f0fb7276e79f2d30a52a166381",
+          "md5": "1a61fa09990af52b2ba2999333e75b28",
+          "sha256": "2a3eedc847000a5a3929bf073895fb92ed1e30f52b5d6209fb3ecd1b58e7dd67"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "1a61fa09990af52b2ba2999333e75b28",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 46724,
+        "upload_time": "2022-08-10T15:41:23",
+        "upload_time_iso_8601": "2022-08-10T15:41:23.538626Z",
+        "url": "https://files.pythonhosted.org/packages/32/e8/4e798e9357e5095dd578b502769d98d018f0fb7276e79f2d30a52a166381/panorama-backpack-0.1.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "1b9f4dc78b1efa0455d84d9d37b989ddb5cab7ca789b317e15b0b8c45fc13d10",
+          "md5": "900d68fd1bbbb0a9fdba05a8d22da24d",
+          "sha256": "944a947c237703833cf97174efdad571692e93a615bd5da43ffa049b486968bd"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "900d68fd1bbbb0a9fdba05a8d22da24d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 45604,
+        "upload_time": "2022-08-10T16:21:50",
+        "upload_time_iso_8601": "2022-08-10T16:21:50.319459Z",
+        "url": "https://files.pythonhosted.org/packages/1b/9f/4dc78b1efa0455d84d9d37b989ddb5cab7ca789b317e15b0b8c45fc13d10/panorama_backpack-0.1.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "20629caf1dd9b8fb6ee1b717d585f8fa05ffcaba37c000e7f174d18228092085",
+          "md5": "60cf8e1bd7ab907e899cecad5ae7148d",
+          "sha256": "efe8c22b6bc4d8af133ef91e14b813ddce4b8fa9f808a94233e47d9da83bff70"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "60cf8e1bd7ab907e899cecad5ae7148d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48521,
+        "upload_time": "2022-08-10T16:21:55",
+        "upload_time_iso_8601": "2022-08-10T16:21:55.176152Z",
+        "url": "https://files.pythonhosted.org/packages/20/62/9caf1dd9b8fb6ee1b717d585f8fa05ffcaba37c000e7f174d18228092085/panorama-backpack-0.1.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "a78cc98f1b9feec2e63cd70f5380f1da25263fd5e2dbae6700e1834e8fbe8348",
+          "md5": "148c3737e4fb4b973a42f69aa594d977",
+          "sha256": "6fb718b89c8f7b49a3b014d98711658d40a12c1bd29e44b3fc51c8bf9f1196c3"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "148c3737e4fb4b973a42f69aa594d977",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 45643,
+        "upload_time": "2022-08-10T21:34:31",
+        "upload_time_iso_8601": "2022-08-10T21:34:31.391368Z",
+        "url": "https://files.pythonhosted.org/packages/a7/8c/c98f1b9feec2e63cd70f5380f1da25263fd5e2dbae6700e1834e8fbe8348/panorama_backpack-0.1.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "90a2ae31e5b4e6f0cd80b0bce25954bd7c13771833ae130d8f0de3618be40be8",
+          "md5": "71a157af4f76cb1964ccb499ba746d37",
+          "sha256": "e2980e6e04e51f94348ca06c5fd11d4829a10d1bfae4ea5778a22c7e49b7bbcc"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "71a157af4f76cb1964ccb499ba746d37",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48597,
+        "upload_time": "2022-08-10T21:34:33",
+        "upload_time_iso_8601": "2022-08-10T21:34:33.202258Z",
+        "url": "https://files.pythonhosted.org/packages/90/a2/ae31e5b4e6f0cd80b0bce25954bd7c13771833ae130d8f0de3618be40be8/panorama-backpack-0.1.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9a3c317e3ee16ee38d5f79e8fd10db39bced9624c84166ba855aa7bad91c5092",
+          "md5": "90f1f1da0e02481292dc244639b22ebd",
+          "sha256": "0ef2c1e85a7400bd06c75cf52e6bb8e855d215b5d9a560172c5a656f58b4a57b"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "90f1f1da0e02481292dc244639b22ebd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 45644,
+        "upload_time": "2022-08-10T21:43:40",
+        "upload_time_iso_8601": "2022-08-10T21:43:40.633048Z",
+        "url": "https://files.pythonhosted.org/packages/9a/3c/317e3ee16ee38d5f79e8fd10db39bced9624c84166ba855aa7bad91c5092/panorama_backpack-0.1.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "db0d5610aa0bdc7d6dfdad9bb740ef0fcf8d0f184f032ceecdf68add083d0acf",
+          "md5": "322e9c38d6775e8113ef5a4e7570b183",
+          "sha256": "c70e807d01207238f60688d83d7a77ac4cb6be78240ef8c469bd0abd7d459236"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "322e9c38d6775e8113ef5a4e7570b183",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 48600,
+        "upload_time": "2022-08-10T21:43:44",
+        "upload_time_iso_8601": "2022-08-10T21:43:44.314276Z",
+        "url": "https://files.pythonhosted.org/packages/db/0d/5610aa0bdc7d6dfdad9bb740ef0fcf8d0f184f032ceecdf68add083d0acf/panorama-backpack-0.1.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "18d3839207235c4249a383c5121c0d8100106f3d84e853ee48adb284550fd8ce",
+          "md5": "d9ee84d4c08d291720f1520a070a3bac",
+          "sha256": "e285a2e57f7e2d6e0c04b94611730baf1b528f69751f27fc04c416447d84f509"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d9ee84d4c08d291720f1520a070a3bac",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 51152,
+        "upload_time": "2022-09-30T16:42:48",
+        "upload_time_iso_8601": "2022-09-30T16:42:48.460225Z",
+        "url": "https://files.pythonhosted.org/packages/18/d3/839207235c4249a383c5121c0d8100106f3d84e853ee48adb284550fd8ce/panorama_backpack-0.1.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "978fa6637145e744cc573b2bccbc431307c22eaf5f870127b9a95499a4b18b73",
+          "md5": "d29542d582355a5fd050e1fce897e01c",
+          "sha256": "583959435defe512361cebe8db4fe81ae2db736fe0d1c7c6449d06a16b0c1ba2"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d29542d582355a5fd050e1fce897e01c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 52258,
+        "upload_time": "2022-09-30T16:42:36",
+        "upload_time_iso_8601": "2022-09-30T16:42:36.135452Z",
+        "url": "https://files.pythonhosted.org/packages/97/8f/a6637145e744cc573b2bccbc431307c22eaf5f870127b9a95499a4b18b73/panorama-backpack-0.1.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "de854bcfdfaa828e5b77f957776dc41c22367611f22b76688a462d69c2ae2ef1",
+          "md5": "90287039465b40e080eb778b7e455f5d",
+          "sha256": "6f0c0443fb1585b77aeac70c82c41576151137339a76ae984808481d07edb72a"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "90287039465b40e080eb778b7e455f5d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 51784,
+        "upload_time": "2022-10-06T10:09:11",
+        "upload_time_iso_8601": "2022-10-06T10:09:11.600409Z",
+        "url": "https://files.pythonhosted.org/packages/de/85/4bcfdfaa828e5b77f957776dc41c22367611f22b76688a462d69c2ae2ef1/panorama_backpack-0.1.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "444fe6d3d424177430c4472977ad8dbea511c1cc89aece4777eb31a54c26b6ed",
+          "md5": "0b64293ec2e5ee1a355ad7830505de6e",
+          "sha256": "5a1d796b6c3ae37c8962c939dff63919f74ce1d98e99e82558496531a0bb0147"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "0b64293ec2e5ee1a355ad7830505de6e",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53116,
+        "upload_time": "2022-10-06T10:09:14",
+        "upload_time_iso_8601": "2022-10-06T10:09:14.090074Z",
+        "url": "https://files.pythonhosted.org/packages/44/4f/e6d3d424177430c4472977ad8dbea511c1cc89aece4777eb31a54c26b6ed/panorama-backpack-0.1.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8f188d79d8df3520e43005d9d4b61b78d2b1786f7061098b0b4ed76561e25586",
+          "md5": "5f9534739e1be9078879e8bed4eb2ab0",
+          "sha256": "a2d16ee01b0613358de696329c9836e1a39dc3cba7c40205bc262b5fbb9be5a2"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5f9534739e1be9078879e8bed4eb2ab0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 51804,
+        "upload_time": "2022-10-06T12:23:34",
+        "upload_time_iso_8601": "2022-10-06T12:23:34.398020Z",
+        "url": "https://files.pythonhosted.org/packages/8f/18/8d79d8df3520e43005d9d4b61b78d2b1786f7061098b0b4ed76561e25586/panorama_backpack-0.1.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4945f577a3c61252594323c0797a1aafbabcdf6f0963fdc493711d45ba0506f1",
+          "md5": "8705d2f98127252fe6eba5a160701ee1",
+          "sha256": "4283902124e9f6858f9b7911f8e4f12c9382dafd954701fd1343f4fcee0da715"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8705d2f98127252fe6eba5a160701ee1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53148,
+        "upload_time": "2022-10-06T12:23:36",
+        "upload_time_iso_8601": "2022-10-06T12:23:36.689959Z",
+        "url": "https://files.pythonhosted.org/packages/49/45/f577a3c61252594323c0797a1aafbabcdf6f0963fdc493711d45ba0506f1/panorama-backpack-0.1.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.1.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f3038525d5be23d0605379a64c200c6932c5ebaa016517fc923cef281adcd187",
+          "md5": "03d57043038bf3ed058a748aa173cc5a",
+          "sha256": "f086ccdcade82e836bfa83ddccee5972ece4eedbba74545b7082e21bad88d1fc"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.1.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "03d57043038bf3ed058a748aa173cc5a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 51763,
+        "upload_time": "2022-10-13T13:01:43",
+        "upload_time_iso_8601": "2022-10-13T13:01:43.588907Z",
+        "url": "https://files.pythonhosted.org/packages/f3/03/8525d5be23d0605379a64c200c6932c5ebaa016517fc923cef281adcd187/panorama_backpack-0.1.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "19afaa13f59b548d481e78cfa32c41ba25b10a16c7768773e15cff69a6249093",
+          "md5": "7bdbbd3baf686cbecb4a692957deb417",
+          "sha256": "49759257e100145837503165cb684ca9f36c2e43ce5c498bdb8583cb96b41c88"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.1.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "7bdbbd3baf686cbecb4a692957deb417",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53021,
+        "upload_time": "2022-10-13T13:01:46",
+        "upload_time_iso_8601": "2022-10-13T13:01:46.139743Z",
+        "url": "https://files.pythonhosted.org/packages/19/af/aa13f59b548d481e78cfa32c41ba25b10a16c7768773e15cff69a6249093/panorama-backpack-0.1.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "86c014db75be2d4a12dc4b59e87f9708d6f7a855840268341a60a2d334af9551",
+          "md5": "391e75eca88c1d5a07a83db0343b2ffb",
+          "sha256": "126395cb53c087ae4dcee2866cf92908df056b91aad969f96e53a0cdc3d20df4"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "391e75eca88c1d5a07a83db0343b2ffb",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 52144,
+        "upload_time": "2022-11-17T15:10:56",
+        "upload_time_iso_8601": "2022-11-17T15:10:56.418598Z",
+        "url": "https://files.pythonhosted.org/packages/86/c0/14db75be2d4a12dc4b59e87f9708d6f7a855840268341a60a2d334af9551/panorama_backpack-0.2.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9dbb45e0c22d4159754a50aa8bf6b5d79b0ce1ab6217948567a595edeede6d42",
+          "md5": "d08a853eb80b41b583c37c427fca1924",
+          "sha256": "25c9169f87c8637547721dc55e854d946c7d5fa475613792c1d2fc0c996e51db"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "d08a853eb80b41b583c37c427fca1924",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53211,
+        "upload_time": "2022-11-17T15:11:04",
+        "upload_time_iso_8601": "2022-11-17T15:11:04.853410Z",
+        "url": "https://files.pythonhosted.org/packages/9d/bb/45e0c22d4159754a50aa8bf6b5d79b0ce1ab6217948567a595edeede6d42/panorama-backpack-0.2.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d2a6387c9b0dd3c2dd7c1701810fe99278dd99eba28dc0ea675f80eef2e7cfcf",
+          "md5": "d6e0c7e59c593dfc7f0045d7cc302a46",
+          "sha256": "d36ed644905b0a4dbeb267274a0a5f5b347680a97dceacb2511718766c6a010d"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "d6e0c7e59c593dfc7f0045d7cc302a46",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 52158,
+        "upload_time": "2022-11-28T19:08:03",
+        "upload_time_iso_8601": "2022-11-28T19:08:03.448798Z",
+        "url": "https://files.pythonhosted.org/packages/d2/a6/387c9b0dd3c2dd7c1701810fe99278dd99eba28dc0ea675f80eef2e7cfcf/panorama_backpack-0.2.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "333ba1e02b1e6179096b2352ac710d01eeefae0293df096927af30481e0d21af",
+          "md5": "b3b0b2b30a090603b1e8e19de5f7355d",
+          "sha256": "783fe1b4afdbe4a641dd08f3f87f62842ec9986fc9d5911df15d80a9b396fb22"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "b3b0b2b30a090603b1e8e19de5f7355d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 53280,
+        "upload_time": "2022-11-28T19:08:05",
+        "upload_time_iso_8601": "2022-11-28T19:08:05.875084Z",
+        "url": "https://files.pythonhosted.org/packages/33/3b/a1e02b1e6179096b2352ac710d01eeefae0293df096927af30481e0d21af/panorama-backpack-0.2.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7eb9107aadd926eec58622d22a339c0e8b885aa6a5738f685c2aa3f44548174a",
+          "md5": "185707a948123a0e5e920737a3e3b223",
+          "sha256": "a14fdd7069a4eb0720402bd485306d6bd562ce8e1d336e2300426477e61ea1d6"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "185707a948123a0e5e920737a3e3b223",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 52763,
+        "upload_time": "2023-01-28T09:57:13",
+        "upload_time_iso_8601": "2023-01-28T09:57:13.558976Z",
+        "url": "https://files.pythonhosted.org/packages/7e/b9/107aadd926eec58622d22a339c0e8b885aa6a5738f685c2aa3f44548174a/panorama_backpack-0.2.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "dd1298474f6d844cc69e4487b795ffb57d69db65fe6db99340f9a393a4385222",
+          "md5": "86ea031d621e618c2089bb9ccaa9e61b",
+          "sha256": "422837c0f8f805b7480addaa64142e3d0215d8466fa5144db8003596f1218f6b"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "86ea031d621e618c2089bb9ccaa9e61b",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 54062,
+        "upload_time": "2023-01-28T09:57:16",
+        "upload_time_iso_8601": "2023-01-28T09:57:16.085903Z",
+        "url": "https://files.pythonhosted.org/packages/dd/12/98474f6d844cc69e4487b795ffb57d69db65fe6db99340f9a393a4385222/panorama-backpack-0.2.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7f4d6f55ae434cf2b0d64520fac21a5fd07d47f3cc6492f9ca38c2824ac8d46a",
+          "md5": "c42f933f4d47545af54eb54e2778e793",
+          "sha256": "ae3ca1da8b69bf25d879dee4549edeb3357a0bab2592f1ccb694f03b889a884d"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c42f933f4d47545af54eb54e2778e793",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53315,
+        "upload_time": "2023-02-06T14:34:35",
+        "upload_time_iso_8601": "2023-02-06T14:34:35.115355Z",
+        "url": "https://files.pythonhosted.org/packages/7f/4d/6f55ae434cf2b0d64520fac21a5fd07d47f3cc6492f9ca38c2824ac8d46a/panorama_backpack-0.2.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ba46dbd672c0b49a087ebe2268ea22759c17f9c2666b620885c9732aab0cb4bc",
+          "md5": "defa08628b99c326ec2b6c213ebb2ccc",
+          "sha256": "90857dcf0f670c162ff054cae8d68325897440acea7e00f9137698cb3733a0a0"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "defa08628b99c326ec2b6c213ebb2ccc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 54693,
+        "upload_time": "2023-02-06T14:34:37",
+        "upload_time_iso_8601": "2023-02-06T14:34:37.688347Z",
+        "url": "https://files.pythonhosted.org/packages/ba/46/dbd672c0b49a087ebe2268ea22759c17f9c2666b620885c9732aab0cb4bc/panorama-backpack-0.2.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ef1eba517c2420eb6a72cf805de477b652055a48f9f2969e66eae3b95e0f8eec",
+          "md5": "87e7a6494eb967d2485534ffa9ef66fd",
+          "sha256": "7ed617b6a9a4d3412ccd3e85a12324d185d0fe6bd15d11e0c3c3bd803dfcf51f"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "87e7a6494eb967d2485534ffa9ef66fd",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53309,
+        "upload_time": "2023-02-06T14:44:52",
+        "upload_time_iso_8601": "2023-02-06T14:44:52.024621Z",
+        "url": "https://files.pythonhosted.org/packages/ef/1e/ba517c2420eb6a72cf805de477b652055a48f9f2969e66eae3b95e0f8eec/panorama_backpack-0.2.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c108cfbadb85da3add45a83cd93451ef55fbda93e370e38a6c78a3d97456be68",
+          "md5": "4810392c7b528a3542e914e4c8a3a72c",
+          "sha256": "e25b586eed0eee9025b6bb8655a625689ce60fd29b432ea3578c576d13219389"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4810392c7b528a3542e914e4c8a3a72c",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 54661,
+        "upload_time": "2023-02-06T14:44:54",
+        "upload_time_iso_8601": "2023-02-06T14:44:54.030441Z",
+        "url": "https://files.pythonhosted.org/packages/c1/08/cfbadb85da3add45a83cd93451ef55fbda93e370e38a6c78a3d97456be68/panorama-backpack-0.2.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9b65dbd2e0fdd0dd6e56662a0a7f56a7f5c5947d7ebf91f10d5a0c42ceb3f0fd",
+          "md5": "c5d8bbf6171e620d7baecdb027106eed",
+          "sha256": "90f96b25c42816d750b50ecd94320612f4b36579ef938ec0dd3bab65d0621eab"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c5d8bbf6171e620d7baecdb027106eed",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53699,
+        "upload_time": "2023-02-10T11:53:04",
+        "upload_time_iso_8601": "2023-02-10T11:53:04.300133Z",
+        "url": "https://files.pythonhosted.org/packages/9b/65/dbd2e0fdd0dd6e56662a0a7f56a7f5c5947d7ebf91f10d5a0c42ceb3f0fd/panorama_backpack-0.2.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6a1a71d24bf6a71e5f5ce281172a7410b2841f941ebe9f97a94b37edce499fcc",
+          "md5": "02003d0c58bc33742f0a8faf2592be73",
+          "sha256": "66a90fe417eb30fe12fa4f266e1b1e83190309b51d1b13d5c4a05d48c557a566"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "02003d0c58bc33742f0a8faf2592be73",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55016,
+        "upload_time": "2023-02-10T11:53:06",
+        "upload_time_iso_8601": "2023-02-10T11:53:06.838796Z",
+        "url": "https://files.pythonhosted.org/packages/6a/1a/71d24bf6a71e5f5ce281172a7410b2841f941ebe9f97a94b37edce499fcc/panorama-backpack-0.2.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "118e44af76a4bd0bdcf7b84d52cbf6423677af1495c8972fa21a99a6d8a61d2d",
+          "md5": "5c7cfc6ed17d2f9d96561cff5147e184",
+          "sha256": "6e86424386845c352f1334ba9b1ddc5ec08692c70735793ba60489798200dc53"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "5c7cfc6ed17d2f9d96561cff5147e184",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53733,
+        "upload_time": "2023-02-10T11:58:06",
+        "upload_time_iso_8601": "2023-02-10T11:58:06.921582Z",
+        "url": "https://files.pythonhosted.org/packages/11/8e/44af76a4bd0bdcf7b84d52cbf6423677af1495c8972fa21a99a6d8a61d2d/panorama_backpack-0.2.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "f0d1658673fd131ce82524bd339785bbb0c8e3453680dc6036b5313db909b4aa",
+          "md5": "8ba25059ca562c592d5d59ccfd7dbe63",
+          "sha256": "594094646282348f6b0acfeda76d7eb348bae9fcdfd41698b43e3db8b9cff799"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "8ba25059ca562c592d5d59ccfd7dbe63",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55033,
+        "upload_time": "2023-02-10T11:58:10",
+        "upload_time_iso_8601": "2023-02-10T11:58:10.471475Z",
+        "url": "https://files.pythonhosted.org/packages/f0/d1/658673fd131ce82524bd339785bbb0c8e3453680dc6036b5313db909b4aa/panorama-backpack-0.2.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.2.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "409762a2bdcc32a34a2cc3b395652d56bdbf6a14ff5fe70f59a4b98d23ec61af",
+          "md5": "7a8cd357b9ad5c74f914ca5b280c9ff0",
+          "sha256": "7e6c4e45a611a4083e83a00bf077b82735a6cb81d912c6b23acf4903ef00a846"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.2.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7a8cd357b9ad5c74f914ca5b280c9ff0",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53764,
+        "upload_time": "2023-02-10T16:43:37",
+        "upload_time_iso_8601": "2023-02-10T16:43:37.971169Z",
+        "url": "https://files.pythonhosted.org/packages/40/97/62a2bdcc32a34a2cc3b395652d56bdbf6a14ff5fe70f59a4b98d23ec61af/panorama_backpack-0.2.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "640dfe406ebe204f38ad7189e94c88746d82a7b1a9f9d3b7b32d1f2172c07e27",
+          "md5": "127774feaad792dcad9012e1eb60e1ce",
+          "sha256": "99c29bd279a77260eb2c60f1d07fc48b0c4a406ededb46cc3fdd0ffe3bfc98b0"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.2.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "127774feaad792dcad9012e1eb60e1ce",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55063,
+        "upload_time": "2023-02-10T16:43:40",
+        "upload_time_iso_8601": "2023-02-10T16:43:40.539461Z",
+        "url": "https://files.pythonhosted.org/packages/64/0d/fe406ebe204f38ad7189e94c88746d82a7b1a9f9d3b7b32d1f2172c07e27/panorama-backpack-0.2.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.0": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ff6a4c6285ca565fc996d8d25cd76063c3abb1565f7c3d438166a73a8f896f9e",
+          "md5": "876b98f57924474acf021f666c8aa4ce",
+          "sha256": "a698162d87a0f31060db54060e81ff8a6cfb526083f3a9b4baad2aac59570cb9"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.3.0-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "876b98f57924474acf021f666c8aa4ce",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 53937,
+        "upload_time": "2023-03-30T17:13:53",
+        "upload_time_iso_8601": "2023-03-30T17:13:53.813092Z",
+        "url": "https://files.pythonhosted.org/packages/ff/6a/4c6285ca565fc996d8d25cd76063c3abb1565f7c3d438166a73a8f896f9e/panorama_backpack-0.3.0-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "190ab64f300b8e1339edef5377b90aa29be38fbe320d77f77653a2c78c9e339f",
+          "md5": "3193a6f67bf2d9e6168aa94c2b8b88c2",
+          "sha256": "5050f73da554b266f84b440276197c59062d7f8bbc1f10f1d2457009d4d3cfe6"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.3.0.tar.gz",
+        "has_sig": false,
+        "md5_digest": "3193a6f67bf2d9e6168aa94c2b8b88c2",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55210,
+        "upload_time": "2023-03-30T17:13:55",
+        "upload_time_iso_8601": "2023-03-30T17:13:55.737273Z",
+        "url": "https://files.pythonhosted.org/packages/19/0a/b64f300b8e1339edef5377b90aa29be38fbe320d77f77653a2c78c9e339f/panorama-backpack-0.3.0.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "49c0b2d148b18b4adad5c39d0570e7ea1fba7d295f4291c56573c9d2444e56b1",
+          "md5": "18cd39b39258b3ba0c5e07352610e882",
+          "sha256": "cf2163c63f268681ecb173138d6e11425987c58b6a757d63f779aaae70b382cc"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.3.1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "18cd39b39258b3ba0c5e07352610e882",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 54087,
+        "upload_time": "2023-03-30T22:25:13",
+        "upload_time_iso_8601": "2023-03-30T22:25:13.581766Z",
+        "url": "https://files.pythonhosted.org/packages/49/c0/b2d148b18b4adad5c39d0570e7ea1fba7d295f4291c56573c9d2444e56b1/panorama_backpack-0.3.1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "5f8e27010b54ec7ec89af1ebc8a759c54396f81dc14168ead567bc1935616a63",
+          "md5": "06936d63d8c4d8130cb52e9e7e5678fc",
+          "sha256": "541e75760be07235deb306406f62d80c9deabef5e914fcfa494909b05f9d99c2"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.3.1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "06936d63d8c4d8130cb52e9e7e5678fc",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55344,
+        "upload_time": "2023-03-30T22:25:16",
+        "upload_time_iso_8601": "2023-03-30T22:25:16.040144Z",
+        "url": "https://files.pythonhosted.org/packages/5f/8e/27010b54ec7ec89af1ebc8a759c54396f81dc14168ead567bc1935616a63/panorama-backpack-0.3.1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.3.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "100cf782d2e6aaa198568db2ca4d17d8a4bd9962afede2ae20cd68cd889f18de",
+          "md5": "7069195363570b85d2e2e95948c61808",
+          "sha256": "972ddcbde88824712af7063ce70a47d371782d8d548c8b502d0c848bc9af2328"
+        },
+        "downloads": -1,
+        "filename": "panorama_backpack-0.3.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "7069195363570b85d2e2e95948c61808",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.7",
+        "size": 54116,
+        "upload_time": "2023-03-30T23:12:03",
+        "upload_time_iso_8601": "2023-03-30T23:12:03.513181Z",
+        "url": "https://files.pythonhosted.org/packages/10/0c/f782d2e6aaa198568db2ca4d17d8a4bd9962afede2ae20cd68cd889f18de/panorama_backpack-0.3.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "39fcbe0472a8b42339e7af6b3c3f90fc96a9f34f3881daea54f02e3294e245e2",
+          "md5": "9e40d3e31c92e38f2adba4ed4d1dfc91",
+          "sha256": "3492482a61263c784f3b2ed9e7e3246aa099d95e7520f096ff4f8fd7c57e3659"
+        },
+        "downloads": -1,
+        "filename": "panorama-backpack-0.3.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "9e40d3e31c92e38f2adba4ed4d1dfc91",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.7",
+        "size": 55381,
+        "upload_time": "2023-03-30T23:12:06",
+        "upload_time_iso_8601": "2023-03-30T23:12:06.596474Z",
+        "url": "https://files.pythonhosted.org/packages/39/fc/be0472a8b42339e7af6b3c3f90fc96a9f34f3881daea54f02e3294e245e2/panorama-backpack-0.3.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "100cf782d2e6aaa198568db2ca4d17d8a4bd9962afede2ae20cd68cd889f18de",
+        "md5": "7069195363570b85d2e2e95948c61808",
+        "sha256": "972ddcbde88824712af7063ce70a47d371782d8d548c8b502d0c848bc9af2328"
+      },
+      "downloads": -1,
+      "filename": "panorama_backpack-0.3.2-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "7069195363570b85d2e2e95948c61808",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 54116,
+      "upload_time": "2023-03-30T23:12:03",
+      "upload_time_iso_8601": "2023-03-30T23:12:03.513181Z",
+      "url": "https://files.pythonhosted.org/packages/10/0c/f782d2e6aaa198568db2ca4d17d8a4bd9962afede2ae20cd68cd889f18de/panorama_backpack-0.3.2-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "39fcbe0472a8b42339e7af6b3c3f90fc96a9f34f3881daea54f02e3294e245e2",
+        "md5": "9e40d3e31c92e38f2adba4ed4d1dfc91",
+        "sha256": "3492482a61263c784f3b2ed9e7e3246aa099d95e7520f096ff4f8fd7c57e3659"
+      },
+      "downloads": -1,
+      "filename": "panorama-backpack-0.3.2.tar.gz",
+      "has_sig": false,
+      "md5_digest": "9e40d3e31c92e38f2adba4ed4d1dfc91",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 55381,
+      "upload_time": "2023-03-30T23:12:06",
+      "upload_time_iso_8601": "2023-03-30T23:12:06.596474Z",
+      "url": "https://files.pythonhosted.org/packages/39/fc/be0472a8b42339e7af6b3c3f90fc96a9f34f3881daea54f02e3294e245e2/panorama-backpack-0.3.2.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
