@@ -28,4 +28,4 @@ def update_all(index, split_cnt=10):
       print('=================================================')
 
 if __name__ == '__main__':
-  update_all(sys.argv[1], split_cnt=sys.argv[2])
+  update_all(int(sys.argv[1]), split_cnt=int(sys.argv[2]))
