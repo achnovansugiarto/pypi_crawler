@@ -1,0 +1,487 @@
+{
+  "info": {
+    "author": "",
+    "author_email": "david lion <david.lion@yscope.com>",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: Apache Software License"
+    ],
+    "description": "# CLP Python Logging Library\n\nThis is a Python `logging` library meant to supplement [CLP (Compressed Log Processor)][0].\nLogs are compressed in a streaming fashion into CLP's Internal Representation (IR) format before written to disk.\nMore details are described in this [Uber's blog][1].\n\nLogs compressed in IR format can be viewed in a [log viewer][2] or programmatically analyzed using\nAPIs provided here. They can also be decompressed back into plain-text log files using [CLP][0] (in a future release).\n\nTo achieve the best compression ratio, CLP should be used to compress large\nbatches of logs, one batch at a time. However, individual log\nfiles are generally small and are generated across a long period of time.\n\nThis logging library helps solve this problem by logging directly in CLP's\nInternal Representation (IR). A log created with a CLP logging handler is first\nparsed and then appended to a compressed output stream in IR form.\nSee [README-protocol.md](README-protocol.md) for more details on the format of\nCLP IR.\n\nThese log files containing the compressed CLP IR streams can then all be\ningested into CLP together at a later time.\n\n## Quick Start\n\nThe package is hosted with pypi (https://pypi.org/project/clp-logging/), so it\ncan be installed with `pip`:\n\n`python3 -m pip install --upgrade clp-logging`\n\n## Logger handlers\n\n### CLPStreamHandler\n\n- Writes encoded logs directly to a stream\n\n### CLPFileHandler\n\n- Simple wrapper around CLPStreamHandler that calls open\n\n#### Example: CLPFileHandler\n\n```python\nimport logging\nfrom pathlib import Path\nfrom clp_logging.handlers import CLPFileHandler\n\nclp_handler = CLPFileHandler(Path(\"example.clp.zst\"))\nlogger = logging.getLogger(__name__)\nlogger.addHandler(clp_handler)\nlogger.warn(\"example warning\")\n```\n\n### CLPSockHandler + CLPSockListener\n\nThis library also supports multiple processes writing to the same log file.\nIn this case, all logging processes write to a listener server process through a TCP socket.\nThe socket name is the log file path passed to CLPSockHandler with a \".sock\" suffix.\n\nA CLPSockListener can be explicitly created (and will run as a daemon) by calling:\n `CLPSockListener.fork(log_path, sock_path, timezone, timestamp_format)`.\nAlternatively CLPSockHandlers can transparently start an associated CLPSockListener\nby calling `CLPSockHandler` with `create_listener=True`.\n\nCLPSockListener must be explicitly stopped once logging is completed.\nThere are two ways to stop the listener process:\n\n- Calling `stop_listener()` from an existing handler, e.g., `clp_handler.stop_listener()`, or from a new handler with the same log path, e.g., `CLPSockHandler(Path(\"example.clp.zst\")).stop_listener()`\n- Kill the CLPSockListener process with SIGTERM\n\n#### Example: CLPSockHandler + CLPSockListener\n\nIn the handler processes or threads:\n\n```python\nimport logging\nfrom pathlib import Path\nfrom clp_logging.handlers import CLPSockHandler\n\nclp_handler = CLPSockHandler(Path(\"example.clp.zst\"), create_listener=True)\nlogger = logging.getLogger(__name__)\nlogger.addHandler(clp_handler)\nlogger.warn(\"example warning\")\n```\n\nIn a single process or thread once logging is completed:\n\n```python\nfrom pathlib import Path\nfrom clp_logging.handlers import CLPSockHandler\n\nCLPSockHandler(Path(\"example.clp.zst\")).stop_listener()\n```\n\n## CLP readers (decoders)\n\n### CLPStreamReader\n\n- Read/decode any arbitrary stream\n- Can be used as an iterator that returns each log message as an object\n- Can skip n logs: `clp_reader.skip_nlogs(N)`\n- Can skip to first log after given time (since unix epoch):\n  - `clp_reader.skip_to_time(TIME)`\n\n### CLPFileReader\n\n- Simple wrapper around CLPStreamHandler that calls open\n\n#### Example code: CLPFileReader\n\n```python\nfrom pathlib import Path\nfrom typing import List\n\nfrom clp_logging.readers import CLPFileReader, Log\n\n# create a list of all Log objects\nlog_objects: List[Log] = []\nwith CLPFileReader(Path(\"example.clp.zst\")) as clp_reader:\n    for log in clp_reader:\n        log_objects.append(log)\n```\n\n### CLPSegmentStreaming\n\n* Classes inheriting CLPBaseReader are only capable of reading a single CLP IR stream from start to finish. This is required as to know the timestamp of an individual log, the starting timestamp (from the IR stream preamble) and all timestamp deltas up to that log must be known. In scenarios where a IR stream is periodically uploaded in chunks, users would need to either continuously read the entire stream or re-read the entire stream from the start.\n* The CLPSegmentStreaming class has the ability to take an input IR stream and segment it, outputting multiple independent IR streams. This makes it possible to read arbitrary segments of the original input IR stream without needing to decode it from the start.\n* In technical terms, the segment streaming reader allows the read operation to start from a non-zero offset, and streams the legal encoded logs from one stream to another.\n* Each read call will return an encoded metadata which can be used to resume from the current call.S\n\n#### Example code: CLPSegmentStreaming\n\n```python\nfrom clp_logging.readers import CLPSegmentStreaming\nfrom clp_logging.protocol import Metadata\n\nsegment_idx: int = 0\nsegment_max_size: int = 8192\noffset: int = 0\nmetadata: Metadata = None\nwhile True:\n\tbytes_read: int\n\twith open(\"example.clp\", \"rb\") as fin, open(f\"{segment_idx}.clp\", \"wb\") as fout:\n\t\tbytes_read, metadata = CLPSegmentStreaming.read(\n\t\t\tfin,\n\t\t\tfout,\n\t\t\toffset=offset,\n\t\t\tmax_bytes_to_write=segment_max_size,\n\t\t\tmetadata=metadata\n\t\t)\n\t\tsegment_idx += 1\n\t\toffset += bytes_read\n\tif metadata == None:\n\t\tbreak\n```\n\nIn the example code provided, \"example.clp\" is streamed into segments named \"0.clp\", \"1.clp\", and so on. Each segment is smaller than 8192 bytes and can be decoded independently.\n\n## Log level timeout feature: CLPLogLevelTimeout\n\nAll log handlers support a configurable timeout feature. A (user configurable)\ntimeout will be scheduled based on logs' logging level (verbosity) that will\nflush the zstandard frame and allow users to run arbitrary code.\nThis feature allows users to automatically perform log related tasks, such as\nperiodically uploading their logs for storage. By setting the timeout in\nresponse to the logs' logging level the responsiveness of a task can be\nadjusted based on the severity of logging level seen.\nAn additional timeout is always triggered on closing the logging handler.\n\nSee the class documentation for specific details.\n\n#### Example code: CLPLogLevelTimeout\n\n```python\nimport logging\nfrom pathlib import Path\nfrom clp_logging.handlers import CLPLogLevelTimeout, CLPSockHandler\n\nclass LogTimeoutUploader:\n    # Store relevent information/objects to carry out the timeout task\n    def __init__(self, log_path: Path) -> None:\n        self.log_path: Path = log_path\n        return\n\n    # Create any methods necessary to carry out the timeout task\n    def upload_log(self) -> None:\n        # upload the logs to the cloud\n        return\n\n    def timeout(self) -> None:\n        self.upload_log()\n\nlog_path: Path = Path(\"example.clp.zst\")\nuploader = LogTimeoutUploader(log_path)\nloglevel_timeout = CLPLogLevelTimeout(uploader.timeout)\nclp_handler = CLPSockHandler(log_path, create_listener=True, loglevel_timeout=loglevel_timeout)\nlogging.getLogger(__name__).addHandler(clp_handler)\n```\n\n## Compatibility\n\nTested on Python 3.6 and 3.8 and should work on any newer version.\nBuilt/packaged on Python 3.8 for convenience regarding type annotation.\n\n## Building/Packaging\n\n1. Create and enter a virtual environment:\n   `python3.8 -m venv venv; . ./venv/bin/activate`\n2. Install development dependencies:\n   `pip install -r requirements-dev.txt`\n3. Build:\n   `python -m build`\n\n## Testing\n\nNote the baseline comparison logging handler and the CLP handler both get\nunique timestamps. It is possible for these timestamps to differ, which will\nresult in a test reporting a false positive error.\n\n1. Create and enter a virtual environment:\n   `python -m venv venv; .  ./venv/bin/activate`\n2. Install development dependencies:\n   `pip install -r requirements-dev.txt`\n3. Install:\n   `pip install dist/clp_logging-*-py3-none-any.whl` or `pip install -e .`\n4. Run unittest:\n   `python -m unittest -bv`\n\n## Contributing\n\nEnsure to run `mypy` and `black` (found in\n[requirements-dev.txt](requirements-dev.txt)) during development to ensure\nsmooth pull requests.\n\n[0]: https://github.com/y-scope/clp\n[1]: https://www.uber.com/blog/reducing-logging-cost-by-two-orders-of-magnitude-using-clp/\n[2]: https://github.com/y-scope/yscope-log-viewer\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "",
+    "keywords": "",
+    "license": "Apache License 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "clp-logging",
+    "package_url": "https://pypi.org/project/clp-logging/",
+    "platform": null,
+    "project_url": "https://pypi.org/project/clp-logging/",
+    "project_urls": {
+      "Bug Tracker": "https://github.com/y-scope/clp-loglib-py/issues",
+      "Homepage": "https://github.com/y-scope/clp-loglib-py"
+    },
+    "release_url": "https://pypi.org/project/clp-logging/0.0.9/",
+    "requires_dist": [
+      "python-dateutil (>=2.7.0)",
+      "typing-extensions (>=4.1.1)",
+      "zstandard (>=0.18.0)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "Logging/encoding/decoding using CLP's IR stream format",
+    "version": "0.0.9",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 17543660,
+  "releases": {
+    "0.0.1": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "752f873b32fc2fd6cad375254ec3a66e11efd8ff9c115616ac7318997fbc99a4",
+          "md5": "80e44c88f38e11b0c3ee8ae52cb17085",
+          "sha256": "5590cf1a9465c83c6218a45e4bf545dfd03ca14857fbe8d5154c51fe6853ef17"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.1-1-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "80e44c88f38e11b0c3ee8ae52cb17085",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21569,
+        "upload_time": "2022-10-27T18:52:34",
+        "upload_time_iso_8601": "2022-10-27T18:52:34.106508Z",
+        "url": "https://files.pythonhosted.org/packages/75/2f/873b32fc2fd6cad375254ec3a66e11efd8ff9c115616ac7318997fbc99a4/clp_logging-0.0.1-1-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "3edf3ed66f8f8cfc1df33a1dfcc262b7f7b4fea7676e90f1a5054e019232fe79",
+          "md5": "946f7fc5d4b35c3126ec92183163d60d",
+          "sha256": "f8c4b3612d6b7de245c937fdb76bf393ea0b31846e5d6fae8e3f5a5b11902606"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.1-1.tar.gz",
+        "has_sig": false,
+        "md5_digest": "946f7fc5d4b35c3126ec92183163d60d",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 23925,
+        "upload_time": "2022-10-27T18:54:21",
+        "upload_time_iso_8601": "2022-10-27T18:54:21.965837Z",
+        "url": "https://files.pythonhosted.org/packages/3e/df/3ed66f8f8cfc1df33a1dfcc262b7f7b4fea7676e90f1a5054e019232fe79/clp_logging-0.0.1-1.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.2": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "2e384de27bf360b9e8ec6133c775bf3b9fbdb2693ee81b779a120d78b80935d8",
+          "md5": "9023ca85d676ebaede884ecfbc599051",
+          "sha256": "b680d1bb52116d30e68072fe1739ee5408cd9eb31eadf512d44d2c65fbea2b48"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.2-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "9023ca85d676ebaede884ecfbc599051",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21815,
+        "upload_time": "2022-10-28T17:50:35",
+        "upload_time_iso_8601": "2022-10-28T17:50:35.189570Z",
+        "url": "https://files.pythonhosted.org/packages/2e/38/4de27bf360b9e8ec6133c775bf3b9fbdb2693ee81b779a120d78b80935d8/clp_logging-0.0.2-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "27f807f9c41f80e49faa7050503a0eb6076440dec048ba1de0772dfdca358e23",
+          "md5": "85df684f99a1c7f2c977e835da21dad5",
+          "sha256": "3309f90b6968a552195797cc286144c72c2d46c7e224ca86d1ebe53b07f18d9b"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.2.tar.gz",
+        "has_sig": false,
+        "md5_digest": "85df684f99a1c7f2c977e835da21dad5",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 24280,
+        "upload_time": "2022-10-28T17:50:37",
+        "upload_time_iso_8601": "2022-10-28T17:50:37.173544Z",
+        "url": "https://files.pythonhosted.org/packages/27/f8/07f9c41f80e49faa7050503a0eb6076440dec048ba1de0772dfdca358e23/clp_logging-0.0.2.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.3": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "c6e082171cf44969fded91a3114390c5bf12d8359f5e96ebc3314e8b169589e0",
+          "md5": "52ce3636be0be0f0e31d3fc948b9496a",
+          "sha256": "370f0fb80d3bbeb1cbce6e23e02db76c70a83c566b94789648a36e761d748bd5"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.3-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "52ce3636be0be0f0e31d3fc948b9496a",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21815,
+        "upload_time": "2022-12-09T07:42:28",
+        "upload_time_iso_8601": "2022-12-09T07:42:28.943816Z",
+        "url": "https://files.pythonhosted.org/packages/c6/e0/82171cf44969fded91a3114390c5bf12d8359f5e96ebc3314e8b169589e0/clp_logging-0.0.3-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4eb7758131b68e26d1056df1fb6e54ec0870f59a3ace13f1ee3ed033a988251d",
+          "md5": "97d5a285af80c181d40514f13111f586",
+          "sha256": "7fec95f50d8c37d630db40a046dcec87129b315130def9428a0a7c8cd0bde5e2"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.3.tar.gz",
+        "has_sig": false,
+        "md5_digest": "97d5a285af80c181d40514f13111f586",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 24282,
+        "upload_time": "2022-12-09T07:42:30",
+        "upload_time_iso_8601": "2022-12-09T07:42:30.444164Z",
+        "url": "https://files.pythonhosted.org/packages/4e/b7/758131b68e26d1056df1fb6e54ec0870f59a3ace13f1ee3ed033a988251d/clp_logging-0.0.3.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.4": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "cf5e140fac7aa306d8ec9d99166af5dcf0d444f40f8a4324a9eabce6b26e2d46",
+          "md5": "691895472e6635f4c623838f9e6f14a7",
+          "sha256": "998bb0ae9511311f412041c9f771abd682f76140b22dd8bff6bd866fc36d952e"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.4-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "691895472e6635f4c623838f9e6f14a7",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 21819,
+        "upload_time": "2022-12-14T22:31:27",
+        "upload_time_iso_8601": "2022-12-14T22:31:27.415090Z",
+        "url": "https://files.pythonhosted.org/packages/cf/5e/140fac7aa306d8ec9d99166af5dcf0d444f40f8a4324a9eabce6b26e2d46/clp_logging-0.0.4-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "8520d0fd222e580bd48ca02cfa0e51c2bb7a8cb415089a8f6a5562d3e573120f",
+          "md5": "582b362081004b61f8d9a9c5a9e3d369",
+          "sha256": "351dc9770354bc93a31696a40c6001c87e9ab9cbcf63f7d656b4e88cdec27631"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.4.tar.gz",
+        "has_sig": false,
+        "md5_digest": "582b362081004b61f8d9a9c5a9e3d369",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 25320,
+        "upload_time": "2022-12-14T22:31:28",
+        "upload_time_iso_8601": "2022-12-14T22:31:28.876386Z",
+        "url": "https://files.pythonhosted.org/packages/85/20/d0fd222e580bd48ca02cfa0e51c2bb7a8cb415089a8f6a5562d3e573120f/clp_logging-0.0.4.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.5": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "b82dc282071c685d291894bdf212bc1095d9064ce2f9033fcdad932e9e78da58",
+          "md5": "50e2f499624d4553e79faacabdc04001",
+          "sha256": "f3750eb8542bb23c75976dd17f4033724a5d8fb9dd59692a53f217527e19cd70"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.5-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "50e2f499624d4553e79faacabdc04001",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 23232,
+        "upload_time": "2022-12-19T17:18:03",
+        "upload_time_iso_8601": "2022-12-19T17:18:03.113456Z",
+        "url": "https://files.pythonhosted.org/packages/b8/2d/c282071c685d291894bdf212bc1095d9064ce2f9033fcdad932e9e78da58/clp_logging-0.0.5-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "e549a8d8dae625a58735b23b448dbaab5071152493a9493299e9d050edd086cd",
+          "md5": "4780ced704d07c4b2800442075078139",
+          "sha256": "f428dbeca0bd159242b6845c7290c67855d1430012914452159694a2b85180e4"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.5.tar.gz",
+        "has_sig": false,
+        "md5_digest": "4780ced704d07c4b2800442075078139",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 27287,
+        "upload_time": "2022-12-19T17:18:04",
+        "upload_time_iso_8601": "2022-12-19T17:18:04.780760Z",
+        "url": "https://files.pythonhosted.org/packages/e5/49/a8d8dae625a58735b23b448dbaab5071152493a9493299e9d050edd086cd/clp_logging-0.0.5.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.6": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "997cea873bc83bb4595b4a7e7be418652493ce30f89679b91fc165fcf88f365b",
+          "md5": "b74072e0a7fcd52893c6e12b223310de",
+          "sha256": "bb574b03dffe825bb011d6a77a3b44982cce5368b74a09671985386005dd09e0"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.6-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b74072e0a7fcd52893c6e12b223310de",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 23500,
+        "upload_time": "2023-01-24T22:30:18",
+        "upload_time_iso_8601": "2023-01-24T22:30:18.848951Z",
+        "url": "https://files.pythonhosted.org/packages/99/7c/ea873bc83bb4595b4a7e7be418652493ce30f89679b91fc165fcf88f365b/clp_logging-0.0.6-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "6e15928cd401d6c11b933b15aa1518417a440a5802dcee6fa2fc86e5eb76c28f",
+          "md5": "683e8dea197d54abc866f3e0cc40cad1",
+          "sha256": "c47cfb58fda3272cb14cb76ea0a1e9a9cb44b1efa31a49d6aac218168997c077"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.6.tar.gz",
+        "has_sig": false,
+        "md5_digest": "683e8dea197d54abc866f3e0cc40cad1",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 27576,
+        "upload_time": "2023-01-24T22:30:20",
+        "upload_time_iso_8601": "2023-01-24T22:30:20.372969Z",
+        "url": "https://files.pythonhosted.org/packages/6e/15/928cd401d6c11b933b15aa1518417a440a5802dcee6fa2fc86e5eb76c28f/clp_logging-0.0.6.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.7": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "7297c45d498f4fda4698bb4dd1a5c3b6ccbcf4bd1c8d1dd82ec8517a40192c9d",
+          "md5": "c49c473972e948b1b8c65e1111c6f204",
+          "sha256": "d99d2e1563b0febd306e8181d1ac1e18cfb36db0d3f5ddb5c6e1f31d3f548b78"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.7-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "c49c473972e948b1b8c65e1111c6f204",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 23535,
+        "upload_time": "2023-02-22T01:11:46",
+        "upload_time_iso_8601": "2023-02-22T01:11:46.586882Z",
+        "url": "https://files.pythonhosted.org/packages/72/97/c45d498f4fda4698bb4dd1a5c3b6ccbcf4bd1c8d1dd82ec8517a40192c9d/clp_logging-0.0.7-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "9731935c3a52af1b9336c1a72f5bb90f3efa254f9320252318bc897197ff340e",
+          "md5": "c35bc59327b5a87c1b0bc28767cdfdc8",
+          "sha256": "a7f8432b04143700f3ac173624e4cd41a57ba5110ae0ca718c1127b4caa1de3d"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.7.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c35bc59327b5a87c1b0bc28767cdfdc8",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 27772,
+        "upload_time": "2023-02-22T01:11:48",
+        "upload_time_iso_8601": "2023-02-22T01:11:48.388653Z",
+        "url": "https://files.pythonhosted.org/packages/97/31/935c3a52af1b9336c1a72f5bb90f3efa254f9320252318bc897197ff340e/clp_logging-0.0.7.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.8": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d9a2ea200adaebfc71fbcec67f62efea1d95a1954600cbb4ba94bdf95ce56aa8",
+          "md5": "b6bae06a93c8c664c2e711b1fd7b081d",
+          "sha256": "56c9995fc54188fb100c406887cfc10380aaaa919e05cf1ccb9a3c1d21fd836b"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.8-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "b6bae06a93c8c664c2e711b1fd7b081d",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 26592,
+        "upload_time": "2023-03-21T03:48:28",
+        "upload_time_iso_8601": "2023-03-21T03:48:28.290870Z",
+        "url": "https://files.pythonhosted.org/packages/d9/a2/ea200adaebfc71fbcec67f62efea1d95a1954600cbb4ba94bdf95ce56aa8/clp_logging-0.0.8-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "ddbdaf5a50f7c0a9e41425b939c8bf1da40f71a32554e65990e6ce483453109e",
+          "md5": "615620a40d17a88fd02f038de1782542",
+          "sha256": "8dc4819404fb8f7c13f7c27570e3a6d20db6c7db6a23a822830f830864c66f07"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.8.tar.gz",
+        "has_sig": false,
+        "md5_digest": "615620a40d17a88fd02f038de1782542",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 32944,
+        "upload_time": "2023-03-21T03:48:30",
+        "upload_time_iso_8601": "2023-03-21T03:48:30.205856Z",
+        "url": "https://files.pythonhosted.org/packages/dd/bd/af5a50f7c0a9e41425b939c8bf1da40f71a32554e65990e6ce483453109e/clp_logging-0.0.8.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ],
+    "0.0.9": [
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "4f368382f0324fb4d046a738127ae68adad1c645f2f484396b64139e042f13cf",
+          "md5": "89756a5bf5e729d6e5736660ef0d40e4",
+          "sha256": "ddd181ea101e4c9736e883e6725d7f33aebdd99b4a0b916ee1879a9c38e809e3"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.9-py3-none-any.whl",
+        "has_sig": false,
+        "md5_digest": "89756a5bf5e729d6e5736660ef0d40e4",
+        "packagetype": "bdist_wheel",
+        "python_version": "py3",
+        "requires_python": ">=3.6",
+        "size": 29964,
+        "upload_time": "2023-04-01T23:15:32",
+        "upload_time_iso_8601": "2023-04-01T23:15:32.017915Z",
+        "url": "https://files.pythonhosted.org/packages/4f/36/8382f0324fb4d046a738127ae68adad1c645f2f484396b64139e042f13cf/clp_logging-0.0.9-py3-none-any.whl",
+        "yanked": false,
+        "yanked_reason": null
+      },
+      {
+        "comment_text": "",
+        "digests": {
+          "blake2b_256": "d8d3d67b203d2bc9329bed6df77031600614a77b336841bacc10f9a0663dac26",
+          "md5": "c03bb776eeec85a0ac86d44041258926",
+          "sha256": "f45f1593cd6e68c8a559f01807c6ef44282293cab65ab90993702d846181fae7"
+        },
+        "downloads": -1,
+        "filename": "clp_logging-0.0.9.tar.gz",
+        "has_sig": false,
+        "md5_digest": "c03bb776eeec85a0ac86d44041258926",
+        "packagetype": "sdist",
+        "python_version": "source",
+        "requires_python": ">=3.6",
+        "size": 37923,
+        "upload_time": "2023-04-01T23:15:34",
+        "upload_time_iso_8601": "2023-04-01T23:15:34.112051Z",
+        "url": "https://files.pythonhosted.org/packages/d8/d3/d67b203d2bc9329bed6df77031600614a77b336841bacc10f9a0663dac26/clp_logging-0.0.9.tar.gz",
+        "yanked": false,
+        "yanked_reason": null
+      }
+    ]
+  },
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4f368382f0324fb4d046a738127ae68adad1c645f2f484396b64139e042f13cf",
+        "md5": "89756a5bf5e729d6e5736660ef0d40e4",
+        "sha256": "ddd181ea101e4c9736e883e6725d7f33aebdd99b4a0b916ee1879a9c38e809e3"
+      },
+      "downloads": -1,
+      "filename": "clp_logging-0.0.9-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "89756a5bf5e729d6e5736660ef0d40e4",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 29964,
+      "upload_time": "2023-04-01T23:15:32",
+      "upload_time_iso_8601": "2023-04-01T23:15:32.017915Z",
+      "url": "https://files.pythonhosted.org/packages/4f/36/8382f0324fb4d046a738127ae68adad1c645f2f484396b64139e042f13cf/clp_logging-0.0.9-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "d8d3d67b203d2bc9329bed6df77031600614a77b336841bacc10f9a0663dac26",
+        "md5": "c03bb776eeec85a0ac86d44041258926",
+        "sha256": "f45f1593cd6e68c8a559f01807c6ef44282293cab65ab90993702d846181fae7"
+      },
+      "downloads": -1,
+      "filename": "clp_logging-0.0.9.tar.gz",
+      "has_sig": false,
+      "md5_digest": "c03bb776eeec85a0ac86d44041258926",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 37923,
+      "upload_time": "2023-04-01T23:15:34",
+      "upload_time_iso_8601": "2023-04-01T23:15:34.112051Z",
+      "url": "https://files.pythonhosted.org/packages/d8/d3/d67b203d2bc9329bed6df77031600614a77b336841bacc10f9a0663dac26/clp_logging-0.0.9.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
