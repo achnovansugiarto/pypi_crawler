@@ -6,6 +6,7 @@ The package is listed in data/package_names.txt
 import sys
 import os
 import subprocess
+import tqdm
 
 PATH = "data/package_names.txt"
 SPLIT_PATH = "tmp"
@@ -34,7 +35,8 @@ def update_all(update, index, split_cnt=10):
     print(f"selected file: {file}")
     # Do update
     with open(f"{SPLIT_PATH}/{file}", "r") as f:
-        for pkg in map(lambda x: x.strip(), f):
+        pkgs = list(map(lambda x: x.strip(), f))
+        for pkg in tqdm.tqdm(pkgs):
             print(f"=============\t\t\t {pkg} \t\t\t================")
             update(pkg)
             print("=================================================")
