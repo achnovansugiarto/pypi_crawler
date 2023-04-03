@@ -1,0 +1,98 @@
+{
+  "info": {
+    "author": "Thomas Rausch",
+    "author_email": "thomas@localstack.cloud",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Development Status :: 5 - Production/Stable",
+      "License :: OSI Approved :: Apache Software License",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Topic :: Software Development :: Libraries",
+      "Topic :: Utilities"
+    ],
+    "description": "localstack-plugin-loader\n========================\n\n<p>\n  <a href=\"https://github.com/localstack/localstack-plugin-loader/actions/workflows/build.yml\"><img alt=\"CI badge\" src=\"https://github.com/localstack/localstack-plugin-loader/actions/workflows/build.yml/badge.svg\"></img></a>\n  <a href=\"https://pypi.org/project/localstack-plugin-loader/\"><img alt=\"PyPI Version\" src=\"https://img.shields.io/pypi/v/localstack-plugin-loader?color=blue\"></a>\n  <a href=\"https://img.shields.io/pypi/l/localstack-plugin-loader.svg\"><img alt=\"PyPI License\" src=\"https://img.shields.io/pypi/l/localstack-plugin-loader.svg\"></a>\n  <a href=\"https://github.com/psf/black\"><img alt=\"Code style: black\" src=\"https://img.shields.io/badge/code%20style-black-000000.svg\"></a>\n</p>\n\nlocalstack-plugin-loader is the dynamic code loading framework used in [LocalStack](https://github.com/localstack/localstack).\n\n\nOverview\n--------\n\nThe localstack-plugin-loader builds a higher-level plugin mechanism around [Python's entry point mechanism](https://packaging.python.org/specifications/entry-points/).\nIt provides tools to load plugins from entry points at run time, and to discover entry points from plugins at build time (so you don't have to declare entry points statically in your `setup.py`).\n\n### Core concepts\n\n* `PluginSpec`: describes a `Plugin`. Each plugin has a namespace, a unique name in that namespace, and a `PluginFactory` (something that creates `Plugin` the spec is describing.\n  In the simplest case, that can just be the Plugin's class).\n* `Plugin`: an object that exposes a `should_load` and `load` method.\n  Note that it does not function as a domain object (it does not hold the plugins lifecycle state, like initialized, loaded, etc..., or other metadata of the Plugin)\n* `PluginFinder`: finds plugins, either at build time (by scanning the modules using `pkgutil` and `setuptools`) or at run time (reading entrypoints of the distribution using [stevedore](https://docs.openstack.org/stevedore/latest/))\n* `PluginManager`: manages the run time lifecycle of a Plugin, which has three states:\n  * resolved: the entrypoint pointing to the PluginSpec was imported and the `PluginSpec` instance was created\n  * init: the `PluginFactory` of the `PluginSpec` was successfully invoked\n  * loaded: the `load` method of the `Plugin` was successfully invoked\n\n![architecture](https://raw.githubusercontent.com/localstack/localstack-plugin-loader/main/docs/localstack-plugin-loader-architecture.png)\n\n### Loading Plugins\n\nAt run time, a `PluginManager` uses a `PluginFinder` that in turn uses stevedore to scan the available entrypoints for things that look like a `PluginSpec`.\nWith `PluginManager.load(name: str)` or `PluginManager.load_all()`, plugins within the namespace that are discoverable in entrypoints can be loaded.\nIf an error occurs at any state of the lifecycle, the `PluginManager` informs the `PluginLifecycleListener` about it, but continues operating.\n\n### Discovering entrypoints\n\nAt build time (e.g., with `python setup.py develop/install/sdist`), a special `PluginFinder` collects anything that can be interpreted as a `PluginSpec`, and creates from it setuptools entrypoints.\nIn the `setup.py` we can use the `plugin.setuptools.load_entry_points` method to collect a dictionary for the `entry_points` value of `setup()`.\n\n```python\nfrom plugin.setuptools import load_entry_points\n\nsetup(\n    entry_points=load_entry_points(exclude=(\"tests\", \"tests.*\",))\n)\n```\n\nNote that `load_entry_points` will try to resolve a cached version of `entry_points.txt` from the `.egg-info` directory,\nto avoid resolving the entry points when building the package from a source distribution.\n\nExamples\n--------\n\nTo build something using the plugin framework, you will first want to introduce a Plugin that does something when it is loaded.\nAnd then, at runtime, you need a component that uses the `PluginManager` to get those plugins.\n\n### One class per plugin\n\nThis is the way we went with `LocalstackCliPlugin`. Every plugin class (e.g., `ProCliPlugin`) is essentially a singleton.\nThis is easy, as the classes are discoverable as plugins.\nSimply create a Plugin class with a name and namespace and it will be discovered by the build time `PluginFinder`.\n\n```python\n\n# abstract case (not discovered at build time, missing name)\nclass CliPlugin(Plugin):\n    namespace = \"my.plugins.cli\"\n\n    def load(self, cli):\n        self.attach(cli)\n\n    def attach(self, cli):\n        raise NotImplementedError\n\n# discovered at build time (has a namespace, name, and is a Plugin)\nclass MyCliPlugin(CliPlugin):\n    name = \"my\"\n\n    def attach(self, cli):\n        # ... attach commands to cli object\n\n```\n\nnow we need a `PluginManager` (which has a generic type) to load the plugins for us:\n\n```python\ncli = # ... needs to come from somewhere\n\nmanager: PluginManager[CliPlugin] = PluginManager(\"my.plugins.cli\", load_args=(cli,))\n\nplugins: List[CliPlugin] = manager.load_all()\n\n# todo: do stuff with the plugins, if you want/need\n#  in this example, we simply use the plugin mechanism to run a one-shot function (attach) on a load argument\n\n```\n\n### Re-usable plugins\n\nWhen you have lots of plugins that are structured in a similar way, we may not want to create a separate Plugin class\nfor each plugin. Instead we want to use the same `Plugin` class to do the same thing, but use several instances of it.\nThe `PluginFactory`, and the fact that `PluginSpec` instances defined at module level are discoverable (inpired\nby [pluggy](https://github.com/pytest-dev/pluggy)), can be used to achieve that.\n\n```python\n\nclass ServicePlugin(Plugin):\n\n    def __init__(self, service_name):\n        self.service_name = service_name\n        self.service = None\n\n    def should_load(self):\n        return self.service_name in config.SERVICES\n\n    def load(self):\n        module = importlib.import_module(\"localstack.services.%s\" % self.service_name)\n        # suppose we define a convention that each service module has a Service class, like moto's `Backend`\n        self.service = module.Service()\n\ndef service_plugin_factory(name) -> PluginFactory:\n    def create():\n        return ServicePlugin(name)\n\n    return create\n\n# discoverable\ns3 = PluginSpec(\"localstack.plugins.services\", \"s3\", service_plugin_factory(\"s3\"))\n\n# discoverable\ndynamodb = PluginSpec(\"localstack.plugins.services\", \"dynamodb\", service_plugin_factory(\"dynamodb\"))\n\n# ... could be simplified with convenience framework code, but the principle will stay the same\n\n```\n\nThen we could use the `PluginManager` to build a Supervisor\n\n```python\n\nclass Supervisor:\n    manager: PluginManager[ServicePlugin]\n\n    def start(self, service_name):\n        plugin = manager.load(service_name)\n        service = plugin.service\n        service.start()\n\n```\n\n### Functions as plugins\n\nwith the `@plugin` decorator, you can expose functions as plugins. They will be wrapped by the framework\ninto `FunctionPlugin` instances, which satisfy both the contract of a Plugin, and that of the function.\n\n```python\nfrom plugin import plugin\n\n\n@plugin(namespace=\"localstack.configurators\")\ndef configure_logging(runtime):\n    logging.basicConfig(level=runtime.config.loglevel)\n\n\n@plugin(namespace=\"localstack.configurators\")\ndef configure_somethingelse(runtime):\n    # do other stuff with the runtime object\n    pass\n```\n\nWith a PluginManager via `load_all`, you receive the `FunctionPlugin` instances, that you can call like the functions\n\n```python\n\nruntime = LocalstackRuntime()\n\nfor configurator in PluginManager(\"localstack.configurators\").load_all():\n    configurator(runtime)\n```\n\nInstall\n-------\n\n    pip install localstack-plugin-loader\n\nDevelop\n-------\n\nCreate the virtual environment, install dependencies, and run tests\n\n    make venv\n    make test\n\nRun the code formatter\n\n    make format\n\nUpload the pypi package using twine\n\n    make upload\n\n\n",
+    "description_content_type": "text/markdown; charset=UTF-8",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/localstack/localstack-plugin-loader",
+    "keywords": "",
+    "license": "Apache License 2.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "localstack-plugin-loader",
+    "package_url": "https://pypi.org/project/localstack-plugin-loader/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/localstack-plugin-loader/",
+    "project_urls": {
+      "Homepage": "https://github.com/localstack/localstack-plugin-loader"
+    },
+    "release_url": "https://pypi.org/project/localstack-plugin-loader/1.1.1/",
+    "requires_dist": [
+      "stevedore (>=3.4)",
+      "black (==21.6b0) ; extra == 'dev'",
+      "isort (==5.9.1) ; extra == 'dev'",
+      "pytest (==6.2.4) ; extra == 'dev'"
+    ],
+    "requires_python": "",
+    "summary": "The dynamic code loading framework used in LocalStack",
+    "version": "1.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 11928337,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "5673a8d4ae2a34e6eef52c7d0ab5425a5e52a38b9c568fd2df764ec48238d9fd",
+        "md5": "d60d7555922f8354ec075c67ae94a237",
+        "sha256": "4772348083650a0e8a8e4e94374d2a7e65195bd279e029a9b4b07aa76be23d59"
+      },
+      "downloads": -1,
+      "filename": "localstack_plugin_loader-1.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d60d7555922f8354ec075c67ae94a237",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": null,
+      "size": 18421,
+      "upload_time": "2021-11-04T18:11:24",
+      "upload_time_iso_8601": "2021-11-04T18:11:24.351518Z",
+      "url": "https://files.pythonhosted.org/packages/56/73/a8d4ae2a34e6eef52c7d0ab5425a5e52a38b9c568fd2df764ec48238d9fd/localstack_plugin_loader-1.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "2e827e78c8056df07bf05196ee40b4244399f7a66ee5c1fe7ac1c837bf30755b",
+        "md5": "4c41096f6d66fb3693a708faad4fad7e",
+        "sha256": "eb829c47332caf2ff1062a2038077e0a5e93c30bb2c61cf2651b07ccadd77448"
+      },
+      "downloads": -1,
+      "filename": "localstack-plugin-loader-1.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "4c41096f6d66fb3693a708faad4fad7e",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": null,
+      "size": 13200,
+      "upload_time": "2021-11-04T18:11:26",
+      "upload_time_iso_8601": "2021-11-04T18:11:26.427517Z",
+      "url": "https://files.pythonhosted.org/packages/2e/82/7e78c8056df07bf05196ee40b4244399f7a66ee5c1fe7ac1c837bf30755b/localstack-plugin-loader-1.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

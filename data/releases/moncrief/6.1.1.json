@@ -1,0 +1,65 @@
+{
+  "info": {
+    "author": "algernon_solutions/jcubeta",
+    "author_email": "jcubeta@algernon.solutions",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: GNU Affero General Public License v3",
+      "Operating System :: OS Independent",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# Algernon\n**everything you need to be serverless and amazing**\n## overview\n>Algernon works in the AWS ecosystem, so if you are somewhere else, this isn't for you #sad_emoji_face\n\nEverything in the Algernon world is broken down to the smallest unit of work, which we call a Task. \nA Task has a task_name and an optional callback. When you run a Task, you can supply it with task_kwargs, which will \nbe the payload delivered to the Task code.\n### listeners and queues\nEvery Task is associated with an SQS queue and an SNS topic. The SNS topic serves as the listener, messages sent to it \nwill be transferred to the corresponding queue for processing.\n### workers\nTo simplify deployment, a single Lambda Function may serve multiple Tasks. In this case, you should use a handler capable \nof parsing out the task_name and routing the task accordingly. We commonly use:\n```python\nfrom some_package import tasks\n\ndef handler(event, context):\n    task_name = event['task_name']\n    task_kwargs = event.get('task_kwargs', {})\n    task_fn = getattr(tasks, task_name)\n    if task_fn is None:\n        raise RuntimeError(f'task: {task_name} is not registered with the system')\n    results = task_fn(**task_kwargs)\n    return results\n```\nThe lambda function is subscribed to the SQS queue, so as tasks are pushed into the queue from the listener, \nthe workers automatically pick them up and start working. \n\n**idempotence**\n\nBy default, workers will pull messages from the queue in batches of ten. \nIf one of the tasks in that batch fails, _the entire batch_ remains in the queue, \nmeaning all those tasks will run again. For this reason, you must be markedly diligent to make your code idempotent. Whether it \nruns once, or it runs a hundred times, the result should be the same (this includes entries to databases, additions to storage, etc)\n\n### callbacks\nOnce a task has run, the results can be sent to another Task, creating a chain. You specify the name of the next \ntask under the callback key in the Task invocation.\n\n### context\nWhen a Lambda function invokes Python code, it provides the handler with two positional arguments, event and context.\nWe hijack the context, and use it to persist resources across a batch. The original AWS context is preserved \nunder the key 'aws'. You can store your own information into this context dictionary, and those will be available \nthroughout the life of the Task Worker.\n\nCommon uses of the context is to store database connections, retrieved credentials, or other things you don't \nwant to repeat ten times when your workers pull a batch.\n\n## Objects and Utilities\n### the @queued decorator\nThis function decorator is applied to the Worker handler function. It allows you to code your handler as if \nit were being directly invoked by Lambda. The decorator takes care of parsing the batch messages from SQS and \nsending indicated callbacks.\n\n### the serializers\nAlgernon loves object oriented programming, and one of our early struggles was in trying to get our objects from Task \nto Task. To accomplish this, we provide a base object (AlgObject), which has one required class method (parse_json). \nObjects which inherit from AlgObject can be sent across the wire in Task task_kwargs.\n\nTo serialize and rebuild AlgObjects, you can use the ajson utility included in this library.\n```python\nfrom algernon import ajson, AlgObject\n\n\nclass DatabaseCredentials(AlgObject):\n    def __init__(self, username, password, read_url, write_url):\n        self._username = username\n        self._password = password\n        self._read_url = read_url\n        self._write_url = write_url\n        \n    @classmethod\n    def parse_json(cls, json_dict):\n        return cls(json_dict['username'], json_dict['password'], json_dict['read_url'], json_dict['write_url'])\n        \n\ncredentials = DatabaseCredentials('my_username', '31iteP@zzW0rd', 'some_db_url', 'some_other_db_url')\nstrung_credentials = ajson.dumps(credentials)\n\n# send them to the next task\n\nrebuilt_credentials = ajson.loads(strung_credentials)\n```\n\nThe ajson utility also handles some common JSON problem children. \n- Python datetime objects\n- Tuples\n- Sets\n- Decimals\n\n### the rebuild_event function\nTo support modularity, the @queued decorator does not run messages through the ajson utility before sending them to the \nTask handler. This decision allows one Task Worker to handle messages meant for a different Task Worker, \nsuch as when routing or replaying messages. If you try to use the ajson utility on messages that contain AlgObjects \nfrom another Worker, and those AlgObjects are not imported into the Worker handler, your Worker will fail.\n\nIf you know that certain Tasks will only ever receive messages that can be rebuilt within the module, you can use the \nrebuild_event function to restore the AlgObjects in the message.\n```python\nfrom algernon import queued, rebuild_event\n\n@queued\ndef handler(event, context):\n    event = rebuild_event(event)\n    task_name = event['task_name']\n    task_kwargs = event['task_kwargs']\n    db_credentials = task_kwargs['db_credentials']\n\n```\n\n### the @lambda_logged decorator\nLambda functions capture all logging activity and store it through the CloudWatch service. To help organize and \nsearch these logs, you can decorate your Task or Worker handler with the @lambda_logged decorator. Doing so will \nclear all existing loggers, which we have found solves many logging problems with Lambda, and then setup the \nroot logger to include timestamp, function information, and request information with your logging. Additionally, \nyou can toggle debug level logging on by setting the environment variable \"DEBUG\" to True. Additionally, \nthe decorator will activate the native Lambda connection the X-Ray service. If you set this decorator, and then \nrun your Worker, you can see the traces for your function with their stats under the AWS X-Ray service. \n\nThis decorator activates logging for the most common libraries (requests, SQLite, etc). You can decorate your own \nfunctions directly to help improve the granularity of your tracing.\n```python\nfrom aws_xray_sdk.core import xray_recorder\n\n@xray_recorder.capture\ndef some_task(**kwargs):\n    print(f'hey, did some work with {kwargs}')\n\n```\nWe have found that the Python boto library and the native x-ray library tend to produce chatter in the logs, so this \ndecorator sets both of them to log level WARNING.\n\n#### combining decorators\nyou absolutely can use the @queued and @lambda_logged decorators together on the same handler.\n\n### StoredData\nwhen passing information from function to function, as during a callback, the task_kwargs are not sent across the wire \nwhole. To help handle large messages, the results of the function will be uploaded to S3 and replaced with a pointer. \nWhen the information arrives at the next task, the information is automatically pulled from S3 and put back in place. \nYou specify the bucket to send the information to by setting the \"ALGERNON_BUCKET_NAME\" environment variable. By \ndefault, StoredData objects are set with the prefix \"cache\". You can change this by \"CACHE_FOLDER_NAME\" environment \nvariable. We suggest you set up expiration lifecycle rules on the bucket you use for this purpose to keep costs down.",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/AlgernonSolutions/algernon",
+    "keywords": "",
+    "license": "GNU Affero General Public License v3.0",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "moncrief",
+    "package_url": "https://pypi.org/project/moncrief/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/moncrief/",
+    "project_urls": {
+      "Homepage": "https://github.com/AlgernonSolutions/algernon"
+    },
+    "release_url": "https://pypi.org/project/moncrief/6.1.1/",
+    "requires_dist": null,
+    "requires_python": ">=3.6.0",
+    "summary": "everything to run a project in a distributed and serverless fashion",
+    "version": "6.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 6288499,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "a3f00a80a63b580730205d64181b4635587b0f3ac0e76280c2db63cb9f27f477",
+        "md5": "cf93154c6dc1172f17379aff1d0cfffc",
+        "sha256": "50a2f23a721a4f0cfa3cec79975db2bfdf74cc6ac06d8985bd0cb6cd02dda3cb"
+      },
+      "downloads": -1,
+      "filename": "moncrief-6.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "cf93154c6dc1172f17379aff1d0cfffc",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6.0",
+      "size": 35171,
+      "upload_time": "2019-09-11T15:51:35",
+      "upload_time_iso_8601": "2019-09-11T15:51:35.264539Z",
+      "url": "https://files.pythonhosted.org/packages/a3/f0/0a80a63b580730205d64181b4635587b0f3ac0e76280c2db63cb9f27f477/moncrief-6.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

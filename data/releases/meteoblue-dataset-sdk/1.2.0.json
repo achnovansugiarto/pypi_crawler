@@ -1,0 +1,97 @@
+{
+  "info": {
+    "author": "meteoblue AG",
+    "author_email": "patrick.zippenfenig@meteoblue.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "License :: OSI Approved :: MIT License",
+      "Programming Language :: Python :: 3"
+    ],
+    "description": "# meteoblue Python Dataset SDK\n\n[![PyPI version](https://badge.fury.io/py/meteoblue-dataset-sdk.svg)](https://badge.fury.io/py/meteoblue-dataset-sdk)\n\nThis library simplifies access to the [meteoblue dataset API](https://docs.meteoblue.com/en/apis/environmental-data/dataset-api).\n\nIn order to use this library you need a meteoblue API key.\n\nFeatures:\n- Fetch any dataset from the meteoblue environmental data archive\n- Transparently integrates job queues to query large datasets\n- Efficiently transfers data using compressed protobuf messages\n- Asynchronous interface to query data in parallel\n- Data can be used as simple floating-point arrays. No further formatting required.\n- Semantic Versioning: The interface for version 1 is declared stable. Breaking interface changes will be published in version 2.\n\n\n## Installation\n- Ensure that you are using at least Python 3.7 with `python --version` (Sometimes `python3`)\n- Install the module with `pip install 'meteoblue_dataset_sdk >=1.0,<2.0'` (Sometimes `pip3`)\n\nThis module will also install the following dependencies automatically:\n- aiohttp >=3.6,<4\n- protobuf >=3.0,<4\n\n\n## Usage\nSee [main.py](./main.py) for a working example. To generate the query JSON it is highly recommended to use the [dataset API web interfaces](https://docs.meteoblue.com/en/apis/environmental-data/web-interfaces).\n\n```python\nimport meteoblue_dataset_sdk\nimport logging\n\n# Display information about the current download state\nlogging.basicConfig(level=logging.INFO)\n\nquery = {\n    \"units\": {\n        \"temperature\": \"C\",\n        \"velocity\": \"km/h\",\n        \"length\": \"metric\",\n        \"energy\": \"watts\",\n    },\n    \"geometry\": {\n        \"type\": \"MultiPoint\",\n        \"coordinates\": [[7.57327, 47.558399, 279]],\n        \"locationNames\": [\"Basel\"],\n    },\n    \"format\": \"protobuf\",\n    \"timeIntervals\": [\"2019-01-01T+00:00/2019-01-01T+00:00\"],\n    \"timeIntervalsAlignment\": \"none\",\n    \"queries\": [\n        {\n            \"domain\": \"NEMSGLOBAL\",\n            \"gapFillDomain\": None,\n            \"timeResolution\": \"hourly\",\n            \"codes\": [{\"code\": 11, \"level\": \"2 m above gnd\"}],\n        }\n    ],\n}\nclient = meteoblue_dataset_sdk.Client(apikey=\"xxxxxx\")\nresult = client.query_sync(query)\n# result is a structured object containing timestamps and data\n\ntimeInterval = result.geometries[0].timeIntervals[0]\ndata = result.geometries[0].codes[0].timeIntervals[0].data\n\nprint(timeInterval)\n# start: 1546300800\n# end: 1546387200\n# stride: 3600\n```\n\nNOTE: `timeInterval.end` is the first timestamp that is not included anymore in the time interval.\n\nIf your code is using `async/await`, you should use `await client.query()` instead of `client.query_sync()`. Asynchronous IO is essential for modern webserver frameworks like Flask or FastAPI.\n\n```python\nclient = meteoblue_dataset_sdk.Client(apikey=\"xxxxxx\")\nresult = await client.query(query)\n```\n\n## Caching results\nIf you are training a model and re-run your program multiple times, you can enable caching to store results from the meteoblue dataset SDK on disk. A simple file cache can be enabled with:\n\n```python\nimport zlib\nfrom meteoblue_dataset_sdk.caching import FileCache\n\n# Cache results for 1 day (86400 seconds)\ncache = FileCache(path=\"./mb_cache\", max_age=86400, compression_level=zlib.Z_BEST_SPEED)\nclient = meteoblue_dataset_sdk.Client(apikey=\"xxxxxx\", cache=cache)\n```\n\nIf you want to implement a different cache (e.g. redis or S3), the SDK offers an abstract base class `caching.cache.AbstractCache`. The required methods are listed [here](./meteoblue_dataset_sdk/caching/abstractcache.py).\n\n\n## Working with timestamps\nTime intervals are encoded as a simple `start`, `end` and `stride` unix timestamps. With just a  view lines of code, timestamps can be converted to an array of datetime objects:\n\n```python\nimport datetime as dt\n\nprint(timeInterval)\n# start: 1546300800\n# end: 1546387200\n# stride: 3600\n\ntimerange = range(timeInterval.start, timeInterval.end, timeInterval.stride)\ntimestamps = list(map(lambda t: dt.date.fromtimestamp(t), timerange))\n```\n\nThis code works well for regular timesteps like hourly, 3-hourly or daily data. Monthly data is unfortunately not regular, and the API returns timestamps as an string array. The following code takes care of all cases and always returns an array of datetime objects:\n\n```python\nimport datetime as dt\nimport dateutil.parser\n\ndef meteoblue_timeinterval_to_timestamps(t):\n    if len(t.timestrings) > 0:\n        def map_ts(time):\n            if \"-\" not in time:\n                return time\n            return dateutil.parser.parse(time.partition(\"-\")[0])\n\n        return list(map(map_ts, t.timestrings))\n\n    timerange = range(t.start, t.end, t.stride)\n    return list(map(lambda t: dt.datetime.fromtimestamp(t), timerange))\n\nquery = { ... }\nresult = client.query_sync(query)\ntimestamps = meteoblue_timeinterval_to_timestamps(result.geometries[0].timeIntervals[0])\n```\n\n## Working with dataframes\nTo convert a result from the meteoblue dataset API to pandas dataframe, a few lines of code can help:\n\n```python\nimport pandas as pd\nimport numpy as np\n\ndef meteoblue_result_to_dataframe(geometry):\n    t = geometry.timeIntervals[0]\n    timestamps = meteoblue_timeinterval_to_timestamps(t)\n\n    n_locations = len(geometry.lats)\n    n_timesteps = len(timestamps)\n\n    df = pd.DataFrame(\n        {\n            \"TIMESTAMP\": np.tile(timestamps, n_locations),\n            \"Longitude\": np.repeat(geometry.lons, n_timesteps),\n            \"Latitude\": np.repeat(geometry.lats, n_timesteps),\n        }\n    )\n\n    for code in geometry.codes:\n        name = str(code.code) + \"_\" + code.level + \"_\" + code.aggregation\n        df[name] = code.timeIntervals[0].data\n\n    return df\n\nquery = { ... }\nresult = client.query_sync(query)\ndf = meteoblue_result_to_dataframe(result.geometries[0])\n```\n\n## Protobuf format\nIn the background, data is transferred using protobuf and defined as [this protobuf structure](./meteoblue_dataset_sdk/Dataset.proto).\n\nA 10 year hourly data series for 1 location requires `350 kb` using protobuf, compared to `1600 kb` using JSON. Additionally the meteoblue Python SDK transfers data using gzip which reduces the size to only `87 kb`. \n\nMore detailed output of the `result` protobuf object:\n\n```\ngeometries {\n  domain: \"NEMSGLOBAL\"\n  lats: 47.66651916503906\n  lons: 7.5\n  asls: 499.7736511230469\n  locationNames: \"Basel\"\n  nx: 1\n  ny: 1\n  timeResolution: \"hourly\"\n  timeIntervals {\n    start: 1546300800\n    end: 1546387200\n    stride: 3600\n  }\n  codes {\n    code: 11\n    level: \"2 m above gnd\"\n    unit: \"\\302\\260C\"\n    aggregation: \"none\"\n    timeIntervals {\n      data: 2.890000104904175\n      data: 2.690000057220459\n      data: 2.549999952316284\n      data: 2.380000114440918\n      data: 2.2699999809265137\n      data: 2.119999885559082\n      data: 1.9900000095367432\n      data: 1.8300000429153442\n      data: 1.8200000524520874\n      data: 2.0999999046325684\n      data: 2.430000066757202\n      data: 2.9200000762939453\n      data: 3.7200000286102295\n      data: 3.930000066757202\n      data: 3.9100000858306885\n      data: 3.5299999713897705\n      data: 3.130000114440918\n      data: 2.880000114440918\n      data: 2.6500000953674316\n      data: 2.4600000381469727\n      data: 2.2799999713897705\n      data: 2.0299999713897705\n      data: 1.690000057220459\n      data: 1.3799999952316284\n    }\n  }\n}\n```\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/meteoblue/python-dataset-sdk",
+    "keywords": "meteoblue",
+    "license": "MIT License",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "meteoblue-dataset-sdk",
+    "package_url": "https://pypi.org/project/meteoblue-dataset-sdk/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/meteoblue-dataset-sdk/",
+    "project_urls": {
+      "Homepage": "https://github.com/meteoblue/python-dataset-sdk"
+    },
+    "release_url": "https://pypi.org/project/meteoblue-dataset-sdk/1.2.0/",
+    "requires_dist": [
+      "aiohttp (<4,>=3.6)",
+      "protobuf (<4,>=3.0)",
+      "aiofiles (<1,>=0.6.0)",
+      "pytest ; extra == 'dev'",
+      "flake8 ; extra == 'dev'",
+      "ipython ; extra == 'dev'",
+      "nox ; extra == 'dev'",
+      "black ; extra == 'dev'",
+      "isort ; extra == 'dev'",
+      "freezegun ; extra == 'dev'",
+      "later ; extra == 'dev'"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "Easy access to the meteoblue dataset API",
+    "version": "1.2.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12836332,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b609e46c9dc537df5980492571ce4ea97f267d1362aad9ff9cfd6b678c3ced8a",
+        "md5": "93d9164d8040bd5a969e7b47078e2770",
+        "sha256": "0bc7e1e17a4a3b8139437170a15e0677dde1c40b222d0bb3c9ecf9a2f788ad1c"
+      },
+      "downloads": -1,
+      "filename": "meteoblue_dataset_sdk-1.2.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "93d9164d8040bd5a969e7b47078e2770",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.7",
+      "size": 22240,
+      "upload_time": "2021-07-29T08:47:10",
+      "upload_time_iso_8601": "2021-07-29T08:47:10.759248Z",
+      "url": "https://files.pythonhosted.org/packages/b6/09/e46c9dc537df5980492571ce4ea97f267d1362aad9ff9cfd6b678c3ced8a/meteoblue_dataset_sdk-1.2.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "7cc5f02b0887ca24cf7dce278eb29a7d2826deceba4513c95c2b1e761823de02",
+        "md5": "91a18c9991476cf0bcd9ed940a8d0a4c",
+        "sha256": "3c57fbe6790a46c71e418360ebf0fa1286e2fe585c5a22c6400e85976dfa6120"
+      },
+      "downloads": -1,
+      "filename": "meteoblue_dataset_sdk-1.2.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "91a18c9991476cf0bcd9ed940a8d0a4c",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 197242,
+      "upload_time": "2021-07-29T08:47:12",
+      "upload_time_iso_8601": "2021-07-29T08:47:12.654897Z",
+      "url": "https://files.pythonhosted.org/packages/7c/c5/f02b0887ca24cf7dce278eb29a7d2826deceba4513c95c2b1e761823de02/meteoblue_dataset_sdk-1.2.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
