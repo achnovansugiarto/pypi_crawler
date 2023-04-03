@@ -3,44 +3,48 @@ import requests
 import json
 import os
 
+
 def update(pkg_name):
     result = get_data(pkg_name)
-    if 'releases' in result:
+    if "releases" in result:
         if download_new(pkg_name, result):
             remove_old(pkg_name, result)
         else:
-            print('Already exists')
+            print("Already exists")
     else:
-        print('No releases')
+        print("No releases")
+
 
 def get_data(pkg_name):
-    url = f'https://pypi.org/pypi/{pkg_name}/json'
+    url = f"https://pypi.org/pypi/{pkg_name}/json"
     result = requests.get(url).json()
     return result
 
+
 def download_new(pkg_name, result):
-    rc = len(result['releases'].keys())
-    save_path = f'data/latest/{pkg_name}.rc{rc}.json'
+    rc = len(result["releases"].keys())
+    save_path = f"data/latest/{pkg_name}.rc{rc}.json"
     if not os.path.exists(save_path):
-        with open(save_path, 'w', encoding='utf8') as f:
+        with open(save_path, "w", encoding="utf8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
-            print(save_path, 'saved')
+            print(save_path, "saved")
         return True
     else:
         return False
 
+
 def remove_old(pkg_name, result):
-    rc = len(result['releases'].keys()) - 1
+    rc = len(result["releases"].keys()) - 1
     while rc > 0:
-        old_json_path = f'data/latest/{pkg_name}.rc{rc}.json'
+        old_json_path = f"data/latest/{pkg_name}.rc{rc}.json"
         if os.path.exists(old_json_path):
             os.remove(old_json_path)
-            print(f'{old_json_path} removed')
+            print(f"{old_json_path} removed")
             break
         else:
-            print(f'{old_json_path} does not exist')
+            print(f"{old_json_path} does not exist")
         rc -= 1
 
-    
-if __name__ == '__main__':    
+
+if __name__ == "__main__":
     update(sys.argv[1])
