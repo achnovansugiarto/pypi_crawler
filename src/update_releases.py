@@ -24,10 +24,13 @@ def download_json(pkg_name, version):
 
 
 def get_release_versions(pkg_name):
-    json_path = glob.glob(f"data/latest/{pkg_name}.rc*.json")[0]
-    with open(json_path, "r") as f:
-        result = json.load(f)
-    return result["releases"].keys()
+    json_path = glob.glob(f"data/latest/{pkg_name}.rc*.json")
+    if json_path:
+        with open(json_path[0], "r") as f:
+            result = json.load(f)
+        return list(result["releases"].keys())
+    else:
+        return []
 
 
 class IgnoreFilter:
@@ -66,12 +69,13 @@ def update(pkg_name):
     )
     releases = list(releases)
     print("filtered releases:", releases)
-    jsons = map(
-        lambda release: (pkg_name, release, download_json(pkg_name, release)), releases
-    )
-    folder = f"data/releases/{pkg_name}"
-    if not os.path.exists(folder):
-        os.mkdir(folder)
-        print(folder, "created")
-    saved_json = map(lambda x: save_json(*x), jsons)
-    _ = list(saved_json)
+    if releases:
+        jsons = map(
+            lambda release: (pkg_name, release, download_json(pkg_name, release)), releases
+        )
+        folder = f"data/releases/{pkg_name}"
+        if not os.path.exists(folder):
+            os.mkdir(folder)
+            print(folder, "created")
+        saved_json = map(lambda x: save_json(*x), jsons)
+        _ = list(saved_json)
