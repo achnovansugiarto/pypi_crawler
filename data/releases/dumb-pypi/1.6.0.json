@@ -1,0 +1,93 @@
+{
+  "info": {
+    "author": "Chris Kuehl",
+    "author_email": "ckuehl@ckuehl.me",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3 :: Only",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8",
+      "Programming Language :: Python :: 3.9",
+      "Programming Language :: Python :: Implementation :: CPython"
+    ],
+    "description": "dumb-pypi\n---------\n\n[![Build Status](https://travis-ci.org/chriskuehl/dumb-pypi.svg?branch=master)](https://travis-ci.org/chriskuehl/dumb-pypi)\n[![Coverage Status](https://coveralls.io/repos/github/chriskuehl/dumb-pypi/badge.svg?branch=master)](https://coveralls.io/github/chriskuehl/dumb-pypi?branch=master)\n[![PyPI version](https://badge.fury.io/py/dumb-pypi.svg)](https://pypi.python.org/pypi/dumb-pypi)\n\n\n`dumb-pypi` is a simple read-only PyPI index server generator, backed entirely\nby static files. It is ideal for internal use by organizations that have a\nbunch of their own packages which they'd like to make available.\n\nYou can view [an example generated repo](https://chriskuehl.github.io/dumb-pypi/test-repo/).\n\n\n## A rant about static files (and why you should use dumb-pypi)\n\nThe main difference between dumb-pypi and other PyPI implementations is that\ndumb-pypi has *no server component*. It's just a script that, given a list of\nPython package names, generates a bunch of static files which you can serve\nfrom any webserver, or even directly from S3.\n\nThere's something magical about being able to serve a package repository\nentirely from a tree of static files. It's incredibly easy to make it fast and\nhighly-available when you don't need to worry about running a bunch of\napplication servers (which are serving a bunch of read-only queries that could\nhave just been pre-generated).\n\nLinux distributions have been doing this right for decades. Debian has a system\nof hundreds of mirrors, and the entire thing is powered entirely by some fancy\n`rsync` commands.\n\nFor the maintainer of a PyPI repositry, `dumb-pypi` has some nice properties:\n\n* **File serving is extremely fast.** nginx can serve your static files faster\n  than you'd ever need. In practice, there are almost no limits on the number\n  of packages or number of versions per package.\n\n* **It's very simple.** There's no complicated WSGI app to deploy, no\n  databases, and no caches. You just need to run the script whenever you have\n  new packages, and your index server is ready in seconds.\n\nFor more about why this design was chosen, see the detailed\n[`RATIONALE.md`][rationale] in this repo.\n\n\n## Usage\n\nTo use dumb-pypi, you need two things:\n\n* A script which generates the index. (That's this project!)\n\n* A generic webserver to serve the generated index.\n\n  This part is up to you. For example, you might sync the built index into an\n  S3 bucket, and serve it directly from S3. You might run nginx from the built\n  index locally.\n\nMy recommended high-availability (but still quite simple) deployment is:\n\n* Store all of the packages in S3.\n\n* Have a cronjob (or equivalent) which rebuilds the index based on the packages\n  in S3. This is incredibly fast—it would not be unreasonable to do it every\n  sixty seconds. After building the index, sync it into a separate S3 bucket.\n\n* Have a webserver (or set of webservers behind a load balancer) running nginx\n  (with the config provided below), with the source being that second S3\n  bucket.\n\n\n### Generating static files\n\nFirst, install `dumb-pypi` somewhere (e.g. into a virtualenv).\n\nBy design, dumb-pypi does *not* require you to have the packages available when\nbuilding the index. You only need a list of filenames, one per line. For\nexample:\n\n```\ndumb-init-1.1.2.tar.gz\ndumb_init-1.2.0-py2.py3-none-manylinux1_x86_64.whl\nocflib-2016.10.31.0.40-py2.py3-none-any.whl\npre_commit-0.9.2.tar.gz\n```\n\nYou should also know a URL to access these packages (if you serve them from the\nsame host as the index, it can be a relative URL). For example, it might be\n`https://my-pypi-packages.s3.amazonaws.com/` or `../../pool/`.\n\nYou can then invoke the script:\n\n```bash\n$ dumb-pypi \\\n    --package-list my-packages \\\n    --packages-url https://my-pypi-packages.s3.amazonaws.com/ \\\n    --output-dir my-built-index\n```\n\nThe built index will be in `my-built-index`. It's now up to you to figure out\nhow to serve that with a webserver (nginx is a good option — details below!).\n\n\n#### Additional options for packages\n\nYou can extend the capabilities of your registry using the extended JSON input\nsyntax when providing your package list to dumb-pypi. Instead of using the\nformat listed above of one filename per line, format your file with one JSON\nobject per line, like this:\n\n```json\n{\"filename\": \"dumb-init-1.1.2.tar.gz\", \"hash\": \"md5=<hash>\", \"requires_python\": \">=3.6\", \"uploaded_by\": \"ckuehl\", \"upload_timestamp\": 1512539924}\n```\n\nThe `filename` key is required. All other keys are optional and will be used to\nprovide additional information in your generated repository. This extended\ninformation can be useful to determine, for example, who uploaded a package.\n(Most of this information is useful in the web UI by humans, not by pip.)\n\nWhere should you get information about the hash, uploader, etc? That's up to\nyou—dumb-pypi isn't in the business of storing or calculating this data. If\nyou're using S3, one easy option is to store it at upload time as [S3\nmetadata][s3-metadata].\n\n\n### Recommended nginx config\n\nYou can serve the packages from any static webserver (including directly from\nS3), but for compatibility with old versions of pip, it's necessary to do a\ntiny bit of URL rewriting (see [`RATIONALE.md`][rationale] for full details\nabout the behavior of various pip versions).\n\nIn particular, if you want to support old pip versions, you need to apply this\nlogic to package names (taken from [PEP 503][pep503]):\n\n```python\ndef normalize(name):\n    return re.sub(r'[-_.]+', '-', name).lower()\n```\n\nHere is an example nginx config which supports all versions of pip and\neasy_install:\n\n```nginx\nserver {\n    location / {\n        root /path/to/index;\n        set_by_lua $canonical_uri \"return string.gsub(string.lower(ngx.var.uri), '[-_.]+', '-')\";\n        try_files $uri $uri/index.html $canonical_uri $canonical_uri/index.html =404;\n    }\n}\n\n```\n\nIf you don't care about easy_install or versions of pip prior to 8.1.2, you can\nomit the `canonical_uri` hack.\n\n\n### Using your deployed index server with pip\n\nWhen running pip, pass `-i https://my-pypi-server/simple` or set the\nenvironment variable `PIP_INDEX_URL=https://my-pypi-server/simple`.\n\n\n## Contributing\n\nThanks for contributing! To get started, run `make venv` and then `.\nvenv/bin/activate` to source the virtualenv. You should now have a `dumb-pypi`\ncommand on your path using your checked-out version of the code.\n\nTo run the tests, call `make test`. To run an individual test, you can do\n`py.test -k name_of_test tests` (with the virtualenv activated).\n\n\n[rationale]: https://github.com/chriskuehl/dumb-pypi/blob/master/RATIONALE.md\n[pep503]: https://www.python.org/dev/peps/pep-0503/#normalized-names\n[s3-metadata]: https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html#UserMetadata\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/chriskuehl/dumb-pypi",
+    "keywords": "",
+    "license": "",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "dumb-pypi",
+    "package_url": "https://pypi.org/project/dumb-pypi/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/dumb-pypi/",
+    "project_urls": {
+      "Homepage": "https://github.com/chriskuehl/dumb-pypi"
+    },
+    "release_url": "https://pypi.org/project/dumb-pypi/1.6.0/",
+    "requires_dist": [
+      "distlib",
+      "jinja2",
+      "packaging"
+    ],
+    "requires_python": ">=3.7",
+    "summary": "",
+    "version": "1.6.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 14656628,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "b04e4dd485062dc1678fe629b37667ff608c7c1361179d1593729ccc0975c651",
+        "md5": "d424b54624fdd51a7b37c4a70b27a723",
+        "sha256": "a55fd701975375714f2ffd60ac5749c44608720f3ea9be62cab100bc3361ac1a"
+      },
+      "downloads": -1,
+      "filename": "dumb_pypi-1.6.0-py2.py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d424b54624fdd51a7b37c4a70b27a723",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2.py3",
+      "requires_python": ">=3.7",
+      "size": 13833,
+      "upload_time": "2021-07-06T20:44:01",
+      "upload_time_iso_8601": "2021-07-06T20:44:01.043905Z",
+      "url": "https://files.pythonhosted.org/packages/b0/4e/4dd485062dc1678fe629b37667ff608c7c1361179d1593729ccc0975c651/dumb_pypi-1.6.0-py2.py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "e3a34b5d643adac1d2fd32559c653b9a05574e2e6d1e4eb3ff85dc427316104c",
+        "md5": "eef80cd84e7bbe7985c44fac5d25a43a",
+        "sha256": "0c99c4e123c9809f6f3b2b01eb4b8393ce194f865b6d668aa4c36a8a3bf793d1"
+      },
+      "downloads": -1,
+      "filename": "dumb_pypi-1.6.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "eef80cd84e7bbe7985c44fac5d25a43a",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.7",
+      "size": 15269,
+      "upload_time": "2021-07-06T20:44:02",
+      "upload_time_iso_8601": "2021-07-06T20:44:02.566496Z",
+      "url": "https://files.pythonhosted.org/packages/e3/a3/4b5d643adac1d2fd32559c653b9a05574e2e6d1e4eb3ff85dc427316104c/dumb_pypi-1.6.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

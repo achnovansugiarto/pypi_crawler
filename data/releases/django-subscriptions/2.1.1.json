@@ -1,0 +1,98 @@
+{
+  "info": {
+    "author": "Josh Smeaton",
+    "author_email": "josh.smeaton@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [
+      "Framework :: Django",
+      "Framework :: Django :: 2.2",
+      "Intended Audience :: Developers",
+      "License :: OSI Approved :: BSD License",
+      "Natural Language :: English",
+      "Programming Language :: Python",
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.6",
+      "Programming Language :: Python :: 3.7",
+      "Programming Language :: Python :: 3.8"
+    ],
+    "description": "# django-subscriptions\n\nA django package for managing the status and terms of a subscription.\n\n[![PyPI version](https://badge.fury.io/py/django-subscriptions.svg)](https://badge.fury.io/py/django-subscriptions)\n[![CircleCI (all branches)](https://img.shields.io/circleci/project/github/kogan/django-subscriptions.svg)](https://circleci.com/gh/kogan/django-subscriptions)\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/ambv/black)\n![PyPI - License](https://img.shields.io/pypi/l/django-subscriptions.svg?style=popout)\n\n## Compatibility\n\n- Django: 2.2 (LTS versions only)\n- Python: 3.6+\n\nOther Django or Python versions **may** work, but that is totally cooincidental\nand no effort is made to maintain compatibility with versions other than those\nlisted above.\n\n## Installation\n\n```bash\n$ pip install django-subscriptions\n```\n\nThen add the following packages to `INSTALLED_APPS` in your settings:\n\n```\nINSTALLED_APPS = [\n    ...\n    \"django_fsm_log\",\n    \"subscriptions.apps.SubscriptionsConfig\",\n    ...\n]\n```\n\nAnd of course, you'll need to run the migrations:\n\n```\n$ python manage.py migrate\n```\n\nYou'll also need to setup the triggers, which can be scheduled with celery or\nrun from a management task. See the [Triggers](#triggers) section below.\n\n## Design\n\nManages subscriptions in a single table. Pushes events (signals) so that\nconsumers can do the actual work required for that subscription, like billing.\n\nSubscriptions are built around a Finite State Machine model, where states and\nallowed transitions between states are well defined on the Model. To update from\none state to another, the user calls methods on the Subscription instance. This\nway, all side-effects and actions are contained within the state methods.\n\nSubscription State must not be modified directly.\n\nWhen a state change is triggered, the subscription will publish relevant signals\nso that interested parties can, themselves, react to the state changes.\n\n![State Diagram](subscriptions-state-diagram.png)\n\n## API\n\nThere are 3 major API components. State change methods, signals/events, and the\ntriggers used to begin the state changes.\n\n### State Methods\n\n\n| Method                                         | Source States                   \t| Target State \t| Signal Emitted       \t|\n|------------------------------------------------|---------------------------------\t|--------------\t|----------------------\t|\n| `cancel_autorenew()`                           | ACTIVE                          \t| EXPIRING     \t| `autorenew_canceled` \t|\n| `enable_autorenew()`                           | EXPIRING                        \t| ACTIVE       \t| `autorenew_enabled`  \t|\n| `renew()`                                      | ACTIVE,SUSPENDED                \t| RENEWING     \t| `subscription_due`   \t|\n| `renewed(new_end, new_ref, description=None)`  | ACTIVE,RENEWING,ERROR            | ACTIVE       \t| `subscription_renewed`|\n| `renewal_failed(description=None)`\t         | RENEWING,ERROR                  \t| SUSPENDED    \t| `renewal_failed`     \t|\n| `end_subscription(description=None)`           | ACTIVE,SUSPENDED,EXPIRING,ERROR \t| ENDED        \t| `subscription_ended` \t|\n| `state_unknown(description=None)`\t             | RENEWING                        \t| ERROR        \t| `subscription_error` \t|\n\nExample:\n\n`subscription.renew()` may only be called if `subscription.state` is either `ACTIVE` or `SUSPENDED`,\nand will cause `subscription.state` to move into the `RENEWING` state.\n\nThe `description` argument is a string that can be used to persist the reason for a state\nchange in the `StateLog` table (and admin inlines).\n\n### Triggers\n\nThere are a bunch of triggers that are used to update subscriptions as they become\ndue or expire. Nothing is configured to run these triggers by default. You can\neither call them as part of your own process, or use `celery beat` to execute\nthe triggers using the tasks provided in `subscriptions.tasks`.\n\n\nCreate a new subscription:\n\n```\nSubscription.objects.add_subscription(start_date, end_date, reference) -> Subscription\n```\n\nTrigger subscriptions that are due for renewal:\n\n```\nSubscription.objects.trigger_renewals() -> int  # number of renewals sent\n```\n\nTrigger subscriptions that are due to expire:\n\n```\nSubscription.objects.trigger_expiring() -> int  # number of expirations\n```\n\nTrigger subscriptions that are suspended:\n\n```\nSubscription.objects.trigger_suspended() -> int  # number of renewals\n```\n\nTrigger subscriptions that have been suspended for longer than `timeout_hours` to\nend (uses `subscription.end` date, not `subscription.last_updated`):\n\n```\nSubscription.objects.trigger_suspended_timeout(timeout_hours=48) -> int  # number of suspensions\n```\n\nTrigger subscriptions that have been stuck in renewing state for longer than `timeout_hours`\nto be marked as an error (uses `subscription.last_updated` to determine the timeout):\n\n```\nSubscription.objects.trigger_stuck(timeout_hours=2) -> int  # number of error subscriptions\n```\n\nIf `settings.SUBSCRIPTIONS_STUCK_RETRY` is `True`, then subscriptions are moved back into\nthe `SUSPENDED` state, ready to be retried. This can be useful when you have an offline\nprocess that can resolve stuck subscription issues, and there is no issue retrying the\nsubscription.\n\n\n### Tasks\n\nThe following tasks are defined but are not scheduled:\n\n```\nsubscriptions.tasks.trigger_renewals\nsubscriptions.tasks.trigger_expiring\nsubscriptions.tasks.trigger_suspended\nsubscriptions.tasks.trigger_suspended_timeout\nsubscriptions.tasks.trigger_stuck\n```\n\nIf you'd like to schedule the tasks, do so with a celery beat configuration like this:\n\n```\n# settings.py\n\nCELERYBEAT_SCHEDULE = {\n    \"subscriptions_renewals\": {\n        \"task\": \"subscriptions.tasks.trigger_renewals\",\n        \"schedule\": crontab(hour=0, minute=10),\n    },\n    \"subscriptions_expiring\": {\n        \"task\": \"subscriptions.tasks.trigger_expiring\",\n        \"schedule\": crontab(hour=0, minute=15),\n    },\n    \"subscriptions_suspended\": {\n        \"task\": \"subscriptions.tasks.trigger_suspended\",\n        \"schedule\": crontab(hour=\"3,6,9\", minute=30),\n    },\n    \"subscriptions_suspended_timeout\": {\n        \"task\": \"subscriptions.tasks.trigger_suspended_timeout\",\n        \"schedule\": crontab(hour=0, minute=40),\n        \"kwargs\": {\"hours\": 48},\n    },\n    \"subscriptions_stuck\": {\n        \"task\": \"subscriptions.tasks.trigger_stuck\",\n        \"schedule\": crontab(hour=\"*/2\", minute=50),\n        \"kwargs\": {\"hours\": 2},\n    },\n}\n```\n\n## Contributing\n\nWe use `pre-commit <https://pre-commit.com/>` to enforce our code style rules\nlocally before you commit them into git. Once you install the pre-commit library\n(locally via pip is fine), just install the hooks::\n\n    pre-commit install -f --install-hooks\n\nThe same checks are executed on the build server, so skipping the local linting\n(with `git commit --no-verify`) will only result in a failed test build.\n\nCurrent style checking tools:\n\n- flake8: python linting\n- isort: python import sorting\n- black: python code formatting\n\nNote:\n\n    You must have python3.6 available on your path, as it is required for some\n    of the hooks.\n\n\n## Generating Migrations\n\nAfter installing all dependencies, you can generate required migration files\nlike so:\n\n```bash\n$ poetry run ipython migrate.py <nameofmigration>\n```\n\n\n## Publishing a new version\n\n1. Bump the version number in pyproject.toml and src/subscriptions/init.py\n2. Commit and push to master\n3. From github, [create a new release](https://github.com/kogan/django-subscriptions/releases)\n4. Name the release \"v<maj.minor.patch>\" using the version number from step 1.\n5. Publish the release\n6. If the release successfully builds, circleci will publish the new package to pypi\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "http://github.com/kogan/",
+    "keywords": "subscriptions,django",
+    "license": "BSD-3-Clause",
+    "maintainer": "Josh Smeaton",
+    "maintainer_email": "josh.smeaton@gmail.com",
+    "name": "django-subscriptions",
+    "package_url": "https://pypi.org/project/django-subscriptions/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-subscriptions/",
+    "project_urls": {
+      "Documentation": "http://github.com/kogan/django-subscriptions/",
+      "Homepage": "http://github.com/kogan/",
+      "Repository": "http://github.com/kogan/django-subscriptions/"
+    },
+    "release_url": "https://pypi.org/project/django-subscriptions/2.1.1/",
+    "requires_dist": [
+      "django-fsm (>=2.6)",
+      "django-fsm-log (>=1.6)"
+    ],
+    "requires_python": ">=3.6",
+    "summary": "A django package for managing subscription states",
+    "version": "2.1.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 9004998,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "1f63a7bc593bd9e076385919268ffbf023702341284925c722472a811567f483",
+        "md5": "8fe80ec11e4cb37e32e959e2f504c593",
+        "sha256": "d76ea649eb4d5f813d95530222d45414e91fc18c8f8b3f5247fca2ff75b61e62"
+      },
+      "downloads": -1,
+      "filename": "django_subscriptions-2.1.1-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "8fe80ec11e4cb37e32e959e2f504c593",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 12720,
+      "upload_time": "2020-12-29T04:58:21",
+      "upload_time_iso_8601": "2020-12-29T04:58:21.033508Z",
+      "url": "https://files.pythonhosted.org/packages/1f/63/a7bc593bd9e076385919268ffbf023702341284925c722472a811567f483/django_subscriptions-2.1.1-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ad906efbc7e2c43215ee61258cc437c9f60063cc7c2c96251f37d47ce0b228d3",
+        "md5": "7106ad233aff30bfd5126cea445aa937",
+        "sha256": "c6cf4bdba0bdda04392fd2c72e42fe543cc487b1e970063724bd5b944a08acba"
+      },
+      "downloads": -1,
+      "filename": "django-subscriptions-2.1.1.tar.gz",
+      "has_sig": false,
+      "md5_digest": "7106ad233aff30bfd5126cea445aa937",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 13085,
+      "upload_time": "2020-12-29T04:58:20",
+      "upload_time_iso_8601": "2020-12-29T04:58:20.156626Z",
+      "url": "https://files.pythonhosted.org/packages/ad/90/6efbc7e2c43215ee61258cc437c9f60063cc7c2c96251f37d47ce0b228d3/django-subscriptions-2.1.1.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

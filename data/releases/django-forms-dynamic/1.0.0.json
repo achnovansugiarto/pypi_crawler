@@ -1,0 +1,84 @@
+{
+  "info": {
+    "author": "DabApps",
+    "author_email": "hello@dabapps.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "django-forms-dynamic\n====================\n\n**Resolve form field arguments dynamically when a form is instantiated, not when it's declared.**\n\nTested against Django 2.2, 3.2 and 4.0 on Python 3.6, 3.7, 3.8, 3.9 and 3.10\n\n![Build Status](https://github.com/dabapps/django-forms-dynamic/workflows/CI/badge.svg)\n[![pypi release](https://img.shields.io/pypi/v/django-forms-dynamic.svg)](https://pypi.python.org/pypi/django-forms-dynamic)\n\n### Installation\n\nInstall from PyPI\n\n    pip install django-forms-dynamic\n\n## Usage\n\n### Passing arguments to form fields from the view\n\nThe standard way to change a Django form's fields at runtime is override the form's `__init__` method, pass in any values you need from the view, and poke around in `self.fields`:\n\n```python\nclass SelectUserFromMyTeamForm(forms.Form):\n    user = forms.ModelChoiceField(queryset=User.objects.none())\n\n    def __init__(self, *args, **kwargs):\n        team = kwargs.pop(\"team\")\n        super().__init__(*args, **kwargs)\n        self.fields[\"user\"].queryset = User.objects.filter(team=team)\n```\n\n```python\ndef select_user_view(request):\n    form = SelectUserFromMyTeamForm(team=request.user.team)\n    return render(\"form.html\", {\"form\": form})\n```\n\nThis works, but it doesn't scale very well to more complex requirements. It also feels messy: Django forms are intended to be declarative, and this is very much procedural code.\n\nWith `django-forms-dynamic`, we can improve on this approach. We need to do two things:\n\n1. Add the `DynamicFormMixin` to your form class (before `forms.Form`).\n2. Wrap any field that needs dynamic behaviour in a `DynamicField`.\n\nThe first argument to the `DynamicField` constructor is the field _class_ that you are wrapping (eg `forms.ModelChoiceField`). All other arguments (with one special-cased exception detailed below) are passed along to the wrapped field when it is created.\n\nBut there's one very important difference: **any argument that would normally be passed to the field constructor can optionally be a _callable_**. If it is a callable, it will be called _when the form is being instantiated_ and it will be passed the form _instance_ as an argument. The value returned by this callable will then be passed into to the field's constructor as usual.\n\nBefore we see a code example, there's one further thing to note: instead of passing arbitrary arguments (like `team` in the example above) into the form's constructor in the view, we borrow a useful idiom from Django REST framework serializers and instead pass a _single_ argument called `context`, which is a dictionary that can contain any values you need from the view. This is attached to the form as `form.context`.\n\nHere's how the code looks now:\n\n```python\nfrom dynamic_forms import DynamicField, DynamicFormMixin\n\n\nclass SelectUserFromMyTeamForm(DynamicFormMixin, forms.Form):\n    user = DynamicField(\n        forms.ModelChoiceField,\n        queryset=lambda form: User.objects.filter(team=form.context[\"team\"]),\n    )\n```\n\n```python\ndef select_user_view(request):\n    form = SelectUserFromMyTeamForm(context={\"team\": request.user.team})\n    return render(\"form.html\", {\"form\": form})\n```\n\nThis is much nicer!\n\n## Truly dynamic forms with XHR\n\nBut let's go further. Once we have access to the `form`, we can make forms truly dynamic by configuring fields based on the values of _other_ fields. This doesn't really make sense in the standard Django request/response approach, but it _does_ make sense when we bring JavaScript into the equation. A form can be loaded from the server multiple times (or in multiple pieces) by making XHR requests from JavaScript code running in the browser.\n\nImplementing this \"from scratch\" in JavaScript is left as an exercise for the reader. Instead, let's look at how you might do this using some modern \"low JavaScript\" frameworks.\n\n### [HTMX](https://htmx.org/)\n\nTo illustrate the pattern we're going to use one of the examples from the HTMX documentation: \"Cascading Selects\". This is where the options available in one `<select>` depend on the value chosen in another `<select>`. See [the HTMX docs page](https://htmx.org/examples/value-select/) for full details and a working example.\n\nHow would we implement the backend of this using `django-forms-dynamic`?\n\nFirst, let's have a look at the form:\n\n```python\nclass MakeAndModelForm(DynamicFormMixin, forms.Form):\n    MAKE_CHOICES = [\n        (\"audi\", \"Audi\"),\n        (\"toyota\", \"Toyota\"),\n        (\"bmw\", \"BMW\"),\n    ]\n\n    MODEL_CHOICES = {\n        \"audi\": [\n            (\"a1\", \"A1\"),\n            (\"a3\", \"A3\"),\n            (\"a6\", \"A6\"),\n        ],\n        \"toyota\": [\n            (\"landcruiser\", \"Landcruiser\"),\n            (\"tacoma\", \"Tacoma\"),\n            (\"yaris\", \"Yaris\"),\n        ],\n        \"bmw\": [\n            (\"325i\", \"325i\"),\n            (\"325ix\", \"325ix\"),\n            (\"x5\", \"X5\"),\n        ],\n    }\n\n    make = forms.ChoiceField(\n        choices=MAKE_CHOICES,\n        initial=\"audi\",\n    )\n    model = DynamicField(\n        forms.ChoiceField,\n        choices=lambda form: form.MODEL_CHOICES[form[\"make\"].value()],\n    )\n```\n\nThe key bit is right at the bottom. We're using a lambda function to load the choices for the `model` field based on the currently selected value of the `make` field. When the form is first shown to the user, `form[\"make\"].value()` will be `\"audi\"`: the `initial` value supplied to the `make` field. After the form is bound, `form[\"make\"].value()` will return whatever the user selected in the `make` dropdown.\n\nHTMX tends to encourage a pattern of splitting your UI into lots of small endpoints that return fragments of HTML. So we need two views: one to return the entire form on first page load, and one to return _just_ the HTML for the `model` field. The latter will be loaded whenever the `make` field changes, and will return the available `models` for the chosen `make`.\n\nHere are the two views:\n\n```python\ndef htmx_form(request):\n    form = MakeAndModelForm()\n    return render(request, \"htmx.html\", {\"form\": form})\n\n\ndef htmx_models(request):\n    form = MakeAndModelForm(request.GET)\n    return HttpResponse(form[\"model\"])\n```\n\nRemember that the string representation of `form[\"model\"]` (the bound field) is the HTML for the `<select>` element, so we can return this directly in the `HttpResponse`.\n\nThese can be wired up to URLs like this:\n\n```python\nurlpatterns = [\n    path(\"htmx-form/\", htmx_form),\n    path(\"htmx-form/models/\", htmx_models),\n]\n```\n\nAnd finally, we need a template. We're using [django-widget-tweaks](https://github.com/jazzband/django-widget-tweaks) to add the necessary `hx-` attributes to the `make` field right in the template.\n\n```django\n{% load widget_tweaks %}\n<!DOCTYPE html>\n\n<html>\n  <head>\n    <script src=\"https://unpkg.com/htmx.org@1.6.1\"></script>\n  </head>\n  <body>\n    <form method=\"POST\">\n      <h3>Pick a make/model</h3>\n      {% csrf_token %}\n      <div>\n        {{ form.make.label_tag }}\n        {% render_field form.make hx-get=\"/htmx-form/models/\" hx-target=\"#id_model\" %}\n      </div>\n      <div>\n        {{ form.model.label_tag }}\n        {{ form.model }}\n      </div>\n    </form>\n  </body>\n</html>\n```\n\n### [Unpoly](https://unpoly.com/)\n\nLet's build exactly the same thing with Unpoly. Unpoly favours a slightly different philosophy: rather than having the backend returning HTML fragments, it tends to prefer the server to return full HTML pages with every XHR request, and \"plucks out\" the relevant element(s) and inserts them into the DOM, replacing the old ones.\n\nWhen it comes to forms, Unpoly uses a special attribute `[up-validate]` to mark fields which, when changed, should trigger the form to be submitted and re-validated. [The docs for `[up-validate]`](https://unpoly.com/input-up-validate) also describe it as \"a great way to partially update a form when one field depends on the value of another field\", so this is what we'll use to implement our cascading selects.\n\nThe form is exactly the same as the HTMX example above. But this time, we only need one view!\n\n```python\ndef unpoly_form(request):\n    form = MakeAndModelForm(request.POST or None)\n    return render(request, \"unpoly.html\", {\"form\": form})\n```\n\n```python\nurlpatterns = [\n    path(\"unpoly-form/\", unpoly_form),\n]\n```\n\nAnd the template is even more simple:\n\n```django\n{% load widget_tweaks %}\n<!DOCTYPE html>\n\n<html>\n  <head>\n    <script src=\"https://unpkg.com/unpoly@2.5.0/unpoly.min.js\"></script>\n  </head>\n  <body>\n    <form method=\"POST\">\n      <h3>Pick a make/model</h3>\n      {% csrf_token %}\n      <div>\n        {{ form.make.label_tag }}\n        {% render_field form.make up-validate=\"form\" %}\n      </div>\n      <div>\n        {{ form.model.label_tag }}\n        {{ form.model }}\n      </div>\n    </form>\n  </body>\n</html>\n```\n\n## The `include` argument\n\nThere's one more feature we might need: what if we want to remove a field from the form entirely unless another field has a particular value? To accomplish this, the `DynamicField` constructor takes one special argument that isn't passed along to the constructor of the wrapped field: `include`. Just like any other argument, this can be a callable that is passed the form instance, and it should return a boolean: `True` if the field should be included in the form, `False` otherwise. Here's an example:\n\n```python\nclass CancellationReasonForm(DynamicFormMixin, forms.Form):\n    CANCELLATION_REASONS = [\n        (\"too-expensive\", \"Too expensive\"),\n        (\"too-boring\", \"Too boring\"),\n        (\"other\", \"Other\"),\n    ]\n\n    cancellation_reason = forms.ChoiceField(choices=CANCELLATION_REASONS)\n    reason_if_other = DynamicField(\n        forms.CharField,\n        include=lambda form: form[\"cancellation_reason\"].value() == \"other\",\n    )\n```\n\n## Known gotcha: callable arguments\n\nOne thing that might catch you out: if the object you're passing in to your form field's constructor is _already_ a callable, you will need to wrap it in another callable that takes the `form` argument and returns the _actual_ callable you want to pass to the field.\n\nThis is most likely to crop up when you're passing a custom widget class, because classes are callable:\n\n```python\nclass CancellationReasonForm(DynamicFormMixin, forms.Form):\n    ...  # other fields\n\n    reason_if_other = DynamicField(\n        forms.CharField,\n        include=lambda form: form[\"cancellation_reason\"].value() == \"other\",\n        widget=lambda _: forms.TextArea,\n    )\n```\n\n## Why the awkward name?\n\nBecause `django-dynamic-forms` was already taken.\n\n## Code of conduct\n\nFor guidelines regarding the code of conduct when contributing to this repository please review [https://www.dabapps.com/open-source/code-of-conduct/](https://www.dabapps.com/open-source/code-of-conduct/)\n\n\n",
+    "description_content_type": "text/markdown",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/dabapps/django-forms-dynamic",
+    "keywords": "",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-forms-dynamic",
+    "package_url": "https://pypi.org/project/django-forms-dynamic/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-forms-dynamic/",
+    "project_urls": {
+      "Changelog": "https://github.com/dabapps/django-forms-dynamic/releases",
+      "Homepage": "https://github.com/dabapps/django-forms-dynamic",
+      "Issues": "https://github.com/dabapps/django-forms-dynamic/issues"
+    },
+    "release_url": "https://pypi.org/project/django-forms-dynamic/1.0.0/",
+    "requires_dist": null,
+    "requires_python": ">=3.6",
+    "summary": "Resolve form field arguments dynamically when a form is instantiated, not when it's declared.",
+    "version": "1.0.0",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 12696669,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "541e0d4dec5b3a046788d08b7187b814db27d0697d340eb4d93ed78c81b48c58",
+        "md5": "afa600e7cc5ae1848461b803f50f390d",
+        "sha256": "59ce7053b120727001cb1f21436d507017cbd8a91a0c65ebc731c399cbadab0c"
+      },
+      "downloads": -1,
+      "filename": "django_forms_dynamic-1.0.0-py3-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "afa600e7cc5ae1848461b803f50f390d",
+      "packagetype": "bdist_wheel",
+      "python_version": "py3",
+      "requires_python": ">=3.6",
+      "size": 6701,
+      "upload_time": "2022-01-26T09:29:24",
+      "upload_time_iso_8601": "2022-01-26T09:29:24.015316Z",
+      "url": "https://files.pythonhosted.org/packages/54/1e/0d4dec5b3a046788d08b7187b814db27d0697d340eb4d93ed78c81b48c58/django_forms_dynamic-1.0.0-py3-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    },
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "4d2d996798f02d20d3ea9ae0614358bbb75c67f50eaae662131f7d59052f2e8c",
+        "md5": "1c92f8617d62b8ce11732704308ddb96",
+        "sha256": "38339fa12722c1eeebb2f22d9a996c80be19339f17de718784c16e2ba3d3bc6f"
+      },
+      "downloads": -1,
+      "filename": "django-forms-dynamic-1.0.0.tar.gz",
+      "has_sig": false,
+      "md5_digest": "1c92f8617d62b8ce11732704308ddb96",
+      "packagetype": "sdist",
+      "python_version": "source",
+      "requires_python": ">=3.6",
+      "size": 7630,
+      "upload_time": "2022-01-26T09:29:25",
+      "upload_time_iso_8601": "2022-01-26T09:29:25.955715Z",
+      "url": "https://files.pythonhosted.org/packages/4d/2d/996798f02d20d3ea9ae0614358bbb75c67f50eaae662131f7d59052f2e8c/django-forms-dynamic-1.0.0.tar.gz",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}

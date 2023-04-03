@@ -1,0 +1,64 @@
+{
+  "info": {
+    "author": "Martin Chase",
+    "author_email": "outofculture@gmail.com",
+    "bugtrack_url": null,
+    "classifiers": [],
+    "description": "Django Cached Field\n===================\n\nIntroduction\n------------\n\nUsing Django ORM and Celery, cache expensive-to-calculate attributes.\n\nExample\n-------\n\nSay you have a CTO who believes everything belongs in a relational database and\na slow method on one of your models::\n\n    class Lamppost(models.Model):\n        # ...\n        @property\n        def slow_full_name(self):\n            ackermann(5, 2)\n            return 'The %s %s of %s' % (self.weight, self.first_name, self.country)\n\nUgh; too slow. Let's cache that (but not with, say, a dedicated\ncaching system). We'll want a few tools. `Celery\n<http://celeryproject.org/>` with `django-celery\n<http://github.com/ask/django-celery>` will need to be set up and\nhumming along smoothly. Then we'll add in our cached field and rename\nour method appropriately::\n\n    from django_cached_field import CachedIntegerField\n\n    class Lamppost(models.Model):\n        # ...\n        slow_full_name = CachedTextField(null=True)\n\n        def calculate_slow_full_name(self):\n            ackermann(5, 2)\n            return 'The %s %s of %s' % (self.weight, self.first_name, self.country)\n\n(Yeah, ``calculate_*`` is just a convention. I clearly haven't given\nup the ruby ghost, but you can pass in your own method name with\nthe ``calculation_method_name`` arg to the field declaration.)\n\nNext, migrate your db schema to automatically include the new cache\ncontrol fields. Note that at least two fields will be added\nto this table, ``cached_slow_full_name`` of type *text*,\n``slow_full_name_recalculation_needed`` of type *boolean*, probably\ndefaulting to true, and possibly ``slow_full_name_expires_after`` of\ntype *datetime*, if we pass ``temporal_triggers=True`` into the field\ndeclaration (more on that later).\n\nAlready that's kinda better. ``lamppost.slow_full_name`` may take a\nwhile the first time it gets called for a given record, but from then\non, it'll be nigh instant. Of course, at this point, it will never\nchange after that first call.\n\nThe remaining important piece of the puzzle is to invalidate our cache\nusing ``flag_slow_full_name_as_stale``. It is probably changed in some\nviews.py (this example code could be more clever about noticing if the\nrelevant values are updated)::\n\n    @render_to('lamppost/edit.html')\n    def edit(request, lamppost_id):\n        lamppost = Lamppost.objects.get(pk=lamppost_id)\n        form = LamppostForm(request.POST, lamppost)\n        if form.is_valid():\n            form.save()\n            lamppost.flag_slow_full_name_as_stale()\n        return {'form': form, 'lamppost': lamppost}\n\n**This is the hardest part as the developer.** Caching requires you\nhunt down every place the value could be changed and calling that\n``flag_slow_full_name_as_stale`` method. Is country assigned a random\nnew value every morning at cron'o'clock? That flag had best be stale\nby cron'o'one. Do you calculate weight based on the sum of all\nassociated pigeons? Hook into the pigeons landing. And takeoff. And\neverything that changes an individual pigeon's weight. As Francis\nBacon said, \"There are only two hard problems in programming:\nnaming, cache invalidation and off-by-one errors.\"\n\nOne possible invalidation scheme you might want to use is expiration\ndates. We know the pigeons on our lamppost are going to die and turn\ninto ghosts, right::\n\n    class Pigeon(models.Model):\n        death_date = models.DateField()\n\n        def die(self):\n            self.weight = 0\n            self.save()\n\nAnd rather than bother the pigeon-death-handling system, we'll take\nnote of their death as they land::\n\n    class Lamppost(models.Model):\n        #...\n        def notice_pigeon_landing(self, pigeon):\n            earliest = self.pigeon_set.all().aggregate(\n                models.Min('death_date'))['death_date']\n            self.expire_slow_full_name_after(earliest)\n\nOr maybe you only want the cache to ever be valid for 30 minutes, lest\n**They** have too easy a job tracking your thoughts.\n\nSo, yeah, you get the idea.\n\nInstallation\n------------\n\nYou can make things easy on yourself::\n\n    pip install django-cached-field\n\nOr, for a more artisanal feeling, you can clone the repo and install it\nusing python and setup.py::\n\n    git clone git@github.com:outofculture/django-cached-field.git\n    cd django-cached-field/\n    python setup.py install\n\nTested with django 1.3.1, celery 2.3.1, and django-celery 2.3.3, but I\nwould entertain other minimums if someone was willing to test them.\n\nConfiguration\n-------------\n\nUse of this library under at least version >= 1.6 of Django should not\nrequire any configuration changes; just import and use. For older\nDjangos, two settings changes are probably required for things to\nwork: make sure it's a registered app, make sure celery sees its tasks\nfile::\n\n   INSTALLED_APPS += ['django_cached_field',]\n   CELERY_IMPORTS += ['django_cached_field.tasks',]\n\nIf you're going to have expiration dates on your values, and you want\nto use timezone-aware datetimes, you will need to set this setting to\nTrue::\n\n   CACHED_FIELD_USE_TIMEZONE = False  # default\n\nOne setting for test environments: whether recalculation should happen\nwhen flagged as stale (default) or be left to the next time the\nattribute is accessed. This is useful for optimizing testing\nenvironments where you don't care that your cached values are invalid\nor that the expense of calculation is applied to a user. Note that, in\nthis situation, you wouldn't need celery. ::\n\n   CACHED_FIELD_EAGER_RECALCULATION = True  # default\n\nThis is a global option, so individual exceptions should instead be\nhandled by passing the ``and_recalculate`` argument to the\n``flag_FIELD_as_stale`` call.\n\nCaveats\n-------\n\n* All ORM methods (e.g. ``order_by``, ``filter``) can only access this field through ``cached_FIELD``.\n* ``recalculate_FIELD`` uses ``.update(cached_FIELD=`` to set the value. Don't expect ``.save`` to be called.\n* ``flag_FIELD_as_stale`` uses ``.update``, as well.\n* This may break if you try to add this mixin to a field class that multiply-inherits (I'm currently grabbing an arbitrary, non-CachedFieldMixin class and making the real field with it).\n* The FIELD_recalculation_needed field is accessed by regex in at least one place, so problems will result from user fields that match the same pattern.\n\nTODO\n----\n\n* Figure out if we can turn temporal_triggers into a celery job that happens once at the given time.\n* All my tests are in the project I pulled this out of, but based on models therein. I don't have experience making tests for standalone django libraries. Someone wanna point me to a tutorial?\n* Recalculation task will not adapt to recalculation_needed_field_name option\n* Replace use of _recalculation_needed regex with class-level registry of cached fields.\n\n\n",
+    "description_content_type": "",
+    "docs_url": null,
+    "download_url": "",
+    "downloads": {
+      "last_day": -1,
+      "last_month": -1,
+      "last_week": -1
+    },
+    "home_page": "https://github.com/outofculture/django-cached-field",
+    "keywords": "django caching",
+    "license": "BSD",
+    "maintainer": "",
+    "maintainer_email": "",
+    "name": "django-cached-field",
+    "package_url": "https://pypi.org/project/django-cached-field/",
+    "platform": "",
+    "project_url": "https://pypi.org/project/django-cached-field/",
+    "project_urls": {
+      "Homepage": "https://github.com/outofculture/django-cached-field"
+    },
+    "release_url": "https://pypi.org/project/django-cached-field/1.3.1/",
+    "requires_dist": [
+      "django (>=1.9)",
+      "celery (>=3.0)"
+    ],
+    "requires_python": "",
+    "summary": "Celery-deferred, cached fields on Django ORM for expensive-to-calculate attributes",
+    "version": "1.3.1",
+    "yanked": false,
+    "yanked_reason": null
+  },
+  "last_serial": 7184197,
+  "urls": [
+    {
+      "comment_text": "",
+      "digests": {
+        "blake2b_256": "ffcfda354a8223722ef3338b3b558735ec8b072953d5a2df134fb78994d8a1ca",
+        "md5": "d26aeff7c10d512bdd365c948e97f5c0",
+        "sha256": "132d0bbf8477986982047bc6404c615ed8ef5fd9a16333e5705cced553533ee5"
+      },
+      "downloads": -1,
+      "filename": "django_cached_field-1.3.1-py2-none-any.whl",
+      "has_sig": false,
+      "md5_digest": "d26aeff7c10d512bdd365c948e97f5c0",
+      "packagetype": "bdist_wheel",
+      "python_version": "py2",
+      "requires_python": null,
+      "size": 9306,
+      "upload_time": "2018-11-02T21:56:16",
+      "upload_time_iso_8601": "2018-11-02T21:56:16.607650Z",
+      "url": "https://files.pythonhosted.org/packages/ff/cf/da354a8223722ef3338b3b558735ec8b072953d5a2df134fb78994d8a1ca/django_cached_field-1.3.1-py2-none-any.whl",
+      "yanked": false,
+      "yanked_reason": null
+    }
+  ],
+  "vulnerabilities": []
+}
